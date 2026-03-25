@@ -1,0 +1,34 @@
+{
+  "overall": {
+    "chunk_mrr_at_10": {
+      "min": 0.55
+    },
+    "chunk_ndcg_at_10": {
+      "min": 0.65
+    },
+    "chunk_recall_at_10": {
+      "min": 0.75
+    },
+    "parent_hit_at_5": {
+      "min": 0.60
+    },
+    "no_answer_violation_rate": {
+      "max": 0.20
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "chunk_mrr_at_10": {
+        "min": 0.65
+      },
+      "chunk_hit_at_5": {
+        "min": 0.80
+      }
+    },
+    "multimodal": {
+      "media_hit_at_5": {
+        "min": 0.40
+      }
+    }
+  }
+}

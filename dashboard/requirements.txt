@@ -1,0 +1,8 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+sqlalchemy>=2.0
+jinja2>=3.1
+pyyaml>=6.0
+python-multipart>=0.0.6
+websockets>=12.0
+pinecone>=3.0.0

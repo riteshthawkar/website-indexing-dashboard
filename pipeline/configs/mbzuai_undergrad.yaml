@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────────────
+# MBZUAI Undergraduate Handbook
+# ─────────────────────────────────────────────────────────────
+_inherit: default.yaml
+
+project_name: "mbzuai_undergrad"
+
+crawler:
+  start_url: "https://mbzuai.ac.ae/undergraduate"
+  max_pages: 500
+  allowed_domains:
+    - "mbzuai.ac.ae"
+
+embedder:
+  pinecone_index: "mbzuai-undergraduate-summary-only-index"

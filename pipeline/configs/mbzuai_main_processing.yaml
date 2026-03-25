@@ -1,0 +1,33 @@
+# ─────────────────────────────────────────────────────────────
+# MBZUAI Main Website — scrape + processing pipeline only
+# Uses the live MBZUAI crawl target but stops before LLM summary
+# generation and Pinecone upload. This is useful for validating
+# crawler, cleaning, conversion, PDF/media extraction, and chunking
+# when API credentials are not available.
+# ─────────────────────────────────────────────────────────────
+_inherit: mbzuai_main.yaml
+
+project_name: "mbzuai_main_processing"
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid

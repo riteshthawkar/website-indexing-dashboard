@@ -1,0 +1,42 @@
+# ─────────────────────────────────────────────────────────────
+# MBZUAI Main Website — Gemini retrieval + local deterministic graph
+# Uses the standard Gemini retrieval stack and adds a local
+# graph formatting stage plus graph-augmented retrieval mode.
+# This does not sync to Neo4j and does not add semantic extraction.
+# ─────────────────────────────────────────────────────────────
+_inherit: mbzuai_main_gemini_retrieval.yaml
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_retrieval
+    type: formatter
+    plugin: gemini_retrieval
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone
+
+retrieval:
+  retriever_backend: "graph_hybrid"

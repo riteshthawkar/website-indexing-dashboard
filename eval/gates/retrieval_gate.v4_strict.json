@@ -1,0 +1,100 @@
+{
+  "overall": {
+    "chunk_hit_at_5": {
+      "min": 0.85
+    },
+    "chunk_mrr_at_10": {
+      "min": 0.75
+    },
+    "chunk_ndcg_at_10": {
+      "min": 0.70
+    },
+    "chunk_recall_at_10": {
+      "min": 0.78
+    },
+    "parent_hit_at_5": {
+      "min": 0.90
+    },
+    "media_hit_at_1": {
+      "min": 0.80
+    },
+    "no_answer_violation_rate": {
+      "max": 0.05
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "chunk_hit_at_5": {
+        "min": 0.82
+      },
+      "chunk_mrr_at_10": {
+        "min": 0.75
+      }
+    },
+    "scoped": {
+      "chunk_hit_at_5": {
+        "min": 0.90
+      },
+      "parent_hit_at_5": {
+        "min": 0.95
+      }
+    },
+    "multimodal": {
+      "chunk_hit_at_5": {
+        "min": 1.0
+      },
+      "media_hit_at_1": {
+        "min": 0.80
+      },
+      "media_hit_at_5": {
+        "min": 1.0
+      }
+    },
+    "synthesis": {
+      "chunk_hit_at_10": {
+        "min": 1.0
+      }
+    }
+  },
+  "by_source_type": {
+    "webpage": {
+      "chunk_hit_at_5": {
+        "min": 0.80
+      }
+    },
+    "pdf": {
+      "chunk_hit_at_5": {
+        "min": 0.90
+      }
+    },
+    "none": {
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    }
+  },
+  "by_benchmark_tag": {
+    "contact_lookup": {
+      "chunk_hit_at_5": {
+        "min": 0.90
+      },
+      "chunk_mrr_at_10": {
+        "min": 0.85
+      },
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    },
+    "relation_heavy_fact": {
+      "chunk_hit_at_5": {
+        "min": 0.90
+      },
+      "chunk_mrr_at_10": {
+        "min": 0.78
+      },
+      "chunk_ndcg_at_10": {
+        "min": 0.68
+      }
+    }
+  }
+}

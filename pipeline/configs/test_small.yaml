@@ -1,0 +1,28 @@
+# ─────────────────────────────────────────────────────────────
+# Small test config — crawls ~10 pages for integration testing
+# ─────────────────────────────────────────────────────────────
+_inherit: default.yaml
+
+project_name: "test_small"
+
+crawler:
+  start_url: "https://mbzuai.ac.ae/research"
+  max_pages: 10
+  max_depth: 2
+  fetch_concurrency: 3
+  sitemap_enabled: false
+  extract_images: true
+  max_images_per_page: 5
+  allowed_domains:
+    - "mbzuai.ac.ae"
+
+# Only run stages that don't need API keys
+stages:
+  - type: crawler
+    plugin: crawl4ai
+  - type: quality_gate
+    plugin: quality_scorer
+  - type: cleaner
+    plugin: trafilatura
+  - type: converter
+    plugin: crawl4ai_md

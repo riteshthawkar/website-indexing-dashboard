@@ -1,0 +1,9 @@
+_inherit: mbzuai_main_gemini_retrieval.yaml
+
+embedder:
+  pinecone_index: "mbzuai-gemini-retrieval-v1"
+  pinecone_sparse_index: ""
+  enable_sparse: false
+
+retrieval:
+  enable_sparse: false

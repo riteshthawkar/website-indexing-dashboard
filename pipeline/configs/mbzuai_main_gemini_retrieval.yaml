@@ -1,0 +1,87 @@
+# ─────────────────────────────────────────────────────────────
+# MBZUAI Main Website — resume-ready Gemini retrieval indexing
+# Uses the completed scrape/processing stages and adds retrieval
+# formatting + Gemini/Pinecone indexing.
+# ─────────────────────────────────────────────────────────────
+_inherit: mbzuai_main_processing.yaml
+
+project_name: "mbzuai_main_processing"
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_retrieval
+    type: formatter
+    plugin: gemini_retrieval
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone
+
+embedder:
+  model: "gemini-embedding-2-preview"
+  output_dimensionality: 1536
+  pinecone_index: "mbzuai-gemini-retrieval-v2"
+  pinecone_sparse_index: "mbzuai-gemini-retrieval-v2-sparse"
+  namespace_chunks: "chunks"
+  namespace_parents: "parents"
+  namespace_media: "media"
+  namespace_facts: "facts"
+  create_index_if_missing: true
+  enable_dense_facts: true
+  enable_sparse: true
+  sparse_model: "pinecone-sparse-english-v0"
+  sparse_text_field: "chunk_text"
+  sparse_upsert_batch_size: 96
+  pinecone_cloud: "aws"
+  pinecone_region: "us-east-1"
+  batch_size: 32
+  media_text_batch_size: 32
+  media_multimodal_batch_size: 4
+  upsert_batch_size: 100
+  max_retries: 10
+  retry_base_delay_sec: 5
+  retry_max_delay_sec: 300
+
+retrieval:
+  dense_chunk_top_k: 12
+  dense_parent_top_k: 6
+  dense_media_top_k: 6
+  dense_fact_top_k: 8
+  lexical_top_k: 12
+  sparse_chunk_top_k: 14
+  sparse_parent_top_k: 8
+  sparse_media_top_k: 8
+  sparse_fact_top_k: 10
+  rrf_k: 60
+  fact_neighbor_window: 1
+  max_context_chunks: 12
+  max_parent_chunks: 10
+  max_media_results: 4
+  same_parent_expand_threshold: 2
+  enable_sparse: true
+  enable_rerank: true
+  rerank_model: "pinecone-rerank-v0"
+  rerank_top_n: 32
+  rerank_return_top_k: 10
+  abstain_min_token_overlap: 0.12
+  fact_abstain_min_token_overlap: 0.20
+  abstain_min_support_score: 0.05

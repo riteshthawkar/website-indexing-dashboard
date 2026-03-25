@@ -1,0 +1,57 @@
+_inherit: mbzuai_main_openai_assertion_indexing.yaml
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_assertion_slices
+    type: formatter
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: upload_graph
+    type: embedder
+    plugin: neo4j_graph_store
+
+retrieval:
+  retriever_backend: "graph_hybrid"

@@ -1,0 +1,16 @@
+_inherit: mbzuai_main_openai_postindex_graph.yaml
+
+retrieval:
+  retriever_backend: "routed_hybrid"
+  routed_graph_enabled: true
+  routed_graph_query_types: ["fact"]
+  routed_graph_min_confidence: 0.38
+  routed_fallback_to_vector: true
+  parallel_graph_enabled: true
+  parallel_query_rewriting_enabled: true
+  parallel_graph_augment_all_queries: true
+  query_planner_enabled: true
+  query_planner_model: "gpt-5-nano"
+  evidence_adjudicator_enabled: true
+  evidence_adjudicator_model: "gpt-5-nano"
+  evidence_adjudicator_min_confidence: 0.58

@@ -1,0 +1,124 @@
+from __future__ import annotations
+
+import json
+from collections import Counter
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Sequence, Set
+
+from pipeline.evaluation.dataset import EvalExample, load_eval_examples
+
+
+def _count_by(values: Iterable[str]) -> Dict[str, int]:
+    counter = Counter(str(value) for value in values)
+    return dict(sorted(counter.items()))
+
+
+def summarize_eval_examples(examples: Sequence[EvalExample]) -> Dict[str, Any]:
+    rows = list(examples)
+    return {
+        "query_count": len(rows),
+        "query_type_counts": _count_by(example.query_type for example in rows),
+        "source_type_counts": _count_by(example.source_type for example in rows),
+        "no_answer_count": sum(1 for example in rows if example.no_answer),
+        "answerable_count": sum(1 for example in rows if not example.no_answer),
+        "with_gold_chunks": sum(1 for example in rows if example.gold_chunk_ids),
+        "with_gold_parents": sum(1 for example in rows if example.gold_parent_ids),
+        "with_gold_media": sum(1 for example in rows if example.gold_media_ids),
+    }
+
+
+def _load_retrieval_bundle_ids(work_dir: str | Path) -> Dict[str, Set[str]]:
+    bundle_path = (
+        Path(work_dir)
+        / "stage_outputs"
+        / "format_retrieval"
+        / "retrieval_bundle.json"
+    )
+    if not bundle_path.exists():
+        raise FileNotFoundError(bundle_path)
+    payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+    return {
+        "gold_chunk_ids": {str(item.get("id")) for item in payload.get("chunk_records", []) if str(item.get("id") or "")},
+        "gold_parent_ids": {str(item.get("id")) for item in payload.get("parent_records", []) if str(item.get("id") or "")},
+        "gold_media_ids": {str(item.get("id")) for item in payload.get("media_records", []) if str(item.get("id") or "")},
+    }
+
+
+def _all_gold_values(example: EvalExample, field_name: str) -> List[str]:
+    values = list(getattr(example, field_name) or [])
+    alternate_values = list((example.metadata or {}).get(f"alternate_{field_name}") or [])
+    output: List[str] = []
+    for item in [*values, *alternate_values]:
+        value = str(item or "").strip()
+        if value:
+            output.append(value)
+    return output
+
+
+def validate_eval_examples(
+    dataset_path: str | Path,
+    *,
+    work_dir: str | Path | None = None,
+) -> Dict[str, Any]:
+    examples = load_eval_examples(dataset_path)
+    summary = summarize_eval_examples(examples)
+    errors: List[Dict[str, Any]] = []
+    warnings: List[Dict[str, Any]] = []
+
+    available_ids: Dict[str, Set[str]] = {}
+    if work_dir:
+        available_ids = _load_retrieval_bundle_ids(work_dir)
+
+    for example in examples:
+        if example.no_answer:
+            if any((example.gold_chunk_ids, example.gold_parent_ids, example.gold_media_ids)):
+                warnings.append(
+                    {
+                        "id": example.id,
+                        "field": "no_answer",
+                        "reason": "no_answer example contains gold evidence ids",
+                    }
+                )
+            continue
+
+        if not any((example.gold_chunk_ids, example.gold_parent_ids, example.gold_media_ids)):
+            errors.append(
+                {
+                    "id": example.id,
+                    "field": "gold_evidence",
+                    "reason": "answerable example is missing all gold evidence ids",
+                }
+            )
+
+        if not example.reference_answer:
+            warnings.append(
+                {
+                    "id": example.id,
+                    "field": "reference_answer",
+                    "reason": "answerable example is missing a reference answer",
+                }
+            )
+
+        if not available_ids:
+            continue
+
+        for field_name, known_ids in available_ids.items():
+            for value in _all_gold_values(example, field_name):
+                if value not in known_ids:
+                    errors.append(
+                        {
+                            "id": example.id,
+                            "field": field_name,
+                            "reason": "missing_index_id",
+                            "value": value,
+                        }
+                    )
+
+    return {
+        "dataset_path": str(Path(dataset_path).resolve()),
+        "work_dir": str(Path(work_dir).resolve()) if work_dir else None,
+        "summary": summary,
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+    }

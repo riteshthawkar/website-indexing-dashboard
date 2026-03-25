@@ -1,0 +1,62 @@
+_inherit: mbzuai_main_gemini_retrieval.yaml
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_assertion_slices
+    type: formatter
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone
+
+embedder:
+  pinecone_index: "mbzuai-gemini-retrieval-v2"
+  pinecone_sparse_index: "mbzuai-gemini-retrieval-v2-sparse"
+
+retrieval:
+  retriever_backend: "vector"
+
+assertions:
+  allowed_authority_classes:
+    - canonical_page
+    - policy_page
+    - official_catalog
+    - official_brochure
+    - faq_page
+  extract_model: "gpt-5-mini"
+  validate_model: "gpt-5-nano"

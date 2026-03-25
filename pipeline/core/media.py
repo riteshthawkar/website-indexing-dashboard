@@ -1,0 +1,430 @@
+"""
+Shared media helpers for ingestion, indexing, and retrieval contracts.
+
+The pipeline keeps media as structured metadata so downstream retrieval and
+response generation can attach relevant images/videos without depending on raw
+HTML tags surviving every stage.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+
+DIRECT_VIDEO_EXTENSIONS = {
+    ".mp4",
+    ".webm",
+    ".ogg",
+    ".mov",
+    ".m4v",
+    ".m3u8",
+}
+
+
+def _clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    text = " ".join(str(value).split())
+    return text.strip()
+
+
+def _clean_url(value: Any) -> str:
+    text = _clean_text(value)
+    return text
+
+
+def _coerce_position(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize a media item to the canonical schema."""
+    media_type = _clean_text(item.get("type") or item.get("media_type") or "image").lower()
+    if media_type not in {"image", "video"}:
+        media_type = "image"
+
+    normalized = {
+        "type": media_type,
+        "url": _clean_url(item.get("url")),
+        "alt": _clean_text(item.get("alt")),
+        "title": _clean_text(item.get("title")),
+        "caption": _clean_text(item.get("caption")),
+        "description": _clean_text(item.get("description")),
+        "context": _clean_text(item.get("context")),
+        "poster_url": _clean_url(item.get("poster_url")),
+        "provider": _clean_text(item.get("provider")),
+        "transcript": _clean_text(item.get("transcript")),
+        "local_path": _clean_text(item.get("local_path")),
+        "asset_uri": _clean_url(item.get("asset_uri")),
+        "source_type": _clean_text(item.get("source_type")),
+        "source_file": _clean_text(item.get("source_file")),
+        "source_url": _clean_url(item.get("source_url")),
+        "source_document_path": _clean_text(item.get("source_document_path")),
+        "embed_type": _clean_text(item.get("embed_type")),
+        "document_id": _clean_text(item.get("document_id")),
+        "md_path": _clean_text(item.get("md_path")),
+        "id": _clean_text(item.get("id")),
+        "position": _coerce_position(item.get("position")),
+        "page_number": _coerce_position(item.get("page_number")),
+        "width": _coerce_position(item.get("width")),
+        "height": _coerce_position(item.get("height")),
+        "mime_type": _clean_text(item.get("mime_type")),
+        "track_urls": [
+            _clean_url(track_url)
+            for track_url in (item.get("track_urls") or [])
+            if _clean_url(track_url)
+        ],
+        "transcript_url": _clean_url(item.get("transcript_url")),
+    }
+
+    if media_type == "image" and not normalized["title"]:
+        normalized["title"] = (
+            normalized["alt"]
+            or normalized["caption"]
+            or normalized["description"]
+            or normalized["context"]
+        )
+    if media_type == "video" and not normalized["title"]:
+        normalized["title"] = (
+            normalized["caption"]
+            or normalized["alt"]
+            or normalized["description"]
+            or normalized["context"]
+            or "Video"
+        )
+    if normalized["local_path"] and not normalized["asset_uri"]:
+        try:
+            normalized["asset_uri"] = Path(normalized["local_path"]).resolve().as_uri()
+        except Exception:
+            pass
+
+    return normalized
+
+
+def dedupe_media_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate media by type + URL while preserving order."""
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for item in items:
+        normalized = normalize_media_item(item)
+        url = normalized.get("url")
+        if not url:
+            continue
+        key = (normalized.get("type"), url)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+
+    return sorted(
+        deduped,
+        key=lambda item: (
+            item.get("position") is None,
+            item.get("position") if item.get("position") is not None else 10**9,
+        ),
+    )
+
+
+def media_items_by_type(items: Iterable[Dict[str, Any]], media_type: str) -> List[Dict[str, Any]]:
+    return [item for item in dedupe_media_items(items) if item.get("type") == media_type]
+
+
+def compact_media_for_metadata(
+    items: Iterable[Dict[str, Any]],
+    *,
+    max_items: int = 8,
+    max_text_len: int = 280,
+    include_local_path: bool = False,
+) -> List[Dict[str, Any]]:
+    """Trim media metadata to a Pinecone-friendly shape."""
+    compacted: List[Dict[str, Any]] = []
+    for item in dedupe_media_items(items)[: max(0, int(max_items))]:
+        compact = {
+            "type": item.get("type", ""),
+            "url": item.get("url", ""),
+            "alt": item.get("alt", "")[:max_text_len],
+            "title": item.get("title", "")[:max_text_len],
+            "caption": item.get("caption", "")[:max_text_len],
+            "description": item.get("description", "")[: max_text_len * 2],
+            "context": item.get("context", "")[:max_text_len],
+            "poster_url": item.get("poster_url", ""),
+            "asset_uri": item.get("asset_uri", ""),
+            "provider": item.get("provider", "")[:80],
+            "transcript": item.get("transcript", "")[: max_text_len * 2],
+            "source_type": item.get("source_type", "")[:40],
+            "source_file": item.get("source_file", "")[: max_text_len * 2],
+            "source_url": item.get("source_url", ""),
+            "document_id": item.get("document_id", "")[:120],
+            "page_number": item.get("page_number"),
+            "embed_type": item.get("embed_type", "")[:40],
+            "position": item.get("position"),
+            "transcript_url": item.get("transcript_url", ""),
+            "mime_type": item.get("mime_type", "")[:80],
+        }
+        if include_local_path and item.get("local_path"):
+            compact["local_path"] = item["local_path"]
+        compacted.append({k: v for k, v in compact.items() if v not in ("", None, [])})
+    return compacted
+
+
+def build_media_embedding_text(
+    items: Iterable[Dict[str, Any]],
+    *,
+    max_items: int = 5,
+    max_transcript_chars: int = 500,
+) -> str:
+    """Build a compact text block so media semantics participate in retrieval."""
+    lines: List[str] = []
+    for item in compact_media_for_metadata(items, max_items=max_items, max_text_len=220):
+        title = item.get("title") or item.get("alt") or item.get("caption") or item.get("type", "media")
+        parts = [f"{item.get('type', 'media').upper()}: {title}"]
+        if item.get("caption") and item["caption"] != title:
+            parts.append(f"caption={item['caption']}")
+        if item.get("description") and item["description"] != title:
+            parts.append(f"description={item['description'][:max_transcript_chars]}")
+        if item.get("context"):
+            parts.append(f"context={item['context']}")
+        if item.get("provider"):
+            parts.append(f"provider={item['provider']}")
+        if item.get("transcript"):
+            parts.append(f"transcript={item['transcript'][:max_transcript_chars]}")
+        lines.append(" - ".join(parts))
+    return "\n".join(lines)
+
+
+def build_media_markdown(
+    items: Iterable[Dict[str, Any]],
+    *,
+    prefer_local_images: bool = True,
+    response_mode: bool = False,
+    allow_html_video: bool = True,
+    relative_to: Optional[str | Path] = None,
+    max_images: Optional[int] = None,
+    max_videos: Optional[int] = None,
+    skip_non_semantic_images: bool = False,
+) -> str:
+    """
+    Render media into markdown.
+
+    For indexing/conversion we keep video markup conservative and link-based.
+    For response generation, direct video URLs can be rendered with HTML5 video.
+    """
+    blocks: List[str] = []
+    image_count = 0
+    video_count = 0
+    for item in dedupe_media_items(items):
+        if item.get("type") == "image":
+            if max_images is not None and image_count >= max_images:
+                continue
+            if skip_non_semantic_images and not _has_semantic_signal(item):
+                continue
+            src = item.get("local_path") if prefer_local_images and item.get("local_path") else item.get("url")
+            if not src:
+                continue
+            if relative_to and item.get("local_path"):
+                src = _relative_media_path(item.get("local_path"), relative_to) or src
+            alt = item.get("alt") or item.get("caption") or item.get("title") or item.get("context") or "Image"
+            block_lines = [f"![{alt}]({src})"]
+            if item.get("caption") and item["caption"] != alt:
+                block_lines.append(f"Caption: {item['caption']}")
+            if item.get("context"):
+                block_lines.append(f"Context: {item['context']}")
+            blocks.append("\n".join(block_lines))
+            image_count += 1
+            continue
+
+        url = item.get("url", "")
+        if not url:
+            continue
+        if max_videos is not None and video_count >= max_videos:
+            continue
+
+        title = item.get("title") or item.get("caption") or item.get("alt") or "Video"
+        block_lines = [f"### Video: {title}"]
+
+        if response_mode and allow_html_video and is_direct_video_url(url):
+            block_lines.append(f'<video controls src="{url}"></video>')
+        else:
+            block_lines.append(f"[Watch video]({url})")
+
+        if item.get("poster_url"):
+            block_lines.append(f"![{title} poster]({item['poster_url']})")
+        if item.get("caption") and item["caption"] != title:
+            block_lines.append(f"Caption: {item['caption']}")
+        if item.get("context"):
+            block_lines.append(f"Context: {item['context']}")
+        if item.get("transcript"):
+            block_lines.append(f"Transcript: {item['transcript'][:800]}")
+        blocks.append("\n".join(block_lines))
+        video_count += 1
+
+    if not blocks:
+        return ""
+    return "## Embedded Media\n\n" + "\n\n".join(blocks)
+
+
+def _has_semantic_signal(item: Dict[str, Any]) -> bool:
+    signal_values = [
+        item.get("alt", ""),
+        item.get("title", ""),
+        item.get("caption", ""),
+        item.get("context", ""),
+    ]
+    generic = {"image", "photo", "figure", "graphic", "img", ""}
+    for value in signal_values:
+        cleaned = _clean_text(value).lower()
+        if cleaned and cleaned not in generic and not cleaned.startswith("figure "):
+            return True
+    return False
+
+
+def _relative_media_path(path: str | Path, relative_to: str | Path) -> str:
+    try:
+        target = Path(path).resolve()
+        base = Path(relative_to).resolve()
+        if base.is_file():
+            base = base.parent
+        return os.path.relpath(str(target), str(base)).replace("\\", "/")
+    except Exception:
+        return ""
+
+
+def build_media_manifest(
+    items: Iterable[Dict[str, Any]],
+    *,
+    kind: str = "document_media",
+) -> Dict[str, Any]:
+    normalized_items = []
+    documents: Dict[str, Dict[str, Any]] = {}
+
+    for item in dedupe_media_items(items):
+        normalized = dict(item)
+        local_path = normalized.get("local_path")
+        if local_path:
+            normalized["asset_uri"] = Path(local_path).resolve().as_uri()
+
+        document_key = (
+            str(normalized.get("document_id") or "")
+            or str(normalized.get("md_path") or "")
+            or str(normalized.get("source_file") or "")
+            or "unknown"
+        )
+        document = documents.setdefault(
+            document_key,
+            {
+                "document_id": str(normalized.get("document_id") or ""),
+                "md_path": str(normalized.get("md_path") or ""),
+                "source_file": str(normalized.get("source_file") or ""),
+                "item_ids": [],
+                "image_count": 0,
+                "video_count": 0,
+            },
+        )
+        document["item_ids"].append(str(normalized.get("id") or ""))
+        if normalized.get("type") == "video":
+            document["video_count"] += 1
+        else:
+            document["image_count"] += 1
+        normalized_items.append(normalized)
+
+    return {
+        "version": 2,
+        "kind": kind,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "documents": list(documents.values()),
+        "items": normalized_items,
+    }
+
+
+def load_media_manifest_items(value: Any) -> List[Dict[str, Any]]:
+    if isinstance(value, list):
+        return dedupe_media_items(value)
+    if isinstance(value, dict):
+        if isinstance(value.get("items"), list):
+            return dedupe_media_items(value["items"])
+    return []
+
+
+def parse_media_field(value: Any) -> List[Dict[str, Any]]:
+    """Parse a metadata field that may already be a list or a JSON string."""
+    if isinstance(value, list):
+        return dedupe_media_items(value)
+    if isinstance(value, dict):
+        return load_media_manifest_items(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            return []
+        return load_media_manifest_items(parsed)
+    return []
+
+
+def build_retrieval_documents(
+    docs: Iterable[Dict[str, Any]],
+    *,
+    max_media_per_doc: int = 4,
+    max_total_media: int = 8,
+) -> List[Dict[str, Any]]:
+    """
+    Build a stable retrieval payload for a response generator.
+
+    The caller can pass Pinecone match dictionaries or pipeline document dicts.
+    """
+    prepared: List[Dict[str, Any]] = []
+    remaining = max_total_media
+
+    for doc in docs:
+        metadata = doc.get("metadata") or {}
+        media = parse_media_field(metadata.get("media"))
+        if not media:
+            media = parse_media_field(metadata.get("images"))
+            media.extend(
+                {**item, "type": "video"}
+                for item in parse_media_field(metadata.get("videos"))
+            )
+        media = compact_media_for_metadata(media, max_items=min(max_media_per_doc, remaining))
+        remaining = max(0, remaining - len(media))
+
+        prepared.append(
+            {
+                "id": doc.get("id") or metadata.get("document_source") or "",
+                "text": doc.get("text", ""),
+                "source_url": metadata.get("document_source") or metadata.get("page_source") or "",
+                "document_title": metadata.get("document_title") or "",
+                "document_summary": metadata.get("document_summary") or "",
+                "media": media,
+            }
+        )
+        if remaining <= 0:
+            break
+
+    return prepared
+
+
+def response_agent_media_instructions() -> str:
+    """Instructions for an answer agent consuming structured retrieval payloads."""
+    return (
+        "Use only the supplied media objects. "
+        "Embed images with markdown image syntax. "
+        "For videos, prefer an HTML5 <video> block only when the URL points to a direct video file; "
+        "otherwise use a markdown watch link. "
+        "Do not invent media URLs, captions, or transcripts. "
+        "Only include media when it is directly relevant to the answer."
+    )
+
+
+def is_direct_video_url(url: str) -> bool:
+    return Path(url.split("?", 1)[0]).suffix.lower() in DIRECT_VIDEO_EXTENSIONS

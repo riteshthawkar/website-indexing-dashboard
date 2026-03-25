@@ -1,0 +1,13 @@
+# Runtime package set for the Docling + Granite Vision PDF path.
+# Install into the project venv with:
+#   pip install -r pipeline/requirements-docling.txt
+
+docling[vlm]==2.80.0
+torch==2.7.0
+torchvision==0.22.0
+torchaudio==2.7.0
+numpy==1.26.4
+opencv-python==4.11.0.86
+chardet==5.2.0
+pdfplumber>=0.11,<1
+PyMuPDF>=1.25,<2

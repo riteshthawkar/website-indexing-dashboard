@@ -1,0 +1,15 @@
+# ─────────────────────────────────────────────────────────────
+# MBZUAI News pages
+# ─────────────────────────────────────────────────────────────
+_inherit: default.yaml
+
+project_name: "mbzuai_news"
+
+crawler:
+  start_url: "https://mbzuai.ac.ae/news"
+  max_pages: 2000
+  allowed_domains:
+    - "mbzuai.ac.ae"
+
+embedder:
+  pinecone_index: "final-mbzuai-webpages-index"

@@ -1,0 +1,10 @@
+_inherit: mbzuai_main_processing.yaml
+
+project_name: "mbzuai_output_validation"
+
+crawler:
+  max_pages: 60
+  max_depth: 2
+  sitemap_seed_limit: 120
+  max_images_per_page: 12
+  max_videos_per_page: 6

@@ -1,0 +1,478 @@
+# ─────────────────────────────────────────────────────────────
+# Default pipeline configuration
+# All project configs should inherit from this file:
+#   _inherit: default.yaml
+# ─────────────────────────────────────────────────────────────
+
+project_name: "default"
+work_dir: "./runs"
+
+pipeline:
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+# Stage execution order — each entry maps to a registered plugin.
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling                 # Docling + Granite Vision for PDFs
+  - id: convert_html
+    type: converter
+    plugin: markitdown              # HTML → Markdown (preserves images)
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: summarize_markdown
+    type: summarizer
+    plugin: openai_summarizer
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_embeddings
+    type: formatter
+    plugin: pinecone_formatter
+  - id: upload_embeddings
+    type: embedder
+    plugin: openai_embedder
+
+# ─── Crawler ────────────────────────────────────────────────
+crawler:
+  start_url: null               # REQUIRED — set in project config
+  max_pages: 1000
+  max_depth: 10
+  fetch_concurrency: 5
+  download_concurrency: 10
+  timeout: 30                   # seconds
+  headless: true
+  max_file_size_mb: 100
+  max_image_size_mb: 10
+  download_retry_attempts: 3
+  download_retry_backoff_sec: 2.0
+  checkpoint_flush_interval_sec: 5
+  sitemap_enabled: true
+  sitemap_seed_limit: 500
+  respect_robots_txt: true
+  include_external: false
+  allowed_domains: []
+  excluded_subdomains: []
+  user_agent: null
+  headers: {}
+  cookies: []
+  proxy: null
+  proxy_config: null
+  storage_state: null
+  viewport: null
+  ignore_https_errors: true
+  enable_stealth: false
+  java_script_enabled: true
+  init_scripts: []
+  wait_until: "domcontentloaded"
+  wait_for: null
+  wait_for_timeout_ms: null
+  delay_before_return_html: 0.1
+  mean_delay: 0.1
+  max_range: 0.3
+  process_iframes: false
+  remove_overlay_elements: true
+  simulate_user: false
+  override_navigator: false
+  magic: false
+  # Image extraction from web pages
+  extract_images: true            # extract content images from HTML
+  download_page_images: true      # cache HTML page images locally for the dashboard
+  max_images_per_page: 20         # max images to save per page
+  extract_videos: true            # extract embedded/direct videos from HTML and iframe embeds
+  max_videos_per_page: 10
+  fetch_video_transcripts: true   # fetch WebVTT/SRT text tracks when available on allowed domains
+  max_video_transcript_kb: 128
+  parse_source_html_for_media: true  # merge media found in raw source when rendered DOM omits it
+
+# ─── Cleaner ────────────────────────────────────────────────
+cleaner:
+  engine: "trafilatura"
+  include_tables: true
+  include_links: true
+  preserve_embedded_media: true
+  min_content_length: 100
+  recursive: true
+
+# ─── Converter ──────────────────────────────────────────────
+converter:
+  max_workers: 10
+  overwrite: false
+  content_filter_threshold: 0.48
+  max_images_in_markdown: 4
+  max_videos_in_markdown: 3
+  append_only_semantic_images: true
+  # Docling PDF settings
+  do_ocr: true
+  do_table_structure: true
+  force_backend_text: true
+  images_scale: 2.0
+  generate_picture_images: true
+  generate_page_images: false
+  document_timeout: 120
+  docling_prefetch_models: true
+  docling_artifacts_path: "~/.cache/docling/models"
+  docling_doc_batch_size: 4
+  docling_doc_batch_concurrency: 2
+  docling_submit_batch_size: 4
+  docling_page_batch_size: 8
+  docling_page_batch_concurrency: 2
+  docling_elements_batch_size: 24
+  # Granite Vision picture descriptions
+  use_vlm: true
+  vlm_runtime: "transformers"              # external Granite captioning over Docling figure crops
+  vlm_preset: "granite_vision"
+  vlm_model: "ibm-granite/granite-vision-3.3-2b"
+  vlm_prompt: "Describe this document figure or infographic in one concise sentence using only visible content and provided document context."
+  vlm_max_new_tokens: 96
+  max_vlm_images_per_doc: 8
+  vlm_batch_size: 1
+  vlm_strategy: "missing_only"            # skip VLM when a figure already has a substantive caption/alt
+  vlm_skip_caption_min_words: 16
+  vlm_max_description_words: 36
+  vlm_image_max_side: 1600
+  vlm_image_max_pixels: 1800000
+  vlm_retry_downscale_factor: 0.6
+  vlm_retry_attempts: 3
+  vlm_min_free_cuda_mb_for_batch: 4096
+  vlm_local_files_only: true              # avoid runtime Hugging Face network fetches; use local cache only
+  vlm_require_accelerator: true           # skip Granite on CPU-only hosts; 2B VLM inference is not production-practical there
+  vlm_use_cache: false
+  vlm_clear_cuda_cache_each_image: true
+  # Extraction validation / quarantine
+  validation_compare_fallback_when_suspicious: true
+  validation_fallback_preference_margin: 0.08
+  validation_min_informative_words: 40
+  validation_min_text_chars: 180
+  validation_min_informative_words_office: 6
+  validation_min_text_chars_office: 20
+  validation_max_suspicious_tokens: 4
+  validation_max_suspicious_token_ratio: 0.025
+  validation_critical_suspicious_token_length: 40
+  validation_max_replacement_char_ratio: 0.002
+  validation_formula_warn_count: 3
+  validation_formula_fail_count: 12
+  validation_formula_fail_word_floor: 200
+  validation_max_single_word_line_ratio: 0.58
+  validation_min_semantic_media_items: 1
+  validation_min_semantic_media_words: 10
+  validation_min_semantic_media_item_words: 4
+
+# ─── Summarizer ─────────────────────────────────────────────
+summarizer:
+  model: "gpt-4.1-nano"
+  temperature: 0.1
+  max_tokens: 32000
+  concurrency: 10
+  retry_attempts: 3
+  retry_delay: 5
+  per_request_delay_sec: 0.0
+  use_existing_summaries: true
+
+# ─── Chunker ────────────────────────────────────────────────
+chunker:
+  strategy: "hybrid"
+  use_docling_native: true
+  include_section_headings: true
+  always_emit_headings: false
+  target_tokens: 450
+  max_tokens: 650
+  overlap_tokens: 80
+  min_chunk_tokens: 140
+  max_chunks_per_document: 64
+
+# ─── Quality ────────────────────────────────────────────────
+quality:
+  min_content_length: 100
+  detect_login_walls: true
+  dedup_threshold: 0.85
+  dedup_num_perm: 128
+  dedup_ngram_size: 5
+  target_languages:
+    - en
+
+# ─── Formatter ──────────────────────────────────────────────
+formatter:
+  include_full_content: true
+  include_summary: true
+  include_media_context: true
+  chunk_documents: false
+  chunk_size_chars: 4000
+  chunk_overlap_chars: 400
+  max_chunks_per_document: 64
+  max_media_per_doc: 8
+  max_images_per_doc: 5           # max images attached per document in metadata
+  max_videos_per_doc: 3
+  fact_min_chars: 40
+  fact_max_chars: 360
+  fact_max_snippets_per_chunk: 5
+  sparse_chunk_max_chars: 6000
+  sparse_parent_max_chars: 8000
+  sparse_media_max_chars: 4000
+  sparse_fact_max_chars: 480
+  sparse_parent_max_headings: 12
+  sparse_parent_max_snippets: 6
+
+graph:
+  extraction_provider: "gemini"
+  extraction_model: "gemini-2.5-flash"
+  extraction_temperature: 0.0
+  extraction_source: "facts_only"
+  extraction_batch_size: 16
+  extraction_parallelism: 3
+  extraction_max_items: 800
+  extraction_max_items_per_document: 3
+  extraction_min_score: 5.0
+  extraction_priority_host_suffixes:
+    - "mbzuai.ac.ae"
+  extraction_resume_cache: true
+  extraction_include_chunk_fallback: false
+  extraction_min_confidence: 0.55
+  extraction_retry_attempts: 5
+  extraction_retry_base_delay_sec: 5
+  extraction_retry_max_delay_sec: 120
+  extraction_split_on_retryable_failure: true
+  extraction_fail_open_after_retries: true
+  promote_min_confidence: 0.65
+  canonicalize_merge_aliases: true
+  neo4j_uri: ""
+  neo4j_database: ""
+  neo4j_username: ""
+  neo4j_password: ""
+  neo4j_namespace: ""
+  neo4j_compact_upload: true
+  neo4j_clear_all_kg_nodes_on_zero_progress: false
+  neo4j_http_timeout_sec: 60
+  neo4j_load_batch_size: 1000
+  neo4j_clear_namespace_on_zero_progress: true
+  allowed_entity_types:
+    - Person
+    - Program
+    - Department
+    - Lab
+    - Policy
+    - Location
+    - Event
+    - Publication
+    - Organization
+    - Contact
+    - Date
+    - Requirement
+    - Facility
+    - Topic
+    - Other
+  allowed_relation_types:
+    - AFFILIATED_WITH
+    - OFFERS
+    - LOCATED_IN
+    - HAS_DEADLINE
+    - MENTIONS
+    - PART_OF
+    - TEACHES
+    - REQUIRES
+    - CONTACTS
+    - HOSTS
+    - RESEARCHES
+    - ABOUT
+    - RELATED_TO
+    - OTHER
+
+assertions:
+  slice_target_tokens: 2200
+  slice_max_tokens: 3200
+  slice_section_margin_tokens: 320
+  max_slices: 0
+  allowed_authority_classes: []
+  excluded_authority_classes: []
+  allowed_document_types: []
+  extract_model: "gpt-5-mini"
+  extract_reasoning_effort: "minimal"
+  extract_temperature: 0.0
+  extract_max_completion_tokens: 4000
+  extract_concurrency: 4
+  extract_retries: 3
+  extract_retry_delay_sec: 3
+  extract_per_request_delay_sec: 0
+  extract_use_cache: true
+  validate_model: "gpt-5-nano"
+  validate_reasoning_effort: "minimal"
+  validate_temperature: 0.0
+  validate_max_completion_tokens: 3000
+  validate_concurrency: 4
+  validate_retries: 3
+  validate_retry_delay_sec: 2
+  validate_per_request_delay_sec: 0
+  validate_use_cache: true
+  promote_min_confidence: 0.58
+  promote_min_authority_score: 0.40
+  promote_allow_ambiguous: false
+
+retrieval:
+  retriever_backend: "vector"
+  routed_graph_enabled: true
+  routed_graph_query_types: ["fact"]
+  routed_graph_min_confidence: 0.38
+  routed_graph_relation_families: []
+  routed_fallback_to_vector: true
+  parallel_graph_enabled: true
+  parallel_query_rewriting_enabled: true
+  parallel_graph_augment_all_queries: true
+  query_planner_enabled: false
+  query_planner_model: "gpt-5-nano"
+  query_planner_reasoning_effort: "minimal"
+  query_planner_min_confidence: 0.55
+  evidence_adjudicator_enabled: false
+  evidence_adjudicator_model: "gpt-5-nano"
+  evidence_adjudicator_reasoning_effort: "minimal"
+  evidence_adjudicator_min_confidence: 0.58
+  evidence_adjudicator_max_completion_tokens: 800
+  evidence_adjudicator_retries: 2
+  evidence_adjudicator_retry_delay_sec: 1
+  evidence_adjudicator_per_request_delay_sec: 0
+  evidence_adjudicator_answer_limit: 4
+  evidence_adjudicator_fact_limit: 4
+  evidence_adjudicator_chunk_limit: 6
+  graph_query_backend: "auto"
+  graph_neo4j_query_limit: 64
+  graph_relation_router_enabled: true
+  graph_relation_only: true
+  graph_relation_route_min_confidence: 0.38
+  graph_relation_graph_first_min_confidence: 0.62
+  graph_relation_reorder_min_confidence: 0.86
+  graph_relation_assertion_limit: 4
+  graph_relation_fact_limit: 6
+  graph_relation_local_candidate_limit: 12
+  graph_relation_prefer_local: true
+  graph_relation_max_query_tokens: 18
+  graph_relation_chunk_seed_bonus: 2.2
+  graph_relation_parent_seed_bonus: 1.4
+  graph_relation_fact_seed_bonus: 2.5
+  parallel_lane_workers: 6
+  enable_local_bm25_fallback: false
+  local_index_max_postings_per_token: 512
+  local_chunk_candidate_pool: 96
+  local_answer_top_k: 10
+  local_answer_candidate_pool: 96
+  local_parent_candidate_pool: 64
+  local_media_candidate_pool: 64
+  dense_chunk_top_k: 12
+  dense_parent_top_k: 6
+  dense_media_top_k: 6
+  dense_fact_top_k: 8
+  dense_assertion_top_k: 10
+  lexical_top_k: 12
+  sparse_chunk_top_k: 14
+  sparse_parent_top_k: 8
+  sparse_media_top_k: 8
+  sparse_fact_top_k: 10
+  sparse_assertion_top_k: 10
+  rrf_k: 60
+  fact_neighbor_window: 1
+  max_context_chunks: 12
+  max_parent_chunks: 10
+  max_media_results: 4
+  same_parent_expand_threshold: 2
+  enable_sparse: true
+  enable_rerank: true
+  rerank_model: "pinecone-rerank-v0"
+  rerank_top_n: 32
+  rerank_return_top_k: 10
+  rerank_fact_top_n: 12
+  rerank_fact_return_top_k: 6
+  rerank_query_max_tokens: 32
+  rerank_doc_max_tokens: 96
+  rerank_retry_doc_max_tokens: [72, 56, 40]
+  rerank_skip_high_confidence_fact: true
+  rerank_skip_fact_overlap: 0.72
+  rerank_skip_fact_support_score: 0.025
+  abstain_min_token_overlap: 0.12
+  fact_abstain_min_token_overlap: 0.20
+  fact_require_fact_support_overlap: 0.35
+  abstain_min_support_score: 0.05
+  parent_candidate_top_k: 3
+  graph_max_fact_results: 4
+  graph_max_additional_media_results: 2
+  graph_max_context_documents: 4
+  graph_max_assertion_results: 4
+  graph_chunk_fact_bonus: 0.25
+  graph_parent_fact_bonus: 0.15
+  graph_chunk_media_bonus: 0.20
+  graph_parent_media_bonus: 0.12
+  graph_assertion_bonus: 0.30
+  graph_max_additional_chunk_candidates: 6
+  graph_max_additional_parent_candidates: 4
+  weight_dense_chunks: 1.0
+  weight_sparse_chunks: 1.2
+  weight_local_chunks: 1.5
+  weight_graph_relation_chunks: 2.2
+  weight_dense_parents: 0.8
+  weight_sparse_parents: 0.9
+  weight_local_parents: 1.4
+  weight_graph_relation_parents: 1.6
+  weight_dense_media: 0.8
+  weight_sparse_media: 0.8
+  weight_local_media: 1.4
+  weight_dense_facts: 1.3
+  weight_sparse_facts: 1.5
+  weight_dense_assertions: 2.0
+  weight_sparse_assertions: 2.2
+  weight_local_facts: 1.9
+  weight_local_answers: 2.1
+  weight_graph_relation_facts: 2.4
+
+# ─── Artifact Storage ────────────────────────────────────────
+storage:
+  plugin: "local"
+  root_dir: null                  # defaults to work_dir/artifact_store
+  public_base_url: null           # set when assets are exposed over HTTP
+  copy_on_register: false
+
+# ─── Embedder ───────────────────────────────────────────────
+embedder:
+  engine: "openai"              # "openai" or "sentence_transformer"
+  model: "text-embedding-3-small"
+  pinecone_index: null          # REQUIRED — set in project config
+  pinecone_sparse_index: null   # optional sparse sidecar index
+  batch_size: 100
+  upsert_batch_size: 100
+  use_sparse_embeddings: false
+  namespace: ""
+  output_dimensionality: 1536
+  namespace_chunks: "chunks"
+  namespace_parents: "parents"
+  namespace_media: "media"
+  namespace_facts: "facts"
+  namespace_assertions: "assertions"
+  create_index_if_missing: true
+  enable_dense_facts: true
+  enable_dense_assertions: true
+  enable_sparse: true
+  sparse_model: "pinecone-sparse-english-v0"
+  sparse_text_field: "chunk_text"
+  sparse_upsert_batch_size: 96
+  sparse_max_text_chars: 12000
+  sparse_max_record_bytes: 24000
+  clear_dense_namespace_on_zero_progress: true
+  clear_sparse_namespace_on_zero_progress: true
+  sparse_metric: "dotproduct"
+  pinecone_cloud: "aws"
+  pinecone_region: "us-east-1"
+  metric: "cosine"
+  pinecone_connect_timeout_sec: 10
+  pinecone_read_timeout_sec: 120
+  progress_flush_every_batches: 1
+  max_retries: 6
+  retry_base_delay_sec: 5
+  retry_max_delay_sec: 120

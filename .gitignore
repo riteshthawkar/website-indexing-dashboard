@@ -1,0 +1,72 @@
+# Virtual environments
+env/
+venv/
+.venv/
+
+# Environment files with secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Large data files
+*.json
+!config.yaml
+!summary_config.yaml
+!**/package.json
+!**/package-lock.json
+!**/tsconfig.json
+!**/components.json
+!eval/gates/*.json
+!eval/benchmarks/*.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Logs
+*.log
+
+# Database files
+*.db
+*.db.lock
+
+# Project runtime artifacts
+runs/
+history/
+dashboard/dashboard.db
+dashboard/logs/
+
+# Frontend local artifacts
+dashboard-ui/node_modules/
+dashboard-ui/.next/
+dashboard-ui/out/
+dashboard-ui/tsconfig.tsbuildinfo
+
+# Tool caches
+.pytest_cache/
+scripts/__pycache__/
+dashboard/__pycache__/
+pipeline/__pycache__/
+pipeline/**/__pycache__/
+.claude/
+tmp_*/
+
+# Local secrets and scratch files
+Neo4j-credentials.txt
+utils.ipynb
