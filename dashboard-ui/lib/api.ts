@@ -43,6 +43,20 @@ export const fetchRunLogs = (runId: number, tail = 200, stage?: string) =>
     `/api/runs/${runId}/logs?tail=${tail}${stage ? `&stage=${stage}` : ""}`
   );
 
+export const fetchStructuredRunLogs = (
+  runId: number,
+  options?: { tail?: number; stage?: string; eventType?: string; level?: string }
+) => {
+  const tail = options?.tail ?? 200;
+  const params = new URLSearchParams({ tail: String(tail) });
+  if (options?.stage) params.set("stage", options.stage);
+  if (options?.eventType) params.set("event_type", options.eventType);
+  if (options?.level) params.set("level", options.level);
+  return request<import("./types").StructuredRunLogResponse>(
+    `/api/runs/${runId}/structured-logs?${params.toString()}`
+  );
+};
+
 export const fetchStageLog = (runId: number, stageName: string, tail = 200) =>
   request<{ lines: string[] }>(`/api/runs/${runId}/stages/${stageName}/log?tail=${tail}`);
 

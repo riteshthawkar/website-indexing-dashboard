@@ -96,7 +96,7 @@ export function ProjectDetailClient() {
             <TabsTrigger value="urls">URLs</TabsTrigger>
             <TabsTrigger value="media">Media</TabsTrigger>
             <TabsTrigger value="stages">Stages</TabsTrigger>
-            {isRunning && <TabsTrigger value="live">Live Output</TabsTrigger>}
+            <TabsTrigger value="live">Logs</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
           </TabsList>
           <TabsContent value="overview" className="mt-4">
@@ -111,11 +111,9 @@ export function ProjectDetailClient() {
           <TabsContent value="stages" className="mt-4">
             <StagesTab stages={run.stages || []} runId={run.id} />
           </TabsContent>
-          {isRunning && (
-            <TabsContent value="live" className="mt-4">
-              <LiveOutputTab runId={run.id} isRunning={isRunning} />
-            </TabsContent>
-          )}
+          <TabsContent value="live" className="mt-4">
+            <LiveOutputTab runId={run.id} isRunning={isRunning} />
+          </TabsContent>
           <TabsContent value="config" className="mt-4">
             <ConfigTab run={run} />
           </TabsContent>

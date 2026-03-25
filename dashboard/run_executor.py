@@ -16,6 +16,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from database import Run, RunLog, get_db, utcnow
 from run_data import collect_metrics
+from structured_logs import append_structured_log, make_structured_log_record
 
 logger = logging.getLogger(__name__)
 
@@ -153,14 +154,39 @@ async def execute_pipeline(
     # Generate a unique run_id for the pipeline (use db id as string)
     pipeline_run_id = f"run_{run_id}"
     work_dir = _resolve_work_dir(config_name, pipeline_run_id)
+    sequence = [0]
 
     _update_run(run_id, status="running", started_at=utcnow(), work_dir=str(work_dir))
 
-    async def _emit_log(level: str, message: str, stage: str = None):
+    def _next_sequence() -> int:
+        sequence[0] += 1
+        return sequence[0]
+
+    async def _emit_log(
+        level: str,
+        message: str,
+        stage: str = None,
+        *,
+        event_type: str = "log",
+        data: Optional[Dict[str, Any]] = None,
+        record: Optional[Dict[str, Any]] = None,
+    ):
         """Emit a log line to WebSocket and store in DB."""
         _add_log(run_id, message, level=level, stage=stage)
+        if record is None:
+            record = make_structured_log_record(
+                sequence=_next_sequence(),
+                run_id=run_id,
+                pipeline_run_id=pipeline_run_id,
+                level=level,
+                event_type=event_type,
+                message=message,
+                stage=stage,
+                data=data,
+            )
+            append_structured_log(work_dir, record)
         if on_log:
-            result = on_log(run_id, level, stage, message)
+            result = on_log(run_id, level, stage, message, record=record)
             if asyncio.iscoroutine(result):
                 await result
 
@@ -170,11 +196,29 @@ async def execute_pipeline(
     def _on_stage_start(stage_type: str, plugin_name: str, info: Optional[Dict]):
         stage_key = f"{stage_type}/{plugin_name}"
         current_stage[0] = stage_key
+        record = make_structured_log_record(
+            sequence=_next_sequence(),
+            run_id=run_id,
+            pipeline_run_id=pipeline_run_id,
+            level="info",
+            event_type="stage_start",
+            message=f"Starting stage: {stage_key}",
+            stage=stage_key,
+            data=info or {},
+        )
+        append_structured_log(work_dir, record)
         asyncio.get_event_loop().create_task(
-            _emit_log("info", f"Starting stage: {stage_key}", stage=stage_key)
+            _emit_log(
+                "info",
+                f"Starting stage: {stage_key}",
+                stage=stage_key,
+                event_type="stage_start",
+                data=info or {},
+                record=record,
+            )
         )
         if on_stage_event:
-            result = on_stage_event(run_id, "start", stage_key, info)
+            result = on_stage_event(run_id, "start", stage_key, info, record=record)
             if asyncio.iscoroutine(result):
                 asyncio.get_event_loop().create_task(result)
 
@@ -182,11 +226,29 @@ async def execute_pipeline(
         stage_key = f"{stage_type}/{plugin_name}"
         status = info.get("status", "unknown") if info else "unknown"
         metrics_str = json.dumps(info.get("metrics", {})) if info else "{}"
+        record = make_structured_log_record(
+            sequence=_next_sequence(),
+            run_id=run_id,
+            pipeline_run_id=pipeline_run_id,
+            level="info" if status == "completed" else "error",
+            event_type="stage_complete",
+            message=f"Stage {stage_key} {status}: {metrics_str}",
+            stage=stage_key,
+            data=info or {},
+        )
+        append_structured_log(work_dir, record)
         asyncio.get_event_loop().create_task(
-            _emit_log("info", f"Stage {stage_key} {status}: {metrics_str}", stage=stage_key)
+            _emit_log(
+                "info" if status == "completed" else "error",
+                f"Stage {stage_key} {status}: {metrics_str}",
+                stage=stage_key,
+                event_type="stage_complete",
+                data=info or {},
+                record=record,
+            )
         )
         if on_stage_event:
-            result = on_stage_event(run_id, "complete", stage_key, info)
+            result = on_stage_event(run_id, "complete", stage_key, info, record=record)
             if asyncio.iscoroutine(result):
                 asyncio.get_event_loop().create_task(result)
 

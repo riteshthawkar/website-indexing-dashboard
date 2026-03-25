@@ -1,15 +1,49 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { getWsUrl } from "@/lib/utils";
+import { getApiBase, getWsUrl } from "@/lib/utils";
+import type { StructuredRunLogEntry, StructuredRunLogResponse } from "@/lib/types";
 
 export function useWebSocket(runId: number, enabled = true) {
-  const [lines, setLines] = useState<string[]>([]);
+  const [entries, setEntries] = useState<StructuredRunLogEntry[]>([]);
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const pingRef = useRef<ReturnType<typeof setInterval>>(undefined);
+  const seenSequencesRef = useRef<Set<number>>(new Set());
 
-  const clear = useCallback(() => setLines([]), []);
+  const clear = useCallback(() => {
+    seenSequencesRef.current = new Set();
+    setEntries([]);
+  }, []);
+
+  const appendEntry = useCallback((entry: StructuredRunLogEntry) => {
+    if (seenSequencesRef.current.has(entry.sequence)) {
+      return;
+    }
+    seenSequencesRef.current.add(entry.sequence);
+    setEntries((prev) => [...prev, entry].sort((a, b) => a.sequence - b.sequence));
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    async function loadInitial() {
+      if (!runId) return;
+      try {
+        const res = await fetch(`${getApiBase()}/api/runs/${runId}/structured-logs?tail=300`);
+        if (!res.ok) return;
+        const payload = (await res.json()) as StructuredRunLogResponse;
+        if (!active) return;
+        seenSequencesRef.current = new Set((payload.items || []).map((item) => item.sequence));
+        setEntries(payload.items || []);
+      } catch {
+        // ignore initial load failures; websocket will still provide live logs
+      }
+    }
+    loadInitial();
+    return () => {
+      active = false;
+    };
+  }, [runId]);
 
   useEffect(() => {
     if (!enabled || !runId) return;
@@ -31,10 +65,31 @@ export function useWebSocket(runId: number, enabled = true) {
       try {
         const data = JSON.parse(evt.data);
         if (data.type === "log") {
-          const prefix = data.level === "error" ? "[ERROR] " : "";
-          setLines((prev) => [...prev, prefix + (data.message || data.line || "")]);
+          const entry = data.record || {
+            sequence: Date.now(),
+            run_id: runId,
+            pipeline_run_id: `run_${runId}`,
+            created_at: new Date().toISOString(),
+            level: data.level || "info",
+            event_type: "log",
+            stage: data.stage || null,
+            message: data.message || data.line || "",
+            data: {},
+          };
+          appendEntry(entry);
         } else if (data.type === "stage") {
-          setLines((prev) => [...prev, `[STAGE] ${data.event}: ${data.stage}`]);
+          const entry = data.record || {
+            sequence: Date.now(),
+            run_id: runId,
+            pipeline_run_id: `run_${runId}`,
+            created_at: new Date().toISOString(),
+            level: data.event === "complete" ? "info" : "info",
+            event_type: `stage_${data.event || "event"}`,
+            stage: data.stage || null,
+            message: `[STAGE] ${data.event}: ${data.stage}`,
+            data: data.info || {},
+          };
+          appendEntry(entry);
         }
       } catch {
         // ignore
@@ -48,7 +103,7 @@ export function useWebSocket(runId: number, enabled = true) {
       if (pingRef.current) clearInterval(pingRef.current);
       ws.close();
     };
-  }, [runId, enabled]);
+  }, [runId, enabled, appendEntry]);
 
-  return { lines, connected, clear };
+  return { entries, connected, clear };
 }

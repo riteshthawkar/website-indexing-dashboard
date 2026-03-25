@@ -7,6 +7,7 @@ import {
   cancelRun,
   deleteRun,
   fetchStageLog,
+  fetchStructuredRunLogs,
 } from "@/lib/api";
 import { toast } from "sonner";
 
@@ -88,5 +89,14 @@ export function useStageLog(runId: number, stageName: string, enabled = true) {
     queryFn: () => fetchStageLog(runId, stageName),
     enabled,
     refetchInterval: 5000,
+  });
+}
+
+export function useStructuredRunLogs(runId: number, enabled = true, tail = 300) {
+  return useQuery({
+    queryKey: ["structured-run-logs", runId, tail],
+    queryFn: () => fetchStructuredRunLogs(runId, { tail }),
+    enabled,
+    refetchInterval: enabled ? 5000 : false,
   });
 }

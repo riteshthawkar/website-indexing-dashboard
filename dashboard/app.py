@@ -41,6 +41,7 @@ from pinecone_ops import (
     snapshot_indexes,
     get_snapshot_history,
 )
+from structured_logs import load_structured_logs, structured_log_path
 from url_manager import (
     add_excluded_subdomain,
     add_target_url,
@@ -99,23 +100,25 @@ class RunManager:
         if run_id in self._ws:
             self._ws[run_id] = [w for w in self._ws[run_id] if w != ws]
 
-    async def _broadcast_log(self, run_id: int, level: str, stage: str, message: str):
+    async def _broadcast_log(self, run_id: int, level: str, stage: str, message: str, record: dict | None = None):
         """Broadcast log line to all WebSocket clients for this run."""
         payload = json.dumps({
             "type": "log",
             "level": level,
             "stage": stage,
             "message": message,
+            "record": record,
         })
         await self._broadcast(run_id, payload)
 
-    async def _broadcast_stage(self, run_id: int, event: str, stage_key: str, info: dict):
+    async def _broadcast_stage(self, run_id: int, event: str, stage_key: str, info: dict, record: dict | None = None):
         """Broadcast stage event to all WebSocket clients."""
         payload = json.dumps({
             "type": "stage",
             "event": event,
             "stage": stage_key,
             "info": info or {},
+            "record": record,
         })
         await self._broadcast(run_id, payload)
 
@@ -203,6 +206,7 @@ async def api_get_run(run_id: int):
     if result.get("work_dir"):
         result["artifact_summary"] = collect_artifact_summary(result["work_dir"])
         result["media_summary"] = collect_media_summary(result["work_dir"])
+        result["structured_log_path"] = str(structured_log_path(result["work_dir"]))
         state = get_pipeline_state(result["work_dir"])
         if state:
             result["stages"] = state.get("stages", [])
@@ -213,6 +217,7 @@ async def api_get_run(run_id: int):
     else:
         result["artifact_summary"] = {"total": 0, "by_type": {}}
         result["media_summary"] = {"total": 0, "images": 0, "videos": 0, "by_source": {}, "video_providers": {}}
+        result["structured_log_path"] = None
         result["stages"] = []
         result["current_stage_index"] = 0
 
@@ -291,6 +296,34 @@ async def api_delete_run(run_id: int):
 @app.get("/api/runs/{run_id}/logs")
 async def api_run_logs(run_id: int, tail: int = 200, stage: Optional[str] = None):
     return get_run_logs(run_id, tail=tail, stage=stage)
+
+
+@app.get("/api/runs/{run_id}/structured-logs")
+async def api_run_structured_logs(
+    run_id: int,
+    tail: int = 200,
+    stage: Optional[str] = None,
+    event_type: Optional[str] = None,
+    level: Optional[str] = None,
+):
+    db = get_db()
+    try:
+        run = db.query(Run).get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if not run.work_dir:
+            return {"items": [], "path": None}
+        path = structured_log_path(run.work_dir)
+        items = load_structured_logs(
+            run.work_dir,
+            tail=tail,
+            stage=stage,
+            event_type=event_type,
+            level=level,
+        )
+        return {"items": items, "path": str(path)}
+    finally:
+        db.close()
 
 
 @app.get("/api/runs/{run_id}/stages/{stage_name}/log")

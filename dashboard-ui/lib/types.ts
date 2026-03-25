@@ -60,6 +60,7 @@ export interface PipelineRun {
   current_stage_index?: number;
   artifact_summary?: ArtifactSummary | null;
   media_summary?: MediaSummary | null;
+  structured_log_path?: string | null;
 }
 
 export interface PineconeIndex {
@@ -177,6 +178,23 @@ export interface RunLogEntry {
   stage: string | null;
   message: string;
   created_at: string | null;
+}
+
+export interface StructuredRunLogEntry {
+  sequence: number;
+  run_id: number;
+  pipeline_run_id: string;
+  created_at: string | null;
+  level: string;
+  event_type: string;
+  stage: string | null;
+  message: string;
+  data: Record<string, unknown>;
+}
+
+export interface StructuredRunLogResponse {
+  items: StructuredRunLogEntry[];
+  path: string | null;
 }
 
 export type RunStatus = PipelineRun["status"];
