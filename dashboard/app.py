@@ -17,6 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
+from artifact_ops import list_artifacts, list_run_files, read_run_file
 from database import init_db, get_db, Run, RunLog
 from run_data import collect_artifact_summary, collect_media_summary, load_run_media
 from scanner import scan_and_import
@@ -48,8 +49,19 @@ from pinecone_ops import (
     snapshot_indexes,
     get_snapshot_history,
 )
-from evaluation_ops import benchmark_job_manager, list_benchmark_jobs, list_eval_assets
-from knowledge_ops import get_run_knowledge_status
+from evaluation_ops import (
+    benchmark_job_manager,
+    cleanup_stale_evaluation_jobs,
+    evaluation_job_manager,
+    init_eval_set,
+    list_benchmark_jobs,
+    list_eval_assets,
+    list_evaluation_jobs,
+    summarize_benchmark_dataset,
+    summarize_eval_set,
+    validate_eval_set,
+)
+from knowledge_ops import browse_assertions, delete_vectors_for_source, get_run_knowledge_status
 from retrieval_ops import run_retrieval_query
 from retriever_service_ops import (
     get_retriever_service_status,
@@ -169,11 +181,15 @@ async def lifespan(app: FastAPI):
     _load_env()
     init_db()
     cleanup_stale_runs()
+    repaired_eval_jobs = cleanup_stale_evaluation_jobs()
+    if repaired_eval_jobs:
+        logger.info("Repaired %s stale evaluation jobs on startup", repaired_eval_jobs)
     imported = scan_and_import()
     if imported:
         logger.info(f"Imported {imported} runs on startup")
     yield
     run_manager.shutdown()
+    evaluation_job_manager.shutdown()
 
 
 app = FastAPI(title="MBZUAI Pipeline Dashboard", lifespan=lifespan)
@@ -213,7 +229,7 @@ async def api_list_runs(status: Optional[str] = None, limit: int = 50):
 async def api_get_run(run_id: int):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         result = run.to_dict(include_config_snapshot=True)
@@ -262,7 +278,7 @@ async def api_create_run(request: Request):
 async def api_start_run(run_id: int):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status not in ("pending", "failed"):
@@ -278,7 +294,7 @@ async def api_start_run(run_id: int):
 async def api_resume_run(run_id: int):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status == "running":
@@ -296,7 +312,7 @@ async def api_resume_run(run_id: int):
 async def api_restart_run(run_id: int, request: Request):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status == "running":
@@ -318,7 +334,7 @@ async def api_restart_run(run_id: int, request: Request):
 async def api_retry_stage(run_id: int, stage_selector: str):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status == "running":
@@ -336,7 +352,7 @@ async def api_retry_stage(run_id: int, stage_selector: str):
 async def api_cancel_run(run_id: int):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status != "running":
@@ -352,7 +368,7 @@ async def api_cancel_run(run_id: int):
 async def api_delete_run(run_id: int):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if run.status == "running":
@@ -386,7 +402,7 @@ async def api_run_structured_logs(
 ):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if not run.work_dir:
@@ -426,7 +442,7 @@ async def api_run_stages(run_id: int):
     """Get stage details from pipeline_state.json."""
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         work_dir = run.work_dir
@@ -450,7 +466,7 @@ async def api_run_stages(run_id: int):
 def _load_run_or_404(run_id: int) -> Run:
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         db.expunge(run)
@@ -484,9 +500,65 @@ async def api_evaluation_assets():
     return await asyncio.to_thread(list_eval_assets)
 
 
+@app.get("/api/runs/{run_id}/evaluation/assets")
+async def api_run_evaluation_assets(run_id: int):
+    run = _load_run_or_404(run_id)
+    return await asyncio.to_thread(list_eval_assets, run.work_dir)
+
+
 @app.get("/api/evaluation/presets")
 async def api_evaluation_presets():
     return await asyncio.to_thread(list_eval_presets)
+
+
+@app.post("/api/evaluation/datasets/init")
+async def api_init_eval_dataset(request: Request):
+    data = await request.json()
+    output_path = str(data.get("output_path") or "").strip()
+    if not output_path:
+        raise HTTPException(status_code=400, detail="output_path is required")
+    force = bool(data.get("force") or False)
+    try:
+        return await asyncio.to_thread(init_eval_set, output_path, force=force)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/evaluation/datasets/summarize")
+async def api_summarize_eval_dataset(request: Request):
+    data = await request.json()
+    dataset_path = str(data.get("dataset_path") or "").strip()
+    if not dataset_path:
+        raise HTTPException(status_code=400, detail="dataset_path is required")
+    try:
+        return await asyncio.to_thread(summarize_eval_set, dataset_path)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/evaluation/datasets/validate")
+async def api_validate_eval_dataset(request: Request):
+    data = await request.json()
+    dataset_path = str(data.get("dataset_path") or "").strip()
+    work_dir = str(data.get("work_dir") or "").strip() or None
+    if not dataset_path:
+        raise HTTPException(status_code=400, detail="dataset_path is required")
+    try:
+        return await asyncio.to_thread(validate_eval_set, dataset_path, work_dir=work_dir)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/evaluation/benchmarks/summarize")
+async def api_summarize_benchmark_dataset(request: Request):
+    data = await request.json()
+    dataset_dir = str(data.get("dataset_dir") or "").strip()
+    if not dataset_dir:
+        raise HTTPException(status_code=400, detail="dataset_dir is required")
+    try:
+        return await asyncio.to_thread(summarize_benchmark_dataset, dataset_dir)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/runs/{run_id}/benchmarks/retrieval")
@@ -495,6 +567,25 @@ async def api_list_retrieval_benchmarks(run_id: int):
     if not run.work_dir:
         return []
     return await asyncio.to_thread(list_benchmark_jobs, run.work_dir)
+
+
+@app.get("/api/runs/{run_id}/evaluation/jobs")
+async def api_list_evaluation_jobs(run_id: int):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        return []
+    return await asyncio.to_thread(list_evaluation_jobs, run.work_dir)
+
+
+@app.post("/api/runs/{run_id}/evaluation/jobs/{job_id}/cancel")
+async def api_cancel_evaluation_job(run_id: int, job_id: str):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    try:
+        return await asyncio.to_thread(evaluation_job_manager.cancel, run.work_dir, job_id)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.post("/api/runs/{run_id}/benchmarks/retrieval")
@@ -525,10 +616,204 @@ async def api_start_retrieval_benchmark(run_id: int, request: Request):
     return job
 
 
+@app.post("/api/runs/{run_id}/evaluation/answers")
+async def api_start_answer_generation(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    dataset_path = str(data.get("dataset_path") or "").strip()
+    output_path = str(data.get("output_path") or "").strip()
+    config_name = str(data.get("config_name") or run.config_name or "").strip()
+    model = str(data.get("model") or "gemini-2.5-flash").strip()
+    if not dataset_path:
+        raise HTTPException(status_code=400, detail="dataset_path is required")
+    if not output_path:
+        raise HTTPException(status_code=400, detail="output_path is required")
+    if not config_name:
+        raise HTTPException(status_code=400, detail="config_name is required")
+    try:
+        return evaluation_job_manager.start_answer_generation(
+            run_id=run_id,
+            config_name=config_name,
+            work_dir=run.work_dir,
+            dataset_path=dataset_path,
+            output_path=output_path,
+            model=model,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/evaluation/ragas")
+async def api_start_ragas(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    predictions_path = str(data.get("predictions_path") or "").strip()
+    if not predictions_path:
+        raise HTTPException(status_code=400, detail="predictions_path is required")
+    metric_names = data.get("metric_names") or []
+    if isinstance(metric_names, str):
+        metric_names = [value.strip() for value in metric_names.split(",") if value.strip()]
+    output_path = str(data.get("output_path") or "").strip() or None
+    llm_model = str(data.get("llm_model") or "gemini-2.5-flash").strip()
+    embedding_model = str(data.get("embedding_model") or "gemini-embedding-2-preview").strip()
+    try:
+        return evaluation_job_manager.start_ragas(
+            run_id=run_id,
+            work_dir=run.work_dir,
+            predictions_path=predictions_path,
+            metric_names=metric_names,
+            llm_model=llm_model,
+            embedding_model=embedding_model,
+            output_path=output_path,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/evaluation/benchmarks/run-standard-retrieval")
+async def api_start_standard_benchmark_retrieval(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    dataset_dir = str(data.get("dataset_dir") or "").strip()
+    output_rankings_path = str(data.get("output_rankings_path") or "").strip()
+    config_name = str(data.get("config_name") or run.config_name or "").strip()
+    if not dataset_dir:
+        raise HTTPException(status_code=400, detail="dataset_dir is required")
+    if not output_rankings_path:
+        raise HTTPException(status_code=400, detail="output_rankings_path is required")
+    try:
+        return evaluation_job_manager.start_standard_benchmark_retrieval(
+            run_id=run_id,
+            config_name=config_name,
+            work_dir=run.work_dir,
+            dataset_dir=dataset_dir,
+            output_rankings_path=output_rankings_path,
+            top_k=int(data.get("top_k") or 10),
+            dense_top_k=int(data.get("dense_top_k") or 100),
+            sparse_top_k=int(data.get("sparse_top_k") or 100),
+            rrf_k=int(data.get("rrf_k") or 60),
+            batch_size=int(data.get("batch_size") or 32),
+            doc_cache_path=str(data.get("doc_cache_path") or "").strip() or None,
+            query_cache_path=str(data.get("query_cache_path") or "").strip() or None,
+            output_path=str(data.get("output_path") or "").strip() or None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/evaluation/benchmarks/evaluate-rankings")
+async def api_start_benchmark_rankings_eval(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    dataset_dir = str(data.get("dataset_dir") or "").strip()
+    rankings_path = str(data.get("rankings_path") or "").strip()
+    if not dataset_dir:
+        raise HTTPException(status_code=400, detail="dataset_dir is required")
+    if not rankings_path:
+        raise HTTPException(status_code=400, detail="rankings_path is required")
+    try:
+        return evaluation_job_manager.start_benchmark_rankings_evaluation(
+            run_id=run_id,
+            work_dir=run.work_dir,
+            dataset_dir=dataset_dir,
+            rankings_path=rankings_path,
+            k=int(data.get("k") or 10),
+            output_path=str(data.get("output_path") or "").strip() or None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/evaluation/benchmarks/export-ir")
+async def api_start_export_ir(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    dataset_id = str(data.get("dataset_id") or "").strip()
+    output_dir = str(data.get("output_dir") or "").strip()
+    if not dataset_id:
+        raise HTTPException(status_code=400, detail="dataset_id is required")
+    if not output_dir:
+        raise HTTPException(status_code=400, detail="output_dir is required")
+    try:
+        return evaluation_job_manager.start_export_ir_benchmark(
+            run_id=run_id,
+            work_dir=run.work_dir,
+            dataset_id=dataset_id,
+            output_dir=output_dir,
+            max_queries=int(data.get("max_queries")) if data.get("max_queries") not in (None, "", False) else None,
+            max_docs=int(data.get("max_docs")) if data.get("max_docs") not in (None, "", False) else None,
+            full_corpus=bool(data.get("full_corpus") or False),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/evaluation/benchmarks/export-hf")
+async def api_start_export_hf(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    mapping_path = str(data.get("mapping_path") or "").strip()
+    output_dir = str(data.get("output_dir") or "").strip()
+    if not mapping_path:
+        raise HTTPException(status_code=400, detail="mapping_path is required")
+    if not output_dir:
+        raise HTTPException(status_code=400, detail="output_dir is required")
+    try:
+        return evaluation_job_manager.start_export_hf_benchmark(
+            run_id=run_id,
+            work_dir=run.work_dir,
+            mapping_path=mapping_path,
+            output_dir=output_dir,
+            max_queries=int(data.get("max_queries")) if data.get("max_queries") not in (None, "", False) else None,
+            max_docs=int(data.get("max_docs")) if data.get("max_docs") not in (None, "", False) else None,
+            max_qrels=int(data.get("max_qrels")) if data.get("max_qrels") not in (None, "", False) else None,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.get("/api/runs/{run_id}/knowledge-base")
 async def api_run_knowledge_base(run_id: int):
     run = _load_run_or_404(run_id)
     return await asyncio.to_thread(get_run_knowledge_status, run)
+
+
+@app.get("/api/runs/{run_id}/knowledge-base/assertions")
+async def api_run_knowledge_assertions(
+    run_id: int,
+    source: str = "promoted",
+    query: Optional[str] = None,
+    answer_type: Optional[str] = None,
+    authority_class: Optional[str] = None,
+    limit: int = 100,
+):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    try:
+        return await asyncio.to_thread(
+            browse_assertions,
+            run.work_dir,
+            source=source,
+            query=query,
+            answer_type=answer_type,
+            authority_class=authority_class,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/runs/{run_id}/audit")
@@ -580,6 +865,18 @@ async def api_stop_retriever_service(run_id: int):
     if not run.work_dir:
         raise HTTPException(status_code=400, detail="Run has no work directory yet")
     return await asyncio.to_thread(stop_retriever_service, run.work_dir)
+
+
+@app.post("/api/indexes/{index_name}/delete-by-source")
+async def api_delete_vectors_by_source(index_name: str, request: Request):
+    data = await request.json()
+    source_url_prefix = str(data.get("source_url_prefix") or "").strip()
+    if not source_url_prefix:
+        raise HTTPException(status_code=400, detail="source_url_prefix is required")
+    try:
+        return await asyncio.to_thread(delete_vectors_for_source, index_name, source_url_prefix)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -685,7 +982,7 @@ async def api_run_images(run_id: int):
 async def api_run_media(run_id: int):
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         work_dir = run.work_dir
@@ -701,6 +998,60 @@ async def api_run_media(run_id: int):
         "items": items,
         **summary,
     }
+
+
+@app.get("/api/runs/{run_id}/artifacts")
+async def api_run_artifacts(
+    run_id: int,
+    artifact_type: Optional[str] = None,
+    producer_stage: Optional[str] = None,
+    role: Optional[str] = None,
+    query: Optional[str] = None,
+    limit: int = 500,
+):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    try:
+        return await asyncio.to_thread(
+            list_artifacts,
+            run.work_dir,
+            artifact_type=artifact_type,
+            producer_stage=producer_stage,
+            role=role,
+            query=query,
+            limit=limit,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/files")
+async def api_run_files(run_id: int, path: Optional[str] = None):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    try:
+        return await asyncio.to_thread(list_run_files, run.work_dir, path)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/runs/{run_id}/file-content")
+async def api_run_file_content(run_id: int, path: str, max_bytes: int = 200000):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    if not path:
+        raise HTTPException(status_code=400, detail="path is required")
+    try:
+        return await asyncio.to_thread(read_run_file, run.work_dir, path, max_bytes=max_bytes)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/assets")

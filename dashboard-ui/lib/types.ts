@@ -238,6 +238,11 @@ export interface RetrievalPlaygroundResult {
 export interface EvaluationAssets {
   datasets: string[];
   gates: string[];
+  mapping_files?: string[];
+  benchmark_dirs?: string[];
+  prediction_files?: string[];
+  rankings_files?: string[];
+  report_files?: string[];
 }
 
 export interface RetrievalBenchmarkJob {
@@ -266,6 +271,43 @@ export interface RetrievalBenchmarkJob {
   manifest_path?: string | null;
 }
 
+export interface EvaluationJob {
+  job_id: string;
+  job_type: string;
+  status: "queued" | "running" | "completed" | "failed" | "cancelled";
+  run_id: number;
+  config_name?: string | null;
+  work_dir: string;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  error_message?: string | null;
+  report_path?: string | null;
+  output_path?: string | null;
+  dataset_path?: string | null;
+  dataset_dir?: string | null;
+  rankings_path?: string | null;
+  output_rankings_path?: string | null;
+  predictions_path?: string | null;
+  model?: string | null;
+  llm_model?: string | null;
+  embedding_model?: string | null;
+  metric_names?: string[] | null;
+  row_count?: number | null;
+  query_count?: number | null;
+  overall?: Record<string, number> | null;
+  gates?: {
+    passed?: boolean;
+    path?: string | null;
+    failures?: string[];
+    [key: string]: unknown;
+  } | null;
+  metadata?: Record<string, unknown> | null;
+  metrics?: Record<string, number | null> | null;
+  manifest_path?: string | null;
+  [key: string]: unknown;
+}
+
 export interface PineconeKnowledgeIndex {
   index_name: string | null;
   stats: PineconeIndex | null;
@@ -284,6 +326,10 @@ export interface KnowledgeBaseStatus {
   };
   graph: Record<string, unknown> | null;
   retrieval_bundle_counts: Record<string, number>;
+  assertions?: {
+    sources: Record<string, string>;
+    counts: Record<string, number>;
+  };
 }
 
 export interface EvaluationPresetMap {
@@ -313,6 +359,33 @@ export interface DryRunStep {
 export interface ConfigDryRunResult {
   config_name: string;
   plan: DryRunStep[];
+}
+
+export interface EvalTemplateInitResult {
+  output_path: string;
+  example_count: number;
+  format: string;
+}
+
+export interface EvalDatasetSummaryResult {
+  query_count: number;
+  answerable_count?: number;
+  no_answer_count?: number;
+  query_type_counts?: Record<string, number>;
+  source_type_counts?: Record<string, number>;
+  with_gold_chunks?: number;
+  with_gold_parents?: number;
+  with_gold_media?: number;
+  [key: string]: unknown;
+}
+
+export interface BenchmarkDatasetSummaryResult {
+  dataset_dir: string;
+  document_count: number;
+  query_count: number;
+  qrel_count: number;
+  queries_with_qrels: number;
+  [key: string]: unknown;
 }
 
 export interface RunAuditIssue {
@@ -359,6 +432,66 @@ export interface RetrieverServiceStatus {
   } | null;
   checked_at?: string | null;
   [key: string]: unknown;
+}
+
+export interface ArtifactCatalogEntry {
+  artifact_id: string;
+  artifact_type: string;
+  role: string;
+  producer_stage: string;
+  uri: string;
+  local_path?: string | null;
+  relative_local_path?: string | null;
+  file_name?: string | null;
+  exists: boolean;
+  metadata?: Record<string, unknown>;
+  source_artifact_ids?: string[];
+  created_at?: string;
+  [key: string]: unknown;
+}
+
+export interface ArtifactCatalogResponse {
+  total: number;
+  returned: number;
+  artifact_types: string[];
+  producer_stages: string[];
+  roles: string[];
+  items: ArtifactCatalogEntry[];
+}
+
+export interface RunFileEntry {
+  name: string;
+  relative_path: string;
+  is_dir: boolean;
+  size?: number | null;
+  modified_at: string;
+  extension?: string;
+  preview_type: string;
+}
+
+export interface RunFileListResponse {
+  root: string;
+  path: string;
+  parent_path?: string | null;
+  items: RunFileEntry[];
+}
+
+export interface RunFileContentResponse {
+  relative_path: string;
+  size: number;
+  modified_at: string;
+  preview_type: string;
+  content?: string | null;
+  parsed_json?: unknown;
+  truncated: boolean;
+}
+
+export interface AssertionBrowseResponse {
+  source: string;
+  total: number;
+  answer_types: string[];
+  authority_classes: string[];
+  items: Record<string, unknown>[];
 }
 
 export type RunStatus = PipelineRun["status"];

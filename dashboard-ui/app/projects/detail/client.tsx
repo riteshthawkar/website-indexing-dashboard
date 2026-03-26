@@ -16,6 +16,7 @@ import { RetrievalTab } from "@/components/project-detail/retrieval-tab";
 import { EvaluationTab } from "@/components/project-detail/evaluation-tab";
 import { KnowledgeTab } from "@/components/project-detail/knowledge-tab";
 import { OperationsTab } from "@/components/project-detail/operations-tab";
+import { ArtifactsTab } from "@/components/project-detail/artifacts-tab";
 import { useRun, useStartRun, useCancelRun } from "@/lib/hooks/use-runs";
 import { Play, Square, ArrowLeft } from "lucide-react";
 
@@ -103,6 +104,7 @@ export function ProjectDetailClient() {
             <TabsTrigger value="retrieval">Retrieval</TabsTrigger>
             <TabsTrigger value="evaluation">Evaluation</TabsTrigger>
             <TabsTrigger value="knowledge">Knowledge</TabsTrigger>
+            <TabsTrigger value="artifacts">Artifacts</TabsTrigger>
             <TabsTrigger value="operations">Operations</TabsTrigger>
             <TabsTrigger value="live">Logs</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
@@ -127,6 +129,9 @@ export function ProjectDetailClient() {
           </TabsContent>
           <TabsContent value="knowledge" className="mt-4">
             <KnowledgeTab runId={run.id} />
+          </TabsContent>
+          <TabsContent value="artifacts" className="mt-4">
+            <ArtifactsTab run={run} />
           </TabsContent>
           <TabsContent value="operations" className="mt-4">
             <OperationsTab run={run} />

@@ -65,24 +65,64 @@ Request body:
 
 ### `Evaluation`
 - benchmark asset discovery
-- retrieval benchmark launcher for a run
-- benchmark job listing with live refresh
+- eval dataset template generation
+- eval dataset summarize / validate actions
+- run-scoped retrieval benchmark launcher
+- grounded answer generation launcher
+- RAGAS launcher
+- standard benchmark export helpers:
+  - `ir_datasets`
+  - Hugging Face mapping exports
+- standard benchmark summarize action
+- standard benchmark retrieval launcher
+- benchmark ranking evaluation launcher
+- evaluation job listing with live refresh
+- evaluation job cancellation
 - report path and headline metrics
-- gate pass/fail status
 
 Backend endpoints:
 - `GET /api/evaluation/assets`
+- `GET /api/runs/{run_id}/evaluation/assets`
+- `POST /api/evaluation/datasets/init`
+- `POST /api/evaluation/datasets/summarize`
+- `POST /api/evaluation/datasets/validate`
+- `POST /api/evaluation/benchmarks/summarize`
 - `GET /api/runs/{run_id}/benchmarks/retrieval`
 - `POST /api/runs/{run_id}/benchmarks/retrieval`
+- `GET /api/runs/{run_id}/evaluation/jobs`
+- `POST /api/runs/{run_id}/evaluation/jobs/{job_id}/cancel`
+- `POST /api/runs/{run_id}/evaluation/answers`
+- `POST /api/runs/{run_id}/evaluation/ragas`
+- `POST /api/runs/{run_id}/evaluation/benchmarks/run-standard-retrieval`
+- `POST /api/runs/{run_id}/evaluation/benchmarks/evaluate-rankings`
+- `POST /api/runs/{run_id}/evaluation/benchmarks/export-ir`
+- `POST /api/runs/{run_id}/evaluation/benchmarks/export-hf`
 
 ### `Knowledge`
 - Pinecone dense/sparse index names and live stats
 - namespace inspection
+- Pinecone snapshot action
+- delete-by-source maintenance action
 - retrieval bundle record counts
+- assertion layer counts
+- assertion browser across candidate/validated/canonical/promoted/quarantined layers
 - Neo4j upload manifest / namespace / graph counts
 
 Backend endpoint:
 - `GET /api/runs/{run_id}/knowledge-base`
+- `GET /api/runs/{run_id}/knowledge-base/assertions`
+- `POST /api/indexes/{index_name}/delete-by-source`
+
+### `Artifacts`
+- artifact catalog browser with filters by type, role, and producer stage
+- run-local file browser rooted at the run work directory
+- text/JSON preview
+- image/video preview through the dashboard asset endpoint
+
+Backend endpoints:
+- `GET /api/runs/{run_id}/artifacts`
+- `GET /api/runs/{run_id}/files`
+- `GET /api/runs/{run_id}/file-content`
 
 ### `Logs`
 - structured log stream
@@ -122,6 +162,9 @@ See also:
 ### Knowledge-base inspection helpers
 - [knowledge_ops.py](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard/knowledge_ops.py)
 
+### Artifact browser helpers
+- [artifact_ops.py](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard/artifact_ops.py)
+
 ## Frontend Components
 
 Run detail page:
@@ -132,6 +175,7 @@ New operational tabs:
 - [retrieval-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/retrieval-tab.tsx)
 - [evaluation-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/evaluation-tab.tsx)
 - [knowledge-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/knowledge-tab.tsx)
+- [artifacts-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/artifacts-tab.tsx)
 
 API client/types:
 - [api.ts](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/lib/api.ts)
@@ -144,6 +188,8 @@ API client/types:
 - Knowledge-base status prefers the actual run upload manifests when present, instead of trusting imported run metadata.
 - Benchmark jobs persist manifest JSON files under:
   - `<work_dir>/dashboard_reports/retrieval_benchmarks`
+- Expanded evaluation jobs persist manifest JSON files under:
+  - `<work_dir>/dashboard_reports/evaluation_jobs`
 - Retriever service manifests and logs persist under:
   - `<work_dir>/dashboard_services`
 - The local retriever service controls are suitable for workstation use. They are not a durable distributed process supervisor.
@@ -151,15 +197,10 @@ API client/types:
 ## What Still Does Not Exist
 
 The dashboard is broader now, but it is still not a complete platform admin surface. Missing pieces include:
-- artifact browser across all stage outputs
 - Neo4j query explorer
-- assertion candidate/promoted assertion browser
-- mutating Pinecone / Neo4j maintenance actions
-- broader evaluation workflows beyond retrieval benchmarking:
-  - eval-set init/validate/summarize
-  - grounded answer generation
-  - RAGAS execution
-  - benchmark export and ranking-eval workflows
+- broader Pinecone / Neo4j maintenance actions beyond snapshotting and delete-by-source
+- broader graph maintenance workflows beyond stage restarts and manifest inspection
+- richer artifact previews for PDFs and structured diffs
 - durable worker/process orchestration across dashboard backend restarts
 - scheduled jobs / refresh automation
 - secrets management

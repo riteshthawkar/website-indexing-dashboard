@@ -96,11 +96,46 @@ export const runRetrievalQuery = (runId: number, data: { query: string; config_n
 export const fetchEvaluationAssets = () =>
   request<import("./types").EvaluationAssets>("/api/evaluation/assets");
 
+export const fetchRunEvaluationAssets = (runId: number) =>
+  request<import("./types").EvaluationAssets>(`/api/runs/${runId}/evaluation/assets`);
+
 export const fetchEvaluationPresets = () =>
   request<import("./types").EvaluationPresetMap>("/api/evaluation/presets");
 
+export const initEvalDataset = (data: { output_path: string; force?: boolean }) =>
+  request<import("./types").EvalTemplateInitResult>("/api/evaluation/datasets/init", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const summarizeEvalDataset = (data: { dataset_path: string }) =>
+  request<import("./types").EvalDatasetSummaryResult>("/api/evaluation/datasets/summarize", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const validateEvalDataset = (data: { dataset_path: string; work_dir?: string | null }) =>
+  request<Record<string, unknown>>("/api/evaluation/datasets/validate", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const summarizeBenchmarkDataset = (data: { dataset_dir: string }) =>
+  request<import("./types").BenchmarkDatasetSummaryResult>("/api/evaluation/benchmarks/summarize", {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
 export const fetchRetrievalBenchmarks = (runId: number) =>
   request<import("./types").RetrievalBenchmarkJob[]>(`/api/runs/${runId}/benchmarks/retrieval`);
+
+export const fetchEvaluationJobs = (runId: number) =>
+  request<import("./types").EvaluationJob[]>(`/api/runs/${runId}/evaluation/jobs`);
+
+export const cancelEvaluationJob = (runId: number, jobId: string) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/jobs/${encodeURIComponent(jobId)}/cancel`, {
+    method: "POST",
+  });
 
 export const startRetrievalBenchmark = (
   runId: number,
@@ -116,8 +151,132 @@ export const startRetrievalBenchmark = (
     body: JSON.stringify(data),
   });
 
+export const startAnswerGeneration = (
+  runId: number,
+  data: {
+    config_name?: string;
+    dataset_path: string;
+    output_path: string;
+    model?: string;
+  }
+) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/answers`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const startRagasEvaluation = (
+  runId: number,
+  data: {
+    predictions_path: string;
+    metric_names?: string[] | string;
+    llm_model?: string;
+    embedding_model?: string;
+    output_path?: string | null;
+  }
+) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/ragas`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const startStandardBenchmarkRetrieval = (
+  runId: number,
+  data: {
+    config_name?: string;
+    dataset_dir: string;
+    output_rankings_path: string;
+    top_k?: number;
+    dense_top_k?: number;
+    sparse_top_k?: number;
+    rrf_k?: number;
+    batch_size?: number;
+    doc_cache_path?: string | null;
+    query_cache_path?: string | null;
+    output_path?: string | null;
+  }
+) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/benchmarks/run-standard-retrieval`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const startBenchmarkRankingsEvaluation = (
+  runId: number,
+  data: {
+    dataset_dir: string;
+    rankings_path: string;
+    k?: number;
+    output_path?: string | null;
+  }
+) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/benchmarks/evaluate-rankings`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const startExportIrBenchmark = (
+  runId: number,
+  data: {
+    dataset_id: string;
+    output_dir: string;
+    max_queries?: number | null;
+    max_docs?: number | null;
+    full_corpus?: boolean;
+  }
+) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/benchmarks/export-ir`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const startExportHfBenchmark = (
+  runId: number,
+  data: {
+    mapping_path: string;
+    output_dir: string;
+    max_queries?: number | null;
+    max_docs?: number | null;
+    max_qrels?: number | null;
+  }
+) =>
+  request<import("./types").EvaluationJob>(`/api/runs/${runId}/evaluation/benchmarks/export-hf`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
 export const fetchKnowledgeBaseStatus = (runId: number) =>
   request<import("./types").KnowledgeBaseStatus>(`/api/runs/${runId}/knowledge-base`);
+
+export const fetchKnowledgeAssertions = (
+  runId: number,
+  options?: {
+    source?: string;
+    query?: string;
+    answerType?: string;
+    authorityClass?: string;
+    limit?: number;
+  }
+) => {
+  const params = new URLSearchParams();
+  if (options?.source) params.set("source", options.source);
+  if (options?.query) params.set("query", options.query);
+  if (options?.answerType) params.set("answer_type", options.answerType);
+  if (options?.authorityClass) params.set("authority_class", options.authorityClass);
+  params.set("limit", String(options?.limit ?? 100));
+  return request<import("./types").AssertionBrowseResponse>(
+    `/api/runs/${runId}/knowledge-base/assertions?${params.toString()}`
+  );
+};
+
+export const deleteVectorsBySource = (indexName: string, sourceUrlPrefix: string) =>
+  request<{ index_name: string; source_url_prefix: string; deleted: number }>(
+    `/api/indexes/${encodeURIComponent(indexName)}/delete-by-source`,
+    {
+      method: "POST",
+      body: JSON.stringify({ source_url_prefix: sourceUrlPrefix }),
+    }
+  );
 
 export const fetchRunAudit = (runId: number, repairState = false) =>
   request<import("./types").RunAuditResult>(`/api/runs/${runId}/audit?repair_state=${repairState ? "true" : "false"}`);
@@ -206,6 +365,35 @@ export const fetchRunImages = (runId: number) =>
 
 export const fetchRunMedia = (runId: number) =>
   request<import("./types").RunMediaResponse>(`/api/runs/${runId}/media`);
+
+export const fetchRunArtifacts = (
+  runId: number,
+  options?: {
+    artifactType?: string;
+    producerStage?: string;
+    role?: string;
+    query?: string;
+    limit?: number;
+  }
+) => {
+  const params = new URLSearchParams();
+  if (options?.artifactType) params.set("artifact_type", options.artifactType);
+  if (options?.producerStage) params.set("producer_stage", options.producerStage);
+  if (options?.role) params.set("role", options.role);
+  if (options?.query) params.set("query", options.query);
+  params.set("limit", String(options?.limit ?? 500));
+  return request<import("./types").ArtifactCatalogResponse>(`/api/runs/${runId}/artifacts?${params.toString()}`);
+};
+
+export const fetchRunFiles = (runId: number, path?: string) =>
+  request<import("./types").RunFileListResponse>(
+    `/api/runs/${runId}/files${path ? `?path=${encodeURIComponent(path)}` : ""}`
+  );
+
+export const fetchRunFileContent = (runId: number, path: string, maxBytes = 200000) =>
+  request<import("./types").RunFileContentResponse>(
+    `/api/runs/${runId}/file-content?path=${encodeURIComponent(path)}&max_bytes=${maxBytes}`
+  );
 
 export const getAssetUrl = (localPath: string) =>
   `${getApiBase()}/api/assets?path=${encodeURIComponent(localPath)}`;

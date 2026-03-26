@@ -66,6 +66,8 @@ pipeline/__pycache__/
 pipeline/**/__pycache__/
 .claude/
 tmp_*/
+eval/tmp/
+eval/dashboard_exports/
 
 # Local secrets and scratch files
 Neo4j-credentials.txt
