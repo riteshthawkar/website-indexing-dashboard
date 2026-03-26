@@ -92,10 +92,10 @@ export function useStageLog(runId: number, stageName: string, enabled = true) {
   });
 }
 
-export function useStructuredRunLogs(runId: number, enabled = true, tail = 300) {
+export function useStructuredRunLogs(runId: number, enabled = true, limit = 300) {
   return useQuery({
-    queryKey: ["structured-run-logs", runId, tail],
-    queryFn: () => fetchStructuredRunLogs(runId, { tail }),
+    queryKey: ["structured-run-logs", runId, limit],
+    queryFn: () => fetchStructuredRunLogs(runId, { limit }),
     enabled,
     refetchInterval: enabled ? 5000 : false,
   });

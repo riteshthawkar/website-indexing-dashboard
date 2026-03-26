@@ -45,10 +45,19 @@ export const fetchRunLogs = (runId: number, tail = 200, stage?: string) =>
 
 export const fetchStructuredRunLogs = (
   runId: number,
-  options?: { tail?: number; stage?: string; eventType?: string; level?: string }
+  options?: {
+    limit?: number;
+    beforeSequence?: number;
+    stage?: string;
+    eventType?: string;
+    level?: string;
+  }
 ) => {
-  const tail = options?.tail ?? 200;
-  const params = new URLSearchParams({ tail: String(tail) });
+  const limit = options?.limit ?? 200;
+  const params = new URLSearchParams({ limit: String(limit) });
+  if (options?.beforeSequence !== undefined) {
+    params.set("before_sequence", String(options.beforeSequence));
+  }
   if (options?.stage) params.set("stage", options.stage);
   if (options?.eventType) params.set("event_type", options.eventType);
   if (options?.level) params.set("level", options.level);

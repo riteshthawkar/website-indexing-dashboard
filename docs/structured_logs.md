@@ -80,7 +80,9 @@ Structured logs are exposed at:
 
 Query params:
 
-- `tail`: number of records to return, default `200`
+- `limit`: number of records to return, default `200`
+- `tail`: backward-compatible alias for `limit`
+- `before_sequence`: optional cursor for older records
 - `stage`: optional exact stage filter
 - `event_type`: optional exact event-type filter
 - `level`: optional exact severity filter
@@ -90,9 +92,18 @@ Response:
 ```json
 {
   "items": [...],
-  "path": "/abs/path/to/runs/.../dashboard_logs/structured_logs.jsonl"
+  "path": "/abs/path/to/runs/.../dashboard_logs/structured_logs.jsonl",
+  "has_more": true,
+  "next_before_sequence": 482
 }
 ```
+
+Pagination semantics:
+
+- records are returned in ascending `sequence` order within each page
+- to fetch older records, call the same endpoint with:
+  - `before_sequence = next_before_sequence`
+- if `has_more` is `false`, there are no older matching records
 
 ## WebSocket Behavior
 
@@ -134,6 +145,7 @@ The UI:
 
 - loads historical structured logs from the REST API
 - appends live structured events from the WebSocket
+- pages older records from the REST API using `before_sequence`
 - renders:
   - severity
   - event type

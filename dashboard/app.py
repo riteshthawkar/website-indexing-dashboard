@@ -301,7 +301,9 @@ async def api_run_logs(run_id: int, tail: int = 200, stage: Optional[str] = None
 @app.get("/api/runs/{run_id}/structured-logs")
 async def api_run_structured_logs(
     run_id: int,
-    tail: int = 200,
+    tail: Optional[int] = None,
+    limit: int = 200,
+    before_sequence: Optional[int] = None,
     stage: Optional[str] = None,
     event_type: Optional[str] = None,
     level: Optional[str] = None,
@@ -312,16 +314,26 @@ async def api_run_structured_logs(
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
         if not run.work_dir:
-            return {"items": [], "path": None}
+            return {
+                "items": [],
+                "path": None,
+                "has_more": False,
+                "next_before_sequence": None,
+            }
         path = structured_log_path(run.work_dir)
-        items = load_structured_logs(
+        effective_limit = tail if tail is not None else limit
+        payload = load_structured_logs(
             run.work_dir,
-            tail=tail,
+            limit=effective_limit,
+            before_sequence=before_sequence,
             stage=stage,
             event_type=event_type,
             level=level,
         )
-        return {"items": items, "path": str(path)}
+        return {
+            **payload,
+            "path": str(path),
+        }
     finally:
         db.close()
 

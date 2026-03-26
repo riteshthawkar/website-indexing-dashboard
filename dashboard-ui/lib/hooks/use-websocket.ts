@@ -1,8 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState, useCallback } from "react";
-import { getApiBase, getWsUrl } from "@/lib/utils";
-import type { StructuredRunLogEntry, StructuredRunLogResponse } from "@/lib/types";
+import { getWsUrl } from "@/lib/utils";
+import type { StructuredRunLogEntry } from "@/lib/types";
 
 export function useWebSocket(runId: number, enabled = true) {
   const [entries, setEntries] = useState<StructuredRunLogEntry[]>([]);
@@ -25,24 +25,8 @@ export function useWebSocket(runId: number, enabled = true) {
   }, []);
 
   useEffect(() => {
-    let active = true;
-    async function loadInitial() {
-      if (!runId) return;
-      try {
-        const res = await fetch(`${getApiBase()}/api/runs/${runId}/structured-logs?tail=300`);
-        if (!res.ok) return;
-        const payload = (await res.json()) as StructuredRunLogResponse;
-        if (!active) return;
-        seenSequencesRef.current = new Set((payload.items || []).map((item) => item.sequence));
-        setEntries(payload.items || []);
-      } catch {
-        // ignore initial load failures; websocket will still provide live logs
-      }
-    }
-    loadInitial();
-    return () => {
-      active = false;
-    };
+    seenSequencesRef.current = new Set();
+    setEntries([]);
   }, [runId]);
 
   useEffect(() => {

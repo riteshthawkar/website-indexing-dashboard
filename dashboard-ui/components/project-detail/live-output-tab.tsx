@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -13,9 +13,12 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import { fetchStructuredRunLogs } from "@/lib/api";
 import { useWebSocket } from "@/lib/hooks/use-websocket";
-import { Trash2 } from "lucide-react";
+import { Loader2, Trash2 } from "lucide-react";
 import type { StructuredRunLogEntry } from "@/lib/types";
+
+const PAGE_SIZE = 200;
 
 function formatTimestamp(value: string | null) {
   if (!value) return "—";
@@ -63,19 +66,105 @@ function LogEntryRow({ entry }: { entry: StructuredRunLogEntry }) {
 }
 
 export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: boolean }) {
-  const { entries, connected, clear } = useWebSocket(runId, true);
+  const { entries: liveEntries, connected, clear } = useWebSocket(runId, true);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [historyEntries, setHistoryEntries] = useState<StructuredRunLogEntry[]>([]);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [hasMore, setHasMore] = useState(false);
+  const [nextBeforeSequence, setNextBeforeSequence] = useState<number | null>(null);
   const [levelFilter, setLevelFilter] = useState("all");
   const [eventTypeFilter, setEventTypeFilter] = useState("all");
   const [stageFilter, setStageFilter] = useState("all");
   const [search, setSearch] = useState("");
 
-  const eventTypes = Array.from(new Set(entries.map((entry) => entry.event_type).filter(Boolean))).sort();
-  const stages = Array.from(new Set(entries.map((entry) => entry.stage).filter(Boolean) as string[])).sort();
-  const filteredEntries = entries.filter((entry) => {
+  const matchesServerFilters = useCallback((entry: StructuredRunLogEntry) => {
     if (levelFilter !== "all" && entry.level !== levelFilter) return false;
     if (eventTypeFilter !== "all" && entry.event_type !== eventTypeFilter) return false;
     if (stageFilter !== "all" && entry.stage !== stageFilter) return false;
+    return true;
+  }, [eventTypeFilter, levelFilter, stageFilter]);
+
+  const mergeEntries = useCallback((records: StructuredRunLogEntry[]) => {
+    const bySequence = new Map<number, StructuredRunLogEntry>();
+    for (const record of records) {
+      bySequence.set(record.sequence, record);
+    }
+    return Array.from(bySequence.values()).sort((a, b) => a.sequence - b.sequence);
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    setLoadingHistory(true);
+    setLoadError(null);
+    fetchStructuredRunLogs(runId, {
+      limit: PAGE_SIZE,
+      level: levelFilter !== "all" ? levelFilter : undefined,
+      eventType: eventTypeFilter !== "all" ? eventTypeFilter : undefined,
+      stage: stageFilter !== "all" ? stageFilter : undefined,
+    })
+      .then((payload) => {
+        if (!active) return;
+        setHistoryEntries(payload.items || []);
+        setHasMore(Boolean(payload.has_more));
+        setNextBeforeSequence(payload.next_before_sequence ?? null);
+      })
+      .catch((error: Error) => {
+        if (!active) return;
+        setHistoryEntries([]);
+        setHasMore(false);
+        setNextBeforeSequence(null);
+        setLoadError(error.message || "Failed to load structured logs.");
+      })
+      .finally(() => {
+        if (active) setLoadingHistory(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [eventTypeFilter, levelFilter, runId, stageFilter]);
+
+  const loadOlder = useCallback(async () => {
+    if (!hasMore || nextBeforeSequence === null || loadingMore) return;
+    setLoadingMore(true);
+    setLoadError(null);
+    try {
+      const payload = await fetchStructuredRunLogs(runId, {
+        limit: PAGE_SIZE,
+        beforeSequence: nextBeforeSequence,
+        level: levelFilter !== "all" ? levelFilter : undefined,
+        eventType: eventTypeFilter !== "all" ? eventTypeFilter : undefined,
+        stage: stageFilter !== "all" ? stageFilter : undefined,
+      });
+      setHistoryEntries((prev) => mergeEntries([...(payload.items || []), ...prev]));
+      setHasMore(Boolean(payload.has_more));
+      setNextBeforeSequence(payload.next_before_sequence ?? null);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Failed to load older logs.";
+      setLoadError(message);
+    } finally {
+      setLoadingMore(false);
+    }
+  }, [
+    eventTypeFilter,
+    hasMore,
+    levelFilter,
+    loadingMore,
+    mergeEntries,
+    nextBeforeSequence,
+    runId,
+    stageFilter,
+  ]);
+
+  const combinedEntries = useMemo(() => {
+    const filteredLive = liveEntries.filter(matchesServerFilters);
+    return mergeEntries([...historyEntries, ...filteredLive]);
+  }, [historyEntries, liveEntries, matchesServerFilters, mergeEntries]);
+
+  const eventTypes = Array.from(new Set(combinedEntries.map((entry) => entry.event_type).filter(Boolean))).sort();
+  const stages = Array.from(new Set(combinedEntries.map((entry) => entry.stage).filter(Boolean) as string[])).sort();
+  const filteredEntries = combinedEntries.filter((entry) => {
     if (!search.trim()) return true;
     const needle = search.trim().toLowerCase();
     const haystack = [
@@ -100,7 +189,7 @@ export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: 
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <CardTitle>Structured Logs</CardTitle>
-            <Badge variant="secondary">{filteredEntries.length}/{entries.length}</Badge>
+            <Badge variant="secondary">{filteredEntries.length}/{combinedEntries.length}</Badge>
             {isRunning && connected && (
               <Badge variant="outline" className="bg-red-500/15 text-red-400 border-red-500/20">
                 <span className="mr-1.5 h-2 w-2 rounded-full bg-red-500 animate-pulse inline-block" />
@@ -128,7 +217,7 @@ export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: 
             </Button>
             <Button variant="ghost" size="sm" onClick={clear}>
               <Trash2 className="mr-2 h-4 w-4" />
-              Clear
+              Clear Live
             </Button>
           </div>
         </div>
@@ -179,10 +268,27 @@ export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: 
             placeholder="Search message, stage, payload"
           />
         </div>
+        <div className="mb-3 flex items-center justify-between text-xs text-muted-foreground">
+          <div>
+            {loadingHistory ? "Loading logs..." : hasMore ? "Older logs available." : "Showing newest available page."}
+          </div>
+          <div className="flex items-center gap-2">
+            {loadError && <span className="text-red-400">{loadError}</span>}
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={loadOlder}
+              disabled={!hasMore || loadingMore || loadingHistory}
+            >
+              {(loadingMore || loadingHistory) && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              Load Older
+            </Button>
+          </div>
+        </div>
         <ScrollArea className="h-96 rounded-md border bg-black/60 p-4 font-mono text-xs leading-5">
-          {entries.length === 0 ? (
+          {combinedEntries.length === 0 ? (
             <p className="text-muted-foreground">
-              {isRunning ? "Waiting for structured logs..." : "No structured logs recorded for this run."}
+              {loadingHistory ? "Loading structured logs..." : isRunning ? "Waiting for structured logs..." : "No structured logs recorded for this run."}
             </p>
           ) : filteredEntries.length === 0 ? (
             <p className="text-muted-foreground">No log entries match the active filters.</p>

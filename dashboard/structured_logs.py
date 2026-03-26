@@ -80,22 +80,52 @@ def _iter_structured_log_records(path: Path) -> Iterable[Dict[str, Any]]:
 def load_structured_logs(
     work_dir: str | Path,
     *,
-    tail: int = 200,
+    limit: int = 200,
+    before_sequence: int | None = None,
     stage: str | None = None,
     event_type: str | None = None,
     level: str | None = None,
-) -> list[Dict[str, Any]]:
+) -> Dict[str, Any]:
     path = structured_log_path(work_dir)
     if not path.exists():
-        return []
+        return {
+            "items": [],
+            "has_more": False,
+            "next_before_sequence": None,
+        }
 
-    window = deque(maxlen=max(int(tail or 200), 1))
+    page_size = max(int(limit or 200), 1)
+    window = deque(maxlen=page_size)
+    matched_count = 0
     for record in _iter_structured_log_records(path):
+        sequence = record.get("sequence")
+        if before_sequence is not None:
+            try:
+                if int(sequence) >= int(before_sequence):
+                    continue
+            except (TypeError, ValueError):
+                continue
         if stage and record.get("stage") != stage:
             continue
         if event_type and record.get("event_type") != event_type:
             continue
         if level and record.get("level") != level:
             continue
+        matched_count += 1
         window.append(record)
-    return list(window)
+
+    items = list(window)
+    has_more = matched_count > len(items)
+    next_before_sequence = None
+    if has_more and items:
+        sequence = items[0].get("sequence")
+        try:
+            next_before_sequence = int(sequence)
+        except (TypeError, ValueError):
+            next_before_sequence = None
+
+    return {
+        "items": items,
+        "has_more": has_more,
+        "next_before_sequence": next_before_sequence,
+    }

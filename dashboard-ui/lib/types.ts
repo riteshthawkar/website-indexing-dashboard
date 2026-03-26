@@ -195,6 +195,8 @@ export interface StructuredRunLogEntry {
 export interface StructuredRunLogResponse {
   items: StructuredRunLogEntry[];
   path: string | null;
+  has_more: boolean;
+  next_before_sequence: number | null;
 }
 
 export type RunStatus = PipelineRun["status"];
