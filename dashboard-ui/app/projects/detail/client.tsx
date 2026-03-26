@@ -12,6 +12,9 @@ import { StagesTab } from "@/components/project-detail/stages-tab";
 import { LiveOutputTab } from "@/components/project-detail/live-output-tab";
 import { ConfigTab } from "@/components/project-detail/config-tab";
 import { MediaTab } from "@/components/project-detail/media-tab";
+import { RetrievalTab } from "@/components/project-detail/retrieval-tab";
+import { EvaluationTab } from "@/components/project-detail/evaluation-tab";
+import { KnowledgeTab } from "@/components/project-detail/knowledge-tab";
 import { useRun, useStartRun, useCancelRun } from "@/lib/hooks/use-runs";
 import { Play, Square, ArrowLeft } from "lucide-react";
 
@@ -96,6 +99,9 @@ export function ProjectDetailClient() {
             <TabsTrigger value="urls">URLs</TabsTrigger>
             <TabsTrigger value="media">Media</TabsTrigger>
             <TabsTrigger value="stages">Stages</TabsTrigger>
+            <TabsTrigger value="retrieval">Retrieval</TabsTrigger>
+            <TabsTrigger value="evaluation">Evaluation</TabsTrigger>
+            <TabsTrigger value="knowledge">Knowledge</TabsTrigger>
             <TabsTrigger value="live">Logs</TabsTrigger>
             <TabsTrigger value="config">Config</TabsTrigger>
           </TabsList>
@@ -110,6 +116,15 @@ export function ProjectDetailClient() {
           </TabsContent>
           <TabsContent value="stages" className="mt-4">
             <StagesTab stages={run.stages || []} runId={run.id} />
+          </TabsContent>
+          <TabsContent value="retrieval" className="mt-4">
+            <RetrievalTab run={run} />
+          </TabsContent>
+          <TabsContent value="evaluation" className="mt-4">
+            <EvaluationTab run={run} />
+          </TabsContent>
+          <TabsContent value="knowledge" className="mt-4">
+            <KnowledgeTab runId={run.id} />
           </TabsContent>
           <TabsContent value="live" className="mt-4">
             <LiveOutputTab runId={run.id} isRunning={isRunning} />

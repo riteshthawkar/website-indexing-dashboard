@@ -72,6 +72,35 @@ export const fetchStageLog = (runId: number, stageName: string, tail = 200) =>
 export const fetchRunStages = (runId: number) =>
   request<import("./types").StageState[]>(`/api/runs/${runId}/stages`);
 
+export const runRetrievalQuery = (runId: number, data: { query: string; config_name?: string }) =>
+  request<import("./types").RetrievalPlaygroundResult>(`/api/runs/${runId}/retrieve`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const fetchEvaluationAssets = () =>
+  request<import("./types").EvaluationAssets>("/api/evaluation/assets");
+
+export const fetchRetrievalBenchmarks = (runId: number) =>
+  request<import("./types").RetrievalBenchmarkJob[]>(`/api/runs/${runId}/benchmarks/retrieval`);
+
+export const startRetrievalBenchmark = (
+  runId: number,
+  data: {
+    config_name?: string;
+    dataset_path: string;
+    gates_path?: string | null;
+    parallelism?: number;
+  }
+) =>
+  request<import("./types").RetrievalBenchmarkJob>(`/api/runs/${runId}/benchmarks/retrieval`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const fetchKnowledgeBaseStatus = (runId: number) =>
+  request<import("./types").KnowledgeBaseStatus>(`/api/runs/${runId}/knowledge-base`);
+
 // --- Pipeline Configs ---
 
 export const fetchPipelineConfigs = () =>

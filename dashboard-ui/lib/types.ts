@@ -199,5 +199,92 @@ export interface StructuredRunLogResponse {
   next_before_sequence: number | null;
 }
 
+export interface RetrievalPlaygroundDocument {
+  id?: string;
+  document_title?: string;
+  source_url?: string;
+  text?: string;
+  score?: number | null;
+  [key: string]: unknown;
+}
+
+export interface RetrievalPlaygroundResult {
+  query: string;
+  config_name: string;
+  work_dir: string;
+  answer_preview?: string | null;
+  result: {
+    mode?: string;
+    retriever_backend?: string;
+    routing_backend?: string;
+    routing_reason?: string;
+    routing_relation_family?: string;
+    routing_relation_confidence?: number | null;
+    routing_latency_ms?: number | null;
+    backend_latency_ms?: number | null;
+    graph_used?: boolean;
+    graph_store_backend?: string | null;
+    abstained?: boolean;
+    selected_chunk_ids?: string[];
+    selected_parent_ids?: string[];
+    selected_answer_ids?: string[];
+    retrieval_documents?: RetrievalPlaygroundDocument[];
+    answer_documents?: RetrievalPlaygroundDocument[];
+    fact_documents?: RetrievalPlaygroundDocument[];
+    [key: string]: unknown;
+  };
+}
+
+export interface EvaluationAssets {
+  datasets: string[];
+  gates: string[];
+}
+
+export interface RetrievalBenchmarkJob {
+  job_id: string;
+  run_id: number;
+  job_type: string;
+  status: "queued" | "running" | "completed" | "failed";
+  config_name: string;
+  work_dir: string;
+  dataset_path: string;
+  gates_path: string | null;
+  parallelism: number;
+  created_at: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  report_path: string | null;
+  query_count: number | null;
+  overall: Record<string, number> | null;
+  gates: {
+    passed?: boolean;
+    path?: string | null;
+    failures?: string[];
+    [key: string]: unknown;
+  } | null;
+  error_message: string | null;
+  manifest_path?: string | null;
+}
+
+export interface PineconeKnowledgeIndex {
+  index_name: string | null;
+  stats: PineconeIndex | null;
+}
+
+export interface KnowledgeBaseStatus {
+  config_name: string | null;
+  retriever_backend: string | null;
+  work_dir: string | null;
+  pinecone: {
+    namespaces: Record<string, string>;
+    indexes: {
+      dense: PineconeKnowledgeIndex;
+      sparse: PineconeKnowledgeIndex;
+    };
+  };
+  graph: Record<string, unknown> | null;
+  retrieval_bundle_counts: Record<string, number>;
+}
+
 export type RunStatus = PipelineRun["status"];
 export type StageStatus = StageState["status"];

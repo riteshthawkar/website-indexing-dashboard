@@ -21,6 +21,7 @@ from database import init_db, get_db, Run, RunLog
 from run_data import collect_artifact_summary, collect_media_summary, load_run_media
 from scanner import scan_and_import
 from run_executor import (
+    _load_env,
     create_run,
     execute_pipeline,
     cancel_run,
@@ -41,6 +42,9 @@ from pinecone_ops import (
     snapshot_indexes,
     get_snapshot_history,
 )
+from evaluation_ops import benchmark_job_manager, list_benchmark_jobs, list_eval_assets
+from knowledge_ops import get_run_knowledge_status
+from retrieval_ops import run_retrieval_query
 from structured_logs import load_structured_logs, structured_log_path
 from url_manager import (
     add_excluded_subdomain,
@@ -149,6 +153,7 @@ run_manager = RunManager()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    _load_env()
     init_db()
     cleanup_stale_runs()
     imported = scan_and_import()
@@ -364,6 +369,90 @@ async def api_run_stages(run_id: int):
     if not state:
         return []
     return state.get("stages", [])
+
+
+# ---------------------------------------------------------------------------
+# API: Retrieval / Evaluation / Knowledge Base
+# ---------------------------------------------------------------------------
+
+
+def _load_run_or_404(run_id: int) -> Run:
+    db = get_db()
+    try:
+        run = db.query(Run).get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        db.expunge(run)
+        return run
+    finally:
+        db.close()
+
+
+@app.post("/api/runs/{run_id}/retrieve")
+async def api_run_retrieve(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    query = str(data.get("query") or "").strip()
+    config_name = str(data.get("config_name") or run.config_name or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="query is required")
+    if not config_name:
+        raise HTTPException(status_code=400, detail="config_name is required")
+    return await asyncio.to_thread(
+        run_retrieval_query,
+        config_name=config_name,
+        work_dir=run.work_dir,
+        query=query,
+    )
+
+
+@app.get("/api/evaluation/assets")
+async def api_evaluation_assets():
+    return await asyncio.to_thread(list_eval_assets)
+
+
+@app.get("/api/runs/{run_id}/benchmarks/retrieval")
+async def api_list_retrieval_benchmarks(run_id: int):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        return []
+    return await asyncio.to_thread(list_benchmark_jobs, run.work_dir)
+
+
+@app.post("/api/runs/{run_id}/benchmarks/retrieval")
+async def api_start_retrieval_benchmark(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    dataset_path = data.get("dataset_path")
+    gates_path = data.get("gates_path")
+    config_name = str(data.get("config_name") or run.config_name or "").strip()
+    parallelism = int(data.get("parallelism") or 4)
+    if not dataset_path:
+        raise HTTPException(status_code=400, detail="dataset_path is required")
+    if not config_name:
+        raise HTTPException(status_code=400, detail="config_name is required")
+    try:
+        job = benchmark_job_manager.start(
+            run_id=run_id,
+            config_name=config_name,
+            work_dir=run.work_dir,
+            dataset_path=dataset_path,
+            gates_path=gates_path,
+            parallelism=parallelism,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return job
+
+
+@app.get("/api/runs/{run_id}/knowledge-base")
+async def api_run_knowledge_base(run_id: int):
+    run = _load_run_or_404(run_id)
+    return await asyncio.to_thread(get_run_knowledge_status, run)
 
 
 # ---------------------------------------------------------------------------
