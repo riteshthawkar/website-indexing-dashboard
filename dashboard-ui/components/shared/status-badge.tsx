@@ -18,7 +18,10 @@ interface StatusBadgeProps {
 
 export function StatusBadge({ status, className, pulse }: StatusBadgeProps) {
   return (
-    <Badge variant="outline" className={`${statusVariants[status] || statusVariants.pending} ${className || ""}`}>
+    <Badge
+      variant="outline"
+      className={`rounded-full px-2.5 py-1 font-medium capitalize tracking-[0.08em] ${statusVariants[status] || statusVariants.pending} ${className || ""}`}
+    >
       {pulse && status === "running" && (
         <span className="mr-1.5 h-2 w-2 rounded-full bg-blue-400 animate-pulse" />
       )}

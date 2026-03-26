@@ -115,12 +115,48 @@ function StageItem({ stage, index, runId }: { stage: StageState; index: number; 
 }
 
 export function StagesTab({ stages, runId }: { stages: StageState[]; runId: number }) {
+  const total = stages?.length || 0;
+  const completed = (stages || []).filter((stage) => stage.status === "completed" || stage.status === "skipped").length;
+  const running = (stages || []).filter((stage) => stage.status === "running").length;
+  const failed = (stages || []).filter((stage) => stage.status === "failed").length;
+  const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
+
   return (
-    <Card>
-      <CardHeader>
+    <Card className="rounded-[1.9rem] border border-white/8 bg-card/80 shadow-[0_28px_72px_-40px_rgba(0,0,0,0.85)] backdrop-blur-xl">
+      <CardHeader className="space-y-4">
         <CardTitle>Pipeline Stages</CardTitle>
+        <div className="grid gap-3 md:grid-cols-4">
+          <div className="rounded-2xl border border-white/8 bg-black/15 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-[0.24em] text-muted-foreground/80">Total</div>
+            <div className="mt-2 text-lg font-semibold">{total}</div>
+          </div>
+          <div className="rounded-2xl border border-emerald-500/15 bg-emerald-500/10 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-[0.24em] text-emerald-200/75">Completed</div>
+            <div className="mt-2 text-lg font-semibold text-emerald-50">{completed}</div>
+          </div>
+          <div className="rounded-2xl border border-blue-500/15 bg-blue-500/10 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-[0.24em] text-blue-200/75">Running</div>
+            <div className="mt-2 text-lg font-semibold text-blue-50">{running}</div>
+          </div>
+          <div className="rounded-2xl border border-red-500/15 bg-red-500/10 px-4 py-3">
+            <div className="text-[11px] uppercase tracking-[0.24em] text-red-200/75">Failed</div>
+            <div className="mt-2 text-lg font-semibold text-red-50">{failed}</div>
+          </div>
+        </div>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between text-sm text-muted-foreground">
+            <span>{completed} of {total} stages complete</span>
+            <span className="font-medium">{progress}%</span>
+          </div>
+          <div className="h-3 overflow-hidden rounded-full border border-white/8 bg-black/25">
+            <div
+              className="h-full rounded-full bg-[linear-gradient(90deg,rgba(53,210,198,0.9),rgba(73,143,226,0.92))] transition-all duration-500"
+              style={{ width: `${progress}%` }}
+            />
+          </div>
+        </div>
       </CardHeader>
-      <CardContent className="space-y-2">
+      <CardContent className="space-y-3">
         {!stages || stages.length === 0 ? (
           <p className="text-sm text-muted-foreground">No stages recorded.</p>
         ) : (

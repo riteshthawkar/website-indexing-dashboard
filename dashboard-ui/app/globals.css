@@ -126,6 +126,8 @@
   body {
     @apply bg-background text-foreground;
     background-image:
+      radial-gradient(circle at top, rgba(53, 210, 198, 0.08), transparent 28%),
+      radial-gradient(circle at right top, rgba(84, 122, 255, 0.08), transparent 24%),
       linear-gradient(to right, rgba(255, 255, 255, 0.03) 1px, transparent 1px),
       linear-gradient(to bottom, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
     background-size: 36px 36px;
@@ -142,6 +144,6 @@
   }
 
   .page-section {
-    @apply p-6;
+    @apply px-6 py-8 xl:px-8 xl:py-10;
   }
 }

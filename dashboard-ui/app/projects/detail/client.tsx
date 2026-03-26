@@ -17,6 +17,7 @@ import { EvaluationTab } from "@/components/project-detail/evaluation-tab";
 import { KnowledgeTab } from "@/components/project-detail/knowledge-tab";
 import { OperationsTab } from "@/components/project-detail/operations-tab";
 import { ArtifactsTab } from "@/components/project-detail/artifacts-tab";
+import { ProcessStatusStrip } from "@/components/project-detail/process-status-strip";
 import { useRun, useStartRun, useCancelRun } from "@/lib/hooks/use-runs";
 import { Play, Square, ArrowLeft } from "lucide-react";
 
@@ -95,20 +96,22 @@ export function ProjectDetailClient() {
         }
       />
       <div className="page-section">
-        <Tabs defaultValue="overview">
-          <TabsList>
-            <TabsTrigger value="overview">Overview</TabsTrigger>
-            <TabsTrigger value="urls">URLs</TabsTrigger>
-            <TabsTrigger value="media">Media</TabsTrigger>
-            <TabsTrigger value="stages">Stages</TabsTrigger>
-            <TabsTrigger value="retrieval">Retrieval</TabsTrigger>
-            <TabsTrigger value="evaluation">Evaluation</TabsTrigger>
-            <TabsTrigger value="knowledge">Knowledge</TabsTrigger>
-            <TabsTrigger value="artifacts">Artifacts</TabsTrigger>
-            <TabsTrigger value="operations">Operations</TabsTrigger>
-            <TabsTrigger value="live">Logs</TabsTrigger>
-            <TabsTrigger value="config">Config</TabsTrigger>
-          </TabsList>
+        <div className="space-y-8">
+          <ProcessStatusStrip run={run} />
+          <Tabs defaultValue="overview" className="space-y-6">
+            <TabsList className="h-auto w-full flex-wrap justify-start gap-2 rounded-[1.75rem] border border-white/8 bg-card/70 p-2 shadow-[0_22px_54px_-34px_rgba(0,0,0,0.8)] backdrop-blur">
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="overview">Overview</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="urls">URLs</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="media">Media</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="stages">Stages</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="retrieval">Retrieval</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="evaluation">Evaluation</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="knowledge">Knowledge</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="artifacts">Artifacts</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="operations">Operations</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="live">Logs</TabsTrigger>
+              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="config">Config</TabsTrigger>
+            </TabsList>
           <TabsContent value="overview" className="mt-4">
             <OverviewTab run={run} />
           </TabsContent>
@@ -137,12 +140,13 @@ export function ProjectDetailClient() {
             <OperationsTab run={run} />
           </TabsContent>
           <TabsContent value="live" className="mt-4">
-            <LiveOutputTab runId={run.id} isRunning={isRunning} />
+            <LiveOutputTab run={run} isRunning={isRunning} />
           </TabsContent>
           <TabsContent value="config" className="mt-4">
             <ConfigTab run={run} />
           </TabsContent>
-        </Tabs>
+          </Tabs>
+        </div>
       </div>
     </>
   );
