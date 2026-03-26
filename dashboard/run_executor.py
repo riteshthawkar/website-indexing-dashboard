@@ -106,7 +106,7 @@ def _update_run(run_id: int, **kwargs):
     """Update run fields in the database."""
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if run:
             for k, v in kwargs.items():
                 setattr(run, k, v)
@@ -145,7 +145,7 @@ async def execute_pipeline(
 
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run:
             logger.error(f"Run {run_id} not found")
             return
@@ -286,7 +286,7 @@ async def execute_pipeline(
         # Apply overrides from the dashboard run
         db2 = get_db()
         try:
-            run = db2.query(Run).get(run_id)
+            run = db2.get(Run, run_id)
             if run and run.start_url:
                 config["crawler"] = config.get("crawler", {})
                 config["crawler"]["start_url"] = run.start_url
@@ -364,7 +364,7 @@ def cancel_run(run_id: int) -> bool:
     """Mark a run as cancelled."""
     db = get_db()
     try:
-        run = db.query(Run).get(run_id)
+        run = db.get(Run, run_id)
         if not run or run.status != "running":
             return False
         run.status = "cancelled"

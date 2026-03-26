@@ -51,7 +51,7 @@ def _is_real_url(url: str) -> bool:
 def _get_run(run_id: int) -> Optional[Run]:
     db = get_db()
     try:
-        return db.query(Run).get(run_id)
+        return db.get(Run, run_id)
     finally:
         db.close()
 
