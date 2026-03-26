@@ -1,10 +1,18 @@
 "use client";
 
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useWebSocket } from "@/lib/hooks/use-websocket";
 import { Trash2 } from "lucide-react";
 import type { StructuredRunLogEntry } from "@/lib/types";
@@ -57,10 +65,34 @@ function LogEntryRow({ entry }: { entry: StructuredRunLogEntry }) {
 export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: boolean }) {
   const { entries, connected, clear } = useWebSocket(runId, true);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [levelFilter, setLevelFilter] = useState("all");
+  const [eventTypeFilter, setEventTypeFilter] = useState("all");
+  const [stageFilter, setStageFilter] = useState("all");
+  const [search, setSearch] = useState("");
+
+  const eventTypes = Array.from(new Set(entries.map((entry) => entry.event_type).filter(Boolean))).sort();
+  const stages = Array.from(new Set(entries.map((entry) => entry.stage).filter(Boolean) as string[])).sort();
+  const filteredEntries = entries.filter((entry) => {
+    if (levelFilter !== "all" && entry.level !== levelFilter) return false;
+    if (eventTypeFilter !== "all" && entry.event_type !== eventTypeFilter) return false;
+    if (stageFilter !== "all" && entry.stage !== stageFilter) return false;
+    if (!search.trim()) return true;
+    const needle = search.trim().toLowerCase();
+    const haystack = [
+      entry.message,
+      entry.stage || "",
+      entry.event_type,
+      entry.level,
+      JSON.stringify(entry.data || {}),
+    ]
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(needle);
+  });
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [entries.length]);
+  }, [filteredEntries.length]);
 
   return (
     <Card>
@@ -68,6 +100,7 @@ export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: 
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
             <CardTitle>Structured Logs</CardTitle>
+            <Badge variant="secondary">{filteredEntries.length}/{entries.length}</Badge>
             {isRunning && connected && (
               <Badge variant="outline" className="bg-red-500/15 text-red-400 border-red-500/20">
                 <span className="mr-1.5 h-2 w-2 rounded-full bg-red-500 animate-pulse inline-block" />
@@ -80,21 +113,82 @@ export function LiveOutputTab({ runId, isRunning }: { runId: number; isRunning: 
               </Badge>
             )}
           </div>
-          <Button variant="ghost" size="sm" onClick={clear}>
-            <Trash2 className="mr-2 h-4 w-4" />
-            Clear
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                setLevelFilter("all");
+                setEventTypeFilter("all");
+                setStageFilter("all");
+                setSearch("");
+              }}
+            >
+              Reset Filters
+            </Button>
+            <Button variant="ghost" size="sm" onClick={clear}>
+              <Trash2 className="mr-2 h-4 w-4" />
+              Clear
+            </Button>
+          </div>
         </div>
       </CardHeader>
       <CardContent>
+        <div className="mb-4 grid gap-3 md:grid-cols-4">
+          <Select value={levelFilter} onValueChange={(value) => setLevelFilter(value || "all")}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="All levels" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All levels</SelectItem>
+              <SelectItem value="info">Info</SelectItem>
+              <SelectItem value="warning">Warning</SelectItem>
+              <SelectItem value="warn">Warn</SelectItem>
+              <SelectItem value="error">Error</SelectItem>
+            </SelectContent>
+          </Select>
+          <Select value={eventTypeFilter} onValueChange={(value) => setEventTypeFilter(value || "all")}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="All event types" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All event types</SelectItem>
+              {eventTypes.map((eventType) => (
+                <SelectItem key={eventType} value={eventType}>
+                  {eventType}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={stageFilter} onValueChange={(value) => setStageFilter(value || "all")}>
+            <SelectTrigger className="w-full">
+              <SelectValue placeholder="All stages" />
+            </SelectTrigger>
+            <SelectContent>
+              <SelectItem value="all">All stages</SelectItem>
+              {stages.map((stage) => (
+                <SelectItem key={stage} value={stage}>
+                  {stage}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Input
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search message, stage, payload"
+          />
+        </div>
         <ScrollArea className="h-96 rounded-md border bg-black/60 p-4 font-mono text-xs leading-5">
           {entries.length === 0 ? (
             <p className="text-muted-foreground">
               {isRunning ? "Waiting for structured logs..." : "No structured logs recorded for this run."}
             </p>
+          ) : filteredEntries.length === 0 ? (
+            <p className="text-muted-foreground">No log entries match the active filters.</p>
           ) : (
             <div className="space-y-2">
-              {entries.map((entry) => (
+              {filteredEntries.map((entry) => (
                 <LogEntryRow key={entry.sequence} entry={entry} />
               ))}
             </div>

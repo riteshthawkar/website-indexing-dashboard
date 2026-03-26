@@ -141,6 +141,11 @@ The UI:
   - timestamp
   - sequence
   - expandable JSON payload
+- supports client-side filters for:
+  - severity
+  - event type
+  - stage
+  - free-text search across message and payload
 
 ## Implementation Files
 
