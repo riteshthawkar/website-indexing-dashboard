@@ -32,6 +32,21 @@ export const createRun = (data: {
 export const startRun = (id: number) =>
   request<{ status: string; run_id: number }>(`/api/runs/${id}/start`, { method: "POST" });
 
+export const resumeRun = (id: number) =>
+  request<{ status: string; run_id: number }>(`/api/runs/${id}/resume`, { method: "POST" });
+
+export const restartRun = (id: number, restartFrom: string) =>
+  request<{ status: string; run_id: number; restart_from: string }>(`/api/runs/${id}/restart`, {
+    method: "POST",
+    body: JSON.stringify({ restart_from: restartFrom }),
+  });
+
+export const retryStage = (runId: number, stageSelector: string) =>
+  request<{ status: string; run_id: number; restart_from: string }>(
+    `/api/runs/${runId}/stages/${encodeURIComponent(stageSelector)}/retry`,
+    { method: "POST" }
+  );
+
 export const cancelRun = (id: number) =>
   request<{ status: string; run_id: number }>(`/api/runs/${id}/cancel`, { method: "POST" });
 
@@ -81,6 +96,9 @@ export const runRetrievalQuery = (runId: number, data: { query: string; config_n
 export const fetchEvaluationAssets = () =>
   request<import("./types").EvaluationAssets>("/api/evaluation/assets");
 
+export const fetchEvaluationPresets = () =>
+  request<import("./types").EvaluationPresetMap>("/api/evaluation/presets");
+
 export const fetchRetrievalBenchmarks = (runId: number) =>
   request<import("./types").RetrievalBenchmarkJob[]>(`/api/runs/${runId}/benchmarks/retrieval`);
 
@@ -100,6 +118,30 @@ export const startRetrievalBenchmark = (
 
 export const fetchKnowledgeBaseStatus = (runId: number) =>
   request<import("./types").KnowledgeBaseStatus>(`/api/runs/${runId}/knowledge-base`);
+
+export const fetchRunAudit = (runId: number, repairState = false) =>
+  request<import("./types").RunAuditResult>(`/api/runs/${runId}/audit?repair_state=${repairState ? "true" : "false"}`);
+
+export const fetchRetrieverServiceStatus = (runId: number) =>
+  request<import("./types").RetrieverServiceStatus>(`/api/runs/${runId}/retriever-service`);
+
+export const startRetrieverService = (
+  runId: number,
+  data: {
+    config_name?: string;
+    host?: string;
+    port?: number;
+    max_concurrency?: number;
+    request_timeout_seconds?: number;
+  }
+) =>
+  request<import("./types").RetrieverServiceStatus>(`/api/runs/${runId}/retriever-service/start`, {
+    method: "POST",
+    body: JSON.stringify(data),
+  });
+
+export const stopRetrieverService = (runId: number) =>
+  request<import("./types").RetrieverServiceStatus>(`/api/runs/${runId}/retriever-service/stop`, { method: "POST" });
 
 // --- Pipeline Configs ---
 
@@ -122,6 +164,12 @@ export const saveConfig = (name: string, data: Record<string, unknown>) =>
     method: "PUT",
     body: JSON.stringify(data),
   });
+
+export const validateConfig = (name: string) =>
+  request<import("./types").ConfigValidationResult>(`/api/configs/${name}/validate`);
+
+export const dryRunConfig = (name: string) =>
+  request<import("./types").ConfigDryRunResult>(`/api/configs/${name}/dry-run`);
 
 export const fetchConfigSchema = () =>
   request<import("./types").ConfigSchema>("/api/configs/schema");

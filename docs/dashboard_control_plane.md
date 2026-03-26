@@ -23,6 +23,28 @@ This dashboard is the operational surface for the MBZUAI retrieval pipeline. It 
 - per-stage metrics
 - stage outputs summary
 
+### `Operations`
+- resume a run from existing `pipeline_state.json`
+- restart a run from a selected stage
+- retry a selected stage
+- validate the current config
+- dry-run the current config to inspect the execution plan
+- audit the run work directory and optionally repair artifact references
+- start, stop, and inspect the local long-lived retriever service for the run
+- inspect available evaluation presets
+
+Backend endpoints:
+- `POST /api/runs/{run_id}/resume`
+- `POST /api/runs/{run_id}/restart`
+- `POST /api/runs/{run_id}/stages/{stage_selector}/retry`
+- `GET /api/configs/{config_name}/validate`
+- `GET /api/configs/{config_name}/dry-run`
+- `GET /api/runs/{run_id}/audit`
+- `GET /api/evaluation/presets`
+- `GET /api/runs/{run_id}/retriever-service`
+- `POST /api/runs/{run_id}/retriever-service/start`
+- `POST /api/runs/{run_id}/retriever-service/stop`
+
 ### `Retrieval`
 - live retrieval playground against the selected run
 - config selection for the retriever
@@ -82,6 +104,12 @@ See also:
 ### Run execution and env loading
 - [run_executor.py](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard/run_executor.py)
 
+### Run-control helpers
+- [control_ops.py](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard/control_ops.py)
+
+### Retriever service lifecycle helpers
+- [retriever_service_ops.py](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard/retriever_service_ops.py)
+
 ### Structured log storage
 - [structured_logs.py](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard/structured_logs.py)
 
@@ -100,6 +128,7 @@ Run detail page:
 - [client.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/app/projects/detail/client.tsx)
 
 New operational tabs:
+- [operations-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/operations-tab.tsx)
 - [retrieval-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/retrieval-tab.tsx)
 - [evaluation-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/evaluation-tab.tsx)
 - [knowledge-tab.tsx](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/components/project-detail/knowledge-tab.tsx)
@@ -115,15 +144,23 @@ API client/types:
 - Knowledge-base status prefers the actual run upload manifests when present, instead of trusting imported run metadata.
 - Benchmark jobs persist manifest JSON files under:
   - `<work_dir>/dashboard_reports/retrieval_benchmarks`
+- Retriever service manifests and logs persist under:
+  - `<work_dir>/dashboard_services`
+- The local retriever service controls are suitable for workstation use. They are not a durable distributed process supervisor.
 
 ## What Still Does Not Exist
 
 The dashboard is broader now, but it is still not a complete platform admin surface. Missing pieces include:
-- retriever service start/stop/health management
-- stage retry / rerun / resume controls
 - artifact browser across all stage outputs
 - Neo4j query explorer
 - assertion candidate/promoted assertion browser
+- mutating Pinecone / Neo4j maintenance actions
+- broader evaluation workflows beyond retrieval benchmarking:
+  - eval-set init/validate/summarize
+  - grounded answer generation
+  - RAGAS execution
+  - benchmark export and ranking-eval workflows
+- durable worker/process orchestration across dashboard backend restarts
 - scheduled jobs / refresh automation
 - secrets management
 

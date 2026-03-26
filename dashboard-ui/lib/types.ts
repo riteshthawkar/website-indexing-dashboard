@@ -286,5 +286,80 @@ export interface KnowledgeBaseStatus {
   retrieval_bundle_counts: Record<string, number>;
 }
 
+export interface EvaluationPresetMap {
+  [name: string]: {
+    type?: string;
+    focus?: string;
+    datasets?: string;
+    metrics?: string[] | string;
+    [key: string]: unknown;
+  };
+}
+
+export interface ConfigValidationResult {
+  config_name: string;
+  valid: boolean;
+  errors: Record<string, string[]>;
+}
+
+export interface DryRunStep {
+  index: number;
+  type: string;
+  plugin: string;
+  description?: string | null;
+  [key: string]: unknown;
+}
+
+export interface ConfigDryRunResult {
+  config_name: string;
+  plan: DryRunStep[];
+}
+
+export interface RunAuditIssue {
+  code: string;
+  message: string;
+  path?: string | null;
+  [key: string]: unknown;
+}
+
+export interface RunAuditResult {
+  work_dir: string;
+  ok: boolean;
+  errors: RunAuditIssue[];
+  warnings: RunAuditIssue[];
+  repair_state: boolean;
+  repaired_artifact_references: number;
+  [key: string]: unknown;
+}
+
+export interface RetrieverServiceStatus {
+  service?: string;
+  status?: string;
+  running: boolean;
+  process_alive?: boolean;
+  pid?: number | null;
+  host?: string | null;
+  port?: number | null;
+  base_url?: string | null;
+  config_name?: string | null;
+  work_dir?: string | null;
+  max_concurrency?: number | null;
+  request_timeout_seconds?: number | null;
+  started_at?: string | null;
+  stopped_at?: string | null;
+  manifest_path?: string | null;
+  log_path?: string | null;
+  health?: {
+    ok?: boolean;
+    [key: string]: unknown;
+  } | null;
+  ready?: {
+    ok?: boolean;
+    [key: string]: unknown;
+  } | null;
+  checked_at?: string | null;
+  [key: string]: unknown;
+}
+
 export type RunStatus = PipelineRun["status"];
 export type StageStatus = StageState["status"];

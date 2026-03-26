@@ -36,6 +36,12 @@ from config_manager import (
     get_config_schema,
     list_configs,
 )
+from control_ops import (
+    audit_run_sync,
+    dry_run_config_sync,
+    list_eval_presets,
+    validate_config_sync,
+)
 from pinecone_ops import (
     fetch_all_index_stats,
     fetch_index_stats,
@@ -45,6 +51,11 @@ from pinecone_ops import (
 from evaluation_ops import benchmark_job_manager, list_benchmark_jobs, list_eval_assets
 from knowledge_ops import get_run_knowledge_status
 from retrieval_ops import run_retrieval_query
+from retriever_service_ops import (
+    get_retriever_service_status,
+    start_retriever_service,
+    stop_retriever_service,
+)
 from structured_logs import load_structured_logs, structured_log_path
 from url_manager import (
     add_excluded_subdomain,
@@ -78,7 +89,7 @@ class RunManager:
         self._tasks: dict[int, asyncio.Task] = {}
         self._ws: dict[int, list[WebSocket]] = {}
 
-    async def start(self, run_id: int):
+    async def start(self, run_id: int, *, resume: Optional[bool] = None, restart_from: Optional[str] = None):
         if run_id in self._tasks and not self._tasks[run_id].done():
             raise HTTPException(status_code=400, detail="Pipeline is already running")
 
@@ -87,6 +98,8 @@ class RunManager:
                 run_id,
                 on_log=self._broadcast_log,
                 on_stage_event=self._broadcast_stage,
+                resume=resume,
+                restart_from=restart_from,
             )
         )
         self._tasks[run_id] = task
@@ -257,8 +270,66 @@ async def api_start_run(run_id: int):
     finally:
         db.close()
 
-    await run_manager.start(run_id)
+    await run_manager.start(run_id, resume=None)
     return {"status": "started", "run_id": run_id}
+
+
+@app.post("/api/runs/{run_id}/resume")
+async def api_resume_run(run_id: int):
+    db = get_db()
+    try:
+        run = db.query(Run).get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.status == "running":
+            raise HTTPException(status_code=400, detail="Run is already running")
+        if not run.work_dir:
+            raise HTTPException(status_code=400, detail="Run has no existing work directory to resume")
+    finally:
+        db.close()
+
+    await run_manager.start(run_id, resume=True)
+    return {"status": "resumed", "run_id": run_id}
+
+
+@app.post("/api/runs/{run_id}/restart")
+async def api_restart_run(run_id: int, request: Request):
+    db = get_db()
+    try:
+        run = db.query(Run).get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.status == "running":
+            raise HTTPException(status_code=400, detail="Run is already running")
+        if not run.work_dir:
+            raise HTTPException(status_code=400, detail="Run has no existing work directory to restart")
+    finally:
+        db.close()
+
+    data = await request.json()
+    restart_from = str(data.get("restart_from") or "").strip()
+    if not restart_from:
+        raise HTTPException(status_code=400, detail="restart_from is required")
+    await run_manager.start(run_id, resume=False, restart_from=restart_from)
+    return {"status": "restarted", "run_id": run_id, "restart_from": restart_from}
+
+
+@app.post("/api/runs/{run_id}/stages/{stage_selector}/retry")
+async def api_retry_stage(run_id: int, stage_selector: str):
+    db = get_db()
+    try:
+        run = db.query(Run).get(run_id)
+        if not run:
+            raise HTTPException(status_code=404, detail="Run not found")
+        if run.status == "running":
+            raise HTTPException(status_code=400, detail="Run is already running")
+        if not run.work_dir:
+            raise HTTPException(status_code=400, detail="Run has no existing work directory to restart")
+    finally:
+        db.close()
+
+    await run_manager.start(run_id, resume=False, restart_from=stage_selector)
+    return {"status": "stage_retry_started", "run_id": run_id, "restart_from": stage_selector}
 
 
 @app.post("/api/runs/{run_id}/cancel")
@@ -413,6 +484,11 @@ async def api_evaluation_assets():
     return await asyncio.to_thread(list_eval_assets)
 
 
+@app.get("/api/evaluation/presets")
+async def api_evaluation_presets():
+    return await asyncio.to_thread(list_eval_presets)
+
+
 @app.get("/api/runs/{run_id}/benchmarks/retrieval")
 async def api_list_retrieval_benchmarks(run_id: int):
     run = _load_run_or_404(run_id)
@@ -453,6 +529,57 @@ async def api_start_retrieval_benchmark(run_id: int, request: Request):
 async def api_run_knowledge_base(run_id: int):
     run = _load_run_or_404(run_id)
     return await asyncio.to_thread(get_run_knowledge_status, run)
+
+
+@app.get("/api/runs/{run_id}/audit")
+async def api_run_audit(run_id: int, repair_state: bool = False):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    return await asyncio.to_thread(audit_run_sync, run.work_dir, repair_state=repair_state)
+
+
+@app.get("/api/runs/{run_id}/retriever-service")
+async def api_retriever_service_status(run_id: int):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    return await asyncio.to_thread(get_retriever_service_status, run.work_dir)
+
+
+@app.post("/api/runs/{run_id}/retriever-service/start")
+async def api_start_retriever_service(run_id: int, request: Request):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    data = await request.json()
+    config_name = str(data.get("config_name") or run.config_name or "").strip()
+    if not config_name:
+        raise HTTPException(status_code=400, detail="config_name is required")
+    host = str(data.get("host") or "127.0.0.1").strip() or "127.0.0.1"
+    port = int(data.get("port") or 8600 + run_id)
+    max_concurrency = int(data.get("max_concurrency") or 4)
+    request_timeout_seconds = float(data.get("request_timeout_seconds") or 90.0)
+    try:
+        return await asyncio.to_thread(
+            start_retriever_service,
+            config_name=config_name,
+            work_dir=run.work_dir,
+            host=host,
+            port=port,
+            max_concurrency=max_concurrency,
+            request_timeout_seconds=request_timeout_seconds,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/runs/{run_id}/retriever-service/stop")
+async def api_stop_retriever_service(run_id: int):
+    run = _load_run_or_404(run_id)
+    if not run.work_dir:
+        raise HTTPException(status_code=400, detail="Run has no work directory yet")
+    return await asyncio.to_thread(stop_retriever_service, run.work_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -652,6 +779,26 @@ async def api_save_config(config_name: str, request: Request):
     if not success:
         raise HTTPException(status_code=400, detail=message)
     return {"status": "saved", "message": message}
+
+
+@app.get("/api/configs/{config_name}/validate")
+async def api_validate_config(config_name: str):
+    try:
+        return await asyncio.to_thread(validate_config_sync, config_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/api/configs/{config_name}/dry-run")
+async def api_dry_run_config(config_name: str):
+    try:
+        return await asyncio.to_thread(dry_run_config_sync, config_name)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------

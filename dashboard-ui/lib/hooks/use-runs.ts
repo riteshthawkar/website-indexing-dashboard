@@ -4,6 +4,9 @@ import {
   fetchRun,
   createRun,
   startRun,
+  resumeRun,
+  restartRun,
+  retryStage,
   cancelRun,
   deleteRun,
   fetchStageLog,
@@ -66,6 +69,45 @@ export function useCancelRun() {
       qc.invalidateQueries({ queryKey: ["runs"] });
       qc.invalidateQueries({ queryKey: ["runs", id] });
       toast.success("Pipeline cancelled");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+export function useResumeRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: resumeRun,
+    onSuccess: (_, id) => {
+      qc.invalidateQueries({ queryKey: ["runs"] });
+      qc.invalidateQueries({ queryKey: ["runs", id] });
+      toast.success("Pipeline resumed");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+export function useRestartRun() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, restartFrom }: { id: number; restartFrom: string }) => restartRun(id, restartFrom),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ["runs"] });
+      qc.invalidateQueries({ queryKey: ["runs", vars.id] });
+      toast.success("Pipeline restart started");
+    },
+    onError: (e: Error) => toast.error(e.message),
+  });
+}
+
+export function useRetryStage() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ runId, stageSelector }: { runId: number; stageSelector: string }) => retryStage(runId, stageSelector),
+    onSuccess: (_, vars) => {
+      qc.invalidateQueries({ queryKey: ["runs"] });
+      qc.invalidateQueries({ queryKey: ["runs", vars.runId] });
+      toast.success("Stage retry started");
     },
     onError: (e: Error) => toast.error(e.message),
   });

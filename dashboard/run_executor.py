@@ -130,6 +130,9 @@ async def execute_pipeline(
     run_id: int,
     on_log: Optional[Callable] = None,
     on_stage_event: Optional[Callable] = None,
+    *,
+    resume: Optional[bool] = None,
+    restart_from: Optional[str] = None,
 ):
     """
     Execute the pipeline by directly importing PipelineOrchestrator.
@@ -151,12 +154,20 @@ async def execute_pipeline(
     finally:
         db.close()
 
-    # Generate a unique run_id for the pipeline (use db id as string)
+    # Generate a unique run_id for the pipeline (use db id as string) unless the run
+    # already points at an imported or previously created work directory.
     pipeline_run_id = f"run_{run_id}"
-    work_dir = _resolve_work_dir(config_name, pipeline_run_id)
+    work_dir = Path(run.work_dir).resolve() if run.work_dir else _resolve_work_dir(config_name, pipeline_run_id)
     sequence = [0]
 
-    _update_run(run_id, status="running", started_at=utcnow(), work_dir=str(work_dir))
+    _update_run(
+        run_id,
+        status="running",
+        started_at=utcnow(),
+        completed_at=None,
+        error_message=None,
+        work_dir=str(work_dir),
+    )
 
     def _next_sequence() -> int:
         sequence[0] += 1
@@ -294,13 +305,16 @@ async def execute_pipeline(
 
         await _emit_log("info", f"Pipeline starting with {len(config.get('stages', []))} stages")
 
-        # Resume failed or interrupted runs when the pipeline state already exists.
-        resume = (work_dir / "pipeline_state.json").exists()
-        if resume:
+        # Resume failed or interrupted runs when explicitly requested or when the
+        # caller leaves the mode unspecified and state already exists.
+        resume_mode = bool(resume) if resume is not None else (work_dir / "pipeline_state.json").exists()
+        if resume_mode:
             await _emit_log("info", f"Resuming pipeline state from {work_dir / 'pipeline_state.json'}")
+        if restart_from:
+            await _emit_log("info", f"Restarting pipeline from stage selector: {restart_from}")
 
         # Run the pipeline
-        state = await orchestrator.run(resume=resume)
+        state = await orchestrator.run(resume=resume_mode, restart_from=restart_from)
 
         # Final metrics update
         try:
