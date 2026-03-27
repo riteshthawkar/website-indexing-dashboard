@@ -17,6 +17,7 @@ from typing import Any, Callable, Dict, List, Optional
 from database import Run, RunLog, get_db, utcnow
 from run_data import collect_metrics
 from structured_logs import append_structured_log, make_structured_log_record
+from worker_runtime import is_worker_active
 
 logger = logging.getLogger(__name__)
 
@@ -494,6 +495,8 @@ def cleanup_stale_runs():
     try:
         stale = db.query(Run).filter(Run.status == "running").all()
         for run in stale:
+            if run.work_dir and is_worker_active(run.work_dir):
+                continue
             run.status = "failed"
             run.error_message = "Interrupted (dashboard restart)"
             run.completed_at = utcnow()

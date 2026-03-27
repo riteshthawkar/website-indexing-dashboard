@@ -129,3 +129,42 @@ def load_structured_logs(
         "has_more": has_more,
         "next_before_sequence": next_before_sequence,
     }
+
+
+def load_structured_logs_after(
+    work_dir: str | Path,
+    *,
+    after_sequence: int = 0,
+    limit: int = 200,
+    stage: str | None = None,
+    event_type: str | None = None,
+    level: str | None = None,
+) -> Dict[str, Any]:
+    path = structured_log_path(work_dir)
+    if not path.exists():
+        return {"items": [], "last_sequence": after_sequence}
+
+    items: list[Dict[str, Any]] = []
+    last_sequence = int(after_sequence or 0)
+    for record in _iter_structured_log_records(path):
+        try:
+            sequence = int(record.get("sequence") or 0)
+        except (TypeError, ValueError):
+            continue
+        if sequence <= int(after_sequence or 0):
+            continue
+        if stage and record.get("stage") != stage:
+            continue
+        if event_type and record.get("event_type") != event_type:
+            continue
+        if level and record.get("level") != level:
+            continue
+        items.append(record)
+        last_sequence = max(last_sequence, sequence)
+        if len(items) >= max(int(limit or 200), 1):
+            break
+
+    return {
+        "items": items,
+        "last_sequence": last_sequence,
+    }

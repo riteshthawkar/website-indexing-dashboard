@@ -8,6 +8,10 @@ Stage details come from pipeline_state.json; the DB stores run metadata.
 import asyncio
 import json
 import logging
+import os
+import signal
+import subprocess
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -18,13 +22,13 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from artifact_ops import list_artifacts, list_run_files, read_run_file
-from database import init_db, get_db, Run, RunLog
+from database import init_db, get_db, Run, RunLog, utcnow
 from run_data import collect_artifact_summary, collect_media_summary, load_run_media
 from scanner import scan_and_import
 from run_executor import (
     _load_env,
+    _resolve_work_dir,
     create_run,
-    execute_pipeline,
     cancel_run,
     get_run_logs,
     get_pipeline_state,
@@ -68,7 +72,7 @@ from retriever_service_ops import (
     start_retriever_service,
     stop_retriever_service,
 )
-from structured_logs import load_structured_logs, structured_log_path
+from structured_logs import load_structured_logs, load_structured_logs_after, structured_log_path
 from url_manager import (
     add_excluded_subdomain,
     add_target_url,
@@ -80,6 +84,14 @@ from url_manager import (
     get_urls_detail_by_name,
     remove_excluded_subdomain,
     remove_target_domain,
+)
+from worker_runtime import (
+    is_worker_active,
+    load_worker_state,
+    pid_is_alive,
+    save_worker_state,
+    utcnow_iso as worker_utcnow_iso,
+    worker_stdout_path,
 )
 
 logging.basicConfig(
@@ -93,80 +105,170 @@ PROJECT_ROOT = BASE_DIR.parent
 
 
 # ---------------------------------------------------------------------------
-# Run Manager — tracks active tasks and WebSocket connections
+# Run Manager — launches detached worker processes
 # ---------------------------------------------------------------------------
 
 class RunManager:
     def __init__(self):
-        self._tasks: dict[int, asyncio.Task] = {}
-        self._ws: dict[int, list[WebSocket]] = {}
+        self._processes: dict[int, int] = {}
+
+    async def _wait_for_exit_and_finalize(self, run_id: int, work_dir: Path, pid: int, grace_seconds: float = 10.0):
+        deadline = asyncio.get_running_loop().time() + grace_seconds
+        escalated = False
+        while asyncio.get_running_loop().time() < deadline:
+            if not pid_is_alive(pid):
+                break
+            await asyncio.sleep(0.5)
+
+        payload = load_worker_state(work_dir) or {}
+        if pid_is_alive(pid):
+            escalated = True
+            try:
+                os.killpg(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            await asyncio.sleep(0.2)
+            payload = load_worker_state(work_dir) or payload
+
+        if not (load_worker_state(work_dir) or {}).get("status") == "stopped":
+            save_worker_state(
+                work_dir,
+                {
+                    **payload,
+                    "pid": pid,
+                    "run_id": run_id,
+                    "status": "stopped",
+                    "finished_at": worker_utcnow_iso(),
+                    "signal": payload.get("signal") or ("SIGKILL" if escalated else "SIGTERM"),
+                    "exit_code": payload.get("exit_code", -9 if escalated else None),
+                },
+            )
+        self._processes.pop(run_id, None)
+
+    @staticmethod
+    def _resolve_run_work_dir(run: Run) -> Path:
+        if run.work_dir:
+            return Path(run.work_dir).resolve()
+        return _resolve_work_dir(run.config_name, f"run_{run.id}")
 
     async def start(self, run_id: int, *, resume: Optional[bool] = None, restart_from: Optional[str] = None):
-        if run_id in self._tasks and not self._tasks[run_id].done():
+        db = get_db()
+        try:
+            run = db.get(Run, run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
+            work_dir = self._resolve_run_work_dir(run)
+        finally:
+            db.close()
+
+        if is_worker_active(work_dir):
             raise HTTPException(status_code=400, detail="Pipeline is already running")
 
-        task = asyncio.create_task(
-            execute_pipeline(
-                run_id,
-                on_log=self._broadcast_log,
-                on_stage_event=self._broadcast_stage,
-                resume=resume,
-                restart_from=restart_from,
-            )
+        stdout_path = worker_stdout_path(work_dir)
+        stdout_path.parent.mkdir(parents=True, exist_ok=True)
+        save_worker_state(
+            work_dir,
+            {
+                "pid": None,
+                "run_id": run_id,
+                "status": "starting",
+                "resume": bool(resume),
+                "restart_from": restart_from,
+                "started_at": worker_utcnow_iso(),
+            },
         )
-        self._tasks[run_id] = task
+
+        command = [sys.executable, str(BASE_DIR / "worker_main.py"), "--run-id", str(run_id)]
+        if resume:
+            command.append("--resume")
+        if restart_from:
+            command.extend(["--restart-from", restart_from])
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONUNBUFFERED", "1")
+
+        try:
+            with stdout_path.open("a", encoding="utf-8") as handle:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(PROJECT_ROOT),
+                    env=env,
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+        except Exception as exc:
+            save_worker_state(
+                work_dir,
+                {
+                    "pid": None,
+                    "run_id": run_id,
+                    "status": "stopped",
+                    "resume": bool(resume),
+                    "restart_from": restart_from,
+                    "finished_at": worker_utcnow_iso(),
+                    "exit_code": 1,
+                    "error": str(exc),
+                },
+            )
+            raise HTTPException(status_code=500, detail=f"Failed to start worker: {exc}") from exc
+
+        self._processes[run_id] = int(process.pid)
+        save_worker_state(
+            work_dir,
+            {
+                "pid": int(process.pid),
+                "run_id": run_id,
+                "status": "starting",
+                "resume": bool(resume),
+                "restart_from": restart_from,
+                "started_at": worker_utcnow_iso(),
+                "command": command,
+            },
+        )
+        db = get_db()
+        try:
+            run = db.get(Run, run_id)
+            if run:
+                run.status = "running"
+                run.work_dir = str(work_dir)
+                run.started_at = run.started_at or utcnow()
+                run.completed_at = None
+                run.error_message = None
+                db.commit()
+        finally:
+            db.close()
 
     async def cancel(self, run_id: int):
-        task = self._tasks.get(run_id)
-        if task and not task.done():
-            task.cancel()
+        db = get_db()
+        try:
+            run = db.get(Run, run_id)
+            if not run:
+                raise HTTPException(status_code=404, detail="Run not found")
+            work_dir = self._resolve_run_work_dir(run)
+        finally:
+            db.close()
+
+        payload = load_worker_state(work_dir)
+        pid = int(payload.get("pid") or 0) if payload else 0
+        if payload and pid and is_worker_active(work_dir):
+            save_worker_state(
+                work_dir,
+                {
+                    **payload,
+                    "status": "cancelling",
+                    "cancellation_requested_at": worker_utcnow_iso(),
+                },
+            )
+            try:
+                os.killpg(pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            asyncio.create_task(self._wait_for_exit_and_finalize(run_id, work_dir, pid))
         cancel_run(run_id)
 
-    def add_ws(self, run_id: int, ws: WebSocket):
-        self._ws.setdefault(run_id, []).append(ws)
-
-    def remove_ws(self, run_id: int, ws: WebSocket):
-        if run_id in self._ws:
-            self._ws[run_id] = [w for w in self._ws[run_id] if w != ws]
-
-    async def _broadcast_log(self, run_id: int, level: str, stage: str, message: str, record: dict | None = None):
-        """Broadcast log line to all WebSocket clients for this run."""
-        payload = json.dumps({
-            "type": "log",
-            "level": level,
-            "stage": stage,
-            "message": message,
-            "record": record,
-        })
-        await self._broadcast(run_id, payload)
-
-    async def _broadcast_stage(self, run_id: int, event: str, stage_key: str, info: dict, record: dict | None = None):
-        """Broadcast stage event to all WebSocket clients."""
-        payload = json.dumps({
-            "type": "stage",
-            "event": event,
-            "stage": stage_key,
-            "info": info or {},
-            "record": record,
-        })
-        await self._broadcast(run_id, payload)
-
-    async def _broadcast(self, run_id: int, payload: str):
-        ws_list = self._ws.get(run_id, [])
-        dead = []
-        for ws in ws_list:
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            ws_list.remove(ws)
-
     def shutdown(self):
-        for run_id, task in self._tasks.items():
-            if not task.done():
-                task.cancel()
-                logger.info(f"Cancelled pipeline task for run {run_id}")
+        self._processes.clear()
 
 
 run_manager = RunManager()
@@ -245,6 +347,8 @@ async def api_get_run(run_id: int):
         result["artifact_summary"] = collect_artifact_summary(result["work_dir"])
         result["media_summary"] = collect_media_summary(result["work_dir"])
         result["structured_log_path"] = str(structured_log_path(result["work_dir"]))
+        result["worker_runtime"] = load_worker_state(result["work_dir"])
+        result["worker_active"] = is_worker_active(result["work_dir"])
         state = get_pipeline_state(result["work_dir"])
         if state:
             result["stages"] = state.get("stages", [])
@@ -256,6 +360,8 @@ async def api_get_run(run_id: int):
         result["artifact_summary"] = {"total": 0, "by_type": {}}
         result["media_summary"] = {"total": 0, "images": 0, "videos": 0, "by_source": {}, "video_providers": {}}
         result["structured_log_path"] = None
+        result["worker_runtime"] = None
+        result["worker_active"] = False
         result["stages"] = []
         result["current_stage_index"] = 0
 
@@ -1207,17 +1313,42 @@ async def api_force_scan():
 @app.websocket("/ws/runs/{run_id}/logs")
 async def ws_run_logs(websocket: WebSocket, run_id: int):
     await websocket.accept()
-    run_manager.add_ws(run_id, websocket)
+    last_sequence = 0
+    work_dir: Optional[str] = None
 
     try:
         while True:
-            data = await websocket.receive_text()
-            if data == "ping":
-                await websocket.send_text(json.dumps({"type": "pong"}))
+            try:
+                data = await asyncio.wait_for(websocket.receive_text(), timeout=1.0)
+                if data == "ping":
+                    await websocket.send_text(json.dumps({"type": "pong"}))
+            except asyncio.TimeoutError:
+                pass
+
+            if not work_dir:
+                db = get_db()
+                try:
+                    run = db.get(Run, run_id)
+                    if not run:
+                        await websocket.send_text(json.dumps({"type": "error", "message": "Run not found"}))
+                        return
+                    work_dir = run.work_dir
+                finally:
+                    db.close()
+
+            if not work_dir:
+                await asyncio.sleep(0.25)
+                continue
+
+            payload = load_structured_logs_after(work_dir, after_sequence=last_sequence, limit=200)
+            for record in payload.get("items", []):
+                await websocket.send_text(json.dumps({"type": "log", "record": record}))
+                try:
+                    last_sequence = max(last_sequence, int(record.get("sequence") or 0))
+                except (TypeError, ValueError):
+                    continue
     except WebSocketDisconnect:
         pass
-    finally:
-        run_manager.remove_ws(run_id, websocket)
 
 
 # ---------------------------------------------------------------------------
