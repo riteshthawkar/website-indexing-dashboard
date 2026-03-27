@@ -151,7 +151,22 @@ def summarize_eval_set(dataset_path: str | Path) -> Dict[str, Any]:
 def validate_eval_set(dataset_path: str | Path, *, work_dir: str | Path | None = None) -> Dict[str, Any]:
     resolved_dataset = _resolve_project_path(dataset_path)
     resolved_work_dir = _resolve_project_path(work_dir) if work_dir else None
-    return validate_eval_examples(resolved_dataset, work_dir=str(resolved_work_dir) if resolved_work_dir else None)
+    try:
+        report = validate_eval_examples(
+            resolved_dataset,
+            work_dir=str(resolved_work_dir) if resolved_work_dir else None,
+        )
+    except FileNotFoundError as exc:
+        report = validate_eval_examples(resolved_dataset)
+        report["work_dir"] = str(resolved_work_dir) if resolved_work_dir else None
+        report.setdefault("warnings", []).append(
+            {
+                "field": "work_dir",
+                "reason": "retrieval_bundle_missing",
+                "message": f"Skipping retrieval-bundle ID validation because the run does not have a retrieval bundle yet: {exc}",
+            }
+        )
+    return report
 
 
 def summarize_benchmark_dataset(dataset_dir: str | Path) -> Dict[str, Any]:

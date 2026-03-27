@@ -21,6 +21,20 @@ import { ProcessStatusStrip } from "@/components/project-detail/process-status-s
 import { useRun, useStartRun, useCancelRun } from "@/lib/hooks/use-runs";
 import { Play, Square, ArrowLeft } from "lucide-react";
 
+const DETAIL_TABS = [
+  "overview",
+  "urls",
+  "media",
+  "stages",
+  "retrieval",
+  "evaluation",
+  "knowledge",
+  "artifacts",
+  "operations",
+  "live",
+  "config",
+] as const;
+
 export function ProjectDetailClient() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id");
@@ -58,6 +72,17 @@ export function ProjectDetailClient() {
 
   const isRunning = run.status === "running";
   const canStart = run.status === "pending" || run.status === "failed";
+  const requestedTab = searchParams.get("tab");
+  const activeTab = requestedTab && DETAIL_TABS.includes(requestedTab as (typeof DETAIL_TABS)[number])
+    ? requestedTab
+    : "overview";
+
+  const setTab = (tab: string) => {
+    const params = new URLSearchParams(searchParams.toString());
+    params.set("id", String(run.id));
+    params.set("tab", tab);
+    router.replace(`/projects/detail?${params.toString()}`);
+  };
 
   return (
     <>
@@ -70,7 +95,10 @@ export function ProjectDetailClient() {
             {canStart && (
               <Button
                 size="sm"
-                onClick={() => startMutation.mutate(run.id)}
+                onClick={async () => {
+                  await startMutation.mutateAsync(run.id);
+                  setTab("live");
+                }}
                 disabled={startMutation.isPending}
               >
                 <Play className="mr-2 h-4 w-4" />
@@ -98,19 +126,19 @@ export function ProjectDetailClient() {
       <div className="page-section">
         <div className="space-y-8">
           <ProcessStatusStrip run={run} />
-          <Tabs defaultValue="overview" className="space-y-6">
-            <TabsList className="h-auto w-full flex-wrap justify-start gap-2 rounded-[1.75rem] border border-white/8 bg-card/70 p-2 shadow-[0_22px_54px_-34px_rgba(0,0,0,0.8)] backdrop-blur">
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="overview">Overview</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="urls">URLs</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="media">Media</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="stages">Stages</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="retrieval">Retrieval</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="evaluation">Evaluation</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="knowledge">Knowledge</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="artifacts">Artifacts</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="operations">Operations</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="live">Logs</TabsTrigger>
-              <TabsTrigger className="rounded-2xl px-4 py-2.5 data-[state=active]:shadow-[0_14px_34px_-24px_rgba(0,0,0,0.75)]" value="config">Config</TabsTrigger>
+          <Tabs value={activeTab} onValueChange={setTab} className="space-y-6">
+            <TabsList className="mx-auto h-auto w-full max-w-7xl flex-wrap justify-center gap-3 rounded-[2rem] border border-white/8 bg-card/85 px-4 py-4 shadow-[0_24px_60px_-34px_rgba(0,0,0,0.9)] backdrop-blur-xl">
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="overview">Overview</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="urls">URLs</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="media">Media</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="stages">Stages</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="retrieval">Retrieval</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="evaluation">Evaluation</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="knowledge">Knowledge</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="artifacts">Artifacts</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="operations">Operations</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="live">Logs</TabsTrigger>
+              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="config">Config</TabsTrigger>
             </TabsList>
           <TabsContent value="overview" className="mt-4">
             <OverviewTab run={run} />

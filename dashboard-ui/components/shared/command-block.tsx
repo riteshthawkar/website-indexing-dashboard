@@ -30,7 +30,7 @@ export function CommandBlock({ label, command, description }: CommandBlockProps)
   };
 
   return (
-    <div className="rounded-2xl border border-border/70 bg-card/70 p-4 shadow-[0_18px_40px_-28px_rgba(0,0,0,0.7)] backdrop-blur">
+    <div className="rounded-[1.6rem] border border-white/8 bg-card/80 p-5 shadow-[0_22px_54px_-34px_rgba(0,0,0,0.84)] backdrop-blur-xl">
       <div className="mb-3 flex items-start justify-between gap-3">
         <div>
           <div className="mb-1 flex items-center gap-2">
@@ -45,11 +45,11 @@ export function CommandBlock({ label, command, description }: CommandBlockProps)
           CLI
         </Badge>
       </div>
-      <div className="flex items-start gap-3 rounded-xl border border-white/8 bg-black/40 p-3">
-        <code className="flex-1 overflow-x-auto whitespace-pre-wrap font-mono text-xs text-primary-foreground/90">
+      <div className="flex items-start gap-3 rounded-2xl border border-cyan-500/20 bg-black/80 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.04)]">
+        <code className="flex-1 overflow-x-auto whitespace-pre-wrap font-mono text-sm leading-6 text-cyan-100">
           {command}
         </code>
-        <Button size="icon" variant="ghost" onClick={handleCopy} className="shrink-0">
+        <Button size="icon" variant="ghost" onClick={handleCopy} className="shrink-0 text-cyan-100 hover:bg-white/8 hover:text-white">
           {copied ? <Check className="h-4 w-4 text-emerald-400" /> : <Copy className="h-4 w-4" />}
         </Button>
       </div>

@@ -81,7 +81,10 @@ export function ProjectsTable({ runs }: ProjectsTableProps) {
                       <Button
                         variant="ghost"
                         size="icon"
-                        onClick={() => startMutation.mutate(run.id)}
+                        onClick={async () => {
+                          await startMutation.mutateAsync(run.id);
+                          router.push(`/projects/detail?id=${run.id}&tab=live`);
+                        }}
                         disabled={startMutation.isPending}
                       >
                         <Play className="h-4 w-4" />

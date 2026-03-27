@@ -48,7 +48,7 @@ export function NewProjectForm() {
     if (andStart) {
       await startRun.mutateAsync(run.id);
     }
-    router.push(`/projects/detail?id=${run.id}`);
+    router.push(`/projects/detail?id=${run.id}${andStart ? "&tab=live" : ""}`);
   };
 
   const loading = createRun.isPending || startRun.isPending;
