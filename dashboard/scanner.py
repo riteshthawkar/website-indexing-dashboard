@@ -30,6 +30,18 @@ def _parse_iso(iso_str: str):
         return None
 
 
+def _state_error_message(state: dict) -> str | None:
+    error_message = state.get("error_message")
+    if error_message:
+        return str(error_message)
+
+    for stage in state.get("stages") or []:
+        stage_error = stage.get("error_message")
+        if stage_error:
+            return str(stage_error)
+    return None
+
+
 def scan_and_import(force_rescan: bool = False) -> int:
     """
     Walk runs/*/*/pipeline_state.json and import any runs not already in the DB.
@@ -73,11 +85,23 @@ def scan_and_import(force_rescan: bool = False) -> int:
 
             existing = existing_by_dir.get(work_dir_str)
             if existing:
+                imported_status = state.get("status", existing.status or "completed")
+                imported_completed_at = _parse_iso(state.get("finished_at"))
+                imported_error_message = _state_error_message(state)
+                preserve_terminal_status = (
+                    imported_status == "running"
+                    and existing.status in {"failed", "cancelled", "completed"}
+                )
+
                 existing.run_name = state.get("project_name", existing.run_name or config_name)
                 existing.config_name = config_name
-                existing.status = state.get("status", existing.status or "completed")
+                if not preserve_terminal_status:
+                    existing.status = imported_status
                 existing.started_at = _parse_iso(state.get("started_at"))
-                existing.completed_at = _parse_iso(state.get("finished_at"))
+                if not preserve_terminal_status or existing.completed_at is None:
+                    existing.completed_at = imported_completed_at
+                if imported_error_message and not preserve_terminal_status:
+                    existing.error_message = imported_error_message
                 existing.pages_scraped = metrics.get("pages_scraped", 0)
                 existing.documents_downloaded = metrics.get("documents_downloaded", 0)
                 existing.pages_cleaned = metrics.get("pages_cleaned", 0)
@@ -105,6 +129,7 @@ def scan_and_import(force_rescan: bool = False) -> int:
                 created_at=_parse_iso(state.get("started_at")) or utcnow(),
                 started_at=_parse_iso(state.get("started_at")),
                 completed_at=_parse_iso(state.get("finished_at")),
+                error_message=_state_error_message(state),
                 pages_scraped=metrics.get("pages_scraped", 0),
                 documents_downloaded=metrics.get("documents_downloaded", 0),
                 pages_cleaned=metrics.get("pages_cleaned", 0),
