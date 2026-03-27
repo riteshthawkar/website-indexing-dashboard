@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -103,6 +104,17 @@ def _resolve_work_dir(config_name: str, run_id: str) -> Path:
     return PROJECT_ROOT / "runs" / config_name / run_id
 
 
+def _slugify_run_name(run_name: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(run_name or "").strip().lower()).strip("-")
+    return slug[:48] or "run"
+
+
+def _make_dashboard_work_dir(config_name: str, run_id: int, run_name: str) -> Path:
+    stamp = utcnow().strftime("%Y%m%dT%H%M%SZ")
+    slug = _slugify_run_name(run_name)
+    return PROJECT_ROOT / "runs" / config_name / f"{stamp}_{slug}_{run_id}"
+
+
 def get_pipeline_state(work_dir: str) -> Optional[dict]:
     """Load pipeline_state.json from a run's work directory."""
     state = load_state(Path(work_dir))
@@ -141,6 +153,9 @@ def create_run(run_name: str, config_name: str, run_type: str = "full", start_ur
             config_snapshot_json=json.dumps(config_snapshot) if config_snapshot else None,
         )
         db.add(run)
+        db.commit()
+        db.refresh(run)
+        run.work_dir = str(_make_dashboard_work_dir(config_name, run.id, run_name))
         db.commit()
         db.refresh(run)
         return run.to_dict()
@@ -208,6 +223,13 @@ async def execute_pipeline(
     pipeline_run_id = f"run_{run_id}"
     work_dir = Path(run.work_dir).resolve() if run.work_dir else _resolve_work_dir(config_name, pipeline_run_id)
     sequence = [0]
+
+    db = get_db()
+    try:
+        db.query(RunLog).filter(RunLog.run_id == run_id).delete(synchronize_session=False)
+        db.commit()
+    finally:
+        db.close()
 
     _update_run(
         run_id,
@@ -403,9 +425,8 @@ async def execute_pipeline(
 
         await _emit_log("info", f"Pipeline starting with {len(config.get('stages', []))} stages")
 
-        # Resume failed or interrupted runs when explicitly requested or when the
-        # caller leaves the mode unspecified and state already exists.
-        resume_mode = bool(resume) if resume is not None else (work_dir / "pipeline_state.json").exists()
+        # Only explicit resume operations should reuse pipeline state.
+        resume_mode = bool(resume)
         if resume_mode:
             await _emit_log("info", f"Resuming pipeline state from {work_dir / 'pipeline_state.json'}")
         if restart_from:

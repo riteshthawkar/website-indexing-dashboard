@@ -53,7 +53,7 @@ async def _async_main(args: argparse.Namespace) -> int:
     task = asyncio.create_task(
         execute_pipeline(
             run_id,
-            resume=True if args.resume else None,
+            resume=bool(args.resume),
             restart_from=args.restart_from,
         )
     )

@@ -13,6 +13,7 @@ import signal
 import subprocess
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +28,7 @@ from run_data import collect_artifact_summary, collect_media_summary, load_run_m
 from scanner import scan_and_import
 from run_executor import (
     _load_env,
+    _make_dashboard_work_dir,
     _resolve_work_dir,
     create_run,
     cancel_run,
@@ -89,6 +91,7 @@ from worker_runtime import (
     is_worker_active,
     load_worker_state,
     pid_is_alive,
+    rotate_attempt_logs,
     save_worker_state,
     utcnow_iso as worker_utcnow_iso,
     worker_stdout_path,
@@ -149,7 +152,12 @@ class RunManager:
     def _resolve_run_work_dir(run: Run) -> Path:
         if run.work_dir:
             return Path(run.work_dir).resolve()
-        return _resolve_work_dir(run.config_name, f"run_{run.id}")
+        return _make_dashboard_work_dir(run.config_name, run.id, run.run_name)
+
+    @staticmethod
+    def _make_fresh_attempt_work_dir(work_dir: Path) -> Path:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        return work_dir.parent / f"{work_dir.name}__fresh_{stamp}"
 
     async def start(self, run_id: int, *, resume: Optional[bool] = None, restart_from: Optional[str] = None):
         db = get_db()
@@ -158,12 +166,22 @@ class RunManager:
             if not run:
                 raise HTTPException(status_code=404, detail="Run not found")
             work_dir = self._resolve_run_work_dir(run)
+            fresh_start = not bool(resume) and not restart_from
+            if fresh_start and (
+                (work_dir / "pipeline_state.json").exists()
+                or (work_dir / "stage_outputs").exists()
+                or (work_dir / "dashboard_logs").exists()
+            ):
+                work_dir = self._make_fresh_attempt_work_dir(work_dir)
+                run.work_dir = str(work_dir)
+                db.commit()
         finally:
             db.close()
 
         if is_worker_active(work_dir):
             raise HTTPException(status_code=400, detail="Pipeline is already running")
 
+        rotate_attempt_logs(work_dir)
         stdout_path = worker_stdout_path(work_dir)
         stdout_path.parent.mkdir(parents=True, exist_ok=True)
         save_worker_state(
@@ -396,7 +414,7 @@ async def api_start_run(run_id: int):
     finally:
         db.close()
 
-    await run_manager.start(run_id, resume=None)
+    await run_manager.start(run_id, resume=False)
     return {"status": "started", "run_id": run_id}
 
 

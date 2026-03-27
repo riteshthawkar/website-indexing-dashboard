@@ -14,6 +14,7 @@ if str(DASHBOARD_DIR) not in sys.path:
 
 from app import RunManager, app
 from database import Run, get_db, utcnow
+from run_executor import create_run
 from structured_logs import append_structured_log, make_structured_log_record
 from worker_runtime import load_worker_state, pid_is_alive, save_worker_state
 
@@ -85,6 +86,18 @@ def test_run_manager_start_spawns_detached_worker(monkeypatch, tmp_path: Path) -
         _delete_run(run.id)
 
 
+def test_create_run_assigns_unique_work_dir() -> None:
+    payload = create_run("MBZUAI Latest Run", "default", "full", "https://mbzuai.ac.ae/")
+    run_id = payload["id"]
+    try:
+        work_dir = Path(payload["work_dir"])
+        assert work_dir.name != f"run_{run_id}"
+        assert "mbzuai-latest-run" in work_dir.name
+        assert work_dir.parent.name == "default"
+    finally:
+        _delete_run(run_id)
+
+
 def test_run_logs_websocket_streams_records_from_file(tmp_path: Path) -> None:
     run = _create_temp_run(tmp_path, status="pending")
     append_structured_log(
@@ -139,6 +152,30 @@ def test_run_manager_forces_stuck_worker_shutdown(monkeypatch, tmp_path: Path) -
         assert worker_state["signal"] == "SIGKILL"
         assert worker_state["exit_code"] == -9
         assert kill_calls[-1] == (424243, signal.SIGKILL)
+    finally:
+        _delete_run(run.id)
+
+
+def test_run_manager_fresh_start_does_not_reuse_existing_pipeline_state(monkeypatch, tmp_path: Path) -> None:
+    run = _create_temp_run(tmp_path, status="pending")
+    manager = RunManager()
+    (tmp_path / "pipeline_state.json").write_text("{}", encoding="utf-8")
+
+    class _FakeProcess:
+        pid = 515151
+
+    monkeypatch.setattr("app.subprocess.Popen", lambda *args, **kwargs: _FakeProcess())
+
+    try:
+        asyncio.run(manager.start(run.id, resume=False))
+        db = get_db()
+        try:
+            refreshed = db.get(Run, run.id)
+            assert refreshed is not None
+            assert refreshed.work_dir != str(tmp_path)
+            assert "__fresh_" in refreshed.work_dir
+        finally:
+            db.close()
     finally:
         _delete_run(run.id)
 

@@ -6,6 +6,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from structured_logs import structured_log_path
+
 
 def utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -21,6 +23,36 @@ def runtime_state_path(work_dir: str | Path) -> Path:
 
 def worker_stdout_path(work_dir: str | Path) -> Path:
     return runtime_dir(work_dir) / "worker_stdout.log"
+
+
+def _archive_existing_file(path: Path, archive_dir: Path) -> Optional[Path]:
+    if not path.exists():
+        return None
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archived = archive_dir / f"{path.stem}_{stamp}{path.suffix}"
+    counter = 1
+    while archived.exists():
+        archived = archive_dir / f"{path.stem}_{stamp}_{counter}{path.suffix}"
+        counter += 1
+    path.replace(archived)
+    return archived
+
+
+def rotate_attempt_logs(work_dir: str | Path) -> Dict[str, Optional[str]]:
+    work_dir = Path(work_dir)
+    archived_structured = _archive_existing_file(
+        structured_log_path(work_dir),
+        structured_log_path(work_dir).parent / "archive",
+    )
+    archived_stdout = _archive_existing_file(
+        worker_stdout_path(work_dir),
+        runtime_dir(work_dir) / "archive",
+    )
+    return {
+        "structured_logs": str(archived_structured) if archived_structured else None,
+        "worker_stdout": str(archived_stdout) if archived_stdout else None,
+    }
 
 
 def load_worker_state(work_dir: str | Path) -> Optional[Dict[str, Any]]:
