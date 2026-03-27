@@ -34,6 +34,54 @@ from pipeline.core.state import load_state
 # Helpers
 # ---------------------------------------------------------------------------
 
+
+class _DashboardStageLogHandler(logging.Handler):
+    """Bridge stage module logs into dashboard raw/structured logs."""
+
+    def __init__(
+        self,
+        *,
+        loop: asyncio.AbstractEventLoop,
+        write_log: Callable[..., Dict[str, Any]],
+        broadcast_log: Optional[Callable[..., None]],
+        current_stage_getter: Callable[[], Optional[str]],
+    ) -> None:
+        super().__init__(level=logging.INFO)
+        self._loop = loop
+        self._write_log = write_log
+        self._broadcast_log = broadcast_log
+        self._current_stage_getter = current_stage_getter
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+            if not message:
+                return
+
+            level = str(record.levelname or "info").lower()
+            stage = self._current_stage_getter()
+            payload = self._write_log(
+                level=level,
+                message=message,
+                stage=stage,
+                event_type="stage_log",
+                data={
+                    "logger": record.name,
+                    "pathname": record.pathname,
+                    "lineno": record.lineno,
+                },
+            )
+            if self._broadcast_log:
+                self._broadcast_log(
+                    level=level,
+                    stage=stage,
+                    message=message,
+                    record=payload,
+                )
+        except Exception:
+            self.handleError(record)
+
+
 def _load_env():
     """Load .env files from project root into os.environ."""
     for env_path in [PROJECT_ROOT / ".env", PROJECT_ROOT / "scrape_latest" / ".env"]:
@@ -173,6 +221,28 @@ async def execute_pipeline(
         sequence[0] += 1
         return sequence[0]
 
+    def _write_log(
+        level: str,
+        message: str,
+        stage: str = None,
+        *,
+        event_type: str = "log",
+        data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        _add_log(run_id, message, level=level, stage=stage)
+        record = make_structured_log_record(
+            sequence=_next_sequence(),
+            run_id=run_id,
+            pipeline_run_id=pipeline_run_id,
+            level=level,
+            event_type=event_type,
+            message=message,
+            stage=stage,
+            data=data,
+        )
+        append_structured_log(work_dir, record)
+        return record
+
     async def _emit_log(
         level: str,
         message: str,
@@ -203,6 +273,7 @@ async def execute_pipeline(
 
     # Build pipeline callbacks
     current_stage = [None]  # mutable container for closure
+    loop = asyncio.get_running_loop()
 
     def _on_stage_start(stage_type: str, plugin_name: str, info: Optional[Dict]):
         stage_key = f"{stage_type}/{plugin_name}"
@@ -276,6 +347,32 @@ async def execute_pipeline(
         asyncio.get_event_loop().create_task(
             _emit_log(level, message, stage=stage)
         )
+
+    def _broadcast_stage_log(
+        *,
+        level: str,
+        stage: Optional[str],
+        message: str,
+        record: Dict[str, Any],
+    ) -> None:
+        if not on_log:
+            return
+
+        def _dispatch() -> None:
+            result = on_log(run_id, level, stage, message, record=record)
+            if asyncio.iscoroutine(result):
+                asyncio.create_task(result)
+
+        loop.call_soon_threadsafe(_dispatch)
+
+    stage_logger = logging.getLogger("pipeline.stages")
+    stage_log_handler = _DashboardStageLogHandler(
+        loop=loop,
+        write_log=_write_log,
+        broadcast_log=_broadcast_stage_log,
+        current_stage_getter=lambda: current_stage[0],
+    )
+    stage_logger.addHandler(stage_log_handler)
 
     try:
         await _emit_log("info", f"Loading config: {config_name}")
@@ -358,6 +455,8 @@ async def execute_pipeline(
             await _emit_log("error", f"Pipeline error: {e}")
         except Exception:
             pass
+    finally:
+        stage_logger.removeHandler(stage_log_handler)
 
 
 def cancel_run(run_id: int) -> bool:
