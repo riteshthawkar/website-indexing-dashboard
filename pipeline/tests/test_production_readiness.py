@@ -676,6 +676,73 @@ class TestCrawlerHelpers:
         assert state["depths"]["https://example.com"] == 0
         assert state["depths"]["https://example.com/a"] == 1
 
+    def test_build_initial_crawl_state_respects_frontier_seed_limit(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _build_initial_crawl_state
+
+        state = _build_initial_crawl_state(
+            "https://example.com",
+            [
+                "https://example.com/a",
+                "https://example.com/b",
+                "https://example.com/c",
+            ],
+            max_pages=10,
+            frontier_seed_limit=1,
+        )
+
+        assert state["pending"] == [
+            {"url": "https://example.com", "parent_url": None},
+            {"url": "https://example.com/a", "parent_url": "https://example.com"},
+        ]
+        assert set(state["depths"]) == {
+            "https://example.com",
+            "https://example.com/a",
+        }
+
+    def test_trim_crawl_state_to_budget_caps_pending_urls(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _trim_crawl_state_to_budget
+
+        state = _trim_crawl_state_to_budget(
+            {
+                "visited": [
+                    "https://example.com",
+                    "https://example.com/a",
+                    "https://example.com/a",
+                ],
+                "pending": [
+                    {"url": "https://example.com/a", "parent_url": "https://example.com"},
+                    {"url": "https://example.com/b", "parent_url": "https://example.com"},
+                    {"url": "https://example.com/c", "parent_url": "https://example.com"},
+                    {"url": "https://example.com/d", "parent_url": "https://example.com"},
+                ],
+                "depths": {
+                    "https://example.com": 0,
+                    "https://example.com/a": 1,
+                    "https://example.com/b": 1,
+                    "https://example.com/c": 1,
+                    "https://example.com/d": 1,
+                },
+                "pages_crawled": 9,
+            },
+            max_pages=4,
+        )
+
+        assert state["visited"] == [
+            "https://example.com",
+            "https://example.com/a",
+        ]
+        assert state["pending"] == [
+            {"url": "https://example.com/b", "parent_url": "https://example.com"},
+            {"url": "https://example.com/c", "parent_url": "https://example.com"},
+        ]
+        assert state["pages_crawled"] == 2
+        assert set(state["depths"]) == {
+            "https://example.com",
+            "https://example.com/a",
+            "https://example.com/b",
+            "https://example.com/c",
+        }
+
 
 class TestCrawlerStage:
     def test_execute_writes_expected_outputs(self, tmp_dir, monkeypatch):
@@ -744,6 +811,69 @@ class TestCrawlerStage:
         assert len(md_files) == 1
         assert md_files[0].read_text() == "# Test"
 
+    def test_execute_seeds_initial_frontier_when_runtime_state_is_empty(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+
+        class FakeAsyncCrawler:
+            def __init__(self, config=None):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def arun(self, url, config):
+                resume_state = getattr(config.deep_crawl_strategy, "_resume_state", {}) or {}
+                assert resume_state.get("pending") == [
+                    {"url": "https://example.com", "parent_url": None}
+                ]
+                return [
+                    SimpleNamespace(
+                        url=url,
+                        html="<html><body><h1>Seeded</h1></body></html>",
+                        success=True,
+                        status_code=200,
+                        links={"internal": [], "external": []},
+                        markdown=SimpleNamespace(
+                            fit_markdown="# Seeded",
+                            raw_markdown="# Seeded",
+                        ),
+                    )
+                ]
+
+        monkeypatch.setattr(crawler_module, "AsyncWebCrawler", FakeAsyncCrawler)
+
+        ctx = StageContext(
+            run_id="run_test",
+            project_name="test",
+            config={
+                "crawler": {
+                    "start_url": "https://example.com",
+                    "max_pages": 1,
+                    "max_depth": 0,
+                    "fetch_concurrency": 1,
+                    "download_concurrency": 1,
+                    "timeout": 5,
+                    "sitemap_enabled": False,
+                    "extract_images": False,
+                    "download_page_images": False,
+                    "respect_robots_txt": False,
+                    "stream_results": False,
+                    "fail_on_empty_result": True,
+                },
+                "converter": {"content_filter_threshold": 0.48},
+            },
+            work_dir=tmp_dir,
+        )
+
+        result = run_async(crawler_module.Crawl4AICrawler().execute(ctx))
+
+        assert result.status == StageStatus.COMPLETED
+        assert result.metrics["pages_scraped"] == 1
+
     def test_skip_extension_filter_blocks_binary_and_media_assets(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import SkipExtensionFilter
 
@@ -752,6 +882,20 @@ class TestCrawlerStage:
         assert not flt.apply("https://example.com/photo.jpg")
         assert not flt.apply("https://example.com/video.mp4")
         assert not flt.apply("https://example.com/file.pdf")
+
+    def test_skip_query_filter_blocks_query_urls_by_default(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import SkipQueryFilter
+
+        flt = SkipQueryFilter()
+        assert flt.apply("https://example.com/page")
+        assert not flt.apply("https://example.com/news?tag=ai")
+
+    def test_skip_query_filter_allows_whitelisted_query_params(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import SkipQueryFilter
+
+        flt = SkipQueryFilter(allow_query_urls=True, allowed_query_param_names={"page"})
+        assert flt.apply("https://example.com/archive?page=2")
+        assert not flt.apply("https://example.com/archive?tag=ai")
 
     def test_document_payload_validator_rejects_html_disguised_as_pdf(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _is_valid_downloaded_document_payload

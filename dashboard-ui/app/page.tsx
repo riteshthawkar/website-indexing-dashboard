@@ -37,6 +37,7 @@ export default function DashboardPage() {
   const chunks = runs?.reduce((sum, run) => sum + run.chunks_created, 0) ?? 0;
   const media = runs?.reduce((sum, run) => sum + run.media_items_extracted, 0) ?? 0;
   const recent = runs?.slice(0, 10) ?? [];
+  const activeRuns = (runs || []).filter((run) => run.status === "running" || run.process_state === "starting" || run.process_state === "cancelling").slice(0, 4);
 
   return (
     <>
@@ -141,27 +142,49 @@ export default function DashboardPage() {
 
           <Card>
             <CardHeader>
-              <CardTitle>Run From Terminal</CardTitle>
+              <CardTitle>Active Processes</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="rounded-2xl border border-primary/20 bg-primary/10 p-4 text-sm text-muted-foreground">
-                The dashboard and CLI use the same pipeline backend. You can start runs from the terminal, then import them here with a filesystem scan.
-              </div>
-              <CommandBlock
-                label="List available configs"
-                command="./scripts/pipeline.sh list-configs"
-                description="Inspect the available scraper/indexing configurations before running."
-              />
-              <CommandBlock
-                label="Run the pipeline directly"
-                command="./scripts/pipeline.sh run --config default"
-                description="Uses the shared virtual environment and writes outputs under runs/."
-              />
-              <CommandBlock
-                label="Start the dashboard"
-                command="./scripts/dashboard.sh"
-                description="Launch the FastAPI + static dashboard shell from the repo root."
-              />
+              {activeRuns.length === 0 ? (
+                <>
+                  <div className="rounded-2xl border border-primary/20 bg-primary/10 p-4 text-sm text-muted-foreground">
+                    No active pipeline processes right now. Start a new run or import one from the terminal.
+                  </div>
+                  <CommandBlock
+                    label="Run the pipeline directly"
+                    command="./scripts/pipeline.sh run --config default"
+                    description="Uses the shared virtual environment and writes outputs under runs/."
+                  />
+                  <CommandBlock
+                    label="Start the dashboard"
+                    command="./scripts/dashboard.sh"
+                    description="Launch the FastAPI + static dashboard shell from the repo root."
+                  />
+                </>
+              ) : (
+                <div className="space-y-3">
+                  {activeRuns.map((run) => (
+                    <div key={run.id} className="rounded-2xl border border-white/8 bg-muted/25 p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-semibold">{run.run_name}</div>
+                          <div className="mt-1 text-xs text-muted-foreground">{run.current_stage || run.last_completed_stage || "waiting for first stage"}</div>
+                        </div>
+                        <div className="flex flex-col items-end gap-1">
+                          <span className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">{run.process_state || run.status}</span>
+                          <span className="text-sm font-semibold">{run.stage_summary?.progress_percent ?? 0}%</span>
+                        </div>
+                      </div>
+                      <div className="mt-3 h-2 overflow-hidden rounded-full border border-white/8 bg-black/25">
+                        <div
+                          className="h-full rounded-full bg-[linear-gradient(90deg,rgba(53,210,198,0.9),rgba(73,143,226,0.92))]"
+                          style={{ width: `${run.stage_summary?.progress_percent || 0}%` }}
+                        />
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </CardContent>
           </Card>
         </div>

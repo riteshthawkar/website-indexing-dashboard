@@ -39,8 +39,7 @@ export function ConfigTab({ run }: { run: PipelineRun }) {
     <Card>
       <CardHeader>
         <CardTitle>
-          Pipeline Configuration: {run.config_name}
-          {run.config_snapshot ? " (snapshot)" : ""}
+          {run.config_snapshot ? "Run Configuration Snapshot" : `Pipeline Configuration: ${run.config_name}`}
         </CardTitle>
       </CardHeader>
       <CardContent>

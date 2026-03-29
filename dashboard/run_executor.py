@@ -29,7 +29,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from pipeline.core.config import load_config as load_pipeline_config, list_configs as list_pipeline_configs
 from pipeline.core.orchestrator import PipelineOrchestrator
-from pipeline.core.state import load_state
+from pipeline.core.state import load_state, save_state
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +123,79 @@ def get_pipeline_state(work_dir: str) -> Optional[dict]:
     return None
 
 
+def sync_terminal_pipeline_state(
+    work_dir: str | Path,
+    *,
+    status: str,
+    error_message: Optional[str] = None,
+    finished_at: Optional[str] = None,
+) -> None:
+    """Persist terminal run status back into pipeline_state.json.
+
+    The dashboard owns external worker lifecycle, so a cancelled/killed worker can
+    leave the pipeline's last checkpoint showing `running`. This helper makes the
+    on-disk state consistent with the dashboard's terminal DB state.
+    """
+    resolved = Path(work_dir)
+    finished_at_iso = str(finished_at or utcnow().isoformat())
+    state = load_state(resolved)
+    if not state:
+        raw_state_path = resolved / "pipeline_state.json"
+        try:
+            payload = json.loads(raw_state_path.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        payload["status"] = status
+        payload["finished_at"] = finished_at_iso
+        stages = payload.get("stages") or []
+        if isinstance(stages, list):
+            for stage in stages:
+                if not isinstance(stage, dict):
+                    continue
+                if stage.get("status") == "running":
+                    stage["status"] = "completed" if status == "completed" else "failed"
+                    stage["finished_at"] = stage.get("finished_at") or finished_at_iso
+                    if error_message and not stage.get("error_message"):
+                        stage["error_message"] = error_message
+            if status == "completed":
+                payload["current_stage_index"] = len(stages)
+        raw_state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return
+
+    state.status = status
+    state.finished_at = finished_at_iso
+
+    first_running_index: Optional[int] = None
+    for index, stage in enumerate(state.stages):
+        if stage.status == "running":
+            if first_running_index is None:
+                first_running_index = index
+            if status == "completed":
+                stage.status = "completed"
+            else:
+                stage.status = "failed"
+                if error_message and not stage.error_message:
+                    stage.error_message = error_message
+            stage.finished_at = stage.finished_at or finished_at_iso
+
+    if status == "completed":
+        state.current_stage_index = len(state.stages)
+    elif first_running_index is not None:
+        state.current_stage_index = first_running_index
+    elif state.stages:
+        state.current_stage_index = min(max(state.current_stage_index, 0), len(state.stages) - 1)
+        if error_message:
+            stage = state.stages[state.current_stage_index]
+            if not stage.error_message:
+                stage.error_message = error_message
+            stage.finished_at = stage.finished_at or finished_at_iso
+
+    save_state(state, resolved)
+
+
 def get_available_configs() -> List[Dict[str, str]]:
     """Return available pipeline config names from the pipeline package."""
     return list_pipeline_configs()
@@ -132,14 +205,38 @@ def get_available_configs() -> List[Dict[str, str]]:
 # Run lifecycle
 # ---------------------------------------------------------------------------
 
-def create_run(run_name: str, config_name: str, run_type: str = "full", start_url: str = "") -> dict:
+def _normalize_config_snapshot(config_snapshot: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(config_snapshot, dict):
+        return None
+    return json.loads(json.dumps(config_snapshot))
+
+
+def _derive_start_url(config_snapshot: Optional[Dict[str, Any]], start_url: str) -> str:
+    resolved_start_url = (start_url or "").strip()
+    if resolved_start_url:
+        return resolved_start_url
+    crawler = config_snapshot.get("crawler") if isinstance(config_snapshot, dict) else None
+    if isinstance(crawler, dict):
+        return str(crawler.get("start_url") or "").strip()
+    return ""
+
+
+def create_run(
+    run_name: str,
+    config_name: str,
+    run_type: str = "full",
+    start_url: str = "",
+    config_snapshot: Optional[Dict[str, Any]] = None,
+) -> dict:
     """Create a new run record in the database."""
     config_name = (config_name or "default").strip()
-    config_snapshot = None
-    try:
-        config_snapshot = load_pipeline_config(config_name)
-    except Exception as e:
-        logger.warning("Could not snapshot config %s for run %s: %s", config_name, run_name, e)
+    resolved_snapshot = _normalize_config_snapshot(config_snapshot)
+    if resolved_snapshot is None:
+        try:
+            resolved_snapshot = load_pipeline_config(config_name)
+        except Exception as e:
+            logger.warning("Could not snapshot config %s for run %s: %s", config_name, run_name, e)
+    resolved_start_url = _derive_start_url(resolved_snapshot, start_url)
 
     db = get_db()
     try:
@@ -147,10 +244,10 @@ def create_run(run_name: str, config_name: str, run_type: str = "full", start_ur
             run_name=run_name,
             config_name=config_name,
             run_type=run_type,
-            start_url=start_url or None,
+            start_url=resolved_start_url or None,
             status="pending",
             created_at=utcnow(),
-            config_snapshot_json=json.dumps(config_snapshot) if config_snapshot else None,
+            config_snapshot_json=json.dumps(resolved_snapshot) if resolved_snapshot else None,
         )
         db.add(run)
         db.commit()
@@ -188,6 +285,20 @@ def _add_log(run_id: int, message: str, level: str = "info", stage: str = None):
         db.commit()
     finally:
         db.close()
+
+
+def _resolve_terminal_error_message(state: Any) -> str:
+    stages = list(getattr(state, "stages", []) or [])
+    for stage in stages:
+        if str(getattr(stage, "status", "") or "").lower() == "failed":
+            message = str(getattr(stage, "error_message", "") or "").strip()
+            if message:
+                return message
+    for stage in reversed(stages):
+        message = str(getattr(stage, "error_message", "") or "").strip()
+        if message:
+            return message
+    return "Pipeline failed"
 
 
 async def execute_pipeline(
@@ -398,10 +509,26 @@ async def execute_pipeline(
     stage_logger.addHandler(stage_log_handler)
 
     try:
-        await _emit_log("info", f"Loading config: {config_name}")
+        db2 = get_db()
+        try:
+            run = db2.get(Run, run_id)
+            config = None
+            if run and run.config_snapshot_json:
+                try:
+                    payload = json.loads(run.config_snapshot_json)
+                    if isinstance(payload, dict):
+                        config = payload
+                except Exception:
+                    logger.warning("Invalid config snapshot for run %s; falling back to %s", run_id, config_name)
+            if config is None:
+                config = load_pipeline_config(config_name)
+        finally:
+            db2.close()
 
-        # Load the pipeline config
-        config = load_pipeline_config(config_name)
+        await _emit_log(
+            "info",
+            f"Loading config snapshot: {config_name}" if run and run.config_snapshot_json else f"Loading config: {config_name}",
+        )
 
         # Apply overrides from the dashboard run
         db2 = get_db()
@@ -445,24 +572,23 @@ async def execute_pipeline(
 
         if state.status == "completed":
             _update_run(run_id, status="completed", completed_at=utcnow())
+            sync_terminal_pipeline_state(work_dir, status="completed")
             await _emit_log("info", "Pipeline completed successfully!")
         else:
-            error_msg = None
-            for s in state.stages:
-                if s.error_message:
-                    error_msg = s.error_message
-                    break
+            error_msg = _resolve_terminal_error_message(state)
             _update_run(
                 run_id,
                 status="failed",
                 completed_at=utcnow(),
-                error_message=error_msg or "Pipeline failed",
+                error_message=error_msg,
             )
-            await _emit_log("error", f"Pipeline failed: {error_msg or 'unknown error'}")
+            sync_terminal_pipeline_state(work_dir, status="failed", error_message=error_msg)
+            await _emit_log("error", f"Pipeline failed: {error_msg}")
 
     except asyncio.CancelledError:
         logger.info(f"Pipeline cancelled for run {run_id}")
         _update_run(run_id, status="cancelled", completed_at=utcnow())
+        sync_terminal_pipeline_state(work_dir, status="cancelled", error_message="Pipeline cancelled")
         await _emit_log("info", "Pipeline cancelled")
 
     except Exception as e:
@@ -473,6 +599,7 @@ async def execute_pipeline(
             completed_at=utcnow(),
             error_message=str(e),
         )
+        sync_terminal_pipeline_state(work_dir, status="failed", error_message=str(e))
         try:
             await _emit_log("error", f"Pipeline error: {e}")
         except Exception:
@@ -488,9 +615,12 @@ def cancel_run(run_id: int) -> bool:
         run = db.get(Run, run_id)
         if not run or run.status != "running":
             return False
+        work_dir = run.work_dir
         run.status = "cancelled"
         run.completed_at = utcnow()
         db.commit()
+        if work_dir:
+            sync_terminal_pipeline_state(work_dir, status="cancelled", error_message="Pipeline cancelled")
         return True
     finally:
         db.close()
@@ -521,6 +651,12 @@ def cleanup_stale_runs():
             run.status = "failed"
             run.error_message = "Interrupted (dashboard restart)"
             run.completed_at = utcnow()
+            if run.work_dir:
+                sync_terminal_pipeline_state(
+                    run.work_dir,
+                    status="failed",
+                    error_message="Interrupted (dashboard restart)",
+                )
         db.commit()
         if stale:
             logger.info(f"Cleaned up {len(stale)} stale runs")

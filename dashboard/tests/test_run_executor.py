@@ -10,7 +10,7 @@ DASHBOARD_DIR = Path(__file__).resolve().parents[1]
 if str(DASHBOARD_DIR) not in sys.path:
     sys.path.insert(0, str(DASHBOARD_DIR))
 
-from run_executor import _DashboardStageLogHandler
+from run_executor import _DashboardStageLogHandler, _resolve_terminal_error_message
 
 
 def test_stage_log_handler_forwards_stage_logs() -> None:
@@ -58,3 +58,18 @@ def test_stage_log_handler_forwards_stage_logs() -> None:
     assert event["event_type"] == "stage_log"
     assert event["data"]["logger"] == "pipeline.stages.crawlers.crawl4ai_crawler"
     assert len(broadcasts) == 1
+
+
+def test_resolve_terminal_error_message_prefers_failed_stage() -> None:
+    class Stage:
+        def __init__(self, status: str, error_message: str | None) -> None:
+            self.status = status
+            self.error_message = error_message
+
+    class State:
+        stages = [
+            Stage("skipped", "No supported documents found in download_dir"),
+            Stage("failed", "No chunk_index available for extraction slice formatting"),
+        ]
+
+    assert _resolve_terminal_error_message(State()) == "No chunk_index available for extraction slice formatting"

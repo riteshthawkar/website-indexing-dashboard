@@ -538,7 +538,9 @@ def evaluate_retrieval_dataset(
     examples = load_eval_examples(dataset_path)
     dataset_fingerprint = _dataset_fingerprint(examples)
     try:
-        config_payload = dict(load_config(config_name) or {})
+        from ..core.config import load_effective_config
+
+        config_payload = dict(load_effective_config(config_name, work_dir=work_dir) or {})
     except FileNotFoundError:
         config_payload = {}
     config_fingerprint = _config_fingerprint(config_payload)

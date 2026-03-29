@@ -18,6 +18,15 @@ export interface ArtifactSummary {
   by_type: Record<string, number>;
 }
 
+export interface StageSummary {
+  total: number;
+  completed: number;
+  running: number;
+  failed: number;
+  pending: number;
+  progress_percent: number;
+}
+
 export interface MediaSummary {
   total: number;
   images: number;
@@ -58,6 +67,14 @@ export interface PipelineRun {
   // Enriched from pipeline_state.json on detail endpoint
   stages?: StageState[];
   current_stage_index?: number;
+  current_stage?: string | null;
+  active_stage?: string | null;
+  last_completed_stage?: string | null;
+  current_stage_progress?: Record<string, unknown> | null;
+  stage_summary?: StageSummary | null;
+  process_state?: string | null;
+  worker_active?: boolean;
+  worker_runtime?: Record<string, unknown> | null;
   artifact_summary?: ArtifactSummary | null;
   media_summary?: MediaSummary | null;
   structured_log_path?: string | null;

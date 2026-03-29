@@ -587,6 +587,7 @@ class EvaluationJobManager:
         def runner() -> Dict[str, Any]:
             return run_standard_benchmark_retrieval(
                 config_name=config_name,
+                work_dir=str(resolved_work_dir),
                 dataset_dir=str(resolved_dataset),
                 output_rankings_path=str(resolved_rankings),
                 top_k=int(top_k),

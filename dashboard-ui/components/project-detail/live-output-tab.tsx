@@ -29,6 +29,14 @@ function levelClass(level: string) {
 }
 
 function summarizeStages(run: PipelineRun) {
+  if (run.stage_summary) {
+    return {
+      ...run.stage_summary,
+      currentStage: run.current_stage
+        ? { stage_id: run.current_stage, stage_type: "", name: run.current_stage, status: run.process_state || run.status }
+        : null,
+    };
+  }
   const stages = run.stages || [];
   const completed = stages.filter((stage) => stage.status === "completed" || stage.status === "skipped").length;
   const running = stages.filter((stage) => stage.status === "running").length;
@@ -277,6 +285,9 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
               <div className="flex flex-wrap items-center gap-2">
                 <Badge variant="secondary">{filteredEntries.length}/{combinedEntries.length} structured</Badge>
                 <Badge variant="outline">{rawLogsQuery.data?.length || 0} raw</Badge>
+                {run.process_state && run.process_state !== run.status && (
+                  <Badge variant="outline">process: {run.process_state}</Badge>
+                )}
                 {isRunning && connected ? (
                   <Badge variant="outline" className="border-red-500/25 bg-red-500/12 text-red-200">
                     <span className="mr-1.5 inline-block h-2 w-2 animate-pulse rounded-full bg-red-400" />

@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from pipeline.core.config import load_config
+from pipeline.core.config import load_effective_config
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.evaluation.benchmark_io import (
     _load_jsonl,
@@ -190,6 +190,7 @@ def _embed_with_cache(
 def run_standard_benchmark_retrieval(
     *,
     config_name: str,
+    work_dir: str | Path | None = None,
     dataset_dir: str | Path,
     output_rankings_path: str | Path,
     top_k: int = 10,
@@ -204,7 +205,7 @@ def run_standard_benchmark_retrieval(
     corpus_rows = _load_jsonl(dataset_dir / "corpus.jsonl")
     query_rows = _load_jsonl(dataset_dir / "queries.jsonl")
 
-    config = load_config(config_name)
+    config = load_effective_config(config_name, work_dir=work_dir)
     embed_cfg = dict(config.get("embedder") or {})
     model = str(embed_cfg.get("model") or "gemini-embedding-2-preview")
     output_dimensionality = int(embed_cfg.get("output_dimensionality") or 1536)

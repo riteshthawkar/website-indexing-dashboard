@@ -27,6 +27,7 @@ export const createRun = (data: {
   run_type?: string;
   start_url?: string;
   config_name?: string;
+  config_snapshot?: Record<string, unknown>;
 }) => request<import("./types").PipelineRun>("/api/runs", { method: "POST", body: JSON.stringify(data) });
 
 export const startRun = (id: number) =>

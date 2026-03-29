@@ -20,9 +20,10 @@ export function useRuns(status?: string) {
     queryFn: () => fetchRuns(status),
     refetchInterval: (query) => {
       const data = query.state.data;
-      const hasRunning = data?.some((r) => r.status === "running");
-      return hasRunning ? 3000 : 30000;
+      const hasActive = data?.some((r) => r.status === "running" || r.process_state === "starting" || r.process_state === "cancelling" || r.worker_active);
+      return hasActive ? 2000 : 15000;
     },
+    refetchOnWindowFocus: true,
   });
 }
 
@@ -31,8 +32,10 @@ export function useRun(id: number) {
     queryKey: ["runs", id],
     queryFn: () => fetchRun(id),
     refetchInterval: (query) => {
-      return query.state.data?.status === "running" ? 2000 : false;
+      const data = query.state.data;
+      return data?.status === "running" || data?.process_state === "starting" || data?.process_state === "cancelling" || data?.worker_active ? 1500 : 10000;
     },
+    refetchOnWindowFocus: true,
   });
 }
 

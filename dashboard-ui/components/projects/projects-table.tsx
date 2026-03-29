@@ -38,7 +38,10 @@ export function ProjectsTable({ runs }: ProjectsTableProps) {
               <TableHead>Name</TableHead>
               <TableHead>Type</TableHead>
               <TableHead>Status</TableHead>
+              <TableHead>Process</TableHead>
+              <TableHead>Stage</TableHead>
               <TableHead>URL</TableHead>
+              <TableHead className="text-right">Progress</TableHead>
               <TableHead className="text-right">Pages</TableHead>
               <TableHead className="text-right">Docs</TableHead>
               <TableHead className="text-right">Chunks</TableHead>
@@ -64,9 +67,30 @@ export function ProjectsTable({ runs }: ProjectsTableProps) {
                 <TableCell>
                   <StatusBadge status={run.status} pulse />
                 </TableCell>
+                <TableCell>
+                  {run.process_state && run.process_state !== run.status ? (
+                    <StatusBadge status={run.process_state} pulse />
+                  ) : (
+                    <span className="text-xs text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="min-w-[220px]">
+                  <div className="space-y-2">
+                    <div className="truncate text-sm font-medium">
+                      {run.current_stage || run.last_completed_stage || "\u2014"}
+                    </div>
+                    <div className="h-2 overflow-hidden rounded-full border border-white/8 bg-black/25">
+                      <div
+                        className="h-full rounded-full bg-[linear-gradient(90deg,rgba(53,210,198,0.9),rgba(73,143,226,0.92))]"
+                        style={{ width: `${run.stage_summary?.progress_percent || 0}%` }}
+                      />
+                    </div>
+                  </div>
+                </TableCell>
                 <TableCell className="max-w-[200px] truncate text-muted-foreground">
                   {run.start_url || "\u2014"}
                 </TableCell>
+                <TableCell className="text-right">{run.stage_summary?.progress_percent ?? 0}%</TableCell>
                 <TableCell className="text-right">{run.pages_scraped}</TableCell>
                 <TableCell className="text-right">{run.docs_converted}</TableCell>
                 <TableCell className="text-right">{run.chunks_created}</TableCell>

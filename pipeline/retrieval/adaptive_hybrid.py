@@ -2031,7 +2031,9 @@ class AdaptiveHybridRetriever:
 
     @classmethod
     def from_config(cls, *, config_name: str, work_dir: str | Path) -> "AdaptiveHybridRetriever":
-        config = load_config(config_name)
+        from ..core.config import load_effective_config
+
+        config = load_effective_config(config_name, work_dir=work_dir)
         backend = str((config.get("retrieval") or {}).get("retriever_backend") or "vector").strip().lower()
         if backend == "graph_hybrid":
             from .graph_rag import GraphRAGRetriever

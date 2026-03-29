@@ -8,6 +8,7 @@ Environment variables can override any config value via ``PIPELINE_<SECTION>__<K
 (double-underscore separates nesting levels).
 """
 
+import json
 import logging
 import os
 from pathlib import Path
@@ -138,6 +139,39 @@ def load_config(
     if overrides:
         config = _deep_merge(config, overrides)
 
+    return config
+
+
+def load_resolved_run_config(work_dir: str | Path) -> Optional[Dict[str, Any]]:
+    """Load a run-local resolved config snapshot written by the orchestrator."""
+    path = Path(work_dir) / "resolved_config.json"
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    config = payload.get("config")
+    return dict(config) if isinstance(config, dict) else None
+
+
+def load_effective_config(
+    name: str,
+    *,
+    work_dir: str | Path | None = None,
+    search_dirs: Optional[List[Path]] = None,
+    overrides: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Load a config, preferring a run-local resolved snapshot when available."""
+    config: Optional[Dict[str, Any]] = None
+    if work_dir:
+        config = load_resolved_run_config(work_dir)
+    if config is None:
+        config = load_config(name, search_dirs=search_dirs, overrides=None)
+    if overrides:
+        config = _deep_merge(config, overrides)
     return config
 
 

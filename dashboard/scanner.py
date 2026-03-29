@@ -8,7 +8,7 @@ import logging
 from pathlib import Path
 
 from database import Run, get_db, utcnow
-from run_executor import collect_metrics, get_pipeline_state, load_pipeline_config
+from run_executor import collect_metrics, get_pipeline_state, load_pipeline_config, sync_terminal_pipeline_state
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +118,13 @@ def scan_and_import(force_rescan: bool = False) -> int:
                 existing.total_bytes = metrics.get("total_bytes", 0)
                 if config_snapshot:
                     existing.config_snapshot_json = json.dumps(config_snapshot)
+                if existing.status in {"completed", "failed", "cancelled"}:
+                    sync_terminal_pipeline_state(
+                        work_dir_str,
+                        status=existing.status,
+                        error_message=existing.error_message,
+                        finished_at=existing.completed_at.isoformat() if existing.completed_at else None,
+                    )
                 continue
 
             run = Run(
@@ -148,6 +155,13 @@ def scan_and_import(force_rescan: bool = False) -> int:
                 config_snapshot_json=json.dumps(config_snapshot) if config_snapshot else None,
             )
             db.add(run)
+            if run.status in {"completed", "failed", "cancelled"}:
+                sync_terminal_pipeline_state(
+                    work_dir_str,
+                    status=run.status,
+                    error_message=run.error_message,
+                    finished_at=run.completed_at.isoformat() if run.completed_at else None,
+                )
             imported += 1
 
         db.commit()

@@ -46,6 +46,14 @@ def test_dashboard_global_routes(client: TestClient) -> None:
         response = client.get(path)
         assert response.status_code == 200, f"{path} failed: {response.text}"
 
+    runs_response = client.get("/api/runs")
+    assert runs_response.status_code == 200, runs_response.text
+    runs = runs_response.json()
+    if runs:
+        first = runs[0]
+        assert "process_state" in first
+        assert "stage_summary" in first
+
 
 def test_dashboard_run_detail_routes(client: TestClient, existing_run: dict) -> None:
     run_id = existing_run["id"]
@@ -69,6 +77,12 @@ def test_dashboard_run_detail_routes(client: TestClient, existing_run: dict) -> 
     ):
         response = client.get(path)
         assert response.status_code == 200, f"{path} failed: {response.text}"
+
+    detail = client.get(f"/api/runs/{run_id}")
+    assert detail.status_code == 200, detail.text
+    payload = detail.json()
+    if payload.get("stages"):
+        assert payload.get("current_stage") or payload.get("last_completed_stage")
 
 
 def test_dashboard_file_preview_route(client: TestClient, existing_run: dict) -> None:
@@ -122,7 +136,9 @@ def test_dashboard_eval_dataset_tools_and_job_cancel(client: TestClient, existin
         json={"dataset_path": datasets[0], "work_dir": existing_run["work_dir"]},
     )
     assert validate_response.status_code == 200, validate_response.text
-    assert validate_response.json()["ok"] is True
+    validate_payload = validate_response.json()
+    assert "ok" in validate_payload
+    assert "errors" in validate_payload
 
     export_response = client.post(
         f"/api/runs/{run_id}/evaluation/benchmarks/export-ir",

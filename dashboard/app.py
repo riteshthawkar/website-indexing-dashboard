@@ -36,6 +36,7 @@ from run_executor import (
     get_pipeline_state,
     get_available_configs,
     cleanup_stale_runs,
+    sync_terminal_pipeline_state,
 )
 from config_manager import (
     load_config,
@@ -74,7 +75,14 @@ from retriever_service_ops import (
     start_retriever_service,
     stop_retriever_service,
 )
-from structured_logs import load_structured_logs, load_structured_logs_after, structured_log_path
+from run_health import detect_crawler_stall
+from structured_logs import (
+    append_structured_log,
+    load_structured_logs,
+    load_structured_logs_after,
+    make_structured_log_record,
+    structured_log_path,
+)
 from url_manager import (
     add_excluded_subdomain,
     add_target_url,
@@ -105,6 +113,94 @@ logger = logging.getLogger(__name__)
 
 BASE_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = BASE_DIR.parent
+
+PUBLIC_CONFIG_NAMES = ("default",)
+
+
+def _load_json_file(path: Path) -> Optional[dict]:
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _count_files(path: Path) -> int:
+    if not path.exists():
+        return 0
+    return sum(1 for item in path.rglob("*") if item.is_file())
+
+
+def _load_current_stage_progress(work_dir: str | Path, active_stage: Optional[str], run_payload: dict) -> Optional[dict]:
+    if not active_stage:
+        return None
+
+    root = Path(work_dir)
+
+    if active_stage == "crawl_web":
+        crawl_state = _load_json_file(root / "crawl_state.json")
+        if not crawl_state:
+            return None
+        visited = crawl_state.get("visited") or []
+        pending = crawl_state.get("pending") or []
+        progress = {
+            "kind": "crawler",
+            "visited_count": len(visited) if isinstance(visited, list) else 0,
+            "pending_count": len(pending) if isinstance(pending, list) else 0,
+            "pages_crawled": int(crawl_state.get("pages_crawled") or 0),
+            "updated_at": crawl_state.get("updated_at"),
+        }
+        snapshot = run_payload.get("config_snapshot") or {}
+        crawler_cfg = snapshot.get("crawler") if isinstance(snapshot, dict) else {}
+        if isinstance(crawler_cfg, dict):
+            try:
+                max_pages = int(crawler_cfg.get("max_pages") or 0)
+            except Exception:
+                max_pages = 0
+            if max_pages > 0:
+                progress["max_pages"] = max_pages
+                progress["progress_percent"] = round(
+                    min(100.0, (progress["visited_count"] / max_pages) * 100.0),
+                    1,
+                )
+        return progress
+
+    if active_stage == "convert_documents":
+        stage_dir = root / "stage_outputs" / "convert_documents"
+        if not stage_dir.exists():
+            return None
+        input_documents = _count_files(root / "downloads")
+        markdown_files = _count_files(stage_dir / "markdown")
+        structured_documents = _count_files(stage_dir / "structured_documents")
+        extracted_images = _count_files(stage_dir / "extracted_images")
+        progress = {
+            "kind": "convert_documents",
+            "input_documents": input_documents,
+            "markdown_files": markdown_files,
+            "structured_documents": structured_documents,
+            "extracted_images": extracted_images,
+        }
+        if input_documents > 0:
+            progress["progress_percent"] = round(min(100.0, (markdown_files / input_documents) * 100.0), 1)
+        return progress
+
+    if active_stage == "upload_retrieval":
+        progress = _load_json_file(root / "stage_outputs" / "upload_retrieval" / "index_upload_progress.json")
+        if not progress:
+            return None
+        progress["kind"] = "upload_retrieval"
+        return progress
+
+    if active_stage == "upload_graph":
+        progress = _load_json_file(root / "stage_outputs" / "upload_graph" / "neo4j_upload_progress.json")
+        if not progress:
+            return None
+        progress["kind"] = "upload_graph"
+        return progress
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +388,228 @@ class RunManager:
 run_manager = RunManager()
 
 
+def _stage_key(stage: dict) -> str:
+    return str(stage.get("stage_id") or f"{stage.get('stage_type')}/{stage.get('name')}")
+
+
+def _normalize_stages_for_run(run_status: str, worker_active: bool, completed_at: Optional[str], error_message: Optional[str], stages: list[dict]) -> list[dict]:
+    normalized: list[dict] = []
+    for stage in stages:
+        item = dict(stage)
+        if item.get("status") == "running" and not worker_active and run_status in {"failed", "cancelled", "completed"}:
+            item["status"] = "failed" if run_status == "cancelled" else run_status
+            item["finished_at"] = item.get("finished_at") or completed_at
+            if error_message and not item.get("error_message"):
+                item["error_message"] = error_message
+        normalized.append(item)
+    return normalized
+
+
+def _derive_stage_summary(stages: list[dict]) -> tuple[Optional[dict], Optional[dict], Optional[dict]]:
+    if not stages:
+        return None, None, None
+    active_stage = next((stage for stage in stages if stage.get("status") == "running"), None)
+    failed_stage = next((stage for stage in stages if stage.get("status") == "failed"), None)
+    last_completed_stage = next(
+        (stage for stage in reversed(stages) if stage.get("status") in {"completed", "skipped"}),
+        None,
+    )
+    current_stage = active_stage or failed_stage or last_completed_stage
+    return current_stage, active_stage, last_completed_stage
+
+
+def _summarize_stage_counts(stages: list[dict]) -> dict:
+    total = len(stages)
+    completed = sum(1 for stage in stages if stage.get("status") in {"completed", "skipped"})
+    running = sum(1 for stage in stages if stage.get("status") == "running")
+    failed = sum(1 for stage in stages if stage.get("status") == "failed")
+    pending = sum(1 for stage in stages if stage.get("status") == "pending")
+    return {
+        "total": total,
+        "completed": completed,
+        "running": running,
+        "failed": failed,
+        "pending": pending,
+        "progress_percent": round((completed / total) * 100) if total else 0,
+    }
+
+
+def _derive_process_state(run_status: str, worker_runtime: Optional[dict], worker_active: bool) -> str:
+    runtime_status = str((worker_runtime or {}).get("status") or "").strip().lower()
+    if runtime_status in {"starting", "cancelling"}:
+        return runtime_status
+    if worker_active and run_status == "running":
+        return "running"
+    return run_status
+
+
+def _enrich_run_payload(run: Run, *, include_config_snapshot: bool = False, include_heavy: bool = False) -> dict:
+    run = _sync_run_health(run)
+    result = run.to_dict(include_config_snapshot=include_config_snapshot)
+
+    result["artifact_summary"] = {"total": 0, "by_type": {}}
+    result["media_summary"] = {"total": 0, "images": 0, "videos": 0, "by_source": {}, "video_providers": {}}
+    result["structured_log_path"] = None
+    result["worker_runtime"] = None
+    result["worker_active"] = False
+    result["stages"] = []
+    result["current_stage_index"] = 0
+    result["current_stage"] = None
+    result["active_stage"] = None
+    result["last_completed_stage"] = None
+    result["current_stage_progress"] = None
+    result["stage_summary"] = {"total": 0, "completed": 0, "running": 0, "failed": 0, "pending": 0, "progress_percent": 0}
+    result["process_state"] = result["status"]
+
+    work_dir = result.get("work_dir")
+    if not work_dir:
+        return result
+
+    if include_heavy:
+        result["artifact_summary"] = collect_artifact_summary(work_dir)
+        result["media_summary"] = collect_media_summary(work_dir)
+
+    result["structured_log_path"] = str(structured_log_path(work_dir))
+    worker_runtime = load_worker_state(work_dir)
+    worker_active = is_worker_active(work_dir)
+    result["worker_runtime"] = worker_runtime
+    result["worker_active"] = worker_active
+    result["process_state"] = _derive_process_state(result["status"], worker_runtime, worker_active)
+
+    state = get_pipeline_state(work_dir)
+    if not state:
+        return result
+
+    stages = _normalize_stages_for_run(
+        result["status"],
+        bool(worker_active),
+        result.get("completed_at"),
+        result.get("error_message"),
+        state.get("stages", []),
+    )
+    current_stage, active_stage, last_completed_stage = _derive_stage_summary(stages)
+    result["stages"] = stages
+    result["current_stage_index"] = state.get("current_stage_index", 0)
+    result["current_stage"] = _stage_key(current_stage) if current_stage else None
+    result["active_stage"] = _stage_key(active_stage) if active_stage else None
+    result["last_completed_stage"] = _stage_key(last_completed_stage) if last_completed_stage else None
+    result["current_stage_progress"] = _load_current_stage_progress(work_dir, result["active_stage"], result)
+    result["stage_summary"] = _summarize_stage_counts(stages)
+    return result
+
+
+def _sync_run_health(run: Run) -> Run:
+    if run.status != "running" or not run.work_dir:
+        return run
+
+    work_dir = Path(run.work_dir)
+    if not is_worker_active(work_dir):
+        return run
+
+    stall = detect_crawler_stall(work_dir)
+    if not stall:
+        return run
+
+    payload = load_worker_state(work_dir) or {}
+    pid = int(payload.get("pid") or 0) if payload else 0
+    if pid and pid_is_alive(pid):
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    save_worker_state(
+        work_dir,
+        {
+            **payload,
+            "pid": pid or payload.get("pid"),
+            "run_id": run.id,
+            "status": "stopped",
+            "finished_at": worker_utcnow_iso(),
+            "signal": "SIGKILL",
+            "exit_code": -9,
+            "error": stall["reason"],
+        },
+    )
+
+    existing = load_structured_logs(work_dir, limit=1)
+    last_sequence = 0
+    if existing["items"]:
+        try:
+            last_sequence = int(existing["items"][-1].get("sequence") or 0)
+        except (TypeError, ValueError):
+            last_sequence = 0
+    append_structured_log(
+        work_dir,
+        make_structured_log_record(
+            sequence=last_sequence + 1,
+            run_id=run.id,
+            pipeline_run_id=f"run_{run.id}",
+            level="error",
+            event_type="stage_stalled",
+            message=stall["reason"],
+            stage=stall["stage"],
+            data=stall,
+        ),
+    )
+
+    db = get_db()
+    try:
+        persisted = db.get(Run, run.id)
+        if persisted:
+            persisted.status = "failed"
+            persisted.completed_at = utcnow()
+            persisted.error_message = stall["reason"]
+            db.add(
+                RunLog(
+                    run_id=run.id,
+                    level="error",
+                    stage=stall["stage"],
+                    message=stall["reason"],
+                )
+            )
+            db.commit()
+            db.refresh(persisted)
+            db.expunge(persisted)
+            if persisted.work_dir:
+                sync_terminal_pipeline_state(
+                    persisted.work_dir,
+                    status="failed",
+                    error_message=stall["reason"],
+                    finished_at=persisted.completed_at.isoformat() if persisted.completed_at else None,
+                )
+            return persisted
+    finally:
+        db.close()
+
+    run.status = "failed"
+    run.completed_at = utcnow()
+    run.error_message = stall["reason"]
+    if run.work_dir:
+        sync_terminal_pipeline_state(
+            run.work_dir,
+            status="failed",
+            error_message=stall["reason"],
+            finished_at=run.completed_at.isoformat(),
+        )
+    return run
+
+
+def _get_public_configs() -> list[dict]:
+    configs = []
+    for item in get_available_configs():
+        if item.get("name") in PUBLIC_CONFIG_NAMES:
+            configs.append(item)
+    if configs:
+        return configs
+    default_config = load_config("default") or {}
+    return [{
+        "file": str(PROJECT_ROOT / "pipeline" / "configs" / "default.yaml"),
+        "name": "default",
+        "project_name": str(default_config.get("project_name") or "default"),
+    }]
+
+
 # ---------------------------------------------------------------------------
 # App lifecycle
 # ---------------------------------------------------------------------------
@@ -344,9 +662,12 @@ async def api_list_runs(status: Optional[str] = None, limit: int = 50):
         q = db.query(Run).order_by(Run.created_at.desc())
         if status:
             q = q.filter(Run.status == status)
-        return [r.to_dict() for r in q.limit(limit).all()]
+        runs = q.limit(limit).all()
+        for run in runs:
+            db.expunge(run)
     finally:
         db.close()
+    return [_enrich_run_payload(run, include_config_snapshot=False, include_heavy=False) for run in runs]
 
 
 @app.get("/api/runs/{run_id}")
@@ -356,34 +677,11 @@ async def api_get_run(run_id: int):
         run = db.get(Run, run_id)
         if not run:
             raise HTTPException(status_code=404, detail="Run not found")
-        result = run.to_dict(include_config_snapshot=True)
+        db.expunge(run)
     finally:
         db.close()
 
-    # Enrich with stage data from pipeline_state.json and artifact summaries.
-    if result.get("work_dir"):
-        result["artifact_summary"] = collect_artifact_summary(result["work_dir"])
-        result["media_summary"] = collect_media_summary(result["work_dir"])
-        result["structured_log_path"] = str(structured_log_path(result["work_dir"]))
-        result["worker_runtime"] = load_worker_state(result["work_dir"])
-        result["worker_active"] = is_worker_active(result["work_dir"])
-        state = get_pipeline_state(result["work_dir"])
-        if state:
-            result["stages"] = state.get("stages", [])
-            result["current_stage_index"] = state.get("current_stage_index", 0)
-        else:
-            result["stages"] = []
-            result["current_stage_index"] = 0
-    else:
-        result["artifact_summary"] = {"total": 0, "by_type": {}}
-        result["media_summary"] = {"total": 0, "images": 0, "videos": 0, "by_source": {}, "video_providers": {}}
-        result["structured_log_path"] = None
-        result["worker_runtime"] = None
-        result["worker_active"] = False
-        result["stages"] = []
-        result["current_stage_index"] = 0
-
-    return result
+    return _enrich_run_payload(run, include_config_snapshot=True, include_heavy=True)
 
 
 @app.post("/api/runs")
@@ -393,13 +691,22 @@ async def api_create_run(request: Request):
     config_name = (data.get("config_name") or data.get("pipeline_config") or "default").strip()
     run_type = data.get("run_type", "full")
     start_url = data.get("start_url", "")
+    config_snapshot = data.get("config_snapshot")
 
     if not run_name:
         raise HTTPException(status_code=400, detail="run_name is required")
-    if load_config(config_name) is None:
-        raise HTTPException(status_code=400, detail=f"Unknown config '{config_name}'")
+    if config_name not in PUBLIC_CONFIG_NAMES:
+        raise HTTPException(status_code=400, detail=f"Unsupported launch config '{config_name}'")
+    if config_snapshot is not None and not isinstance(config_snapshot, dict):
+        raise HTTPException(status_code=400, detail="config_snapshot must be a JSON object")
 
-    return create_run(run_name, config_name, run_type, start_url)
+    return create_run(
+        run_name,
+        config_name,
+        run_type,
+        start_url,
+        config_snapshot=config_snapshot,
+    )
 
 
 @app.post("/api/runs/{run_id}/start")
@@ -583,7 +890,13 @@ async def api_run_stages(run_id: int):
     state = get_pipeline_state(work_dir)
     if not state:
         return []
-    return state.get("stages", [])
+    return _normalize_stages_for_run(
+        run.status,
+        is_worker_active(work_dir),
+        run.completed_at.isoformat() if run.completed_at else None,
+        run.error_message,
+        state.get("stages", []),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1207,7 +1520,7 @@ async def api_serve_image(path: str):
 
 @app.get("/api/pipeline-configs")
 async def api_pipeline_configs():
-    return get_available_configs()
+    return _get_public_configs()
 
 
 @app.get("/api/stages")
@@ -1235,7 +1548,7 @@ async def api_list_stages():
 
 @app.get("/api/configs")
 async def api_list_configs():
-    return list_configs()
+    return [item for item in list_configs() if item.get("name") in PUBLIC_CONFIG_NAMES]
 
 
 @app.get("/api/configs/schema")

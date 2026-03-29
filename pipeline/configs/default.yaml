@@ -1,7 +1,7 @@
 # ─────────────────────────────────────────────────────────────
-# Default pipeline configuration
-# All project configs should inherit from this file:
-#   _inherit: default.yaml
+# Default product pipeline configuration
+# Single user-facing launch template. Keep this file as the
+# editable base config and apply per-run changes via snapshots.
 # ─────────────────────────────────────────────────────────────
 
 project_name: "default"
@@ -32,27 +32,52 @@ stages:
   - id: deduplicate_markdown
     type: quality_gate
     plugin: dedup_filter
-  - id: summarize_markdown
-    type: summarizer
-    plugin: openai_summarizer
   - id: chunk_content
     type: chunker
     plugin: hybrid
-  - id: format_embeddings
+  - id: format_assertion_slices
     type: formatter
-    plugin: pinecone_formatter
-  - id: upload_embeddings
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: upload_retrieval
     type: embedder
-    plugin: openai_embedder
+    plugin: gemini_pinecone
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: upload_graph
+    type: embedder
+    plugin: neo4j_graph_store
 
 # ─── Crawler ────────────────────────────────────────────────
 crawler:
-  start_url: null               # REQUIRED — set in project config
-  max_pages: 1000
-  max_depth: 10
+  start_url: "https://mbzuai.ac.ae"
+  max_pages: 1200
+  max_depth: 4
   fetch_concurrency: 5
   download_concurrency: 10
   timeout: 30                   # seconds
+  stream_results: false
+  fail_on_empty_result: true
+  frontier_empty_timeout_sec: 180
+  crawl_stall_timeout_sec: 900
   headless: true
   max_file_size_mb: 100
   max_image_size_mb: 10
@@ -60,11 +85,16 @@ crawler:
   download_retry_backoff_sec: 2.0
   checkpoint_flush_interval_sec: 5
   sitemap_enabled: true
-  sitemap_seed_limit: 500
+  sitemap_seed_limit: 200
+  sitemap_frontier_seed_limit: 10
   respect_robots_txt: true
   include_external: false
-  allowed_domains: []
-  excluded_subdomains: []
+  allow_query_urls: false
+  allowed_query_param_names: []
+  allowed_domains:
+    - "mbzuai.ac.ae"
+  excluded_subdomains:
+    - "library.mbzuai.ac.ae"
   user_agent: null
   headers: {}
   cookies: []
@@ -121,7 +151,7 @@ converter:
   images_scale: 2.0
   generate_picture_images: true
   generate_page_images: false
-  document_timeout: 120
+  document_timeout: 180
   docling_prefetch_models: true
   docling_artifacts_path: "~/.cache/docling/models"
   docling_doc_batch_size: 4
@@ -131,7 +161,7 @@ converter:
   docling_page_batch_concurrency: 2
   docling_elements_batch_size: 24
   # Granite Vision picture descriptions
-  use_vlm: true
+  use_vlm: false
   vlm_runtime: "transformers"              # external Granite captioning over Docling figure crops
   vlm_preset: "granite_vision"
   vlm_model: "ibm-granite/granite-vision-3.3-2b"
@@ -294,7 +324,12 @@ assertions:
   slice_max_tokens: 3200
   slice_section_margin_tokens: 320
   max_slices: 0
-  allowed_authority_classes: []
+  allowed_authority_classes:
+    - canonical_page
+    - policy_page
+    - official_catalog
+    - official_brochure
+    - faq_page
   excluded_authority_classes: []
   allowed_document_types: []
   extract_model: "gpt-5-mini"
@@ -320,7 +355,7 @@ assertions:
   promote_allow_ambiguous: false
 
 retrieval:
-  retriever_backend: "vector"
+  retriever_backend: "routed_hybrid"
   routed_graph_enabled: true
   routed_graph_query_types: ["fact"]
   routed_graph_min_confidence: 0.38
@@ -329,11 +364,11 @@ retrieval:
   parallel_graph_enabled: true
   parallel_query_rewriting_enabled: true
   parallel_graph_augment_all_queries: true
-  query_planner_enabled: false
+  query_planner_enabled: true
   query_planner_model: "gpt-5-nano"
   query_planner_reasoning_effort: "minimal"
   query_planner_min_confidence: 0.55
-  evidence_adjudicator_enabled: false
+  evidence_adjudicator_enabled: true
   evidence_adjudicator_model: "gpt-5-nano"
   evidence_adjudicator_reasoning_effort: "minimal"
   evidence_adjudicator_min_confidence: 0.58
@@ -441,11 +476,13 @@ storage:
 
 # ─── Embedder ───────────────────────────────────────────────
 embedder:
-  engine: "openai"              # "openai" or "sentence_transformer"
-  model: "text-embedding-3-small"
-  pinecone_index: null          # REQUIRED — set in project config
-  pinecone_sparse_index: null   # optional sparse sidecar index
-  batch_size: 100
+  engine: "gemini"
+  model: "gemini-embedding-2-preview"
+  pinecone_index: "mbzuai-gemini-retrieval-v2"
+  pinecone_sparse_index: "mbzuai-gemini-retrieval-v2-sparse"
+  batch_size: 32
+  media_text_batch_size: 32
+  media_multimodal_batch_size: 4
   upsert_batch_size: 100
   use_sparse_embeddings: false
   namespace: ""
@@ -473,6 +510,6 @@ embedder:
   pinecone_connect_timeout_sec: 10
   pinecone_read_timeout_sec: 120
   progress_flush_every_batches: 1
-  max_retries: 6
+  max_retries: 10
   retry_base_delay_sec: 5
-  retry_max_delay_sec: 120
+  retry_max_delay_sec: 300

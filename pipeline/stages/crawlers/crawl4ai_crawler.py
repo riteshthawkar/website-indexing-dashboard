@@ -9,6 +9,7 @@ runtime checkpoint so failed crawls can continue from the last known frontier.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import gzip
 import hashlib
 import inspect
@@ -346,6 +347,7 @@ def _build_initial_crawl_state(
     start_url: str,
     discovered_urls: Sequence[str],
     max_pages: int,
+    frontier_seed_limit: Optional[int] = None,
 ) -> dict[str, Any]:
     """Seed the crawl frontier from the start URL and sitemap-discovered URLs."""
     normalized_start = _normalize_http_url(start_url)
@@ -356,6 +358,8 @@ def _build_initial_crawl_state(
     depths = {normalized_start: 0}
     seen = {normalized_start}
     remaining = max(0, int(max_pages) - 1)
+    if frontier_seed_limit is not None:
+        remaining = min(remaining, max(0, int(frontier_seed_limit)))
 
     for candidate in discovered_urls:
         normalized = _normalize_http_url(candidate)
@@ -374,6 +378,80 @@ def _build_initial_crawl_state(
         "depths": depths,
         "pages_crawled": 0,
     }
+
+
+def _trim_crawl_state_to_budget(crawl_state: Optional[Dict[str, Any]], max_pages: int) -> Dict[str, Any]:
+    """Normalize and cap crawler frontier state to the configured page budget."""
+    if not isinstance(crawl_state, dict):
+        return {"visited": [], "pending": [], "depths": {}, "pages_crawled": 0}
+
+    budget = max(1, int(max_pages or 1))
+
+    visited: list[str] = []
+    seen: set[str] = set()
+    for value in crawl_state.get("visited") or []:
+        normalized = _normalize_http_url(value)
+        if not normalized or normalized in seen:
+            continue
+        visited.append(normalized)
+        seen.add(normalized)
+        if len(visited) >= budget:
+            break
+
+    pending: list[dict[str, Optional[str]]] = []
+    for item in crawl_state.get("pending") or []:
+        url = None
+        parent_url = None
+        if isinstance(item, dict):
+            url = _normalize_http_url(item.get("url"))
+            parent_url = _normalize_http_url(item.get("parent_url"))
+        else:
+            url = _normalize_http_url(item)
+        if not url or url in seen:
+            continue
+        if len(visited) + len(pending) >= budget:
+            break
+        pending.append({"url": url, "parent_url": parent_url})
+        seen.add(url)
+
+    depths = crawl_state.get("depths") or {}
+    if isinstance(depths, dict):
+        depths = {
+            _normalize_http_url(url): depth
+            for url, depth in depths.items()
+            if _normalize_http_url(url) in seen
+        }
+    else:
+        depths = {}
+
+    pages_crawled = crawl_state.get("pages_crawled", 0)
+    try:
+        pages_crawled = int(pages_crawled)
+    except (TypeError, ValueError):
+        pages_crawled = 0
+    pages_crawled = min(max(pages_crawled, 0), len(visited), budget)
+
+    crawl_state["visited"] = visited
+    crawl_state["pending"] = pending
+    crawl_state["depths"] = depths
+    crawl_state["pages_crawled"] = pages_crawled
+    return crawl_state
+
+
+def _has_resumable_crawl_state(crawl_state: Optional[Dict[str, Any]]) -> bool:
+    """Return True only when crawl state contains usable frontier or progress."""
+    if not isinstance(crawl_state, dict):
+        return False
+
+    pending = crawl_state.get("pending") or []
+    visited = crawl_state.get("visited") or []
+    pages_crawled = crawl_state.get("pages_crawled", 0)
+    try:
+        pages_crawled = int(pages_crawled)
+    except (TypeError, ValueError):
+        pages_crawled = 0
+
+    return bool(pending or visited or pages_crawled > 0)
 
 
 def _select_best_srcset(srcset: str) -> str:
@@ -942,10 +1020,52 @@ class SkipExtensionFilter(URLFilter):
         return ext not in CRAWL_SKIP_EXTENSIONS
 
 
+class SkipQueryFilter(URLFilter):
+    """Reject crawl-frontier URLs with query params unless explicitly allowed."""
+
+    def __init__(self, allow_query_urls: bool = False, allowed_query_param_names: Iterable[str] | None = None):
+        super().__init__(name="SkipQueryFilter")
+        self.allow_query_urls = bool(allow_query_urls)
+        self.allowed_query_param_names = {
+            str(value).strip().lower()
+            for value in (allowed_query_param_names or [])
+            if str(value).strip()
+        }
+
+    def apply(self, url: str) -> bool:
+        normalized = _normalize_http_url(url)
+        if not normalized:
+            return False
+        parsed = urlparse(normalized)
+        if not parsed.query:
+            return True
+        if not self.allow_query_urls:
+            return False
+        if not self.allowed_query_param_names:
+            return True
+        query_names = {
+            str(key).strip().lower()
+            for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+            if str(key).strip()
+        }
+        return query_names.issubset(self.allowed_query_param_names)
+
+
 @register_stage
 class Crawl4AICrawler(CrawlerStage):
     name = "crawl4ai"
     description = "Resumable Crawl4AI deep crawler with sitemap seeding and controlled downloads."
+
+    def _has_crawl_output(self) -> bool:
+        return any(
+            [
+                int(self.stats.get("pages_scraped") or 0) > 0,
+                int(self.stats.get("markdown_written") or 0) > 0,
+                int(self.stats.get("documents_downloaded") or 0) > 0,
+                bool(self.url_mapping),
+                bool(self.url_to_md_mapping),
+            ]
+        )
 
     async def validate_config(self, config: Dict[str, Any]) -> List[str]:
         errors: list[str] = []
@@ -1040,6 +1160,14 @@ class Crawl4AICrawler(CrawlerStage):
         }
         self.include_external = self._should_include_external_links()
         self.proxy = self.config.get("proxy")
+        self.allow_query_urls = bool(self.config.get("allow_query_urls", False))
+        self.allowed_query_param_names = {
+            str(value).strip().lower()
+            for value in (self.config.get("allowed_query_param_names") or [])
+            if str(value).strip()
+        }
+        self.frontier_empty_timeout = max(30, int(self.config.get("frontier_empty_timeout_sec", 180) or 180))
+        self.crawl_stall_timeout = max(self.frontier_empty_timeout, int(self.config.get("crawl_stall_timeout_sec", 900) or 900))
 
         self.html_dir = ensure_dir(ctx.work_dir / "html")
         self.md_dir = ensure_dir(ctx.work_dir / "markdown")
@@ -1079,18 +1207,26 @@ class Crawl4AICrawler(CrawlerStage):
         self._last_flush_at = 0.0
         self._session: Optional[aiohttp.ClientSession] = None
         self._download_semaphore = asyncio.Semaphore(self.download_concurrency)
+        self._last_crawl_state_update_at = time.time()
+        self._last_result_seen_at = 0.0
+        self._crawl_watchdog_error: Optional[str] = None
 
         self._load_runtime_state(ctx.checkpoint)
 
         try:
             await self._open_http_session()
 
-            if not self.crawl_state:
+            if not _has_resumable_crawl_state(self.crawl_state):
                 sitemap_urls = []
                 if self.config.get("sitemap_enabled", True):
                     sitemap_urls = await self._discover_sitemap_urls()
                     self.stats["sitemap_urls_seeded"] = len(sitemap_urls)
-                self.crawl_state = _build_initial_crawl_state(self.start_url, sitemap_urls, self.max_pages)
+                self.crawl_state = _build_initial_crawl_state(
+                    self.start_url,
+                    sitemap_urls,
+                    self.max_pages,
+                    frontier_seed_limit=self.config.get("sitemap_frontier_seed_limit"),
+                )
                 self._write_crawl_state_file()
 
             browser_config = self._build_browser_config()
@@ -1099,10 +1235,27 @@ class Crawl4AICrawler(CrawlerStage):
             async with AsyncWebCrawler(config=browser_config) as crawler:
                 results = crawler.arun(url=self.start_url, config=run_config)
                 if asyncio.iscoroutine(results):
-                    results = await results
+                    crawl_task = asyncio.create_task(results)
+                    watchdog = asyncio.create_task(self._watch_crawl_health(crawl_task))
+                    try:
+                        results = await crawl_task
+                    except asyncio.CancelledError:
+                        if self._crawl_watchdog_error:
+                            raise RuntimeError(self._crawl_watchdog_error) from None
+                        raise
+                    finally:
+                        watchdog.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await watchdog
                 await self._consume_crawl_results(results)
 
             self._flush_runtime_state(force=True)
+
+            if bool(self.config.get("fail_on_empty_result", True)) and not self._has_crawl_output():
+                return StageResult.failure(
+                    "Crawler produced no pages, markdown, or downloaded documents. Check start_url, allowed_domains, robots/auth requirements, or remote blocking.",
+                    checkpoint={"runtime_state_file": str(self.runtime_state_file)},
+                )
 
             return StageResult.success(
                 outputs={
@@ -1196,7 +1349,12 @@ class Crawl4AICrawler(CrawlerStage):
                 {"url": url, "parent_url": None}
                 for url in crawl_state.get("to_visit", [])
             ]
-        self.crawl_state = crawl_state
+        normalized_crawl_state = _trim_crawl_state_to_budget(crawl_state, self.max_pages)
+        self.crawl_state = (
+            normalized_crawl_state
+            if _has_resumable_crawl_state(normalized_crawl_state)
+            else {}
+        )
 
         sitemap_state = load_json_safe(self.sitemap_state_file, {}) or {}
         self.discovered_sitemaps = {
@@ -1296,6 +1454,8 @@ class Crawl4AICrawler(CrawlerStage):
                 host = (urlparse(normalized_page).hostname or "").lower()
                 if not any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains):
                     continue
+                if not self._allow_frontier_url(normalized_page):
+                    continue
                 collected_urls.append(normalized_page)
                 if sitemap_limit and len(collected_urls) >= sitemap_limit:
                     break
@@ -1320,6 +1480,23 @@ class Crawl4AICrawler(CrawlerStage):
         }
         atomic_write_json(self.sitemap_state_file, self.discovered_sitemaps)
         return deduped
+
+    def _allow_frontier_url(self, url: str) -> bool:
+        parsed = urlparse(_normalize_http_url(url) or "")
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        if parsed.query:
+            if not self.allow_query_urls:
+                return False
+            if self.allowed_query_param_names:
+                names = {
+                    str(key).strip().lower()
+                    for key, _ in parse_qsl(parsed.query, keep_blank_values=True)
+                    if str(key).strip()
+                }
+                if not names.issubset(self.allowed_query_param_names):
+                    return False
+        return True
 
     def _build_browser_config(self) -> BrowserConfig:
         browser_kwargs = {
@@ -1353,6 +1530,10 @@ class Crawl4AICrawler(CrawlerStage):
         filter_chain = FilterChain(
             filters=[
                 AllowedDomainFilter(self.allowed_domains, self.excluded_subdomains),
+                SkipQueryFilter(
+                    allow_query_urls=self.allow_query_urls,
+                    allowed_query_param_names=self.allowed_query_param_names,
+                ),
                 SkipExtensionFilter(),
             ]
         )
@@ -1370,10 +1551,9 @@ class Crawl4AICrawler(CrawlerStage):
 
         run_kwargs = {
             "deep_crawl_strategy": deep_crawl,
-            # Stream results as they are discovered so long crawls produce
-            # incremental artifacts/checkpoints instead of buffering until the
-            # entire traversal completes.
-            "stream": True,
+            # crawl4ai 0.8.0 returns empty async result streams for some valid
+            # deep-crawl runs when stream=True. Default to the stable list mode.
+            "stream": bool(self.config.get("stream_results", False)),
             "page_timeout": int(self.timeout * 1000),
             "wait_until": self.config.get("wait_until", "domcontentloaded"),
             "wait_for": self.config.get("wait_for"),
@@ -1408,6 +1588,7 @@ class Crawl4AICrawler(CrawlerStage):
         page_url = _normalize_http_url(getattr(result, "url", None))
         if not page_url:
             return
+        self._last_result_seen_at = time.time()
 
         status_code = getattr(result, "status_code", None)
         html = getattr(result, "html", None) or ""
@@ -1505,6 +1686,32 @@ class Crawl4AICrawler(CrawlerStage):
             )
 
         self._flush_runtime_state()
+
+    async def _watch_crawl_health(self, crawl_task: "asyncio.Task[Any]") -> None:
+        while not crawl_task.done():
+            await asyncio.sleep(5)
+            if crawl_task.done():
+                return
+
+            pending = len((self.crawl_state or {}).get("pending", []))
+            visited = len((self.crawl_state or {}).get("visited", []))
+            idle_seconds = max(0.0, time.time() - float(self._last_crawl_state_update_at or time.time()))
+
+            if pending == 0 and visited > 0 and not self._has_crawl_output() and idle_seconds >= self.frontier_empty_timeout:
+                self._crawl_watchdog_error = (
+                    f"Crawler exhausted its frontier without producing output "
+                    f"(visited={visited}, pending=0, idle={int(idle_seconds)}s)."
+                )
+                crawl_task.cancel()
+                return
+
+            if visited > 0 and not self._has_crawl_output() and idle_seconds >= self.crawl_stall_timeout:
+                self._crawl_watchdog_error = (
+                    f"Crawler stalled without producing output "
+                    f"(visited={visited}, pending={pending}, idle={int(idle_seconds)}s)."
+                )
+                crawl_task.cancel()
+                return
 
     def _extract_markdown(self, result: Any) -> str:
         markdown = getattr(result, "markdown", None)
@@ -1756,7 +1963,19 @@ class Crawl4AICrawler(CrawlerStage):
         return None
 
     async def _on_crawl_state_change(self, state: Dict[str, Any]) -> None:
-        self.crawl_state = state
+        previous_visited = len((self.crawl_state or {}).get("visited", []))
+        previous_pending = len((self.crawl_state or {}).get("pending", []))
+        self.crawl_state = _trim_crawl_state_to_budget(state, self.max_pages)
+        self._last_crawl_state_update_at = time.time()
+        current_visited = len(self.crawl_state.get("visited", []))
+        current_pending = len(self.crawl_state.get("pending", []))
+        if current_visited != previous_visited or current_pending != previous_pending:
+            logger.debug(
+                "Normalized crawl state to budget: visited=%d pending=%d max_pages=%d",
+                current_visited,
+                current_pending,
+                self.max_pages,
+            )
         self._write_crawl_state_file()
         self._flush_runtime_state()
 

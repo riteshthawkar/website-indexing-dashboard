@@ -6,15 +6,11 @@ import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/com
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
+import { Textarea } from "@/components/ui/textarea";
+import { Badge } from "@/components/ui/badge";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { useCreateRun, useStartRun } from "@/lib/hooks/use-runs";
-import { fetchPipelineConfigs } from "@/lib/api";
+import { fetchConfig } from "@/lib/api";
 
 const RUN_TYPES = ["full", "incremental", "reindex"];
 
@@ -26,24 +22,42 @@ export function NewProjectForm() {
   const [name, setName] = useState("");
   const [runType, setRunType] = useState("full");
   const [startUrl, setStartUrl] = useState("");
-  const [configName, setConfigName] = useState("");
-  const [availableConfigs, setAvailableConfigs] = useState<{ name: string; project_name: string }[]>([]);
+  const [configName] = useState("default");
+  const [configText, setConfigText] = useState("");
+  const [configError, setConfigError] = useState<string | null>(null);
+  const [configLoaded, setConfigLoaded] = useState(false);
 
   useEffect(() => {
-    fetchPipelineConfigs()
-      .then((configs) => {
-        setAvailableConfigs(configs);
-        setConfigName((current) => current || configs[0]?.name || "");
+    fetchConfig("default")
+      .then((config) => {
+        setConfigText(JSON.stringify(config, null, 2));
+        setConfigLoaded(true);
       })
-      .catch(() => {});
+      .catch((error: Error) => {
+        setConfigError(error.message || "Could not load default config.");
+      });
   }, []);
 
   const handleCreate = async (andStart = false) => {
+    let configSnapshot: Record<string, unknown>;
+    try {
+      const parsed = JSON.parse(configText);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Configuration must be a JSON object.");
+      }
+      configSnapshot = parsed as Record<string, unknown>;
+    } catch (error) {
+      setConfigError(error instanceof Error ? error.message : "Configuration is not valid JSON.");
+      return;
+    }
+    setConfigError(null);
+
     const run = await createRun.mutateAsync({
       run_name: name,
       run_type: runType,
       start_url: startUrl || undefined,
       config_name: configName,
+      config_snapshot: configSnapshot,
     });
     if (andStart) {
       await startRun.mutateAsync(run.id);
@@ -58,7 +72,7 @@ export function NewProjectForm() {
       <CardHeader>
         <CardTitle>Create New Project</CardTitle>
         <CardDescription>
-          Configure the run once here, or use the equivalent terminal commands from the side panel.
+          Start from the single default pipeline template, adjust it for this run, then launch.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
@@ -89,37 +103,52 @@ export function NewProjectForm() {
             <Label htmlFor="url">Start URL (optional override)</Label>
             <Input
               id="url"
-              placeholder="https://example.com"
+              placeholder="https://mbzuai.ac.ae"
               value={startUrl}
               onChange={(e) => setStartUrl(e.target.value)}
             />
           </div>
           <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
-            <Label htmlFor="pipeline-config">Pipeline Configuration</Label>
-            <Select value={configName} onValueChange={(v) => v && setConfigName(v)}>
-              <SelectTrigger>
-                <SelectValue placeholder="Select a config..." />
-              </SelectTrigger>
-              <SelectContent>
-                {availableConfigs.map((c) => (
-                  <SelectItem key={c.name} value={c.name}>
-                    {c.project_name || c.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Label>Base Configuration</Label>
+            <div className="flex min-h-10 items-center rounded-xl border border-white/10 bg-black/30 px-3">
+              <Badge variant="secondary" className="rounded-md border-white/10 bg-white/8 px-3 py-1 text-xs uppercase tracking-[0.18em]">
+                {configName}
+              </Badge>
+            </div>
           </div>
         </div>
 
         <p className="text-sm text-muted-foreground">
-          Stages are defined by the pipeline configuration. All stages in the selected config will run in order.
+          The run stores its own config snapshot. Editing this JSON changes only the new run you are launching.
         </p>
 
+        <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
+          <div className="flex items-center justify-between gap-3">
+            <Label htmlFor="config-snapshot">Run Configuration Snapshot</Label>
+            <span className="text-xs text-muted-foreground">JSON, derived from `default.yaml`</span>
+          </div>
+          <Textarea
+            id="config-snapshot"
+            value={configText}
+            onChange={(e) => setConfigText(e.target.value)}
+            className="min-h-[28rem] resize-y bg-black/65 font-mono text-[12px] leading-6 text-cyan-100"
+            spellCheck={false}
+            disabled={!configLoaded && !configError}
+          />
+          {configError ? (
+            <p className="text-sm text-red-400">{configError}</p>
+          ) : (
+            <p className="text-xs text-muted-foreground">
+              Keep the base config in version control and use this snapshot to override crawl scope, stages, indexes, or retrieval settings for the run.
+            </p>
+          )}
+        </div>
+
         <div className="flex flex-col gap-3 sm:flex-row">
-          <Button className="sm:flex-1" onClick={() => handleCreate(false)} disabled={!name.trim() || !configName || loading}>
+          <Button className="sm:flex-1" onClick={() => handleCreate(false)} disabled={!name.trim() || !configLoaded || loading}>
             Create Run
           </Button>
-          <Button className="sm:flex-1" variant="secondary" onClick={() => handleCreate(true)} disabled={!name.trim() || !configName || loading}>
+          <Button className="sm:flex-1" variant="secondary" onClick={() => handleCreate(true)} disabled={!name.trim() || !configLoaded || loading}>
             Create & Start
           </Button>
         </div>

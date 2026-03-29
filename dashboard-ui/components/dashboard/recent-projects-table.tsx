@@ -24,10 +24,12 @@ export function RecentProjectsTable({ runs }: RecentProjectsTableProps) {
     <div className="overflow-x-auto">
       <Table>
         <TableHeader>
-          <TableRow>
-            <TableHead>Name</TableHead>
-            <TableHead>Status</TableHead>
-            <TableHead className="text-right">Docs</TableHead>
+            <TableRow>
+              <TableHead>Name</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Stage</TableHead>
+              <TableHead className="text-right">Progress</TableHead>
+              <TableHead className="text-right">Docs</TableHead>
             <TableHead className="text-right">Chunks</TableHead>
             <TableHead className="text-right">Media</TableHead>
             <TableHead className="text-right">Embeddings</TableHead>
@@ -46,8 +48,25 @@ export function RecentProjectsTable({ runs }: RecentProjectsTableProps) {
                 <span className="font-medium">{run.run_name}</span>
               </TableCell>
               <TableCell>
-                <StatusBadge status={run.status} pulse />
+                <div className="flex flex-col gap-1">
+                  <StatusBadge status={run.status} pulse />
+                  {run.process_state && run.process_state !== run.status && (
+                    <StatusBadge status={run.process_state} />
+                  )}
+                </div>
               </TableCell>
+              <TableCell className="min-w-[220px]">
+                <div className="space-y-2">
+                  <div className="truncate text-sm font-medium">{run.current_stage || run.last_completed_stage || "\u2014"}</div>
+                  <div className="h-2 overflow-hidden rounded-full border border-white/8 bg-black/25">
+                    <div
+                      className="h-full rounded-full bg-[linear-gradient(90deg,rgba(53,210,198,0.9),rgba(73,143,226,0.92))]"
+                      style={{ width: `${run.stage_summary?.progress_percent || 0}%` }}
+                    />
+                  </div>
+                </div>
+              </TableCell>
+              <TableCell className="text-right">{run.stage_summary?.progress_percent ?? 0}%</TableCell>
               <TableCell className="text-right">{run.docs_converted}</TableCell>
               <TableCell className="text-right">{run.chunks_created}</TableCell>
               <TableCell className="text-right">{run.media_items_extracted}</TableCell>

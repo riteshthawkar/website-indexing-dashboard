@@ -9,7 +9,7 @@ import { ScrollArea } from "@/components/ui/scroll-area";
 import { formatDuration } from "@/lib/utils";
 import { useStageLog } from "@/lib/hooks/use-runs";
 import { ChevronDown } from "lucide-react";
-import type { StageState } from "@/lib/types";
+import type { PipelineRun, StageState } from "@/lib/types";
 
 function formatValue(value: unknown): string {
   if (value === null || value === undefined || value === "") return "\u2014";
@@ -114,17 +114,23 @@ function StageItem({ stage, index, runId }: { stage: StageState; index: number; 
   );
 }
 
-export function StagesTab({ stages, runId }: { stages: StageState[]; runId: number }) {
-  const total = stages?.length || 0;
-  const completed = (stages || []).filter((stage) => stage.status === "completed" || stage.status === "skipped").length;
-  const running = (stages || []).filter((stage) => stage.status === "running").length;
-  const failed = (stages || []).filter((stage) => stage.status === "failed").length;
-  const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
+export function StagesTab({ run }: { run: PipelineRun }) {
+  const stages = run.stages || [];
+  const total = run.stage_summary?.total ?? stages.length;
+  const completed = run.stage_summary?.completed ?? stages.filter((stage) => stage.status === "completed" || stage.status === "skipped").length;
+  const running = run.stage_summary?.running ?? stages.filter((stage) => stage.status === "running").length;
+  const failed = run.stage_summary?.failed ?? stages.filter((stage) => stage.status === "failed").length;
+  const progress = run.stage_summary?.progress_percent ?? (total > 0 ? Math.round((completed / total) * 100) : 0);
 
   return (
     <Card className="rounded-[1.9rem] border border-white/8 bg-card/80 shadow-[0_28px_72px_-40px_rgba(0,0,0,0.85)] backdrop-blur-xl">
       <CardHeader className="space-y-4">
         <CardTitle>Pipeline Stages</CardTitle>
+        <div className="flex flex-wrap items-center gap-2">
+          <StatusBadge status={run.status} pulse />
+          {run.process_state && run.process_state !== run.status && <StatusBadge status={run.process_state} pulse />}
+          {run.current_stage && <Badge variant="outline">current: {run.current_stage}</Badge>}
+        </div>
         <div className="grid gap-3 md:grid-cols-4">
           <div className="rounded-2xl border border-white/8 bg-black/15 px-4 py-3">
             <div className="text-[11px] uppercase tracking-[0.24em] text-muted-foreground/80">Total</div>
@@ -161,7 +167,7 @@ export function StagesTab({ stages, runId }: { stages: StageState[]; runId: numb
           <p className="text-sm text-muted-foreground">No stages recorded.</p>
         ) : (
           stages.map((stage, index) => (
-            <StageItem key={`${stage.stage_type}-${stage.name}`} stage={stage} index={index} runId={runId} />
+            <StageItem key={`${stage.stage_type}-${stage.name}`} stage={stage} index={index} runId={run.id} />
           ))
         )}
       </CardContent>

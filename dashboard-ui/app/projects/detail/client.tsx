@@ -35,6 +35,20 @@ const DETAIL_TABS = [
   "config",
 ] as const;
 
+const DETAIL_TAB_LABELS: Record<(typeof DETAIL_TABS)[number], string> = {
+  overview: "Overview",
+  urls: "URLs",
+  media: "Media",
+  stages: "Stages",
+  retrieval: "Retrieval",
+  evaluation: "Evaluation",
+  knowledge: "Knowledge",
+  artifacts: "Artifacts",
+  operations: "Operations",
+  live: "Logs",
+  config: "Config",
+};
+
 export function ProjectDetailClient() {
   const searchParams = useSearchParams();
   const id = searchParams.get("id");
@@ -91,10 +105,14 @@ export function ProjectDetailClient() {
         description={run.start_url || undefined}
         actions={
           <div className="flex items-center gap-2">
-            <StatusBadge status={run.status} pulse />
+            <StatusBadge status={run.status} pulse size="lg" />
+            {run.process_state && run.process_state !== run.status && (
+              <StatusBadge status={run.process_state} pulse size="lg" />
+            )}
             {canStart && (
               <Button
-                size="sm"
+                size="lg"
+                className="shadow-[0_18px_38px_-24px_rgba(0,0,0,0.85)]"
                 onClick={async () => {
                   await startMutation.mutateAsync(run.id);
                   setTab("live");
@@ -107,8 +125,9 @@ export function ProjectDetailClient() {
             )}
             {isRunning && (
               <Button
-                size="sm"
+                size="lg"
                 variant="destructive"
+                className="shadow-[0_18px_38px_-24px_rgba(0,0,0,0.85)]"
                 onClick={() => cancelMutation.mutate(run.id)}
                 disabled={cancelMutation.isPending}
               >
@@ -116,7 +135,12 @@ export function ProjectDetailClient() {
                 Cancel
               </Button>
             )}
-            <Button variant="outline" size="sm" onClick={() => router.push("/projects")}>
+            <Button
+              variant="outline"
+              size="lg"
+              className="border-white/12 bg-white/4 shadow-[0_18px_38px_-24px_rgba(0,0,0,0.85)]"
+              onClick={() => router.push("/projects")}
+            >
               <ArrowLeft className="mr-2 h-4 w-4" />
               Back
             </Button>
@@ -127,19 +151,19 @@ export function ProjectDetailClient() {
         <div className="space-y-8">
           <ProcessStatusStrip run={run} />
           <Tabs value={activeTab} onValueChange={setTab} className="space-y-6">
-            <TabsList className="mx-auto h-auto w-full max-w-7xl flex-wrap justify-center gap-3 rounded-[2rem] border border-white/8 bg-card/85 px-4 py-4 shadow-[0_24px_60px_-34px_rgba(0,0,0,0.9)] backdrop-blur-xl">
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="overview">Overview</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="urls">URLs</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="media">Media</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="stages">Stages</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="retrieval">Retrieval</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="evaluation">Evaluation</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="knowledge">Knowledge</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="artifacts">Artifacts</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="operations">Operations</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="live">Logs</TabsTrigger>
-              <TabsTrigger className="min-w-[8.5rem] rounded-2xl px-6 py-3.5 text-sm data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)]" value="config">Config</TabsTrigger>
-            </TabsList>
+            <div className="mx-auto w-full max-w-7xl overflow-x-auto px-1 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden">
+              <TabsList className="mx-auto flex min-w-max flex-nowrap justify-start gap-3 rounded-[2rem] border border-white/8 bg-card/85 px-3 py-3 shadow-[0_24px_60px_-34px_rgba(0,0,0,0.9)] backdrop-blur-xl sm:min-w-0 sm:flex-wrap sm:justify-center sm:px-4 sm:py-4">
+                {DETAIL_TABS.map((tab) => (
+                  <TabsTrigger
+                    key={tab}
+                    value={tab}
+                    className="min-h-12 min-w-[9.5rem] flex-none rounded-2xl px-6 py-3 text-sm font-medium text-center data-[state=active]:shadow-[0_16px_36px_-22px_rgba(0,0,0,0.8)] sm:min-w-[10.25rem] sm:px-7"
+                  >
+                    {DETAIL_TAB_LABELS[tab]}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </div>
           <TabsContent value="overview" className="mt-4">
             <OverviewTab run={run} />
           </TabsContent>
@@ -150,7 +174,7 @@ export function ProjectDetailClient() {
             <MediaTab runId={run.id} />
           </TabsContent>
           <TabsContent value="stages" className="mt-4">
-            <StagesTab stages={run.stages || []} runId={run.id} />
+            <StagesTab run={run} />
           </TabsContent>
           <TabsContent value="retrieval" className="mt-4">
             <RetrievalTab run={run} />
