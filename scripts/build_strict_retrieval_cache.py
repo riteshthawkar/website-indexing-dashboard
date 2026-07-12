@@ -98,7 +98,7 @@ def main() -> int:
     examples = load_eval_examples(args.dataset)
     config_payload = dict(load_config(args.config) or {})
     embed_cfg = dict(config_payload.get("embedder") or {})
-    cache_model = str(embed_cfg.get("model") or "gemini-embedding-2-preview")
+    cache_model = str(embed_cfg.get("model") or "gemini-embedding-2")
     cache_output_dimensionality = embed_cfg.get("output_dimensionality")
 
     cache_path = Path(args.retrieval_cache).resolve()

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 from urllib.parse import urlparse
 
+from pipeline.core.artifact_contracts import ArtifactContract, resolve_artifact_path
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.google_genai import import_genai, import_genai_types
 from pipeline.core.io import atomic_write_json, load_json_safe
@@ -94,9 +95,9 @@ HIGH_SIGNAL_HEADING_TERMS = (
 
 
 def _make_gemini_client():
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is required for semantic graph extraction")
+        raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required for semantic graph extraction")
     genai = import_genai()
     return genai.Client(api_key=api_key)
 
@@ -155,8 +156,9 @@ def _json_schema(*, allowed_entity_types: Sequence[str], allowed_relation_types:
 def _build_prompt(batch: Sequence[Dict[str, Any]], *, allowed_entity_types: Sequence[str], allowed_relation_types: Sequence[str]) -> str:
     entity_types = ", ".join(allowed_entity_types)
     relation_types = ", ".join(allowed_relation_types)
-    payload = [
-        {
+    payload = []
+    for item in batch:
+        obj = {
             "source_id": item["source_id"],
             "source_kind": item["source_kind"],
             "heading": item.get("heading", ""),
@@ -164,8 +166,13 @@ def _build_prompt(batch: Sequence[Dict[str, Any]], *, allowed_entity_types: Sequ
             "section_path": item.get("section_path", []),
             "text": item.get("text", ""),
         }
-        for item in batch
-    ]
+        if item.get("gliner_entities"):
+            obj["pre_extracted_entities"] = [
+                {"name": e["name"], "type": e["entity_type"]}
+                for e in item["gliner_entities"]
+            ]
+        payload.append(obj)
+
     return (
         "Extract high-confidence entities and relations from the supplied document evidence.\n"
         "Only extract what is explicitly supported by the text.\n"
@@ -174,6 +181,7 @@ def _build_prompt(batch: Sequence[Dict[str, Any]], *, allowed_entity_types: Sequ
         f"{entity_types}.\n"
         "Use only these relation types when possible: "
         f"{relation_types}.\n"
+        "Some items have 'pre_extracted_entities' (from zero-shot models). Use them as hints, verify them, and extract complex relations between them and any other entities you find.\n"
         "If no supported entities or relations exist for an item, return empty arrays for that item.\n"
         "Keep confidence between 0 and 1.\n\n"
         f"INPUT:\n{json.dumps(payload, ensure_ascii=False)}"
@@ -605,11 +613,16 @@ class SemanticGraphExtractFormatter(FormatterStage):
     description = "Extracts candidate semantic entities and relations from retrieval evidence using Gemini."
 
     async def execute(self, ctx: StageContext) -> StageResult:
-        retrieval_bundle_file = ctx.previous_outputs.get("retrieval_bundle_file")
-        if not retrieval_bundle_file:
-            bundle_artifacts = ctx.find_artifacts(artifact_type="retrieval_bundle")
-            if bundle_artifacts and bundle_artifacts[-1].local_path:
-                retrieval_bundle_file = bundle_artifacts[-1].local_path
+        retrieval_bundle = resolve_artifact_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="retrieval_bundle",
+                role="retrieval_corpus",
+                legacy_output_key="retrieval_bundle_file",
+                label="retrieval bundle",
+            ),
+        )
+        retrieval_bundle_file = retrieval_bundle.path if retrieval_bundle else ""
         if not retrieval_bundle_file:
             return StageResult.failure("No retrieval_bundle available for semantic graph extraction")
 
@@ -688,6 +701,19 @@ class SemanticGraphExtractFormatter(FormatterStage):
                         "source_url": record.get("source_url", ""),
                     }
                 )
+        gliner_entities_file = ctx.previous_outputs.get("gliner_entities_file")
+        if not gliner_entities_file:
+            gliner_artifacts = ctx.find_artifacts(artifact_type="gliner_entities")
+            if gliner_artifacts and gliner_artifacts[-1].local_path:
+                gliner_entities_file = gliner_artifacts[-1].local_path
+
+        gliner_entities = {}
+        if gliner_entities_file:
+            gliner_entities = load_json_safe(gliner_entities_file, {}) or {}
+
+        for item in items:
+            item["gliner_entities"] = gliner_entities.get(item["source_id"]) or []
+
 
         source_lookup = {item["source_id"]: item for item in items if item.get("source_id")}
         ordered_items = _select_items_for_extraction(
@@ -769,12 +795,22 @@ class SemanticGraphExtractFormatter(FormatterStage):
         candidate_entities: List[Dict[str, Any]] = []
         candidate_relations: List[Dict[str, Any]] = []
         extraction_records: List[Dict[str, Any]] = []
+
+        seen_entity_ids = set()
         for item in ordered_items:
             extracted = cache_payload.get(item["cache_key"]) or {"source_id": item["source_id"], "entities": [], "relations": []}
             extraction_records.append(extracted)
+
+            for entity in item.get("gliner_entities") or []:
+                if entity["id"] not in seen_entity_ids:
+                    seen_entity_ids.add(entity["id"])
+                    candidate_entities.append(entity)
+
             for entity in extracted.get("entities") or []:
                 if coerce_confidence(entity.get("confidence"), default=0.0) >= min_confidence:
-                    candidate_entities.append(entity)
+                    if entity["id"] not in seen_entity_ids:
+                        seen_entity_ids.add(entity["id"])
+                        candidate_entities.append(entity)
             for relation in extracted.get("relations") or []:
                 if coerce_confidence(relation.get("confidence"), default=0.0) >= min_confidence:
                     candidate_relations.append(relation)

@@ -1,18 +1,22 @@
 # Retriever System
 
-This document is the current handoff for the MBZUAI retrieval system. It describes the production retrieval path, the exact Pinecone indexes and Neo4j graph to use, the indexing pipeline that produced them, and how another agent should query the system.
+This document is the current handoff for the MBZUAI retrieval system. It describes the canonical production retrieval contract and promoted local graph, plus a clearly labeled historical Neo4j snapshot retained for reference.
 
-This document is intentionally specific to the validated OpenAI assertion-first run:
+The canonical production contract is:
+
+- indexing and retrieval config: `pipeline/configs/mbzuai_production.yaml`
+
+This document also records the latest validated OpenAI assertion-first run:
 
 - run: `runs/mbzuai_main_processing/mbzuai_openai_full_20260325`
-- retrieval config: `mbzuai_main_openai_routed_retrieval`
-- benchmark report: `/tmp/mbzuai_openai_retrieval_report_v4_final4.json`
+- historical retrieval config: `mbzuai_main_openai_routed_retrieval`
+- benchmark report: historical external artifact `mbzuai_openai_retrieval_report_v4_final4.json` (not committed)
 
 ## 1. Current Production System
 
 The current production-facing retriever is:
 
-- config: `pipeline/configs/mbzuai_main_openai_routed_retrieval.yaml`
+- config: `pipeline/configs/mbzuai_production.yaml`
 - backend: `routed_hybrid`
 
 Behavior:
@@ -32,18 +36,33 @@ The routed backend is the only backend another agent should use by default.
 
 Dense index:
 
-- `mbzuai-gemini-retrieval-v2`
+- `mbzuai-gemini-retrieval-v3`
 
 Sparse sidecar index:
 
-- `mbzuai-gemini-retrieval-v2-sparse`
+- `mbzuai-gemini-retrieval-v3-sparse`
 
-Namespaces in both indexes:
+Production resolves these nine namespace bases from the promoted upload manifest:
+
+- `mbzuai_main-chunks`
+- `mbzuai_main-parents`
+- `mbzuai_main-media`
+- `mbzuai_main-facts`
+- `mbzuai_main-evidence-spans`
+- `mbzuai_main-summaries`
+- `mbzuai_main-assertions`
+- `mbzuai_main-entities`
+- `mbzuai_main-communities`
+
+Every resolved namespace appends `--<release_id>`. Both dense and sparse reads must use the exact names in `index_upload_manifest.json`; static namespace names are not the production contract.
+
+The validated historical snapshot used these static namespaces:
 
 - `chunks`
 - `parents`
 - `media`
 - `facts`
+- `summaries`
 - `assertions`
 
 Counts in the validated OpenAI run:
@@ -64,9 +83,9 @@ Sparse counts:
 
 Source artifact:
 
-- [index_upload_manifest.json](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/runs/mbzuai_main_processing/mbzuai_openai_full_20260325/stage_outputs/upload_retrieval/index_upload_manifest.json)
+- `stage_outputs/upload_retrieval/index_upload_manifest.json` within the historical run work directory
 
-### Neo4j
+### Neo4j historical snapshot (optional connector)
 
 Neo4j endpoint:
 
@@ -116,7 +135,7 @@ Allowed edge types:
 
 Source artifact:
 
-- [neo4j_upload_manifest.json](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/runs/mbzuai_main_processing/mbzuai_openai_full_20260325/stage_outputs/upload_graph/neo4j_upload_manifest.json)
+- `stage_outputs/upload_graph/neo4j_upload_manifest.json` within the historical run work directory
 
 Important rule for any direct Neo4j querying:
 
@@ -138,7 +157,7 @@ Responsibilities:
 
 - dense Pinecone retrieval
 - sparse Pinecone retrieval
-- namespace fusion across `chunks`, `parents`, `media`, `facts`, `assertions`
+- namespace fusion across manifest-resolved `chunks`, `parents`, `media`, `facts`, `evidence_spans`, `summaries`, `assertions`, `entities`, and `communities`
 - local bundle-backed retrieval support
 - reranking
 - assertion-first factual retrieval
@@ -184,6 +203,8 @@ Responsibilities:
 - bounded query rewriting
 - parallel vector plus graph augmentation
 - routing telemetry
+- retrieval confidence and bounded evidence packs
+- optional summary-lane retrieval for broad synthesis queries
 - fallback behavior if graph initialization or graph lookup fails
 
 This is the backend another agent should use.
@@ -198,9 +219,11 @@ The post-index graph config is:
 
 - `pipeline/configs/mbzuai_main_openai_postindex_graph.yaml`
 
-The routed retrieval config is:
+The canonical routed retrieval config is:
 
-- `pipeline/configs/mbzuai_main_openai_routed_retrieval.yaml`
+- `pipeline/configs/mbzuai_production.yaml`
+
+New production runs use release-scoped names such as `mbzuai_main-chunks--<release_id>` and record every resolved name in `index_upload_manifest.json`. Runtime retrieval must use the manifest; it must not reconstruct or hard-code a namespace.
 
 ### Stage order
 
@@ -247,15 +270,15 @@ This is why factual retrieval is now based on typed evidence instead of only raw
 
 Used during indexing and query planning:
 
-- assertion extraction: `gpt-5-mini`
-- assertion validation: `gpt-5-nano`
-- query planner: `gpt-5-nano`
+- assertion extraction: `gpt-5-mini-2025-08-07`
+- assertion validation: `gpt-5-nano-2025-08-07`
+- query planner: `gpt-5-nano-2025-08-07`
 
 ### Embedding and retrieval models
 
 Used for Pinecone vector and sparse retrieval:
 
-- dense embedding model: `gemini-embedding-2-preview`
+- dense embedding model: `gemini-embedding-2`
 - dense output dimensionality: `1536`
 - sparse model: `pinecone-sparse-english-v0`
 - reranker: `pinecone-rerank-v0`
@@ -274,7 +297,7 @@ The routed retriever uses a planner before retrieval.
 Current routed settings:
 
 - `query_planner_enabled: true`
-- `query_planner_model: "gpt-5-nano"`
+- `query_planner_model: "gpt-5-nano-2025-08-07"`
 - `parallel_graph_enabled: true`
 - `parallel_query_rewriting_enabled: true`
 - `parallel_graph_augment_all_queries: true`
@@ -377,7 +400,7 @@ Use the routed retriever through the project API:
 from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
 
 retriever = AdaptiveHybridRetriever.from_config(
-    config_name="mbzuai_main_openai_routed_retrieval",
+    config_name="mbzuai_production",
     work_dir="runs/mbzuai_main_processing/mbzuai_openai_full_20260325",
 )
 
@@ -393,7 +416,7 @@ else:
 
 ```bash
 ./env/bin/python -m pipeline retrieve \
-  --config mbzuai_main_openai_routed_retrieval \
+  --config mbzuai_production \
   --work-dir runs/mbzuai_main_processing/mbzuai_openai_full_20260325 \
   --query "Who is the president of MBZUAI?" \
   --json
@@ -407,7 +430,7 @@ Start:
 
 ```bash
 ./env/bin/python -m pipeline serve-retriever \
-  --config mbzuai_main_openai_routed_retrieval \
+  --config mbzuai_production \
   --work-dir runs/mbzuai_main_processing/mbzuai_openai_full_20260325 \
   --host 127.0.0.1 \
   --port 8060
@@ -443,24 +466,23 @@ Additional service fields in the response:
 
 ## 9. Environment Variables
 
-The current routed production stack needs:
+The private production retriever needs:
 
 - `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY`
 - `PINECONE_API_KEY`
-- `NEO4J_URI`
-- `NEO4J_USERNAME`
-- `NEO4J_PASSWORD`
-- `NEO4J_DATABASE`
+- `RETRIEVAL_SERVICE_TOKEN` (the same dedicated 32+ character secret configured on the backend)
 
 Why:
 
-- OpenAI is used for assertion extraction and query planning
-- Gemini is still used for dense embeddings
+- OpenAI is used during indexing and for runtime query planning/adjudication
+- Gemini is used for dense embeddings
 - Pinecone is the vector store
-- Neo4j is the online graph store
+- the retrieval-service token authenticates backend-to-retriever requests and attestation
 
-If another agent queries Neo4j directly, it should also use:
+Do not place `PINECONE_API_KEY` or Google/Gemini credentials on the public backend component when it runs with `RETRIEVAL_SERVICE_MODE=required`. The backend has its own answer-generation and application secrets; only `OPENAI_API_KEY` and `RETRIEVAL_SERVICE_TOKEN` are shared with the private retriever.
+
+The canonical graph store is the promoted local JSON artifact. Neo4j credentials are optional and belong only on the retriever/indexing component when `graph.store_backend: neo4j` is intentionally enabled. A direct query of the documented historical Neo4j snapshot must also use:
 
 - `NEO4J_NAMESPACE=mbzuai_main_processing:mbzuai_openai_full_20260325`
 
@@ -479,7 +501,7 @@ Run state:
 
 Final strict retrieval benchmark:
 
-- [mbzuai_openai_retrieval_report_v4_final4.json](/tmp/mbzuai_openai_retrieval_report_v4_final4.json)
+- historical external artifact `mbzuai_openai_retrieval_report_v4_final4.json` (not committed)
 
 Final strict metrics:
 
@@ -557,8 +579,8 @@ Configs:
 
 - `pipeline/configs/mbzuai_main_openai_assertion_indexing.yaml`
 - `pipeline/configs/mbzuai_main_openai_postindex_graph.yaml`
-- `pipeline/configs/mbzuai_main_openai_routed_retrieval.yaml`
-- `pipeline/configs/default.yaml`
+- `pipeline/configs/mbzuai_production.yaml`
+- `pipeline/configs/default.yaml` (shared inherited defaults)
 
 Evaluation:
 
@@ -570,15 +592,13 @@ Evaluation:
 
 If another agent only needs the operational instructions, use this:
 
-1. Use config `mbzuai_main_openai_routed_retrieval`.
-2. Use work dir `runs/mbzuai_main_processing/mbzuai_openai_full_20260325`.
+1. Use config `mbzuai_production`.
+2. Resolve the current work directory from the protected `active_release.json` pointer. `runs/mbzuai_main_processing/mbzuai_openai_full_20260325` is historical evidence only.
 3. Query Pinecone indexes:
-   - `mbzuai-gemini-retrieval-v2`
-   - `mbzuai-gemini-retrieval-v2-sparse`
-4. Use namespaces:
-   - `chunks`, `parents`, `media`, `facts`, `assertions`
-5. Query Neo4j only within namespace:
-   - `mbzuai_main_processing:mbzuai_openai_full_20260325`
+   - `mbzuai-gemini-retrieval-v3`
+   - `mbzuai-gemini-retrieval-v3-sparse`
+4. Resolve all nine dense and sparse namespaces from the promoted release's `index_upload_manifest.json`; each current namespace appends `--<release_id>` to its `mbzuai_main-*` base.
+5. Use the promoted local graph artifact. Neo4j is optional; if querying the documented historical connector, filter every node and edge to `mbzuai_main_processing:mbzuai_openai_full_20260325`.
 6. Use `retrieval_documents` as the evidence payload.
 7. Respect `abstained`.
 8. Use the long-lived retrieval service in production instead of CLI-per-request.

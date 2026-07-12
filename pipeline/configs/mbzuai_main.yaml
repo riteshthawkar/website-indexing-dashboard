@@ -8,10 +8,38 @@ project_name: "mbzuai_main"
 crawler:
   start_url: "https://mbzuai.ac.ae"
   max_pages: 5000
+  fetch_concurrency: 4
+  download_concurrency: 8
+  sitemap_crawl_batch_size: 30
+  validate_source_html_mode: "always"
+  recoverable_skip_max_retries: 2
+  excluded_path_prefixes:
+    - "/tag/"
+    - "/ar/tag/"
   allowed_domains:
     - "mbzuai.ac.ae"
   excluded_subdomains:
     - "library.mbzuai.ac.ae"
 
 embedder:
-  pinecone_index: "final-mbzuai-summary-text-index"
+  # Candidate runs must never clear or mutate the active release namespaces.
+  # The upload manifest records the resolved names and the retriever consumes
+  # that manifest after promotion.
+  namespace_strategy: "release"
+  namespace_release_template: "{base}--{release_id}"
+  model: "gemini-embedding-2"
+  output_dimensionality: 1536
+  pinecone_index: "mbzuai-gemini-retrieval-v3"
+  pinecone_sparse_index: "mbzuai-gemini-retrieval-v3-sparse"
+  namespace: ""
+  namespace_chunks: "mbzuai_main-chunks"
+  namespace_parents: "mbzuai_main-parents"
+  namespace_media: "mbzuai_main-media"
+  namespace_facts: "mbzuai_main-facts"
+  namespace_evidence_spans: "mbzuai_main-evidence-spans"
+  namespace_summaries: "mbzuai_main-summaries"
+  namespace_assertions: "mbzuai_main-assertions"
+  namespace_entities: "mbzuai_main-entities"
+  namespace_communities: "mbzuai_main-communities"
+  enable_dense_evidence_spans: true
+  enable_sparse_evidence_spans: true

@@ -306,6 +306,31 @@ def _window_around(text: str, match: re.Match[str], *, width: int = 64) -> str:
     return _clean_text(text[start:end])
 
 
+def _support_contact_window(text: str, match: re.Match[str], *, default_width: int = 64) -> str:
+    window = _window_around(text, match, width=default_width)
+    expanded = _window_around(text, match, width=220)
+    expanded_lower = expanded.lower()
+    if (
+        any(marker in expanded_lower for marker in ("working hours", "technical support", "it team", "support"))
+        and "8:00" in expanded_lower
+        and ("12:30" in expanded_lower or "friday" in expanded_lower)
+    ):
+        fragments = _sentence_fragments(expanded)
+        for index, fragment in enumerate(fragments):
+            fragment_lower = fragment.lower()
+            if match.group(0).lower() in fragment_lower and (
+                "working hours" in fragment_lower or "technical support" in fragment_lower or "it team" in fragment_lower
+            ):
+                if "12:30" not in fragment_lower and index + 1 < len(fragments):
+                    next_fragment = fragments[index + 1]
+                    next_lower = next_fragment.lower()
+                    if "working hours" in next_lower and ("12:30" in next_lower or "friday" in next_lower):
+                        return _clean_text(f"{fragment} {next_fragment}")
+                return fragment
+        return expanded
+    return window
+
+
 def _extract_qualifiers(*values: str) -> List[str]:
     qualifiers = set()
     for value in values:
@@ -722,7 +747,7 @@ def _extract_contact_records(source: Dict[str, Any], *, source_kind: str, text: 
     )
     for regex, answer_type in ((_EMAIL_RE, "email"), (_PHONE_RE, "phone"), (_URL_RE, "website"), (_DOMAIN_RE, "website")):
         for match in regex.finditer(text):
-            window = _window_around(text, match)
+            window = _support_contact_window(text, match) if answer_type == "email" else _window_around(text, match)
             lower_window = window.lower()
             confidence = 0.60
             if any(token in lower_window for token in ("contact", "email", "phone", "website", "directory", "reach", "mail")):

@@ -38,6 +38,378 @@ def tmp_dir():
     shutil.rmtree(d, ignore_errors=True)
 
 
+def test_preflight_local_json_graph_does_not_require_neo4j(monkeypatch):
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    monkeypatch.delenv("NEO4J_URI", raising=False)
+    monkeypatch.delenv("NEO4J_USERNAME", raising=False)
+    monkeypatch.delenv("NEO4J_PASSWORD", raising=False)
+
+    stage_plugins = {
+        "crawl_web": "crawl4ai",
+        "prepare_mbzuai_index": "mbzuai_index_readiness",
+        "score_raw_content": "quality_scorer",
+        "clean_html": "trafilatura",
+        "convert_documents": "docling",
+        "convert_html": "markitdown",
+        "deduplicate_markdown": "dedup_filter",
+        "chunk_content": "hybrid",
+        "format_assertion_slices": "extraction_slices",
+        "extract_assertions_openai": "openai_assertion_extract",
+        "validate_assertions_openai": "openai_assertion_validate",
+        "canonicalize_assertions": "assertion_canonicalize",
+        "promote_assertions": "assertion_promote",
+        "format_retrieval": "retrieval_bundle_v2",
+        "format_graph": "knowledge_graph",
+        "promote_graph": "semantic_graph_promote",
+        "community_graph": "semantic_graph_community",
+        "summarize_community_graph": "semantic_graph_summarize",
+        "upload_retrieval": "gemini_pinecone",
+    }
+    config = {
+        "pipeline": {
+            "audit_on_stage_complete": True,
+            "audit_on_run_complete": True,
+            "fail_on_audit_error": True,
+        },
+        "stages": [{"id": stage_id, "plugin": plugin} for stage_id, plugin in stage_plugins.items()],
+        "embedder": {
+            "namespace_strategy": "release",
+            "pinecone_index": "dense",
+            "pinecone_sparse_index": "sparse",
+            "namespace_chunks": "chunks",
+            "namespace_parents": "parents",
+            "namespace_media": "media",
+            "namespace_facts": "facts",
+            "namespace_assertions": "assertions",
+            "verify_index_after_upload": True,
+            "enable_sparse": True,
+        },
+        "graph": {
+            "store_backend": "local_json",
+            "extraction_fail_open_after_retries": False,
+        },
+    }
+
+    report = assess_production_readiness(config, config_name="local-json", validation_errors={})
+
+    assert report["ok"] is True
+    names = {check["name"]: check for check in report["checks"]}
+    assert names["graph_store"]["status"] == "ok"
+    assert "neo4j_credentials" not in names
+
+
+def test_preflight_rejects_release_template_without_identity(monkeypatch):
+    from pipeline.core.config import load_config
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    config = load_config("default")
+    config["embedder"]["namespace_release_template"] = "{base}"
+
+    report = assess_production_readiness(config, config_name="default", validation_errors={})
+
+    check = next(item for item in report["checks"] if item["name"] == "pinecone_release_isolation")
+    assert check["status"] == "error"
+    assert "release_id" in check["details"]["error"]
+
+
+def test_cli_runs_required_preflight_without_upload_graph(monkeypatch):
+    from pipeline import cli
+
+    called = {"preflight": 0, "run": 0}
+
+    class FakeOrchestrator:
+        def __init__(self, config, run_id=None):
+            self.config = config
+
+        async def validate(self):
+            return {}
+
+        async def run(self, **kwargs):
+            called["run"] += 1
+            raise AssertionError("blocked run must not execute")
+
+    config = {
+        "pipeline": {"require_production_preflight": True},
+        "stages": [{"id": "upload_retrieval", "plugin": "gemini_pinecone"}],
+    }
+    monkeypatch.setattr(cli, "load_config", lambda name: config)
+    monkeypatch.setattr(cli, "PipelineOrchestrator", FakeOrchestrator)
+
+    def fake_preflight(*args, **kwargs):
+        called["preflight"] += 1
+        return {
+            "ok": False,
+            "error_count": 1,
+            "warning_count": 0,
+            "checks": [{"name": "contract", "status": "error", "message": "blocked"}],
+        }
+
+    monkeypatch.setattr(cli, "assess_production_readiness", fake_preflight)
+    args = SimpleNamespace(
+        config="default",
+        run_id="candidate",
+        resume=False,
+        restart_from_stage=None,
+        preflight=False,
+        skip_preflight=False,
+    )
+
+    assert cli.cmd_run(args) == 1
+    assert called == {"preflight": 1, "run": 0}
+
+    args.skip_preflight = True
+    assert cli.cmd_run(args) == 1
+    assert called == {"preflight": 1, "run": 0}
+
+
+def test_canonical_production_name_cannot_use_downgraded_effective_config(monkeypatch):
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    config = {
+        "pipeline": {
+            "audit_on_stage_complete": True,
+            "audit_on_run_complete": True,
+            "fail_on_audit_error": True,
+        },
+        "stages": [],
+        "retrieval": {"retriever_backend": "adaptive_hybrid"},
+    }
+
+    report = assess_production_readiness(config, config_name="mbzuai_production")
+
+    contract = next(check for check in report["checks"] if check["name"] == "canonical_production_contract")
+    assert contract["status"] == "error"
+    assert "pipeline.production_profile must be true" in contract["details"]["errors"]
+
+
+def test_preflight_neo4j_backend_requires_upload_stage_and_credentials(monkeypatch):
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    monkeypatch.delenv("NEO4J_URI", raising=False)
+    monkeypatch.delenv("NEO4J_USERNAME", raising=False)
+    monkeypatch.delenv("NEO4J_PASSWORD", raising=False)
+
+    stage_plugins = {
+        "crawl_web": "crawl4ai",
+        "prepare_mbzuai_index": "mbzuai_index_readiness",
+        "score_raw_content": "quality_scorer",
+        "clean_html": "trafilatura",
+        "convert_documents": "docling",
+        "convert_html": "markitdown",
+        "deduplicate_markdown": "dedup_filter",
+        "chunk_content": "hybrid",
+        "format_assertion_slices": "extraction_slices",
+        "extract_assertions_openai": "openai_assertion_extract",
+        "validate_assertions_openai": "openai_assertion_validate",
+        "canonicalize_assertions": "assertion_canonicalize",
+        "promote_assertions": "assertion_promote",
+        "format_retrieval": "retrieval_bundle_v2",
+        "format_graph": "knowledge_graph",
+        "promote_graph": "semantic_graph_promote",
+        "community_graph": "semantic_graph_community",
+        "summarize_community_graph": "semantic_graph_summarize",
+        "upload_retrieval": "gemini_pinecone",
+    }
+    config = {
+        "pipeline": {
+            "audit_on_stage_complete": True,
+            "audit_on_run_complete": True,
+            "fail_on_audit_error": True,
+        },
+        "stages": [{"id": stage_id, "plugin": plugin} for stage_id, plugin in stage_plugins.items()],
+        "embedder": {
+            "namespace_strategy": "release",
+            "pinecone_index": "dense",
+            "pinecone_sparse_index": "sparse",
+            "namespace_chunks": "chunks",
+            "namespace_parents": "parents",
+            "namespace_media": "media",
+            "namespace_facts": "facts",
+            "namespace_assertions": "assertions",
+            "verify_index_after_upload": True,
+        },
+        "graph": {
+            "store_backend": "neo4j",
+            "neo4j_verify_after_upload": True,
+            "extraction_fail_open_after_retries": False,
+        },
+    }
+
+    report = assess_production_readiness(config, config_name="neo4j", validation_errors={})
+    messages = [check["message"] for check in report["checks"] if check["status"] == "error"]
+
+    assert report["ok"] is False
+    assert any("Production assertion-first stages are missing" in message for message in messages)
+    assert any("Neo4j credentials are required" in message for message in messages)
+
+
+def test_preflight_accepts_v5_semantic_graph_release_order(monkeypatch):
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    stages = [
+        ("crawl_web", "crawl4ai"),
+        ("prepare_mbzuai_index", "mbzuai_index_readiness"),
+        ("score_raw_content", "quality_scorer"),
+        ("clean_html", "trafilatura"),
+        ("convert_documents", "docling"),
+        ("convert_html", "markitdown"),
+        ("deduplicate_markdown", "dedup_filter"),
+        ("chunk_content", "hybrid"),
+        ("build_retrieval_bundle", "gemini_retrieval"),
+        ("format_graph", "knowledge_graph"),
+        ("extract_semantic_graph", "semantic_graph_extract"),
+        ("canonicalize_semantic_graph", "semantic_graph_canonicalize"),
+        ("promote_graph", "semantic_graph_promote"),
+        ("community_graph", "semantic_graph_community"),
+        ("summarize_community_graph", "semantic_graph_summarize"),
+        ("finalize_retrieval_bundle", "gemini_retrieval"),
+        ("upload_retrieval", "gemini_pinecone"),
+    ]
+    config = {
+        "pipeline": {
+            "audit_on_stage_complete": True,
+            "audit_on_run_complete": True,
+            "fail_on_audit_error": True,
+        },
+        "stages": [{"id": stage_id, "plugin": plugin} for stage_id, plugin in stages],
+        "embedder": {
+            "namespace_strategy": "release",
+            "pinecone_index": "dense",
+            "pinecone_sparse_index": "sparse",
+            "namespace_chunks": "chunks",
+            "namespace_parents": "parents",
+            "namespace_media": "media",
+            "namespace_facts": "facts",
+            "namespace_evidence_spans": "evidence_spans",
+            "namespace_summaries": "summaries",
+            "namespace_assertions": "assertions",
+            "namespace_entities": "entities",
+            "namespace_communities": "communities",
+            "verify_index_after_upload": True,
+            "enable_sparse": True,
+        },
+        "graph": {
+            "store_backend": "local_json",
+            "extraction_fail_open_after_retries": False,
+        },
+    }
+
+    report = assess_production_readiness(config, config_name="semantic-v5", validation_errors={})
+
+    names = {check["name"]: check for check in report["checks"]}
+    assert names["stage_order"]["status"] == "ok"
+    assert "semantic-graph/v5" in names["stage_order"]["message"]
+    assert names["pinecone_targets"]["status"] == "ok"
+    assert not [check for check in report["checks"] if check["status"] == "error"]
+
+
+def test_extractive_summarizer_runs_without_openai(monkeypatch, tmp_dir):
+    from pipeline.core.base import StageContext
+    from pipeline.stages.summarizers.openai_summarizer import OpenAISummarizer
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    md_dir = tmp_dir / "markdown"
+    md_dir.mkdir()
+    (md_dir / "admissions.md").write_text(
+        "# Graduate Admissions\n\n"
+        "MBZUAI offers MSc and PhD programs in artificial intelligence fields. "
+        "Applicants must submit required documents before the published deadline. "
+        "The university is located in Masdar City, Abu Dhabi, UAE. "
+        "The 2026 application cycle includes online screening and admissions review.",
+        encoding="utf-8",
+    )
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "openai":
+            raise AssertionError("extractive summarizer must not import openai")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    stage = OpenAISummarizer()
+    config = {
+        "summarizer": {
+            "provider": "extractive",
+            "concurrency": 1,
+            "extractive_summary_max_chars": 800,
+            "extractive_key_facts": 5,
+        }
+    }
+    errors = run_async(stage.validate_config(config))
+    assert errors == []
+
+    ctx = StageContext(
+        run_id="test-run",
+        project_name="test",
+        config=config,
+        work_dir=tmp_dir,
+        previous_outputs={"md_dir": str(md_dir)},
+        stage_definition={"type": "summarizer", "plugin": "openai_summarizer"},
+        stage_id="summarize_content",
+    )
+
+    result = run_async(stage.execute(ctx))
+
+    assert result.status.value == "completed"
+    assert result.metrics["processed"] == 1
+    summary_files = list((tmp_dir / "stage_outputs" / "summarize_content" / "summaries").glob("*.summary.json"))
+    assert len(summary_files) == 1
+    payload = json.loads(summary_files[0].read_text(encoding="utf-8"))
+    assert payload["summary_provider"] == "extractive"
+    assert "MBZUAI offers MSc and PhD programs" in payload["detailed_summary"]
+
+
+def test_gliner_stage_can_skip_without_loading_model(monkeypatch, tmp_dir):
+    from pipeline.core.base import StageContext
+    from pipeline.stages.formatters.gliner_extract_formatter import GLiNERExtractFormatter
+
+    real_import = builtins.__import__
+
+    def guarded_import(name, *args, **kwargs):
+        if name == "gliner":
+            raise AssertionError("disabled GLiNER stage must not import gliner")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded_import)
+    retrieval_bundle = tmp_dir / "retrieval_bundle.json"
+    retrieval_bundle.write_text(
+        json.dumps({"fact_records": [{"id": "fact-1", "text": "MBZUAI is in Abu Dhabi."}]}),
+        encoding="utf-8",
+    )
+    ctx = StageContext(
+        run_id="test-run",
+        project_name="test",
+        config={"graph": {"gliner_enabled": False}},
+        work_dir=tmp_dir,
+        previous_outputs={"retrieval_bundle_file": str(retrieval_bundle)},
+        stage_definition={"type": "formatter", "plugin": "gliner_extract"},
+        stage_id="gliner_extract_graph",
+    )
+
+    result = run_async(GLiNERExtractFormatter().execute(ctx))
+
+    assert result.status.value == "completed"
+    assert result.metrics["skipped"] is True
+    output = tmp_dir / "stage_outputs" / "gliner_extract_graph" / "gliner_entities.json"
+    assert json.loads(output.read_text(encoding="utf-8")) == {}
+
+
 # ─────────────────────────────────────────────────────────────
 # 1. IO Utilities — test real file operations and edge cases
 # ─────────────────────────────────────────────────────────────
@@ -93,7 +465,7 @@ class TestConfig:
     def test_default_config_has_all_sections(self):
         from pipeline.core.config import load_config
         config = load_config("default")
-        for section in ("crawler", "cleaner", "converter", "chunker", "summarizer", "quality", "embedder", "formatter"):
+        for section in ("crawler", "cleaner", "converter", "chunker", "quality", "summarizer", "embedder", "formatter", "graph", "retrieval"):
             assert section in config, f"Missing section: {section}"
 
     def test_inheritance_overrides_only_specified_keys(self):
@@ -101,8 +473,12 @@ class TestConfig:
         from pipeline.core.config import load_config
         config = load_config("mbzuai_main")
         assert config["crawler"]["start_url"] == "https://mbzuai.ac.ae"
-        assert config["crawler"]["max_depth"] == 10  # inherited
-        assert config["summarizer"]["model"] == "gpt-4.1-nano"  # inherited
+        assert config["crawler"]["max_depth"] == 4  # inherited
+        assert config["embedder"]["engine"] == "gemini"  # inherited
+        assert config["embedder"]["model"] == "gemini-embedding-2"  # inherited
+        assert config["embedder"]["output_dimensionality"] == 1536
+        assert config["embedder"]["pinecone_summary_index"] == "mbzuai-summary-gemini-index-latest"
+        assert config["embedder"]["pinecone_text_index"] == "mbzuai-text-gemini-index-latest"
 
     def test_deep_merge_preserves_base_keys(self):
         from pipeline.core.config import _deep_merge
@@ -126,6 +502,25 @@ class TestConfig:
             config = load_config("default")
             assert config["crawler"]["max_pages"] == 42
 
+    def test_deployment_control_environment_does_not_pollute_config(self):
+        from pipeline.core.config import load_config
+
+        with patch.dict(
+            os.environ,
+            {
+                "PIPELINE_CONFIG": "mbzuai_production",
+                "PIPELINE_PREFLIGHT": "true",
+                "PIPELINE_RESUME": "false",
+                "PIPELINE_RESTART_FROM_STAGE": "upload_retrieval",
+            },
+        ):
+            config = load_config("default")
+
+        assert "config" not in config
+        assert "preflight" not in config
+        assert "resume" not in config
+        assert "restart_from_stage" not in config
+
     def test_env_override_type_parsing(self):
         from pipeline.core.config import _parse_env_value
         assert _parse_env_value("true") is True
@@ -146,6 +541,53 @@ class TestConfig:
         from pipeline.core.config import load_config
         with pytest.raises(FileNotFoundError):
             load_config("this_config_does_not_exist_xyz123")
+
+    def test_repository_relative_config_path_is_accepted(self):
+        from pipeline.core.config import load_config
+
+        config = load_config("pipeline/configs/mbzuai_main_retrieval_bundle_refresh.yaml")
+        assert config["project_name"] == "mbzuai_main"
+
+    def test_canonical_production_config_keeps_required_capabilities(self):
+        from pipeline.core.config import load_config
+
+        config = load_config("mbzuai_production")
+        plugins = [stage["plugin"] for stage in config["stages"]]
+        assert config["pipeline"]["production_profile"] is True
+        assert config["embedder"]["namespace_strategy"] == "release"
+        assert config["retrieval"]["retriever_backend"] == "routed_hybrid"
+        assert config["retrieval"]["query_planner_enabled"] is True
+        assert config["retrieval"]["evidence_adjudicator_max_workers"] == 2
+        assert (
+            config["retrieval"]["evidence_adjudicator_provider_timeout_sec"]
+            <= config["retrieval"]["evidence_adjudicator_timeout_sec"]
+        )
+        assert "openai_assertion_extract" in plugins
+        assert "openai_assertion_validate" in plugins
+        assert "assertion_promote" in plugins
+        assert "retrieval_bundle_v2" in plugins
+
+    def test_default_config_passes_production_preflight_wiring(self):
+        from pipeline.core.config import load_config
+        from pipeline.core.preflight import assess_production_readiness
+
+        with patch.dict(
+            os.environ,
+            {
+                "OPENAI_API_KEY": "test-openai",
+                "GEMINI_API_KEY": "test-gemini",
+                "PINECONE_API_KEY": "test-pinecone",
+                "NEO4J_URI": "https://neo4j.example",
+                "NEO4J_USERNAME": "neo4j",
+                "NEO4J_PASSWORD": "secret",
+            },
+            clear=False,
+        ):
+            report = assess_production_readiness(load_config("default"), validation_errors={})
+
+        assert report["ok"]
+        assert report["error_count"] == 0
+        assert any(check["name"] == "pinecone_verification" for check in report["checks"])
 
 
 # ─────────────────────────────────────────────────────────────
@@ -174,12 +616,15 @@ class TestRegistry:
             ("quality_gate", "language_detector"),
             ("summarizer", "openai_summarizer"),
             ("formatter", "pinecone_formatter"),
+            ("formatter", "mbzuai_index_readiness"),
+            ("formatter", "mbzuai_legacy_vectorstores"),
             ("formatter", "gemini_retrieval"),
             ("formatter", "knowledge_graph"),
             ("formatter", "semantic_graph_extract"),
             ("formatter", "semantic_graph_canonicalize"),
             ("formatter", "semantic_graph_promote"),
             ("embedder", "openai_embedder"),
+            ("embedder", "mbzuai_legacy_pinecone"),
             ("embedder", "gemini_pinecone"),
             ("embedder", "neo4j_graph_store"),
         }
@@ -699,6 +1144,119 @@ class TestCrawlerHelpers:
             "https://example.com/a",
         }
 
+    def test_raw_source_candidate_urls_include_canonical_trailing_slash_variant(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _raw_source_candidate_urls
+
+        assert _raw_source_candidate_urls("https://mbzuai.ac.ae/about/office-of-the-president") == [
+            "https://mbzuai.ac.ae/about/office-of-the-president",
+            "https://mbzuai.ac.ae/about/office-of-the-president/",
+        ]
+        assert _raw_source_candidate_urls("https://mbzuai.ac.ae/file.pdf") == [
+            "https://mbzuai.ac.ae/file.pdf",
+        ]
+
+    def test_content_quality_403_skips_are_recoverable(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _is_recoverable_crawl_skip_reason
+
+        assert _is_recoverable_crawl_skip_reason(
+            "SKIPPED_HTTP_403:content_quality:blocked_or_error_page,url_token_mismatch,thin_html"
+        )
+
+    def test_transient_network_navigation_errors_are_recoverable(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _is_recoverable_crawl_skip_reason
+
+        assert _is_recoverable_crawl_skip_reason(
+            "SKIPPED_ERROR:Unexpected error in _crawl_web: "
+            "Page.goto: net::ERR_INTERNET_DISCONNECTED at https://mbzuai.ac.ae/news/example"
+        )
+
+    def test_browser_close_connection_error_is_benign_shutdown_error(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _is_benign_browser_close_error
+
+        assert _is_benign_browser_close_error(
+            Exception("Browser.close: Connection closed while reading from the driver")
+        )
+        assert not _is_benign_browser_close_error(Exception("Page.goto: Timeout 45000ms exceeded"))
+
+    def test_path_prefix_filter_blocks_tag_archives(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import PathPrefixFilter
+
+        flt = PathPrefixFilter(["/tag/", "/ar/tag/"])
+
+        assert not flt.apply("https://mbzuai.ac.ae/tag/cohort6")
+        assert not flt.apply("https://mbzuai.ac.ae/ar/tag/student-life")
+        assert flt.apply("https://mbzuai.ac.ae/news/research-announcement")
+
+    def test_requeue_recoverable_skipped_urls_honors_retry_cap(self, monkeypatch):
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [],
+            "visited": ["https://mbzuai.ac.ae/news/a"],
+            "pages_crawled": 1,
+            "depths": {},
+        }
+        crawler.url_mapping = {
+            "https://mbzuai.ac.ae/news/a": "SKIPPED_ERROR:Page.goto: net::ERR_INTERNET_DISCONNECTED"
+        }
+        crawler.stats = {
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+        }
+        crawler.recoverable_skip_retries = {"https://mbzuai.ac.ae/news/a": 2}
+        crawler.recoverable_skip_max_retries = 2
+        crawler.excluded_path_prefixes = set()
+        crawler.start_url = "https://mbzuai.ac.ae"
+        crawler.allowed_domains = {"mbzuai.ac.ae"}
+        crawler.excluded_subdomains = set()
+        monkeypatch.setattr(
+            crawler_module,
+            "_host_resolves_to_private_or_reserved",
+            lambda _host: False,
+        )
+
+        requeued = crawler._requeue_recoverable_skipped_urls()
+
+        assert requeued == []
+        assert crawler.url_mapping["https://mbzuai.ac.ae/news/a"].startswith("SKIPPED_ERROR")
+        assert crawler.stats["recoverable_skips_exhausted"] == 1
+
+    def test_requeue_recoverable_skipped_urls_excludes_configured_path_prefix(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [],
+            "visited": ["https://mbzuai.ac.ae/tag/cohort6"],
+            "pages_crawled": 1,
+            "depths": {},
+        }
+        crawler.url_mapping = {
+            "https://mbzuai.ac.ae/tag/cohort6": "SKIPPED_ERROR:Page.goto: net::ERR_INTERNET_DISCONNECTED"
+        }
+        crawler.stats = {
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+        }
+        crawler.recoverable_skip_retries = {}
+        crawler.recoverable_skip_max_retries = 2
+        crawler.excluded_path_prefixes = {"/tag"}
+
+        requeued = crawler._requeue_recoverable_skipped_urls()
+
+        assert requeued == []
+        assert crawler.url_mapping["https://mbzuai.ac.ae/tag/cohort6"].startswith(
+            "SKIPPED_EXCLUDED_FRONTIER"
+        )
+        assert crawler.stats["skipped_urls"] == 1
+        assert crawler.stats["excluded_frontier_urls"] == 1
+
     def test_trim_crawl_state_to_budget_caps_pending_urls(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _trim_crawl_state_to_budget
 
@@ -742,6 +1300,215 @@ class TestCrawlerHelpers:
             "https://example.com/b",
             "https://example.com/c",
         }
+
+    def test_selects_raw_source_when_rendered_capture_is_generic_mbzuai_shell(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import (
+            _html_to_markdown,
+            _select_preferred_page_capture,
+        )
+
+        page_url = "https://mbzuai.ac.ae/study/graduate-admission-process"
+        rendered_html = """
+        <html><head><title>MBZUAI - Mohamed bin Zayed University of Artificial Intelligence</title></head>
+        <body><main><h1>Thoughtcurators for AI creators</h1><p>Explore our AI degrees.</p></main></body></html>
+        """
+        raw_source_html = """
+        <html><head><title>Graduate admission process - MBZUAI</title></head>
+        <body><main><h1>Graduate admission process</h1>
+        <p>Applicants must submit transcripts, CV, recommendation letters, and a statement of purpose.</p>
+        </main></body></html>
+        """
+
+        selected_html, selected_source, report = _select_preferred_page_capture(
+            page_url,
+            rendered_html,
+            raw_source_html=raw_source_html,
+            rendered_markdown="# Thoughtcurators for AI creators\n\nExplore our AI degrees.",
+        )
+        markdown = _html_to_markdown(selected_html, page_url)
+
+        assert selected_source == "raw_source"
+        assert report["selection_reason"] == "rendered_capture_unusable"
+        assert "generic_site_shell" in report["rendered"]["reasons"]
+        assert "Graduate admission process" in markdown
+        assert "transcripts" in markdown
+        assert "Thoughtcurators" not in markdown
+
+    def test_markdown_quality_rejects_blocked_pages_before_indexing(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
+
+        reason = _markdown_quality_reason(
+            "# 403 Forbidden\n\nYou do not have permission to access this page.",
+            "https://mbzuai.ac.ae/about/contact",
+        )
+
+        assert reason == "blocked_or_error_page"
+
+    def test_markdown_quality_rejects_generic_title_only_redirect_shell(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _html_quality_report, _markdown_quality_reason
+
+        page_url = (
+            "https://mbzuai.ac.ae/news/"
+            "h-h-sheikh-theyab-bin-zayed-al-nahyan-witnesses-mbzuai-inaugural-commencement"
+        )
+        html = """
+        <html>
+          <head><title>MBZUAI - Mohamed bin Zayed University of Artificial Intelligence</title></head>
+          <body>MBZUAI - Mohamed bin Zayed University of Artificial Intelligence</body>
+        </html>
+        """
+
+        report = _html_quality_report(html, page_url)
+
+        assert report["usable"] is False
+        assert "generic_mbzuai_title" in report["reasons"]
+        assert _markdown_quality_reason(
+            "MBZUAI - Mohamed bin Zayed University of Artificial Intelligence",
+            page_url,
+            html=html,
+        ) == "generic_mbzuai_title"
+
+    def test_html_markdown_adds_page_title_and_rejects_generic_shell_fallback(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _html_to_markdown, _markdown_quality_reason
+
+        page_url = "https://mbzuai.ac.ae/news/working-together-to-serve-the-nation"
+        html = """
+        <html><head><title>Working together to serve the nation - MBZUAI</title></head>
+        <body><main><p>MBZUAI hosted a delegation from Khalifa University to discuss collaboration
+        and research opportunities for the UAE AI ecosystem.</p></main></body></html>
+        """
+        generic_markdown = (
+            "# Thought curators for AI creators\n\n"
+            "* [Commencement 2026](https://mbzuai.ac.ae/the-node/commencement-2026/)\n"
+            "* [Research](https://research.mbzuai.ac.ae/)\n"
+        )
+
+        markdown = _html_to_markdown(html, page_url)
+
+        assert markdown.startswith("# Working together to serve the nation")
+        assert _markdown_quality_reason(markdown, page_url, html=html) == ""
+        assert _markdown_quality_reason(generic_markdown, page_url, html=html) == "generic_site_shell"
+
+    def test_markdown_quality_rejects_navigation_heavy_crawl_output(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _html_to_markdown, _markdown_quality_reason
+
+        nav_links = "\n".join(
+            f"{idx}. [Menu {idx}](https://mbzuai.ac.ae/ar/menu-{idx})"
+            for idx in range(20)
+        )
+        markdown = nav_links + "\n\nريادة الأعمال في جامعة محمد بن زايد للذكاء الاصطناعي."
+        reason = _markdown_quality_reason(markdown, "https://mbzuai.ac.ae/ar/innovate/entrepreneurship")
+
+        html = """
+        <html><body><nav><a>About</a><a>Study</a><a>Research</a></nav>
+        <main><h1>ريادة الأعمال</h1><p>تدعم جامعة محمد بن زايد للذكاء الاصطناعي الشركات الناشئة وبرامج الابتكار.</p></main>
+        </body></html>
+        """
+
+        assert reason == "navigation_heavy"
+        regenerated = _html_to_markdown(html, "https://mbzuai.ac.ae/ar/innovate/entrepreneurship")
+        assert "ريادة الأعمال" in regenerated
+        assert "About" not in regenerated
+
+    def test_markdown_quality_rejects_mega_menu_prefix_before_content(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
+
+        markdown = """
+        About
+          1. [Leadership and Governance](https://mbzuai.ac.ae/about/leadership/)
+          2. [Office of the President](https://mbzuai.ac.ae/about/office-of-the-president/)
+          3. [Office of the Provost](https://mbzuai.ac.ae/office-of-the-provost/)
+
+        Study
+          1. [Graduate Admission Process](https://mbzuai.ac.ae/study/graduate-admission-process/)
+          2. [Undergraduate Admission Process](https://mbzuai.ac.ae/study/ug-admission-process/)
+          3. [Master's Programs](https://mbzuai.ac.ae/study/msc-programs/)
+
+        Office of the President
+
+        Professor Xing describes MBZUAI's research and education mission.
+        """
+
+        assert _markdown_quality_reason(
+            markdown,
+            "https://mbzuai.ac.ae/about/office-of-the-president",
+        ) == "navigation_heavy"
+
+    def test_html_to_markdown_fallback_removes_class_based_navigation(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _html_to_markdown, _markdown_quality_reason
+
+        html = """
+        <html><body>
+          <div class="header-main"><a>About</a><a>Study</a><a>Research</a><a>Faculty Directory</a></div>
+          <div class="container pt-24">
+            <p class="blue-c">As a founding president, Professor Xing is keen to create a framework for AI research and education.</p>
+            <p>There is a considerable need for more AI literate talent.</p>
+          </div>
+          <section class="chairs-message">
+            <h2>Message from the President</h2>
+            <p>Professor Eric Xing describes MBZUAI's mission and global research impact.</p>
+          </section>
+          <div class="footer-main"><a>Careers</a><a>Contact</a></div>
+        </body></html>
+        """
+
+        markdown = _html_to_markdown(html, "https://mbzuai.ac.ae/about/office-of-the-president")
+
+        assert "Professor Xing" in markdown
+        assert "Professor Eric Xing" in markdown
+        assert "Faculty Directory" not in markdown
+        assert _markdown_quality_reason(markdown, "https://mbzuai.ac.ae/about/office-of-the-president", html=html) == ""
+
+    def test_navigation_detector_does_not_reject_body_text_with_research_terms(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
+
+        markdown = """
+        # Office of the President
+
+        As a founding president, Professor Xing is keen to create a framework that can facilitate research,
+        education, and innovation to be better organized and more impactful.
+
+        MBZUAI recruits exceptional faculty across a range of disciplines and develops AI literate talent.
+        """
+
+        assert _markdown_quality_reason(markdown, "https://mbzuai.ac.ae/about/office-of-the-president") == ""
+
+    def test_markdown_quality_rejects_thin_faculty_cookie_boilerplate(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
+
+        markdown = """
+        # Yuxia Wang
+
+        مهتم بالعمل مع أعضاء هيئة التدريس لديناقم بتعبئة النموذج أدناه وسنقوم بالرد عليك.
+
+        We use cookies
+
+        We use necessary and analytics cookies to operate our website, analyze traffic, and improve your experience.
+        """
+
+        assert _markdown_quality_reason(
+            markdown,
+            "https://mbzuai.ac.ae/ar/study/faculty/yuxia-wang-ar",
+        ) == "thin_boilerplate"
+
+    def test_markdown_quality_rejects_arabic_homepage_navigation_lead_in(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
+
+        markdown = """
+        الرئيسيه - MBZUAI
+        MBZUAI
+        نبذة عن الجامعة
+        1. [أعضاء الهيئة التدريسية](https://mbzuai.ac.ae/ar/study/faculty-directory/)
+        الدراسة
+        1. [إجراءات القبول للبكالوريوس](https://mbzuai.ac.ae/ar/study/undergraduate-admission-process/)
+        البحوث
+        1. [قسم معالجة اللغات الطبيعية](https://mbzuai.ac.ae/ar/research-department/natural-language-processing-department/)
+        الابتكار
+        1. [علاقات الشراكة والتعاون](https://mbzuai.ac.ae/ar/innovate/partnership/)
+        **اكتشف برامجنا الدراسية**
+        """
+
+        assert _markdown_quality_reason(markdown, "https://mbzuai.ac.ae/ar") == "navigation_heavy"
 
 
 class TestCrawlerStage:
@@ -792,6 +1559,7 @@ class TestCrawlerStage:
                     "extract_images": False,
                     "download_page_images": False,
                     "respect_robots_txt": False,
+                    "validate_source_html": False,
                 },
                 "converter": {"content_filter_threshold": 0.48},
             },
@@ -810,6 +1578,161 @@ class TestCrawlerStage:
         md_files = list((tmp_dir / "markdown").glob("*.md"))
         assert len(md_files) == 1
         assert md_files[0].read_text() == "# Test"
+
+    def test_execute_replaces_generic_mbzuai_rendered_capture_with_valid_source_html(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+
+        page_url = "https://mbzuai.ac.ae/study/graduate-admission-process"
+        rendered_html = """
+        <html><head><title>MBZUAI - Mohamed bin Zayed University of Artificial Intelligence</title></head>
+        <body><main><h1>Thoughtcurators for AI creators</h1><p>Explore our AI degrees.</p></main></body></html>
+        """
+        raw_source_html = """
+        <html><head><title>Graduate admission process - MBZUAI</title></head>
+        <body><main><h1>Graduate admission process</h1>
+        <p>Applicants must submit official transcripts and other admission documents.</p>
+        </main></body></html>
+        """
+
+        class FakeAsyncCrawler:
+            def __init__(self, config=None):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def arun(self, url, config):
+                return [
+                    SimpleNamespace(
+                        url=page_url,
+                        html=rendered_html,
+                        success=True,
+                        status_code=200,
+                        links={"internal": [], "external": []},
+                        markdown=SimpleNamespace(
+                            fit_markdown="# Thoughtcurators for AI creators\n\nExplore our AI degrees.",
+                            raw_markdown="# Thoughtcurators for AI creators\n\nExplore our AI degrees.",
+                        ),
+                    )
+                ]
+
+        async def fake_fetch_raw_source_page(self, source_url):
+            assert source_url == page_url
+            return raw_source_html, 200
+
+        monkeypatch.setattr(crawler_module, "AsyncWebCrawler", FakeAsyncCrawler)
+        monkeypatch.setattr(crawler_module.Crawl4AICrawler, "_fetch_raw_source_page", fake_fetch_raw_source_page)
+
+        ctx = StageContext(
+            run_id="run_test",
+            project_name="test",
+            config={
+                "crawler": {
+                    "start_url": page_url,
+                    "max_pages": 1,
+                    "max_depth": 0,
+                    "fetch_concurrency": 1,
+                    "download_concurrency": 1,
+                    "timeout": 5,
+                    "sitemap_enabled": False,
+                    "extract_images": False,
+                    "download_page_images": False,
+                    "respect_robots_txt": False,
+                    "validate_source_html": True,
+                },
+                "converter": {"content_filter_threshold": 0.48},
+            },
+            work_dir=tmp_dir,
+        )
+
+        result = run_async(crawler_module.Crawl4AICrawler().execute(ctx))
+
+        assert result.status == StageStatus.COMPLETED
+        assert result.metrics["source_html_replacements"] == 1
+        html_file = next((tmp_dir / "html").glob("*.html"))
+        markdown_file = next((tmp_dir / "markdown").glob("*.md"))
+        metadata = load_json_safe(tmp_dir / "page_metadata.json")
+
+        assert "Graduate admission process - MBZUAI" in html_file.read_text(encoding="utf-8")
+        assert "official transcripts" in markdown_file.read_text(encoding="utf-8")
+        assert "Thoughtcurators" not in markdown_file.read_text(encoding="utf-8")
+        assert metadata[page_url]["capture_source"] == "raw_source"
+        assert metadata[page_url]["markdown_source"] == "source_html"
+
+    def test_execute_skips_blocked_rendered_capture_when_source_recovery_fails(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+
+        page_url = "https://mbzuai.ac.ae/about/contact"
+
+        class FakeAsyncCrawler:
+            def __init__(self, config=None):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def arun(self, url, config):
+                return [
+                    SimpleNamespace(
+                        url=page_url,
+                        html="<html><body><h1>403 Forbidden</h1><p>Access denied.</p></body></html>",
+                        success=True,
+                        status_code=200,
+                        links={"internal": [], "external": []},
+                        markdown=SimpleNamespace(
+                            fit_markdown="# 403 Forbidden\n\nAccess denied.",
+                            raw_markdown="# 403 Forbidden\n\nAccess denied.",
+                        ),
+                    )
+                ]
+
+        async def fake_fetch_raw_source_page(self, source_url):
+            assert source_url == page_url
+            return "", None
+
+        monkeypatch.setattr(crawler_module, "AsyncWebCrawler", FakeAsyncCrawler)
+        monkeypatch.setattr(crawler_module.Crawl4AICrawler, "_fetch_raw_source_page", fake_fetch_raw_source_page)
+
+        ctx = StageContext(
+            run_id="run_test",
+            project_name="test",
+            config={
+                "crawler": {
+                    "start_url": page_url,
+                    "max_pages": 1,
+                    "max_depth": 0,
+                    "fetch_concurrency": 1,
+                    "download_concurrency": 1,
+                    "timeout": 5,
+                    "sitemap_enabled": False,
+                    "extract_images": False,
+                    "download_page_images": False,
+                    "respect_robots_txt": False,
+                    "validate_source_html": True,
+                },
+                "converter": {"content_filter_threshold": 0.48},
+            },
+            work_dir=tmp_dir,
+        )
+
+        result = run_async(crawler_module.Crawl4AICrawler().execute(ctx))
+
+        assert result.status == StageStatus.COMPLETED
+        assert result.metrics["pages_scraped"] == 0
+        assert result.metrics["pages_failed"] == 1
+        assert not list((tmp_dir / "html").glob("*.html"))
+        mappings = load_json_safe(tmp_dir / "mappings.json")
+        assert mappings[page_url].startswith("SKIPPED_LOW_QUALITY")
 
     def test_execute_seeds_initial_frontier_when_runtime_state_is_empty(self, tmp_dir, monkeypatch):
         from pipeline.core.base import StageContext, StageStatus
@@ -863,6 +1786,7 @@ class TestCrawlerStage:
                     "respect_robots_txt": False,
                     "stream_results": False,
                     "fail_on_empty_result": True,
+                    "validate_source_html": False,
                 },
                 "converter": {"content_filter_threshold": 0.48},
             },
@@ -873,6 +1797,189 @@ class TestCrawlerStage:
 
         assert result.status == StageStatus.COMPLETED
         assert result.metrics["pages_scraped"] == 1
+
+    def test_execute_crawls_large_sitemap_frontier_in_bounded_batches(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+
+        class FakeAsyncCrawler:
+            calls = []
+
+            def __init__(self, config=None):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def arun(self, url, config):
+                raise AssertionError("large sitemap frontier should use bounded arun_many batches")
+
+            async def arun_many(self, urls, config):
+                self.calls.append(list(urls))
+                return [
+                    SimpleNamespace(
+                        url=url,
+                        html=f"<html><head><title>{url}</title></head><body><h1>{url}</h1></body></html>",
+                        success=True,
+                        status_code=200,
+                        links={"internal": [], "external": []},
+                        markdown=SimpleNamespace(
+                            fit_markdown=f"# {url}",
+                            raw_markdown=f"# {url}",
+                        ),
+                    )
+                    for url in urls
+                ]
+
+        async def fake_discover(self):
+            return [f"https://example.com/page-{i}" for i in range(5)]
+
+        monkeypatch.setattr(crawler_module, "AsyncWebCrawler", FakeAsyncCrawler)
+        monkeypatch.setattr(crawler_module.Crawl4AICrawler, "_discover_sitemap_urls", fake_discover)
+
+        ctx = StageContext(
+            run_id="run_test",
+            project_name="test",
+            config={
+                "crawler": {
+                    "start_url": "https://example.com",
+                    "max_pages": 10,
+                    "max_depth": 0,
+                    "fetch_concurrency": 1,
+                    "download_concurrency": 1,
+                    "timeout": 5,
+                    "sitemap_enabled": True,
+                    "sitemap_batch_crawl": True,
+                    "sitemap_crawl_batch_size": 2,
+                    "sitemap_frontier_seed_limit": 10,
+                    "extract_images": False,
+                    "download_page_images": False,
+                    "respect_robots_txt": False,
+                    "fail_on_empty_result": True,
+                    "validate_source_html": False,
+                },
+                "converter": {"content_filter_threshold": 0.48},
+            },
+            work_dir=tmp_dir,
+        )
+
+        result = run_async(crawler_module.Crawl4AICrawler().execute(ctx))
+
+        assert result.status == StageStatus.COMPLETED
+        assert result.metrics["pages_scraped"] == 6
+        assert result.metrics["sitemap_batches_completed"] == 3
+        assert [len(call) for call in FakeAsyncCrawler.calls] == [2, 2, 2]
+        crawl_state = json.loads((tmp_dir / "crawl_state.json").read_text())
+        assert crawl_state["pending"] == []
+        assert crawl_state["pages_crawled"] == 6
+
+    def test_execute_recovers_failed_sitemap_batch_url_with_http_retry(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+
+        failed_url = "https://example.com/page-0"
+
+        class FakeAsyncCrawler:
+            def __init__(self, config=None):
+                self.config = config
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def arun(self, url, config):
+                raise AssertionError("large sitemap frontier should use bounded arun_many batches")
+
+            async def arun_many(self, urls, config):
+                results = []
+                for url in urls:
+                    if url == failed_url:
+                        results.append(
+                            SimpleNamespace(
+                                url=url,
+                                html="",
+                                success=False,
+                                status_code=None,
+                                links={"internal": [], "external": []},
+                                markdown=None,
+                                error_message="BrowserContext.add_init_script: Target page, context or browser has been closed",
+                            )
+                        )
+                    else:
+                        results.append(
+                            SimpleNamespace(
+                                url=url,
+                                html=f"<html><body><h1>{url}</h1></body></html>",
+                                success=True,
+                                status_code=200,
+                                links={"internal": [], "external": []},
+                                markdown=SimpleNamespace(
+                                    fit_markdown=f"# {url}",
+                                    raw_markdown=f"# {url}",
+                                ),
+                            )
+                        )
+                return results
+
+        async def fake_discover(self):
+            return [f"https://example.com/page-{i}" for i in range(3)]
+
+        fallback_calls = {"count": 0}
+
+        async def fake_fetch_raw_source_page(self, page_url):
+            if page_url == failed_url:
+                fallback_calls["count"] += 1
+                if fallback_calls["count"] == 1:
+                    return "", None
+                return "<html><body><h1>Recovered</h1></body></html>", 200
+            return "", None
+
+        monkeypatch.setattr(crawler_module, "AsyncWebCrawler", FakeAsyncCrawler)
+        monkeypatch.setattr(crawler_module.Crawl4AICrawler, "_discover_sitemap_urls", fake_discover)
+        monkeypatch.setattr(crawler_module.Crawl4AICrawler, "_fetch_raw_source_page", fake_fetch_raw_source_page)
+
+        ctx = StageContext(
+            run_id="run_test",
+            project_name="test",
+            config={
+                "crawler": {
+                    "start_url": "https://example.com",
+                    "max_pages": 10,
+                    "max_depth": 0,
+                    "fetch_concurrency": 1,
+                    "download_concurrency": 1,
+                    "timeout": 5,
+                    "sitemap_enabled": True,
+                    "sitemap_batch_crawl": True,
+                    "sitemap_crawl_batch_size": 2,
+                    "sitemap_failed_url_retry_attempts": 2,
+                    "sitemap_frontier_seed_limit": 10,
+                    "extract_images": False,
+                    "download_page_images": False,
+                    "respect_robots_txt": False,
+                    "fail_on_empty_result": True,
+                    "validate_source_html": False,
+                },
+                "converter": {"content_filter_threshold": 0.48},
+            },
+            work_dir=tmp_dir,
+        )
+
+        result = run_async(crawler_module.Crawl4AICrawler().execute(ctx))
+
+        assert result.status == StageStatus.COMPLETED
+        assert result.metrics["pages_scraped"] == 4
+        assert result.metrics["pages_failed"] == 0
+        assert result.metrics["skipped_urls"] == 0
+        assert result.metrics["http_fallback_retries"] == 1
+        mappings = json.loads((tmp_dir / "mappings.json").read_text())
+        assert failed_url in mappings
+        assert not str(mappings[failed_url]).startswith("SKIPPED")
 
     def test_skip_extension_filter_blocks_binary_and_media_assets(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import SkipExtensionFilter
@@ -2230,6 +3337,81 @@ class TestOrchestrator:
             _REGISTRY.pop("test_restart_one", None)
             _REGISTRY.pop("test_restart_two", None)
 
+    def test_active_release_upload_cannot_be_restarted_but_candidate_resume_is_allowed(self, tmp_dir):
+        from pipeline.core.base import PipelineStage, StageResult
+        from pipeline.core.io import atomic_write_json
+        from pipeline.core.orchestrator import ActiveReleaseMutationError, PipelineOrchestrator
+        from pipeline.core.registry import _REGISTRY, register_stage
+
+        calls = {"upload": 0}
+
+        @register_stage
+        class CandidateUploadStage(PipelineStage):
+            name = "candidate_upload"
+            stage_type = "test_active_upload"
+
+            async def execute(self, ctx):
+                calls["upload"] += 1
+                return StageResult.success(outputs={"attempt": calls["upload"]})
+
+        try:
+            active_pointer = tmp_dir / "active_release.json"
+            work_dir = tmp_dir / "candidate-immutable"
+            config = {
+                "project_name": "test",
+                "pipeline": {"active_release_file": str(active_pointer)},
+                "stages": [
+                    {
+                        "id": "upload_retrieval",
+                        "type": "test_active_upload",
+                        "plugin": "candidate_upload",
+                    }
+                ],
+            }
+
+            first = run_async(
+                PipelineOrchestrator(config, work_dir=work_dir, run_id="candidate-immutable").run()
+            )
+            assert first.status == "completed"
+
+            resumed_candidate = run_async(
+                PipelineOrchestrator(config, work_dir=work_dir, run_id="candidate-immutable").run(
+                    resume=True,
+                    restart_from="upload_retrieval",
+                )
+            )
+            assert resumed_candidate.status == "completed"
+            assert calls["upload"] == 2
+
+            atomic_write_json(
+                active_pointer,
+                {
+                    "status": "passed",
+                    "run_id": "candidate-immutable",
+                    "active_release_manifest": str(work_dir / "release" / "retrieval_release_manifest.json"),
+                },
+            )
+            snapshot_path = work_dir / "resolved_config.json"
+            snapshot_before = snapshot_path.read_bytes()
+            mutated_config = dict(config)
+            mutated_config["forbidden_active_mutation"] = True
+
+            with pytest.raises(ActiveReleaseMutationError, match="active release"):
+                run_async(
+                    PipelineOrchestrator(mutated_config, work_dir=work_dir, run_id="candidate-immutable").run(
+                        resume=True,
+                        restart_from="upload_retrieval",
+                    )
+                )
+            with pytest.raises(ActiveReleaseMutationError, match="active release"):
+                run_async(
+                    PipelineOrchestrator(mutated_config, work_dir=work_dir, run_id="candidate-immutable").run()
+                )
+            assert calls["upload"] == 2
+            assert snapshot_path.read_bytes() == snapshot_before
+        finally:
+            _REGISTRY.pop("test_active_upload", None)
+
     def test_run_fails_fast_when_work_dir_is_locked(self, tmp_dir, monkeypatch):
         from pipeline.core.base import PipelineStage, StageResult
         from pipeline.core.orchestrator import PipelineOrchestrator, RunLockError
@@ -2969,6 +4151,79 @@ class TestDoclingConverter:
         assert calls[0] == [str(pdf_paths[0]), str(pdf_paths[1])]
         assert calls[1] == [str(pdf_paths[2])]
 
+    def test_large_pdf_defaults_to_docling_page_windows(self, tmp_dir, monkeypatch):
+        from pipeline.stages.converters import docling_converter as module
+
+        pdf_path = tmp_dir / "catalogue.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%fake\n")
+        monkeypatch.setattr(module, "_pdf_page_count", lambda path: 120)
+
+        assert module._docling_pdf_conversion_mode(pdf_path, {"docling_max_pages": 80}) == (
+            "page_windows",
+            "page_count>80 (120)",
+        )
+        assert module._docling_pdf_conversion_mode(
+            pdf_path,
+            {"docling_max_pages": 80, "docling_large_pdf_strategy": "fallback"},
+        ) == ("fallback", "page_count>80 (120)")
+
+    def test_convert_large_pdf_with_docling_windows_preserves_docling_extraction(self, tmp_dir, monkeypatch):
+        from docling.datamodel.base_models import ConversionStatus
+        from pipeline.stages.converters import docling_converter as module
+
+        pdf_path = tmp_dir / "catalogue.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%fake\n")
+        monkeypatch.setattr(module, "_pdf_page_count", lambda path: 3)
+
+        class FakeDoc:
+            def __init__(self, text):
+                self.text = text
+
+            def export_to_markdown(self, image_mode=None):
+                return self.text
+
+            def save_as_json(self, filename, artifacts_dir=None, image_mode=None, indent=2):
+                Path(filename).parent.mkdir(parents=True, exist_ok=True)
+                Path(filename).write_text(json.dumps({"text": self.text}), encoding="utf-8")
+
+        class FakeConversion:
+            def __init__(self, text):
+                self.status = ConversionStatus.SUCCESS
+                self.document = FakeDoc(text)
+                self.errors = []
+
+        calls = []
+
+        class FakeConverter:
+            def convert(self, source, raises_on_error=False, page_range=(1, 999999)):
+                calls.append(page_range)
+                return FakeConversion(f"Docling pages {page_range[0]}-{page_range[1]}")
+
+        result = module._convert_large_pdf_with_docling_windows(
+            pdf_path,
+            tmp_dir / "out" / "catalogue.md",
+            tmp_dir / "out" / "images" / "catalogue",
+            tmp_dir / "out" / "structured" / "catalogue.docling.json",
+            {
+                "use_vlm": False,
+                "generate_picture_images": False,
+                "docling_large_pdf_window_pages": 2,
+            },
+            converter=FakeConverter(),
+            pdf_options=SimpleNamespace(generate_picture_images=False),
+        )
+
+        assert result is not None
+        assert result["engine"] == "docling_page_windows"
+        assert calls == [(1, 2), (3, 3)]
+        merged = Path(result["md_path"]).read_text(encoding="utf-8")
+        assert "## Pages 1-2" in merged
+        assert "Docling pages 1-2" in merged
+        assert "## Pages 3-3" in merged
+        structured = json.loads(Path(result["structured_document_path"]).read_text(encoding="utf-8"))
+        assert structured["schema"] == "mbzuai_docling_page_windows.v1"
+        assert len(structured["parts"]) == 2
+
     def test_rewrite_structured_doc_image_refs_removes_sidecar_artifacts(self, tmp_dir):
         from pipeline.stages.converters.docling_converter import _rewrite_structured_doc_image_refs
 
@@ -3530,6 +4785,49 @@ class TestChunkers:
         assert chunk_index["strategy"] == "hybrid"
         assert all(chunk["chunk_count"] == result.outputs["chunk_count"] for chunk in chunk_index["chunks"])
         assert all(chunk["token_count"] > 0 for chunk in chunk_index["chunks"])
+
+    def test_split_text_by_budget_splits_oversized_units_inside_multi_unit_text(self):
+        from pipeline.core.chunking import estimate_token_count
+        from pipeline.stages.chunkers.common import split_text_by_budget
+
+        text = "\n\n".join(
+            [
+                "# Admissions",
+                ("MBZUAI admissions requirements " * 500).strip(),
+                "Short closing note.",
+            ]
+        )
+
+        chunks = split_text_by_budget(text, max_tokens=120, overlap_tokens=20)
+
+        assert len(chunks) > 3
+        assert max(estimate_token_count(chunk) for chunk in chunks) <= 120
+
+    def test_split_text_by_budget_drops_overlap_when_next_unit_would_exceed_budget(self):
+        from pipeline.core.chunking import estimate_token_count
+        from pipeline.stages.chunkers.common import split_text_by_budget
+
+        text = " ".join(
+            [
+                ("Intro " * 150).strip() + ".",
+                ("Program " * 150).strip() + ".",
+                ("Research " * 150).strip() + ".",
+                ("Country " * 450).strip() + ".",
+            ]
+        )
+
+        chunks = split_text_by_budget(text, max_tokens=650, overlap_tokens=80)
+
+        assert len(chunks) >= 2
+        assert max(estimate_token_count(chunk) for chunk in chunks) <= 650
+
+    def test_docling_hybrid_chunker_uses_configured_token_budget(self):
+        from pipeline.stages.chunkers.common import _build_docling_hybrid_chunker
+
+        chunker = _build_docling_hybrid_chunker(650, always_emit_headings=False)
+
+        assert chunker.tokenizer.get_max_tokens() == 650
+        assert chunker.tokenizer.count_tokens("<|fim_prefix|> MBZUAI") > 0
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4427,7 +5725,7 @@ class TestSemanticGraphStages:
             },
         )
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(
             mod,
             "_call_gemini_structured",
@@ -4850,6 +6148,184 @@ class TestSemanticGraphStages:
 
 
 class TestGeminiPineconeEmbedder:
+    def test_upload_plan_rejects_partial_entity_or_sparse_lanes(self):
+        from pipeline.stages.embedders.gemini_pinecone_embedder import _assert_upload_plan_complete
+
+        planned = {"chunks": 10, "entities": 2, "sparse_entities": 2, "communities": 1}
+        _assert_upload_plan_complete(planned, dict(planned))
+
+        with pytest.raises(RuntimeError, match="entities.*uploaded.*1"):
+            _assert_upload_plan_complete(
+                planned,
+                {"chunks": 10, "entities": 1, "sparse_entities": 2, "communities": 1},
+            )
+
+    def test_release_namespaces_are_stable_and_isolated(self):
+        from pipeline.stages.embedders.gemini_pinecone_embedder import _resolve_upload_namespaces
+
+        base = {
+            "namespace_strategy": "release",
+            "namespace_chunks": "mbzuai-chunks",
+            "namespace_parents": "mbzuai-parents",
+        }
+        first = _resolve_upload_namespaces(base, run_id="release-2026-07-11")
+        repeated = _resolve_upload_namespaces(base, run_id="release-2026-07-11")
+        second = _resolve_upload_namespaces(base, run_id="release-2026-07-12")
+
+        assert first == repeated
+        assert first["chunks"].startswith("mbzuai-chunks--release-2026-07-11--")
+        assert first["chunks"] != second["chunks"]
+        assert len(set(first.values())) == len(first)
+
+    def test_make_gemini_client_passes_http_timeout(self, monkeypatch):
+        from pipeline.stages.embedders import gemini_pinecone_embedder as module
+
+        captured = {}
+
+        class FakeHttpOptions:
+            def __init__(self, *, timeout=None):
+                self.timeout = timeout
+
+        class FakeTypes:
+            HttpOptions = FakeHttpOptions
+
+        class FakeGenAI:
+            class Client:
+                def __init__(self, **kwargs):
+                    captured.update(kwargs)
+
+        monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+        monkeypatch.setenv("GEMINI_API_KEY", "fallback-key")
+        monkeypatch.setattr(module, "import_genai", lambda: FakeGenAI)
+        monkeypatch.setattr(module, "import_genai_types", lambda: FakeTypes)
+
+        module._make_gemini_client(request_timeout_ms=12345)
+
+        assert captured["api_key"] == "test-key"
+        assert captured["http_options"].timeout == 12345
+
+    def test_verify_namespace_counts_detects_mismatch(self):
+        from pipeline.stages.embedders.gemini_pinecone_embedder import _verify_namespace_counts
+
+        class FakeIndex:
+            def describe_index_stats(self):
+                return {
+                    "namespaces": {
+                        "chunks": {"vector_count": 10},
+                        "assertions": {"vector_count": 2},
+                    }
+                }
+
+        report = _verify_namespace_counts(
+            index=FakeIndex(),
+            expected={"chunks": 10, "assertions": 3},
+            min_count_only=False,
+        )
+
+        assert report["failures"] == [{"namespace": "assertions", "expected": 3, "actual": 2}]
+
+    def test_embed_text_batch_sends_each_text_as_separate_content(self, monkeypatch):
+        import pipeline.stages.embedders.gemini_pinecone_embedder as mod
+
+        captured = {}
+
+        class FakePart:
+            @staticmethod
+            def from_text(*, text):
+                return ("text", text)
+
+        class FakeContent:
+            def __init__(self, *, role, parts):
+                self.role = role
+                self.parts = parts
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeModels:
+            def embed_content(self, *, model, contents, config):
+                captured["model"] = model
+                captured["contents"] = contents
+                captured["config"] = config
+                return SimpleNamespace(
+                    embeddings=[
+                        SimpleNamespace(values=[float(index), float(index + 1)])
+                        for index, _content in enumerate(contents)
+                    ]
+                )
+
+        fake_types = SimpleNamespace(
+            EmbedContentConfig=FakeConfig,
+            Content=FakeContent,
+            Part=FakePart,
+        )
+        monkeypatch.setattr(mod, "import_genai_types", lambda: fake_types)
+
+        vectors = mod._embed_text_batch(
+            SimpleNamespace(models=FakeModels()),
+            model="gemini-embedding-2-preview",
+            texts=["first", "second"],
+            task_type="RETRIEVAL_DOCUMENT",
+            output_dimensionality=1024,
+        )
+
+        assert vectors == [[0.0, 1.0], [1.0, 2.0]]
+        assert captured["model"] == "gemini-embedding-2-preview"
+        assert captured["config"].kwargs == {
+            "task_type": "RETRIEVAL_DOCUMENT",
+            "output_dimensionality": 1024,
+        }
+        assert [content.role for content in captured["contents"]] == ["user", "user"]
+        assert [content.parts[0][1] for content in captured["contents"]] == ["first", "second"]
+
+    def test_embed_text_batch_uses_prompt_instruction_for_gemini_embedding_2(self, monkeypatch):
+        import pipeline.stages.embedders.gemini_pinecone_embedder as mod
+
+        captured = {}
+
+        class FakePart:
+            @staticmethod
+            def from_text(*, text):
+                return ("text", text)
+
+        class FakeContent:
+            def __init__(self, *, role, parts):
+                self.role = role
+                self.parts = parts
+
+        class FakeConfig:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        class FakeModels:
+            def embed_content(self, *, model, contents, config):
+                captured["model"] = model
+                captured["contents"] = contents
+                captured["config"] = config
+                return SimpleNamespace(embeddings=[SimpleNamespace(values=[1.0, 2.0])])
+
+        fake_types = SimpleNamespace(
+            EmbedContentConfig=FakeConfig,
+            Content=FakeContent,
+            Part=FakePart,
+        )
+        monkeypatch.setattr(mod, "import_genai_types", lambda: fake_types)
+
+        vectors = mod._embed_text_batch(
+            SimpleNamespace(models=FakeModels()),
+            model="gemini-embedding-2",
+            texts=["MBZUAI admissions"],
+            task_type="RETRIEVAL_DOCUMENT",
+            output_dimensionality=1024,
+        )
+
+        assert vectors == [[1.0, 2.0]]
+        assert captured["config"].kwargs == {"output_dimensionality": 1024}
+        assert captured["contents"][0].parts[0][1] == (
+            "title: none | text: MBZUAI admissions"
+        )
+
     def test_execute_uploads_chunk_parent_media_namespaces(self, tmp_dir, monkeypatch):
         from pipeline.core.base import StageContext
         from pipeline.core.io import atomic_write_json
@@ -4889,7 +6365,7 @@ class TestGeminiPineconeEmbedder:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setattr(
             mod,
@@ -4971,7 +6447,7 @@ class TestGeminiPineconeEmbedder:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setattr(mod, "_ensure_sparse_index", lambda *args, **kwargs: True)
         monkeypatch.setitem(sys.modules, "pinecone", SimpleNamespace(Pinecone=FakePinecone, ServerlessSpec=lambda **kwargs: kwargs))
@@ -5237,7 +6713,7 @@ class TestGeminiPineconeEmbedder:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setattr(mod, "_ensure_sparse_index", lambda *args, **kwargs: True)
         monkeypatch.setitem(sys.modules, "pinecone", SimpleNamespace(Pinecone=FakePinecone, ServerlessSpec=lambda **kwargs: kwargs))
@@ -5333,6 +6809,34 @@ class TestGeminiPineconeEmbedder:
         report = audit_run(tmp_dir)
         assert any(issue.code == "index_manifest_bundle_mismatch" for issue in report.errors)
 
+    def test_audit_run_uses_manifest_declared_finalized_bundle(self, tmp_dir):
+        from pipeline.core.io import atomic_write_json, sha256_file
+        from pipeline.core.run_audit import audit_run
+        from pipeline.core.state import PipelineState, save_state
+
+        stage_finalize = tmp_dir / "stage_outputs" / "finalize_retrieval_bundle"
+        stage_build = tmp_dir / "stage_outputs" / "build_retrieval_bundle"
+        stage_upload = tmp_dir / "stage_outputs" / "upload_retrieval"
+        stage_finalize.mkdir(parents=True)
+        stage_build.mkdir(parents=True)
+        stage_upload.mkdir(parents=True)
+        finalized_bundle = stage_finalize / "retrieval_bundle.json"
+        stale_build_bundle = stage_build / "retrieval_bundle.json"
+        atomic_write_json(finalized_bundle, {"bundle_version": 5, "chunk_records": [{"id": "final"}]})
+        atomic_write_json(stale_build_bundle, {"bundle_version": 4, "chunk_records": [{"id": "stale"}]})
+        atomic_write_json(
+            stage_upload / "index_upload_manifest.json",
+            {
+                "index_name": "idx",
+                "retrieval_bundle_file": str(finalized_bundle),
+                "retrieval_bundle_sha256": sha256_file(finalized_bundle),
+            },
+        )
+        save_state(PipelineState(run_id="r1", project_name="p1", status="completed"), tmp_dir)
+
+        report = audit_run(tmp_dir)
+        assert not any(issue.code == "index_manifest_bundle_mismatch" for issue in report.errors)
+
     def test_execute_clears_sparse_namespace_before_zero_progress_reupload(self, tmp_dir, monkeypatch):
         from pipeline.core.base import StageContext
         from pipeline.core.io import atomic_write_json
@@ -5370,7 +6874,7 @@ class TestGeminiPineconeEmbedder:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setattr(mod, "_ensure_sparse_index", lambda *args, **kwargs: True)
         monkeypatch.setitem(sys.modules, "pinecone", SimpleNamespace(Pinecone=FakePinecone, ServerlessSpec=lambda **kwargs: kwargs))
@@ -5444,7 +6948,7 @@ class TestGeminiPineconeEmbedder:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setattr(mod, "_ensure_sparse_index", lambda *args, **kwargs: True)
         monkeypatch.setitem(sys.modules, "pinecone", SimpleNamespace(Pinecone=FakePinecone, ServerlessSpec=lambda **kwargs: kwargs))
@@ -5515,7 +7019,7 @@ class TestGeminiPineconeEmbedder:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setitem(sys.modules, "pinecone", SimpleNamespace(Pinecone=FakePinecone, ServerlessSpec=lambda **kwargs: kwargs))
 
@@ -5640,6 +7144,50 @@ class TestAdaptiveHybridRetriever:
         atomic_write_json(stage_dir / "retrieval_bundle.json", bundle)
         atomic_write_json(stage_dir / "lexical_corpus.json", lexical)
         return run_dir
+
+    def test_loads_current_mbzuai_retrieval_bundle_stage_id(self, tmp_dir):
+        from pipeline.core.io import atomic_write_json
+        from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+        run_dir = tmp_dir / "current_run"
+        stage_dir = run_dir / "stage_outputs" / "build_retrieval_bundle"
+        stage_dir.mkdir(parents=True)
+        atomic_write_json(
+            stage_dir / "retrieval_bundle.json",
+            {
+                "chunk_records": [
+                    {
+                        "id": "chunk-current",
+                        "dense_text": "MBZUAI admission requirements",
+                        "text": "MBZUAI admission requirements",
+                        "document_title": "Admission Requirements",
+                        "document_id": "doc-current",
+                        "source_url": "https://mbzuai.ac.ae/study/admission-requirements",
+                    }
+                ],
+                "parent_records": [],
+                "media_records": [],
+                "fact_records": [],
+            },
+        )
+        atomic_write_json(
+            stage_dir / "lexical_corpus.json",
+            [
+                {
+                    "id": "chunk-current",
+                    "record_type": "chunk",
+                    "text": "MBZUAI admission requirements",
+                    "tokens": ["mbzuai", "admission", "requirements"],
+                }
+            ],
+        )
+
+        retriever = AdaptiveHybridRetriever(
+            config={"embedder": {"pinecone_index": "test-index"}, "retrieval": {}},
+            work_dir=run_dir,
+        )
+
+        assert "chunk-current" in retriever.chunk_map
 
     def _build_contact_lookup_run(self, tmp_dir):
         from pipeline.core.io import atomic_write_json
@@ -6724,7 +8272,7 @@ class TestAdaptiveHybridRetriever:
         import pipeline.evaluation.answer_generation as mod
 
         monkeypatch.setattr(mod, "AdaptiveHybridRetriever", FakeRetriever)
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: FakeClient())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: FakeClient())
 
         result = generate_answer_predictions(
             config_name="test",
@@ -6827,7 +8375,7 @@ class TestAdaptiveHybridRetriever:
         import pipeline.evaluation.answer_generation as mod
 
         monkeypatch.setattr(mod, "AdaptiveHybridRetriever", FakeRetriever)
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: FakeClient())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: FakeClient())
 
         result = generate_answer_predictions(
             config_name="test",
@@ -6912,7 +8460,7 @@ class TestAdaptiveHybridRetriever:
         import pipeline.evaluation.answer_generation as mod
 
         monkeypatch.setattr(mod, "AdaptiveHybridRetriever", FakeRetriever)
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: FakeClient())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: FakeClient())
 
         result = generate_answer_predictions(
             config_name="test",
@@ -6998,7 +8546,7 @@ class TestAdaptiveHybridRetriever:
         import pipeline.evaluation.answer_generation as mod
 
         monkeypatch.setattr(mod, "AdaptiveHybridRetriever", FakeRetriever)
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: FakeClient())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: FakeClient())
 
         result = generate_answer_predictions(
             config_name="test",
@@ -7994,13 +9542,26 @@ class TestAdaptiveHybridRetriever:
         monkeypatch.setattr(mod, "_embed_query", lambda *args, **kwargs: [0.1, 0.2])
 
         class FakeSparseIndex:
+            calls = []
+
             def search(self, **kwargs):
+                self.calls.append(kwargs)
                 return {"result": {"hits": [{"_id": "chunk3"}]}}
 
         retriever = AdaptiveHybridRetriever(config=config, work_dir=run_dir)
-        retriever._sparse_index = FakeSparseIndex()
+        fake_sparse = FakeSparseIndex()
+        retriever._sparse_index = fake_sparse
 
         ids = retriever._sparse_query_ids(namespace="chunks", query="admissions requirements", top_k=3)
+        assert fake_sparse.calls == [
+            {
+                "namespace": "chunks",
+                "top_k": 3,
+                "inputs": {"text": "admissions requirements"},
+                "fields": [],
+                "timeout": 10.0,
+            }
+        ]
         assert "chunk1" in ids
         assert "chunk3" in ids
 
@@ -10031,13 +11592,16 @@ class TestRoutedHybridRetriever:
             entity_tokens=("mbzuai",),
             graph_first=True,
         )
-        retriever.graph.prepare_query_context = lambda query, **kwargs: (_ for _ in ()).throw(RuntimeError("graph failure"))
+        retriever.graph.prepare_query_context = lambda query, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("graph failure in /srv/private/releases/run-42 with secret-token")
+        )
 
         result = retriever.retrieve("In which city is MBZUAI located?")
 
         assert result["routing_backend"] == "vector"
         assert result["routing_reason"] == "graph_error_fallback"
-        assert result["routing_graph_error"] == "graph failure"
+        assert result["routing_graph_error"] == "graph_context_failed"
+        assert "/srv/private" not in str(result)
 
     def test_routed_retriever_routes_contact_lookup_queries_to_graph_backend(self, tmp_dir):
         from pipeline.retrieval.graph_rag import GraphQueryContext, RelationCandidateSet, RelationQueryPlan
@@ -10182,6 +11746,11 @@ class TestQueryAliasExpansion:
 
 
 class TestNeo4jGraphStoreEmbedder:
+    def test_query_count_supports_neo4j_query_api_values_shape(self):
+        from pipeline.stages.embedders.neo4j_graph_store import _query_count
+
+        assert _query_count({"data": {"fields": ["count"], "values": [[12]]}}) == 12
+
     def test_filter_graph_bundle_for_neo4j_keeps_compact_retrieval_subgraph(self):
         from pipeline.stages.embedders.neo4j_graph_store import _filter_graph_bundle_for_neo4j
 
@@ -10657,6 +12226,78 @@ class TestRunAudit:
         removed = reconcile_state_artifact_ids(state, catalog)
         assert removed == 1
         assert state.stages[0].artifact_ids == [existing.artifact_id]
+
+    def test_audit_allows_pruned_crawler_intermediates_after_downstream_stage(self, tmp_dir):
+        from pipeline.core.run_audit import audit_run
+        from pipeline.core.state import PipelineState, StageState, save_state
+
+        run_dir = tmp_dir / "run"
+        run_dir.mkdir()
+        cleaned_dir = run_dir / "stage_outputs" / "clean_html" / "cleaned_html"
+        cleaned_dir.mkdir(parents=True)
+
+        save_state(
+            PipelineState(
+                run_id="r1",
+                project_name="p1",
+                status="completed",
+                stages=[
+                    StageState(
+                        name="crawl4ai",
+                        stage_type="crawler",
+                        stage_id="crawl_web",
+                        status="completed",
+                        outputs={
+                            "html_dir": str(run_dir / "html"),
+                            "images_dir": str(run_dir / "downloaded_page_images"),
+                        },
+                    ),
+                    StageState(
+                        name="trafilatura",
+                        stage_type="cleaner",
+                        stage_id="clean_html",
+                        status="completed",
+                        outputs={"cleaned_dir": str(cleaned_dir)},
+                    ),
+                ],
+                current_stage_index=2,
+            ),
+            run_dir,
+        )
+
+        report = audit_run(run_dir)
+        assert report.ok
+        assert any(issue.code == "pruned_intermediate_dir" for issue in report.warnings)
+
+    def test_audit_requires_crawler_intermediates_before_downstream_stage(self, tmp_dir):
+        from pipeline.core.run_audit import audit_run
+        from pipeline.core.state import PipelineState, StageState, save_state
+
+        run_dir = tmp_dir / "run"
+        run_dir.mkdir()
+
+        save_state(
+            PipelineState(
+                run_id="r1",
+                project_name="p1",
+                status="completed",
+                stages=[
+                    StageState(
+                        name="crawl4ai",
+                        stage_type="crawler",
+                        stage_id="crawl_web",
+                        status="completed",
+                        outputs={"html_dir": str(run_dir / "html")},
+                    )
+                ],
+                current_stage_index=1,
+            ),
+            run_dir,
+        )
+
+        report = audit_run(run_dir)
+        assert not report.ok
+        assert any(issue.code == "missing_output_dir" for issue in report.errors)
 
     def test_audit_detects_accepted_report_with_missing_markdown(self, tmp_dir):
         from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record, save_artifact_catalog
@@ -11268,6 +12909,10 @@ class TestRetrievalEvaluation:
             "pipeline.evaluation.retrieval_eval.AdaptiveHybridRetriever.from_config",
             lambda **kwargs: FakeRetriever(),
         )
+        monkeypatch.setattr(
+            "pipeline.evaluation.retrieval_eval.validate_eval_examples",
+            lambda *args, **kwargs: {"ok": True, "errors": [], "warnings": [], "summary": {"query_count": 2}},
+        )
 
         report = evaluate_retrieval_dataset(
             config_name="unused",
@@ -11793,9 +13438,7 @@ class TestRetrievalEvaluation:
         assert report["cache"]["miss_count"] == 2
         assert report["cache"]["hit_count"] == 0
 
-    def test_evaluate_retrieval_dataset_supports_parallel_retrieval_workers(self, tmp_dir, monkeypatch):
-        import time
-
+    def test_evaluate_retrieval_dataset_caps_unshared_parallel_retrieval_workers(self, tmp_dir, monkeypatch):
         from pipeline.evaluation.retrieval_eval import evaluate_retrieval_dataset
 
         dataset_path = tmp_dir / "gold.jsonl"
@@ -11835,7 +13478,6 @@ class TestRetrievalEvaluation:
             output_dimensionality = 8
 
             def __init__(self):
-                self.active = False
                 created_instances.append(self)
 
             def embed_queries(self, queries):
@@ -11845,51 +13487,50 @@ class TestRetrievalEvaluation:
                 return [0.1, 0.2, 9.0]
 
             def retrieve(self, query, *, query_vector=None):
-                if self.active:
-                    raise AssertionError("parallel evaluation must not share one retriever instance across workers")
-                self.active = True
-                time.sleep(0.05)
-                try:
-                    if "located" in query:
-                        return {
-                            "mode": "fact",
-                            "seed_chunk_ids": ["chunk-a"],
-                            "selected_chunk_ids": ["chunk-a"],
-                            "selected_parent_ids": ["parent-a"],
-                            "dense_parent_ids": ["parent-a"],
-                            "selected_media_ids": [],
-                            "dense_media_ids": [],
-                            "media": [],
-                        }
+                if "located" in query:
                     return {
                         "mode": "fact",
-                        "seed_chunk_ids": ["chunk-b"],
-                        "selected_chunk_ids": ["chunk-b"],
-                        "selected_parent_ids": ["parent-b"],
-                        "dense_parent_ids": ["parent-b"],
+                        "seed_chunk_ids": ["chunk-a"],
+                        "selected_chunk_ids": ["chunk-a"],
+                        "selected_parent_ids": ["parent-a"],
+                        "dense_parent_ids": ["parent-a"],
                         "selected_media_ids": [],
                         "dense_media_ids": [],
                         "media": [],
                     }
-                finally:
-                    self.active = False
+                return {
+                    "mode": "fact",
+                    "seed_chunk_ids": ["chunk-b"],
+                    "selected_chunk_ids": ["chunk-b"],
+                    "selected_parent_ids": ["parent-b"],
+                    "dense_parent_ids": ["parent-b"],
+                    "selected_media_ids": [],
+                    "dense_media_ids": [],
+                    "media": [],
+                }
 
         monkeypatch.setattr(
             "pipeline.evaluation.retrieval_eval.AdaptiveHybridRetriever.from_config",
             lambda **kwargs: FakeRetriever(),
         )
 
+        events = []
         report = evaluate_retrieval_dataset(
             config_name="unused",
             work_dir=tmp_dir,
             dataset_path=dataset_path,
             parallelism=2,
+            progress_callback=lambda event, payload: events.append((event, dict(payload))),
         )
 
         assert report["query_count"] == 2
         assert report["overall"]["chunk_hit_at_10"] == 1.0
         assert report["overall"]["parent_hit_at_5"] == 1.0
-        assert len(created_instances) >= 2
+        assert report["execution"]["parallelism_requested"] == 2
+        assert report["execution"]["parallelism_effective"] == 1
+        assert report["execution"]["shared_parallel_retriever"] is False
+        assert len(created_instances) == 1
+        assert any(event == "retrieval_eval_parallelism_capped" for event, _payload in events)
 
     def test_evaluate_retrieval_dataset_can_share_parallel_retriever_when_supported(self, tmp_dir, monkeypatch):
         import time
@@ -11985,8 +13626,90 @@ class TestRetrievalEvaluation:
         assert report["execution"]["shared_parallel_retriever"] is True
         assert len(created_instances) == 1
 
+    def test_evaluate_retrieval_dataset_records_query_errors_without_dropping_report(self, tmp_dir, monkeypatch):
+        from pipeline.evaluation.retrieval_eval import evaluate_retrieval_dataset
+
+        dataset_path = tmp_dir / "gold.jsonl"
+        dataset_path.write_text(
+            json.dumps(
+                {
+                    "id": "q1",
+                    "query": "Where is MBZUAI located?",
+                    "query_type": "fact",
+                    "source_type": "webpage",
+                    "gold_chunk_ids": ["chunk-a"],
+                    "gold_parent_ids": ["parent-a"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        class FakeRetriever:
+            model = "fake-embed-model"
+            output_dimensionality = 8
+
+            def retrieve(self, query, *, query_vector=None):
+                raise RuntimeError("retriever exploded")
+
+        monkeypatch.setattr(
+            "pipeline.evaluation.retrieval_eval.AdaptiveHybridRetriever.from_config",
+            lambda **kwargs: FakeRetriever(),
+        )
+        events = []
+
+        report = evaluate_retrieval_dataset(
+            config_name="unused",
+            work_dir=tmp_dir,
+            dataset_path=dataset_path,
+            progress_callback=lambda event, payload: events.append((event, dict(payload))),
+        )
+
+        assert report["query_count"] == 1
+        assert report["execution"]["retrieval_error_count"] == 1
+        assert report["retrieval_errors"][0]["id"] == "q1"
+        assert "retriever exploded" in report["retrieval_errors"][0]["error"]
+        assert report["overall"]["chunk_hit_at_10"] == 0.0
+        assert any(event == "retrieval_eval_query_done" and payload["error"] for event, payload in events)
+
 
 class TestEvaluationDatasetTools:
+    def test_validate_eval_set_accepts_current_mbzuai_retrieval_bundle_stage_id(self, tmp_dir):
+        from pipeline.core.io import atomic_write_json
+        from pipeline.evaluation.dataset_tools import validate_eval_examples
+
+        run_dir = tmp_dir / "run"
+        stage_dir = run_dir / "stage_outputs" / "build_retrieval_bundle"
+        stage_dir.mkdir(parents=True)
+        atomic_write_json(
+            stage_dir / "retrieval_bundle.json",
+            {
+                "chunk_records": [{"id": "chunk-current"}],
+                "parent_records": [{"id": "parent-current"}],
+                "media_records": [],
+            },
+        )
+        dataset_path = tmp_dir / "eval.jsonl"
+        dataset_path.write_text(
+            json.dumps(
+                {
+                    "id": "ok-current",
+                    "query": "Admissions requirements?",
+                    "query_type": "fact",
+                    "source_type": "webpage",
+                    "gold_chunk_ids": ["chunk-current"],
+                    "gold_parent_ids": ["parent-current"],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        report = validate_eval_examples(dataset_path, work_dir=run_dir)
+
+        assert report["ok"] is True
+        assert report["errors"] == []
+
     def test_validate_eval_set_checks_gold_ids_against_retrieval_bundle(self, tmp_dir):
         from pipeline.evaluation.dataset_tools import validate_eval_examples
 
@@ -12039,6 +13762,509 @@ class TestEvaluationDatasetTools:
         assert report["query_type_counts"] == {"fact": 2, "multimodal": 1}
         assert report["source_type_counts"] == {"none": 1, "pdf": 1, "webpage": 1}
         assert report["no_answer_count"] == 1
+
+
+class TestMBZLegacyVectorStoreFormatterQualityMetadata:
+    def test_authority_and_intent_metadata_for_official_admissions_page(self):
+        from pipeline.stages.formatters.mbzuai_legacy_vectorstore_formatter import (
+            _infer_authority,
+            _infer_intent_tags,
+        )
+
+        authority_class, authority_score = _infer_authority(
+            "https://mbzuai.ac.ae/study/admission-requirements",
+            "Admission Requirements",
+            "webpage",
+        )
+        intents = _infer_intent_tags(
+            "https://mbzuai.ac.ae/study/admission-requirements",
+            "Admission Requirements",
+            "Official eligibility, application requirements, and deadlines.",
+            {"h1": ["Admission Requirements"], "h2": ["Required documents"]},
+        )
+
+        assert authority_class == "official_admissions"
+        assert authority_score >= 0.9
+        assert "admissions" in intents
+
+    def test_news_authority_is_lower_than_official_program_page(self):
+        from pipeline.stages.formatters.mbzuai_legacy_vectorstore_formatter import _infer_authority
+
+        news_class, news_score = _infer_authority(
+            "https://mbzuai.ac.ae/news/artificial-intelligence-event",
+            "AI Event",
+            "webpage",
+        )
+        program_class, program_score = _infer_authority(
+            "https://mbzuai.ac.ae/study/graduate-programs",
+            "Graduate Programs",
+            "webpage",
+        )
+
+        assert news_class == "time_bound_content"
+        assert program_class == "official_program"
+        assert program_score > news_score
+
+
+class TestMBZUAIIndexReadiness:
+    def test_inventory_coverage_excludes_intentional_url_exclusions(self):
+        from pipeline.stages.formatters.mbzuai_index_readiness_formatter import (
+            _coverage_gate,
+            _failure_manifest,
+        )
+
+        runtime_state = {
+            "stats": {
+                "pages_scraped": 2504,
+                "documents_downloaded": 120,
+            },
+            "url_mapping": {
+                **{
+                    f"https://mbzuai.ac.ae/tag/topic-{idx}": "SKIPPED_EXCLUDED_FRONTIER:path_prefix"
+                    for idx in range(1004)
+                },
+                "https://mbzuai.ac.ae/missing": "SKIPPED_HTTP_404",
+            },
+            "crawl_state": {
+                "visited": ["https://mbzuai.ac.ae"],
+                "pending": [],
+                "pages_crawled": 1,
+            },
+        }
+        formatter_config = {
+            "expected_site_inventory_count": 3800,
+            "minimum_inventory_coverage_ratio": 0.75,
+            "critical_url_patterns": [r"/study/"],
+        }
+
+        failure_manifest = _failure_manifest(runtime_state, formatter_config)
+        coverage_gate = _coverage_gate(
+            canonical_metadata={
+                "https://mbzuai.ac.ae/study/graduate-admission-process": {
+                    "indexable": True,
+                }
+            },
+            failure_manifest=failure_manifest,
+            formatter_config=formatter_config,
+        )
+
+        assert failure_manifest["intentional_excluded_count"] == 1004
+        assert failure_manifest["hard_failure_count"] == 1
+        assert failure_manifest["effective_expected_inventory_count"] == 2796
+        assert failure_manifest["raw_inventory_coverage_ratio"] == 0.6905
+        assert failure_manifest["inventory_coverage_ratio"] > 0.93
+        assert coverage_gate["ok"] is True
+        assert coverage_gate["inventory_gap"] is False
+
+    def test_production_coverage_gate_rejects_excess_hard_failures(self):
+        from pipeline.stages.formatters.mbzuai_index_readiness_formatter import _coverage_gate
+
+        gate = _coverage_gate(
+            canonical_metadata={
+                "https://mbzuai.ac.ae/study/": {"indexable": True},
+            },
+            failure_manifest={
+                "hard_failure_count": 26,
+                "expected_site_inventory_count": 3800,
+                "effective_expected_inventory_count": 3800,
+                "inventory_coverage_ratio": 0.95,
+                "failed_urls": [],
+            },
+            formatter_config={
+                "expected_site_inventory_count": 3800,
+                "minimum_inventory_coverage_ratio": 0.90,
+                "maximum_hard_failure_count": 25,
+                "critical_url_patterns": [r"/study/"],
+            },
+        )
+
+        assert gate["ok"] is False
+        assert gate["hard_failure_gap"] is True
+
+    def test_canonical_stage_writes_url_identity_and_change_manifest(self, tmp_dir):
+        from pipeline.core.base import StageContext
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.formatters.mbzuai_index_readiness_formatter import MBZUAIIndexReadinessFormatter
+
+        md_path = tmp_dir / "admissions.md"
+        md_path.write_text("Admission requirements for MBZUAI graduate applicants.", encoding="utf-8")
+        page_metadata_file = tmp_dir / "page_metadata.json"
+        page_link_graph_file = tmp_dir / "page_link_graph.json"
+        atomic_write_json(
+            page_metadata_file,
+            {
+                "https://mbzuai.ac.ae/en/study/admissions/?utm_source=test": {
+                    "url": "https://mbzuai.ac.ae/en/study/admissions/?utm_source=test",
+                    "title": "Admissions",
+                    "language": "en-US",
+                    "markdown_path": str(md_path),
+                    "headings": {"h1": ["Admissions"]},
+                },
+                "https://mbzuai.ac.ae/ar/study/admissions/": {
+                    "url": "https://mbzuai.ac.ae/ar/study/admissions/",
+                    "title": "Admissions Arabic",
+                    "language": "ar",
+                    "markdown_path": str(md_path),
+                    "headings": {"h1": ["Admissions"]},
+                },
+            },
+        )
+        atomic_write_json(
+            page_link_graph_file,
+            {
+                "edges": [
+                    {
+                        "source_url": "https://mbzuai.ac.ae/en/study/admissions/",
+                        "target_url": "https://mbzuai.ac.ae/en/study/scholarships/",
+                        "properties": {"link_type": "internal", "anchor_texts": ["Scholarships"]},
+                    }
+                ]
+            },
+        )
+        ctx = StageContext(
+            run_id="r-index-ready",
+            project_name="mbzuai",
+            config={"formatter": {}},
+            work_dir=tmp_dir,
+            previous_outputs={
+                "page_metadata_file": str(page_metadata_file),
+                "page_link_graph_file": str(page_link_graph_file),
+            },
+            stage_definition={"type": "formatter", "plugin": "mbzuai_index_readiness"},
+            stage_id="prepare_mbzuai_index",
+        )
+
+        result = run_async(MBZUAIIndexReadinessFormatter().execute(ctx))
+
+        assert result.status.value == "completed"
+        identity = load_json_safe(result.outputs["url_identity_map_file"])
+        changes = load_json_safe(result.outputs["page_change_manifest_file"])
+        canonical_metadata = load_json_safe(result.outputs["canonical_page_metadata_file"])
+        coverage_gate = load_json_safe(result.outputs["index_coverage_gate_file"])
+        assert identity["duplicate_family_count"] == 1
+        assert changes["new_page_count"] == 1
+        assert coverage_gate["missing_critical_count"] >= 1
+        assert "crawl_failure_manifest_file" in result.outputs
+        assert any(item["language"] == "en" for item in identity["records"])
+        first_record = next(iter(canonical_metadata.values()))
+        assert first_record["canonical_family_url"] == "https://mbzuai.ac.ae/study/admissions"
+        assert first_record["content_hash"]
+
+    def test_canonical_metadata_marks_homepage_redirect_alias_non_indexable(self):
+        from pipeline.core.mbzuai_indexing import canonicalize_page_metadata
+
+        canonical = canonicalize_page_metadata(
+            {
+                "https://mbzuai.ac.ae/about/contact": {
+                    "url": "https://mbzuai.ac.ae/about/contact",
+                    "canonical_url": "https://mbzuai.ac.ae/",
+                    "status_code": 301,
+                    "title": "MBZUAI - Mohamed bin Zayed University of Artificial Intelligence",
+                }
+            }
+        )
+
+        record = canonical["https://mbzuai.ac.ae/about/contact"]
+        assert record["page_type"] == "redirect_alias"
+        assert record["indexable"] is False
+        assert record["index_exclusion_reason"] == "homepage_redirect_alias"
+
+    def test_legacy_formatter_preserves_backend_contract_and_adds_citation_metadata(self, tmp_dir):
+        from pipeline.core.base import StageContext
+        from pipeline.core.chunking import build_chunk_index
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.formatters.mbzuai_legacy_vectorstore_formatter import MBZLegacyVectorStoreFormatter
+
+        md_path = tmp_dir / "admissions.md"
+        md_path.write_text("## Required documents\n\nApplicants must submit transcripts.", encoding="utf-8")
+        chunks_file = tmp_dir / "chunks.json"
+        atomic_write_json(
+            chunks_file,
+            build_chunk_index(
+                [
+                    {
+                        "document_id": "doc-admissions",
+                        "document_title": "Admission Requirements",
+                        "document_type": "webpage",
+                        "source_markdown_path": str(md_path),
+                        "source_url": "https://mbzuai.ac.ae/en/study/admissions/",
+                        "section_path": ["Study", "Admission Requirements", "Required documents"],
+                        "text": "Applicants must submit transcripts and other required documents.",
+                    }
+                ],
+                strategy="hybrid",
+            ),
+        )
+        summaries_dir = tmp_dir / "summaries"
+        summaries_dir.mkdir()
+        atomic_write_json(
+            summaries_dir / "admissions.summary.json",
+            {
+                "source_original_file": str(md_path),
+                "document_title": "Admission Requirements",
+                "document_summary": "Official admission requirements.",
+                "key_facts": ["Applicants submit transcripts."],
+                "keywords": ["admissions"],
+            },
+        )
+        page_metadata_file = tmp_dir / "canonical_page_metadata.json"
+        atomic_write_json(
+            page_metadata_file,
+            {
+                "https://mbzuai.ac.ae/en/study/admissions": {
+                    "url": "https://mbzuai.ac.ae/en/study/admissions",
+                    "canonical_url": "https://mbzuai.ac.ae/en/study/admissions",
+                    "canonical_family_url": "https://mbzuai.ac.ae/study/admissions",
+                    "normalized_path": "/study/admissions",
+                    "language": "en",
+                    "title": "Admission Requirements",
+                    "content_hash": "abc123",
+                    "locale_variant_urls": [
+                        "https://mbzuai.ac.ae/en/study/admissions",
+                        "https://mbzuai.ac.ae/ar/study/admissions",
+                    ],
+                    "headings": {"h1": ["Admission Requirements"], "h2": ["Required documents"]},
+                }
+            },
+        )
+        ctx = StageContext(
+            run_id="r-legacy",
+            project_name="mbzuai",
+            config={"formatter": {}},
+            work_dir=tmp_dir,
+            previous_outputs={
+                "chunks_file": str(chunks_file),
+                "summaries_dir": str(summaries_dir),
+                "page_metadata_file": str(page_metadata_file),
+            },
+            stage_definition={"type": "formatter", "plugin": "mbzuai_legacy_vectorstores"},
+            stage_id="format_legacy_vectorstores",
+        )
+
+        result = run_async(MBZLegacyVectorStoreFormatter().execute(ctx))
+
+        assert result.status.value == "completed"
+        text_docs = load_json_safe(result.outputs["legacy_text_formatted_file"])
+        metadata = text_docs[0]["metadata"]
+        assert metadata["page_source"] == "https://mbzuai.ac.ae/en/study/admissions/"
+        assert metadata["context"]
+        assert metadata["canonical_family_url"] == "https://mbzuai.ac.ae/study/admissions"
+        assert metadata["page_title"] == "Admission Requirements"
+        assert metadata["section_title"] == "Required documents"
+        assert "Admission Requirements > Required documents" in metadata["breadcrumb"]
+        assert metadata["citation_anchor"]["language"] == "en"
+
+    def test_legacy_formatter_restores_public_pdf_source_url_from_download_mapping(self, tmp_dir):
+        from pipeline.core.base import StageContext
+        from pipeline.core.chunking import build_chunk_index
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.formatters.mbzuai_legacy_vectorstore_formatter import MBZLegacyVectorStoreFormatter
+
+        pdf_path = tmp_dir / "downloads" / "MAAIBrochure2025.pdf"
+        pdf_path.parent.mkdir()
+        pdf_path.write_text("pdf placeholder", encoding="utf-8")
+        md_path = tmp_dir / "MAAIBrochure2025.md"
+        md_path.write_text("## Admissions & Fees\n\nMBZUAI accepts applications from qualified candidates.", encoding="utf-8")
+        atomic_write_json(
+            tmp_dir / "mappings.json",
+            {"https://staticcdn.mbzuai.ac.ae/mbzuaiwpprd01/2025/02/MAAIBrochure2025.pdf": str(pdf_path)},
+        )
+        chunks_file = tmp_dir / "chunks.json"
+        atomic_write_json(
+            chunks_file,
+            build_chunk_index(
+                [
+                    {
+                        "document_id": "doc-maai",
+                        "document_title": "MAAI Brochure",
+                        "document_type": "pdf",
+                        "source_file": str(pdf_path),
+                        "source_markdown_path": str(md_path),
+                        "source_url": "",
+                        "section_path": ["Admissions & Fees"],
+                        "text": "MBZUAI accepts applications from qualified candidates.",
+                    }
+                ],
+                strategy="hybrid",
+            ),
+        )
+        summaries_dir = tmp_dir / "summaries"
+        summaries_dir.mkdir()
+        atomic_write_json(
+            summaries_dir / "maai.summary.json",
+            {
+                "source_original_file": str(md_path),
+                "document_title": "MAAI Brochure",
+                "document_summary": "Admissions and fees brochure.",
+                "key_facts": [],
+                "keywords": ["admissions"],
+            },
+        )
+        ctx = StageContext(
+            run_id="r-legacy-pdf",
+            project_name="mbzuai",
+            config={"formatter": {}},
+            work_dir=tmp_dir,
+            previous_outputs={"chunks_file": str(chunks_file), "summaries_dir": str(summaries_dir)},
+            stage_definition={"type": "formatter", "plugin": "mbzuai_legacy_vectorstores"},
+            stage_id="format_legacy_vectorstores",
+        )
+
+        result = run_async(MBZLegacyVectorStoreFormatter().execute(ctx))
+
+        assert result.status.value == "completed"
+        text_docs = load_json_safe(result.outputs["legacy_text_formatted_file"])
+        metadata = text_docs[0]["metadata"]
+        assert metadata["page_source"] == "https://staticcdn.mbzuai.ac.ae/mbzuaiwpprd01/2025/02/MAAIBrochure2025.pdf"
+        assert metadata["source_file"] == str(md_path)
+
+    def test_legacy_formatter_uses_canonical_url_for_redirected_html_citations(self, tmp_dir):
+        from pipeline.core.base import StageContext
+        from pipeline.core.chunking import build_chunk_index
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.formatters.mbzuai_legacy_vectorstore_formatter import MBZLegacyVectorStoreFormatter
+
+        md_path = tmp_dir / "redirected.md"
+        md_path.write_text("## Explore our AI degrees\n\nOur degree programs.", encoding="utf-8")
+        chunks_file = tmp_dir / "chunks.json"
+        atomic_write_json(
+            chunks_file,
+            build_chunk_index(
+                [
+                    {
+                        "document_id": "doc-home",
+                        "document_title": "MBZUAI Degree Programs",
+                        "document_type": "webpage",
+                        "source_markdown_path": str(md_path),
+                        "source_url": "https://mbzuai.ac.ae/about/leadership/hong-dekyi-liang",
+                        "section_path": ["Explore our AI degrees"],
+                        "text": "Our degree programs include master’s, doctoral, and undergraduate options.",
+                    }
+                ],
+                strategy="hybrid",
+            ),
+        )
+        summaries_dir = tmp_dir / "summaries"
+        summaries_dir.mkdir()
+        atomic_write_json(
+            summaries_dir / "redirected.summary.json",
+            {
+                "source_original_file": str(md_path),
+                "document_title": "MBZUAI Degree Programs",
+                "document_summary": "Degree programs page.",
+                "key_facts": [],
+                "keywords": ["programs"],
+            },
+        )
+        page_metadata_file = tmp_dir / "canonical_page_metadata.json"
+        atomic_write_json(
+            page_metadata_file,
+            {
+                "https://mbzuai.ac.ae/about/leadership/hong-dekyi-liang": {
+                    "url": "https://mbzuai.ac.ae/about/leadership/hong-dekyi-liang",
+                    "status_code": 301,
+                    "canonical_url": "https://mbzuai.ac.ae/",
+                    "canonical_family_url": "https://mbzuai.ac.ae/",
+                    "title": "MBZUAI",
+                    "headings": {"h2": ["Explore our AI degrees"]},
+                }
+            },
+        )
+        ctx = StageContext(
+            run_id="r-legacy-redirect",
+            project_name="mbzuai",
+            config={"formatter": {}},
+            work_dir=tmp_dir,
+            previous_outputs={
+                "chunks_file": str(chunks_file),
+                "summaries_dir": str(summaries_dir),
+                "page_metadata_file": str(page_metadata_file),
+            },
+            stage_definition={"type": "formatter", "plugin": "mbzuai_legacy_vectorstores"},
+            stage_id="format_legacy_vectorstores",
+        )
+
+        result = run_async(MBZLegacyVectorStoreFormatter().execute(ctx))
+
+        assert result.status.value == "completed"
+        text_docs = load_json_safe(result.outputs["legacy_text_formatted_file"])
+        metadata = text_docs[0]["metadata"]
+        assert metadata["page_source"] == "https://mbzuai.ac.ae/"
+        assert metadata["canonical_url"] == "https://mbzuai.ac.ae/"
+
+    def test_knowledge_graph_includes_website_link_graph_edges(self, tmp_dir):
+        from pipeline.core.base import StageContext
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.formatters.knowledge_graph_formatter import KnowledgeGraphFormatter
+
+        retrieval_bundle_file = tmp_dir / "retrieval_bundle.json"
+        page_graph_file = tmp_dir / "canonical_page_link_graph.json"
+        atomic_write_json(
+            retrieval_bundle_file,
+            {
+                "parent_records": [
+                    {
+                        "id": "page-admissions",
+                        "parent_type": "page",
+                        "document_id": "doc-admissions",
+                        "document_title": "Admissions",
+                        "source_url": "https://mbzuai.ac.ae/en/study/admissions",
+                    }
+                ],
+                "chunk_records": [
+                    {
+                        "id": "chunk-admissions",
+                        "document_id": "doc-admissions",
+                        "document_title": "Admissions",
+                        "source_url": "https://mbzuai.ac.ae/en/study/admissions",
+                        "text": "Admissions requirements.",
+                        "chunk_index": 0,
+                        "chunk_count": 1,
+                    }
+                ],
+                "media_records": [],
+                "fact_records": [],
+            },
+        )
+        atomic_write_json(
+            page_graph_file,
+            {
+                "nodes": [
+                    {"id": "page:a", "url": "https://mbzuai.ac.ae/en/study/admissions", "label": "Admissions"},
+                    {"id": "page:b", "url": "https://mbzuai.ac.ae/en/study/scholarships", "label": "Scholarships"},
+                ],
+                "edges": [
+                    {
+                        "id": "edge:ab",
+                        "source_id": "page:a",
+                        "target_id": "page:b",
+                        "source_url": "https://mbzuai.ac.ae/en/study/admissions",
+                        "target_url": "https://mbzuai.ac.ae/en/study/scholarships",
+                        "properties": {"link_type": "internal"},
+                    }
+                ],
+            },
+        )
+        ctx = StageContext(
+            run_id="r-graph",
+            project_name="mbzuai",
+            config={"formatter": {}},
+            work_dir=tmp_dir,
+            previous_outputs={
+                "retrieval_bundle_file": str(retrieval_bundle_file),
+                "canonical_page_link_graph_file": str(page_graph_file),
+            },
+            stage_definition={"type": "formatter", "plugin": "knowledge_graph"},
+            stage_id="format_graph",
+        )
+
+        result = run_async(KnowledgeGraphFormatter().execute(ctx))
+
+        assert result.status.value == "completed"
+        assert result.metrics["website_page_nodes"] == 2
+        assert result.metrics["website_link_edges"] == 1
+        graph = load_json_safe(result.outputs["knowledge_graph_file"])
+        assert any(edge["edge_type"] == "WEBSITE_LINKS_TO" for edge in graph["edges"])
 
 
 class TestBenchmarkIO:
@@ -12310,6 +14536,58 @@ class TestRetrievalGateChecks:
         assert key_a == key_b
 
 
+class TestRetrievalAblationComparison:
+    def test_compare_reports_promotes_candidate_without_primary_metric_regressions(self):
+        from pipeline.evaluation.ablation import compare_retrieval_reports
+
+        baseline = {
+            "query_count": 2,
+            "overall": {
+                "chunk_hit_at_5": 0.50,
+                "chunk_recall_at_10": 0.50,
+                "chunk_mrr_at_10": 0.50,
+                "chunk_ndcg_at_10": 0.50,
+                "parent_hit_at_5": 0.50,
+                "no_answer_violation_rate": 0.10,
+            },
+        }
+        candidate = {
+            "query_count": 2,
+            "overall": {
+                "chunk_hit_at_5": 0.60,
+                "chunk_recall_at_10": 0.55,
+                "chunk_mrr_at_10": 0.50,
+                "chunk_ndcg_at_10": 0.51,
+                "parent_hit_at_5": 0.50,
+                "no_answer_violation_rate": 0.05,
+            },
+        }
+
+        report = compare_retrieval_reports(baseline=baseline, candidate=candidate)
+
+        assert report["passed"] is True
+        assert report["recommendation"] == "promote"
+        assert report["regression_count"] == 0
+        assert any(row["metric"] == "no_answer_violation_rate" and row["status"] == "improvement" for row in report["metrics"])
+
+    def test_compare_reports_holds_candidate_on_regression(self):
+        from pipeline.evaluation.ablation import compare_retrieval_reports
+
+        baseline = {"overall": {"chunk_mrr_at_10": 0.70}}
+        candidate = {"overall": {"chunk_mrr_at_10": 0.60}}
+
+        report = compare_retrieval_reports(
+            baseline=baseline,
+            candidate=candidate,
+            metrics=["chunk_mrr_at_10"],
+            regression_tolerance=0.001,
+        )
+
+        assert report["passed"] is False
+        assert report["recommendation"] == "hold"
+        assert report["regressions"][0]["metric"] == "chunk_mrr_at_10"
+
+
 class TestRagasEvaluation:
     def test_ragas_eval_requires_optional_dependency(self, tmp_dir, monkeypatch):
         from pipeline.evaluation import ragas_eval as module
@@ -12530,18 +14808,36 @@ class TestRetrievalService:
             health = client.get("/healthz")
             assert health.status_code == 200
             assert health.json()["ready"] is True
+            assert "work_dir" not in health.json()
+
+            health_alias = client.get("/health")
+            assert health_alias.status_code == 200
+            assert health_alias.json()["ready"] is True
 
             ready = client.get("/readyz")
             assert ready.status_code == 200
-            assert ready.json()["config_name"] == "cfg"
+            assert ready.json()["service"] == "retriever"
+
+            ready_alias = client.get("/ready")
+            assert ready_alias.status_code == 200
+            assert ready_alias.json()["service"] == "retriever"
 
             response = client.post("/retrieve", json={"query": "Where is MBZUAI located?"})
             assert response.status_code == 200
             payload = response.json()
             assert payload["service_backend"] == "retrieval_service"
             assert payload["service_config_name"] == "cfg"
+            assert "service_work_dir" not in payload
             assert payload["selected_chunk_ids"] == ["chunk-1"]
             assert payload["retrieval_documents"][0]["document_title"] == "MBZUAI FAQ"
+            assert payload["service_cache_hit"] is False
+            assert fake.calls == ["Where is MBZUAI located?"]
+
+            cached_response = client.post("/retrieve", json={"query": "  where   is mbzuai located?  "})
+            assert cached_response.status_code == 200
+            cached_payload = cached_response.json()
+            assert cached_payload["service_cache_hit"] is True
+            assert cached_payload["selected_chunk_ids"] == ["chunk-1"]
             assert fake.calls == ["Where is MBZUAI located?"]
 
     def test_retrieval_service_returns_timeout(self, tmp_dir, monkeypatch):
@@ -12553,7 +14849,7 @@ class TestRetrievalService:
 
         class SlowRetriever:
             def retrieve(self, query: str):
-                time.sleep(1.2)
+                time.sleep(1.5)
                 return {"mode": "fact", "selected_chunk_ids": [], "retrieval_documents": [], "abstained": True}
 
         monkeypatch.setattr(
@@ -12566,12 +14862,84 @@ class TestRetrievalService:
             work_dir=tmp_dir,
             max_concurrency=1,
             request_timeout_seconds=1.0,
+            queue_timeout_seconds=0.05,
         )
 
         with TestClient(app) as client:
             response = client.post("/retrieve", json={"query": "test timeout"})
             assert response.status_code == 504
             assert response.json()["detail"] == "retrieval_timeout"
+
+            saturated = client.post("/retrieve", json={"query": "second request while worker is stuck"})
+            assert saturated.status_code == 503
+            assert saturated.json()["detail"] == "retrieval_busy"
+            assert client.get("/readyz").status_code == 503
+
+            time.sleep(0.6)
+            ready = client.get("/readyz")
+            assert ready.status_code == 200
+            attestation = client.get("/attestationz").json()
+            assert attestation["timed_out_inflight"] == 0
+            assert attestation["detached_inflight"] == 0
+            assert attestation["queue_rejection_count"] == 1
+
+    def test_cancelled_request_keeps_worker_capacity_reserved(self, tmp_dir, monkeypatch):
+        import threading
+
+        import httpx
+
+        from pipeline.service.retrieval_api import create_retrieval_service_app
+
+        started = threading.Event()
+        finish = threading.Event()
+
+        class BlockingRetriever:
+            def retrieve(self, query: str):
+                started.set()
+                finish.wait(timeout=5.0)
+                return {"mode": "fact", "selected_chunk_ids": [], "retrieval_documents": [], "abstained": True}
+
+        monkeypatch.setattr(
+            "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+            lambda **_: BlockingRetriever(),
+        )
+        app = create_retrieval_service_app(
+            config_name="cfg",
+            work_dir=tmp_dir,
+            max_concurrency=1,
+            request_timeout_seconds=4.0,
+            queue_timeout_seconds=0.05,
+        )
+
+        async def exercise_disconnect():
+            async with app.router.lifespan_context(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+                    request_task = asyncio.create_task(client.post("/retrieve", json={"query": "cancel me"}))
+                    assert await asyncio.to_thread(started.wait, 1.0)
+                    request_task.cancel()
+                    with pytest.raises(asyncio.CancelledError):
+                        await request_task
+
+                    saturated = await client.post("/retrieve", json={"query": "must wait"})
+                    assert saturated.status_code == 503
+                    assert saturated.json()["detail"] == "retrieval_busy"
+                    assert (await client.get("/readyz")).status_code == 503
+
+                    finish.set()
+                    for _ in range(50):
+                        health = (await client.get("/attestationz")).json()
+                        if health["detached_inflight"] == 0:
+                            break
+                        await asyncio.sleep(0.01)
+                    assert health["detached_inflight"] == 0
+                    assert health["cancelled_request_count"] == 1
+                    assert (await client.get("/readyz")).status_code == 200
+
+        try:
+            asyncio.run(exercise_disconnect())
+        finally:
+            finish.set()
 
 
 class TestIndexedLocalRetrieval:
@@ -13304,7 +15672,7 @@ class TestOpenAIAssertionPipeline:
 
         import pipeline.stages.embedders.gemini_pinecone_embedder as mod
 
-        monkeypatch.setattr(mod, "_make_gemini_client", lambda: object())
+        monkeypatch.setattr(mod, "_make_gemini_client", lambda **_: object())
         monkeypatch.setattr(mod, "_embed_text_batch", lambda *args, texts=None, **kwargs: [[0.1, 0.2] for _ in texts])
         monkeypatch.setitem(sys.modules, "pinecone", SimpleNamespace(Pinecone=FakePinecone, ServerlessSpec=lambda **kwargs: kwargs))
 
@@ -13599,3 +15967,177 @@ class TestOpenAIAssertionPipeline:
         assert payload["selected_fact_ids"] == []
         assert payload["selected_chunk_ids"] == []
         assert payload["retrieval_documents"] == []
+
+
+class TestMBZLegacyPineconeMetadata:
+    def test_legacy_metadata_compaction_preserves_answer_contract_under_byte_limit(self):
+        from pipeline.stages.embedders.mbzuai_legacy_pinecone_embedder import (
+            _metadata_size_bytes,
+            _serialize_legacy_metadata,
+        )
+
+        raw_metadata = {
+            "page_source": "https://mbzuai.ac.ae/study/admissions/",
+            "source": "https://mbzuai.ac.ae/study/admissions/",
+            "canonical_url": "https://mbzuai.ac.ae/study/admissions/",
+            "canonical_family_url": "https://mbzuai.ac.ae/study/admissions",
+            "page_title": "Admission Requirements",
+            "section_title": "Required documents",
+            "breadcrumb": "Admissions > Required documents",
+            "authority_class": "official",
+            "authority_score": 1.0,
+            "intent_tags": ["admissions", "requirements"],
+            "context": "شروط القبول في جامعة محمد بن زايد للذكاء الاصطناعي. " * 900,
+            "document_summary": "Admission summary. " * 900,
+            "key_facts": ["Applicants must submit official documents. " * 30 for _ in range(24)],
+            "keywords": ["admissions", "requirements", "scholarship"] * 20,
+            "page_metadata": {"raw_html_snapshot": "x" * 50000, "title": "Admission Requirements"},
+            "media": [{"url": "https://example.com/image.jpg", "description": "x" * 10000}],
+            "images": [{"url": "https://example.com/image.jpg", "description": "x" * 10000}],
+            "citation_anchor": {"source_url": "https://mbzuai.ac.ae/study/admissions/", "text": "x" * 10000},
+        }
+
+        metadata, stats = _serialize_legacy_metadata(raw_metadata, max_bytes=12000)
+
+        assert _metadata_size_bytes(metadata) <= 12000
+        assert metadata["page_source"] == raw_metadata["page_source"]
+        assert metadata["canonical_family_url"] == raw_metadata["canonical_family_url"]
+        assert metadata["page_title"] == "Admission Requirements"
+        assert metadata["context"]
+        assert "page_metadata" not in metadata
+        assert "media" not in metadata
+        assert stats["compacted"] is True
+        assert stats["removed_fields"]
+
+    def test_upload_records_compacts_metadata_before_upsert(self, tmp_dir):
+        from pipeline.stages.embedders.mbzuai_legacy_pinecone_embedder import (
+            _metadata_size_bytes,
+            _upload_records,
+        )
+
+        upserts = []
+
+        class FakeIndex:
+            def upsert(self, *, vectors, namespace):
+                upserts.append((namespace, vectors))
+
+        docs = [
+            {
+                "id": "doc-1",
+                "metadata": {
+                    "page_source": "https://mbzuai.ac.ae/study/",
+                    "source": "https://mbzuai.ac.ae/study/",
+                    "context": "MBZUAI admissions context. " * 1000,
+                    "document_summary": "Summary. " * 1500,
+                    "page_metadata": {"raw": "x" * 40000},
+                    "media": [{"description": "x" * 20000}],
+                },
+            }
+        ]
+
+        uploaded, stats = _upload_records(
+            index=FakeIndex(),
+            docs=docs,
+            dense_vectors=[[0.1, 0.2]],
+            sparse_vectors=[{"indices": [1], "values": [0.5]}],
+            namespace="test-run",
+            upsert_batch_size=1,
+            progress_path=tmp_dir / "progress.json",
+            progress_phase="summary",
+            progress_totals={"summary": 1},
+            progress_uploaded={"summary": 0},
+            metadata_max_bytes=9000,
+        )
+
+        assert uploaded == 1
+        assert upserts[0][0] == "test-run"
+        vector = upserts[0][1][0]
+        assert vector["sparse_values"]["indices"] == [1]
+        assert _metadata_size_bytes(vector["metadata"]) <= 9000
+        assert vector["metadata"]["page_source"] == "https://mbzuai.ac.ae/study/"
+        assert "context" in vector["metadata"]
+        assert stats["metadata_compacted_vectors"] == 1
+
+    def test_upload_records_splits_large_upsert_payloads(self, tmp_dir):
+        from pipeline.stages.embedders.mbzuai_legacy_pinecone_embedder import _json_size_bytes, _upload_records
+
+        upserts = []
+
+        class FakeIndex:
+            def upsert(self, *, vectors, namespace):
+                assert _json_size_bytes({"vectors": vectors, "namespace": namespace}) <= 50000
+                upserts.append(vectors)
+
+        docs = [
+            {
+                "id": f"doc-{idx}",
+                "metadata": {
+                    "page_source": "https://mbzuai.ac.ae/study/",
+                    "context": "Admission context. " * 200,
+                },
+            }
+            for idx in range(6)
+        ]
+        dense_vectors = [[0.123456789 for _ in range(1024)] for _ in docs]
+
+        uploaded, stats = _upload_records(
+            index=FakeIndex(),
+            docs=docs,
+            dense_vectors=dense_vectors,
+            sparse_vectors=None,
+            namespace="test-run",
+            upsert_batch_size=6,
+            progress_path=tmp_dir / "progress.json",
+            progress_phase="text",
+            progress_totals={"text": 6},
+            progress_uploaded={"text": 0},
+            metadata_max_bytes=35000,
+            upsert_payload_max_bytes=50000,
+        )
+
+        assert uploaded == 6
+        assert len(upserts) > 1
+        assert stats["upsert_requests"] == len(upserts)
+
+    def test_legacy_gemini_embedding_cache_is_bound_to_text_digest(self, tmp_dir, monkeypatch):
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.embedders.mbzuai_legacy_pinecone_embedder import (
+            _generate_dense_embeddings,
+            _texts_digest,
+        )
+        import pipeline.stages.embedders.gemini_pinecone_embedder as gemini_mod
+
+        cache_path = tmp_dir / "legacy_dense_embedding_cache.json"
+        atomic_write_json(
+            cache_path,
+            {
+                "schema_version": 1,
+                "engine": "gemini",
+                "model": "gemini-embedding-2-preview",
+                "output_dimensionality": 2,
+                "text_count": 1,
+                "text_digest": _texts_digest(["old text"]),
+                "embeddings": [[9.0, 9.0]],
+            },
+        )
+
+        monkeypatch.setattr(gemini_mod, "_make_gemini_client", lambda **_: object())
+        monkeypatch.setattr(gemini_mod, "_call_with_retry", lambda _name, fn, **_kwargs: fn())
+        monkeypatch.setattr(
+            gemini_mod,
+            "_embed_text_batch",
+            lambda _client, *, model, texts, task_type, output_dimensionality: [[0.1, 0.2] for _ in texts],
+        )
+
+        embeddings = _generate_dense_embeddings(
+            ["new text"],
+            engine="gemini",
+            model="gemini-embedding-2-preview",
+            batch_size=1,
+            output_dimensionality=2,
+            cache_path=cache_path,
+        )
+
+        assert embeddings == [[0.1, 0.2]]
+        cache_payload = load_json_safe(cache_path)
+        assert cache_payload["text_digest"] == _texts_digest(["new text"])

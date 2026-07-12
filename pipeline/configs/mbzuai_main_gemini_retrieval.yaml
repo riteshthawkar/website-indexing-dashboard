@@ -5,7 +5,7 @@
 # ─────────────────────────────────────────────────────────────
 _inherit: mbzuai_main_processing.yaml
 
-project_name: "mbzuai_main_processing"
+project_name: "mbzuai_main"
 
 stages:
   - id: crawl_web
@@ -37,17 +37,25 @@ stages:
     plugin: gemini_pinecone
 
 embedder:
-  model: "gemini-embedding-2-preview"
+  model: "gemini-embedding-2"
   output_dimensionality: 1536
-  pinecone_index: "mbzuai-gemini-retrieval-v2"
-  pinecone_sparse_index: "mbzuai-gemini-retrieval-v2-sparse"
+  pinecone_index: "mbzuai-gemini-retrieval-v3"
+  pinecone_sparse_index: "mbzuai-gemini-retrieval-v3-sparse"
   namespace_chunks: "chunks"
   namespace_parents: "parents"
   namespace_media: "media"
   namespace_facts: "facts"
+  namespace_evidence_spans: "evidence_spans"
+  namespace_summaries: "summaries"
+  namespace_assertions: "assertions"
+  namespace_entities: "entities"
+  namespace_communities: "communities"
   create_index_if_missing: true
   enable_dense_facts: true
+  enable_dense_evidence_spans: true
+  enable_dense_assertions: true
   enable_sparse: true
+  enable_sparse_evidence_spans: true
   sparse_model: "pinecone-sparse-english-v0"
   sparse_text_field: "chunk_text"
   sparse_upsert_batch_size: 96
@@ -60,17 +68,20 @@ embedder:
   max_retries: 10
   retry_base_delay_sec: 5
   retry_max_delay_sec: 300
+  gemini_request_timeout_ms: 120000
 
 retrieval:
   dense_chunk_top_k: 12
   dense_parent_top_k: 6
   dense_media_top_k: 6
   dense_fact_top_k: 8
+  dense_evidence_span_top_k: 10
   lexical_top_k: 12
   sparse_chunk_top_k: 14
   sparse_parent_top_k: 8
   sparse_media_top_k: 8
   sparse_fact_top_k: 10
+  sparse_evidence_span_top_k: 12
   rrf_k: 60
   fact_neighbor_window: 1
   max_context_chunks: 12
@@ -82,6 +93,23 @@ retrieval:
   rerank_model: "pinecone-rerank-v0"
   rerank_top_n: 32
   rerank_return_top_k: 10
+  rerank_query_max_tokens: 32
+  rerank_doc_max_tokens: 96
+  rerank_doc_max_chars: 800
+  rerank_request_max_chars: 9000
+  rerank_retry_doc_max_tokens: [72, 56, 40]
   abstain_min_token_overlap: 0.12
   fact_abstain_min_token_overlap: 0.20
   abstain_min_support_score: 0.05
+  unsupported_intent_guard_enabled: true
+  future_year_guard_horizon: 1
+  namespace_evidence_spans: "evidence_spans"
+  evidence_budget_items: 8
+  evidence_budget_chars: 8000
+  evidence_budget_max_per_source: 2
+  aggregation_evidence_budget_items: 12
+  aggregation_evidence_budget_chars: 10000
+  large_page_evidence_budget_items: 12
+  large_page_evidence_budget_chars: 10000
+  temporal_exact_year_guard_enabled: true
+  temporal_guard_top_k: 5

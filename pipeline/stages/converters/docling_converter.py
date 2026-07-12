@@ -202,6 +202,7 @@ def _rewrite_structured_doc_image_refs(structured_doc_path: Path, image_artifact
     if not structured_doc_path.exists():
         return
 
+    structured_doc_parent = structured_doc_path.parent.resolve()
     image_artifacts_dir = image_artifacts_dir.resolve()
     image_files = {
         path.name: path
@@ -227,7 +228,7 @@ def _rewrite_structured_doc_image_refs(structured_doc_path: Path, image_artifact
             basename = Path(unquote(value)).name
             canonical = image_files.get(basename)
             if canonical and value != str(canonical):
-                return Path(os.path.relpath(canonical, structured_doc_path.parent)).as_posix()
+                return Path(os.path.relpath(canonical, structured_doc_parent)).as_posix()
         return value
 
     data = json.loads(structured_doc_path.read_text(encoding="utf-8"))
@@ -265,6 +266,14 @@ def _clear_cuda_cache() -> None:
             torch.cuda.empty_cache()
     except Exception:
         return
+
+
+def _free_disk_mb(path: Path) -> Optional[float]:
+    try:
+        usage = shutil.disk_usage(path)
+        return usage.free / (1024 * 1024)
+    except Exception:
+        return None
 
 
 def _cuda_free_mb() -> Optional[int]:
@@ -914,12 +923,12 @@ def _export_converted_docling_document(
     )
 
     md_path.parent.mkdir(parents=True, exist_ok=True)
-    image_artifacts_dir.mkdir(parents=True, exist_ok=True)
 
     extracted_images: List[Dict[str, Any]] = []
     described_images = 0
     doc_for_export = doc
     if pdf_options.generate_picture_images:
+        image_artifacts_dir.mkdir(parents=True, exist_ok=True)
         markdown, extracted_images, doc_for_export = _export_docling_markdown(
             doc,
             file_path,
@@ -945,12 +954,19 @@ def _export_converted_docling_document(
     md_path.write_text(markdown, encoding="utf-8")
     structured_doc_path.parent.mkdir(parents=True, exist_ok=True)
     if doc_for_export is doc:
-        doc.save_as_json(
-            structured_doc_path,
-            artifacts_dir=image_artifacts_dir,
-            image_mode=ImageRefMode.REFERENCED,
-            indent=2,
-        )
+        if pdf_options.generate_picture_images:
+            doc.save_as_json(
+                structured_doc_path,
+                artifacts_dir=image_artifacts_dir,
+                image_mode=ImageRefMode.REFERENCED,
+                indent=2,
+            )
+        else:
+            doc.save_as_json(
+                structured_doc_path,
+                image_mode=ImageRefMode.PLACEHOLDER,
+                indent=2,
+            )
     else:
         doc_for_export.save_as_json(
             structured_doc_path,
@@ -1117,7 +1133,262 @@ def _convert_with_docling(
         return None
 
 
-def _fallback_extract_text(file_path: Path) -> Optional[str]:
+def _convert_docling_page_range(
+    file_path: Path,
+    md_path: Path,
+    image_artifacts_dir: Path,
+    structured_doc_path: Path,
+    config: Dict[str, Any],
+    *,
+    page_range: tuple[int, int],
+    converter: Any = None,
+    pdf_options: Any = None,
+) -> Optional[Dict[str, Any]]:
+    """Convert one inclusive 1-based PDF page range using Docling."""
+    if file_path.suffix.lower() != ".pdf":
+        return None
+
+    try:
+        from docling.datamodel.base_models import ConversionStatus
+
+        if converter is None or pdf_options is None:
+            converter, pdf_options = _build_docling_pdf_converter(config)
+        conversion = converter.convert(
+            str(file_path),
+            raises_on_error=False,
+            page_range=page_range,
+        )
+        status = getattr(conversion, "status", None)
+        doc = getattr(conversion, "document", None)
+        if doc is None or status not in {
+            ConversionStatus.SUCCESS,
+            ConversionStatus.PARTIAL_SUCCESS,
+        }:
+            error_messages = [
+                getattr(err, "error_message", "")
+                for err in (getattr(conversion, "errors", None) or [])
+                if getattr(err, "error_message", "")
+            ]
+            logger.error(
+                "Docling page-window conversion failed for %s pages %d-%d with status=%s%s",
+                file_path.name,
+                page_range[0],
+                page_range[1],
+                status,
+                f' errors={" ; ".join(error_messages)}' if error_messages else "",
+            )
+            return None
+        return _export_converted_docling_document(
+            doc,
+            file_path,
+            md_path,
+            image_artifacts_dir,
+            structured_doc_path,
+            config,
+            pdf_options=pdf_options,
+        )
+    except ImportError as exc:
+        logger.error("Docling import failed: %s", exc)
+        return None
+    except Exception as exc:
+        logger.error(
+            "Docling page-window conversion failed for %s pages %d-%d: %s",
+            file_path.name,
+            page_range[0],
+            page_range[1],
+            exc,
+            exc_info=True,
+        )
+        return None
+
+
+def _page_range_suffix(start_page: int, end_page: int) -> str:
+    return f"pages_{start_page:04d}_{end_page:04d}"
+
+
+def _page_windows(page_count: int, window_pages: int) -> List[tuple[int, int]]:
+    windows: List[tuple[int, int]] = []
+    start_page = 1
+    while start_page <= page_count:
+        end_page = min(page_count, start_page + window_pages - 1)
+        windows.append((start_page, end_page))
+        start_page = end_page + 1
+    return windows
+
+
+def _windowed_path(path: Path, start_page: int, end_page: int) -> Path:
+    return path.with_name(f"{path.stem}.{_page_range_suffix(start_page, end_page)}{path.suffix}")
+
+
+def _convert_large_pdf_with_docling_windows(
+    file_path: Path,
+    md_path: Path,
+    image_artifacts_dir: Path,
+    structured_doc_path: Path,
+    config: Dict[str, Any],
+    *,
+    converter: Any = None,
+    pdf_options: Any = None,
+) -> Optional[Dict[str, Any]]:
+    page_count = _pdf_page_count(file_path)
+    if not page_count:
+        return _convert_with_docling(
+            file_path,
+            md_path,
+            image_artifacts_dir,
+            structured_doc_path,
+            config,
+            converter=converter,
+            pdf_options=pdf_options,
+        )
+
+    configured_window_pages = int(config.get("docling_large_pdf_window_pages") or 0)
+    if configured_window_pages <= 0:
+        configured_window_pages = min(40, max(1, int(config.get("docling_max_pages") or 40)))
+    window_pages = max(1, configured_window_pages)
+    min_window_pages = max(1, int(config.get("docling_large_pdf_min_window_pages") or 1))
+    allow_window_text_fallback = bool(config.get("docling_large_pdf_allow_window_text_fallback", True))
+
+    logger.info(
+        "Docling page-window conversion for %s: %d pages, %d pages/window",
+        file_path.name,
+        page_count,
+        window_pages,
+    )
+
+    parts: List[Dict[str, Any]] = []
+    all_images: List[Dict[str, Any]] = []
+    vlm_described = 0
+    fallback_windows = 0
+
+    def convert_range(start_page: int, end_page: int) -> bool:
+        nonlocal fallback_windows, vlm_described
+
+        suffix = _page_range_suffix(start_page, end_page)
+        part_md_path = _windowed_path(md_path, start_page, end_page)
+        part_structured_path = _windowed_path(structured_doc_path, start_page, end_page)
+        part_image_dir = image_artifacts_dir / suffix
+
+        result = _convert_docling_page_range(
+            file_path,
+            part_md_path,
+            part_image_dir,
+            part_structured_path,
+            config,
+            page_range=(start_page, end_page),
+            converter=converter,
+            pdf_options=pdf_options,
+        )
+        if result:
+            result["page_range"] = [start_page, end_page]
+            parts.append(result)
+            images = list(result.get("images") or [])
+            all_images.extend(images)
+            vlm_described += int(result.get("vlm_described", 0))
+            return True
+
+        page_span = end_page - start_page + 1
+        if page_span > min_window_pages:
+            midpoint = start_page + (page_span // 2) - 1
+            logger.warning(
+                "Retrying %s pages %d-%d as smaller Docling windows.",
+                file_path.name,
+                start_page,
+                end_page,
+            )
+            return convert_range(start_page, midpoint) and convert_range(midpoint + 1, end_page)
+
+        if allow_window_text_fallback:
+            fallback_text = _fallback_extract_text(file_path, page_range=(start_page, end_page))
+            if fallback_text:
+                part_md_path.parent.mkdir(parents=True, exist_ok=True)
+                part_md_path.write_text(fallback_text, encoding="utf-8")
+                fallback_windows += 1
+                parts.append(
+                    {
+                        "md_path": str(part_md_path),
+                        "images": [],
+                        "source_file": str(file_path),
+                        "engine": "fallback_pdf_text_window",
+                        "vlm_described": 0,
+                        "structured_document_path": "",
+                        "page_range": [start_page, end_page],
+                    }
+                )
+                logger.warning(
+                    "Used text-only fallback for %s page %d after Docling page-window retries failed.",
+                    file_path.name,
+                    start_page,
+                )
+                return True
+
+        return False
+
+    for start_page, end_page in _page_windows(page_count, window_pages):
+        if not convert_range(start_page, end_page):
+            logger.error(
+                "Docling page-window conversion failed for %s pages %d-%d.",
+                file_path.name,
+                start_page,
+                end_page,
+            )
+            return None
+
+    parts.sort(key=lambda item: (item.get("page_range") or [0, 0])[0])
+    merged_sections = [
+        f"# {file_path.stem}",
+        (
+            "<!-- converted_by: docling_page_windows; "
+            f"page_count: {page_count}; window_pages: {window_pages}; "
+            f"fallback_windows: {fallback_windows} -->"
+        ),
+    ]
+    structured_parts: List[Dict[str, Any]] = []
+    for part in parts:
+        start_page, end_page = part.get("page_range") or [0, 0]
+        part_md_path = Path(str(part.get("md_path") or ""))
+        if not part_md_path.is_file():
+            continue
+        part_markdown = part_md_path.read_text(encoding="utf-8", errors="replace").strip()
+        merged_sections.append(f"## Pages {start_page}-{end_page}\n\n{part_markdown}")
+        structured_path = str(part.get("structured_document_path") or "")
+        structured_parts.append(
+            {
+                "page_range": [start_page, end_page],
+                "backend": str(part.get("engine") or ""),
+                "markdown_path": str(part_md_path),
+                "structured_document_path": structured_path,
+            }
+        )
+
+    md_path.parent.mkdir(parents=True, exist_ok=True)
+    md_path.write_text("\n\n".join(section for section in merged_sections if section.strip()), encoding="utf-8")
+    structured_doc_path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(
+        structured_doc_path,
+        {
+            "schema": "mbzuai_docling_page_windows.v1",
+            "source_file": str(file_path),
+            "page_count": page_count,
+            "window_pages": window_pages,
+            "fallback_windows": fallback_windows,
+            "parts": structured_parts,
+        },
+    )
+
+    return {
+        "md_path": str(md_path),
+        "images": all_images,
+        "source_file": str(file_path),
+        "engine": "docling_page_windows",
+        "vlm_described": vlm_described,
+        "structured_document_path": str(structured_doc_path),
+        "page_window_count": len(parts),
+        "fallback_window_count": fallback_windows,
+    }
+
+
+def _fallback_extract_text(file_path: Path, page_range: Optional[tuple[int, int]] = None) -> Optional[str]:
     """Fallback extraction using PyMuPDF/pdfplumber."""
     ext = file_path.suffix.lower()
     if ext != ".pdf":
@@ -1128,7 +1399,10 @@ def _fallback_extract_text(file_path: Path) -> Optional[str]:
 
         doc = fitz.open(str(file_path))
         pages = []
-        for i, page in enumerate(doc):
+        start_page = max(1, int(page_range[0])) if page_range else 1
+        end_page = min(int(page_range[1]), int(doc.page_count)) if page_range else int(doc.page_count)
+        for i in range(start_page - 1, end_page):
+            page = doc[i]
             text = page.get_text("text")
             if text.strip():
                 pages.append(f"## Page {i + 1}\n\n{text}")
@@ -1145,7 +1419,10 @@ def _fallback_extract_text(file_path: Path) -> Optional[str]:
 
         pages = []
         with pdfplumber.open(str(file_path)) as pdf:
-            for i, page in enumerate(pdf.pages):
+            start_page = max(1, int(page_range[0])) if page_range else 1
+            end_page = min(int(page_range[1]), len(pdf.pages)) if page_range else len(pdf.pages)
+            for i in range(start_page - 1, end_page):
+                page = pdf.pages[i]
                 text = page.extract_text() or ""
                 if text.strip():
                     pages.append(f"## Page {i + 1}\n\n{text}")
@@ -1159,10 +1436,147 @@ def _fallback_extract_text(file_path: Path) -> Optional[str]:
     return None
 
 
+def _pdf_page_count(file_path: Path) -> Optional[int]:
+    if file_path.suffix.lower() != ".pdf":
+        return None
+
+    try:
+        import fitz
+
+        doc = fitz.open(str(file_path))
+        page_count = int(doc.page_count)
+        doc.close()
+        return page_count
+    except Exception as exc:
+        logger.debug("Unable to count PDF pages with PyMuPDF for %s: %s", file_path.name, exc)
+
+    try:
+        import pdfplumber
+
+        with pdfplumber.open(str(file_path)) as pdf:
+            return len(pdf.pages)
+    except Exception as exc:
+        logger.debug("Unable to count PDF pages with pdfplumber for %s: %s", file_path.name, exc)
+
+    return None
+
+
+def _should_use_docling_for_pdf(file_path: Path, config: Dict[str, Any]) -> tuple[bool, str]:
+    if file_path.suffix.lower() != ".pdf":
+        return False, "not_pdf"
+
+    max_pages = int(config.get("docling_max_pages") or 0)
+    if max_pages > 0:
+        page_count = _pdf_page_count(file_path)
+        if page_count is not None and page_count > max_pages:
+            return False, f"page_count>{max_pages} ({page_count})"
+
+    max_size_mb = float(config.get("docling_max_file_size_mb") or 0)
+    if max_size_mb > 0:
+        size_mb = file_path.stat().st_size / (1024 * 1024)
+        if size_mb > max_size_mb:
+            return False, f"file_size_mb>{max_size_mb:g} ({size_mb:.1f})"
+
+    return True, ""
+
+
+def _docling_pdf_conversion_mode(file_path: Path, config: Dict[str, Any]) -> tuple[str, str]:
+    should_use_direct, reason = _should_use_docling_for_pdf(file_path, config)
+    if should_use_direct:
+        return "direct", ""
+
+    strategy = str(config.get("docling_large_pdf_strategy") or "page_windows").strip().lower()
+    if strategy in {"page_windows", "page_window", "windowed", "windows"}:
+        return "page_windows", reason
+    return "fallback", reason
+
+
 def _write_markdown_output(md_path: Path, markdown: str) -> str:
     md_path.parent.mkdir(parents=True, exist_ok=True)
     md_path.write_text(markdown, encoding="utf-8")
     return str(md_path)
+
+
+def _existing_image_metadata_from_dir(
+    image_artifacts_dir: Path,
+    *,
+    source_file: Path,
+    md_path: Path,
+) -> List[Dict[str, Any]]:
+    if not image_artifacts_dir.is_dir():
+        return []
+
+    supported_suffixes = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
+    images: List[Dict[str, Any]] = []
+    for image_path in sorted(image_artifacts_dir.rglob("*")):
+        if not image_path.is_file() or image_path.suffix.lower() not in supported_suffixes:
+            continue
+        images.append(
+            {
+                "local_path": str(image_path.resolve()),
+                "source_file": str(source_file),
+                "md_path": str(md_path),
+                "alt": "",
+                "caption": "",
+                "description": "",
+            }
+        )
+    return images
+
+
+def _existing_conversion_result(
+    file_path: Path,
+    md_path: Path,
+    image_artifacts_dir: Path,
+    structured_doc_path: Path,
+    config: Dict[str, Any],
+    *,
+    expected_engine: str,
+    require_structured: bool,
+) -> Optional[Dict[str, Any]]:
+    if not bool(config.get("reuse_existing_conversions", True)):
+        return None
+    if not md_path.is_file():
+        return None
+    if require_structured and not structured_doc_path.is_file():
+        return None
+
+    try:
+        markdown_text = md_path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return None
+    if not markdown_text.strip():
+        return None
+
+    images = _existing_image_metadata_from_dir(
+        image_artifacts_dir,
+        source_file=file_path,
+        md_path=md_path,
+    )
+    assessment = assess_markdown_document(
+        markdown_text,
+        source_ext=file_path.suffix.lower(),
+        config=config,
+        media_items=images,
+    )
+    if not assessment["accepted"]:
+        logger.warning(
+            "Ignoring existing conversion for %s because quality validation no longer accepts it: %s",
+            file_path.name,
+            ",".join(assessment.get("reasons") or ["quality_failed"]),
+        )
+        return None
+
+    logger.info("Reusing existing %s conversion for %s", expected_engine, file_path.name)
+    return {
+        "md_path": str(md_path),
+        "images": images,
+        "source_file": str(file_path),
+        "engine": expected_engine,
+        "vlm_described": 0,
+        "structured_document_path": str(structured_doc_path) if structured_doc_path.is_file() else "",
+        "reused_existing": True,
+    }
 
 
 def _convert_non_pdf_document(file_path: Path, md_path: Path) -> Optional[Dict[str, Any]]:
@@ -1248,7 +1662,7 @@ class DoclingConverter(ConverterStage):
         try:
             import docling  # noqa: F401
         except ImportError:
-            errors.append("docling is not installed. Run: pip install 'docling[vlm]'")
+            errors.append("docling is not installed. Run: pip install -r pipeline/requirements-docling.txt")
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
@@ -1266,6 +1680,14 @@ class DoclingConverter(ConverterStage):
         md_dir = ensure_dir(ctx.output_dir("markdown"))
         images_dir = ensure_dir(ctx.output_dir("extracted_images"))
         structured_docs_dir = ensure_dir(ctx.output_dir("structured_documents"))
+        min_free_disk_mb = float(config.get("min_free_disk_mb") or 0)
+        free_disk_mb = _free_disk_mb(ctx.work_dir)
+        if min_free_disk_mb > 0 and free_disk_mb is not None and free_disk_mb < min_free_disk_mb:
+            raise RuntimeError(
+                f"Insufficient free disk space for Docling conversion: "
+                f"{free_disk_mb:.0f} MB available, {min_free_disk_mb:.0f} MB required. "
+                "Free disk space or disable heavy binary artifact generation before resuming."
+            )
 
         if document_artifacts:
             files = [
@@ -1291,6 +1713,7 @@ class DoclingConverter(ConverterStage):
         failed = 0
         fallback_converted = 0
         docling_converted = 0
+        docling_window_converted = 0
         office_fallback_converted = 0
         validation_failed = 0
         fallback_selected = 0
@@ -1310,6 +1733,62 @@ class DoclingConverter(ConverterStage):
             if record.local_path
         }
         pdf_files = [fp for fp in files if fp.suffix.lower() == ".pdf"]
+        docling_window_reasons: Dict[str, str] = {}
+        docling_text_fallback_reasons: Dict[str, str] = {}
+        pdf_files_for_docling: List[Path] = []
+        for fp in pdf_files:
+            conversion_mode, reason = _docling_pdf_conversion_mode(fp, config)
+            if conversion_mode == "direct":
+                pdf_files_for_docling.append(fp)
+            elif conversion_mode == "page_windows":
+                docling_window_reasons[str(fp.resolve())] = reason
+            else:
+                docling_text_fallback_reasons[str(fp.resolve())] = reason
+        if docling_window_reasons:
+            logger.info(
+                "Using Docling page-window conversion for %d large/expensive PDF(s): %s",
+                len(docling_window_reasons),
+                "; ".join(
+                    f"{Path(path).name} ({reason})"
+                    for path, reason in list(docling_window_reasons.items())[:8]
+                ),
+            )
+        if docling_text_fallback_reasons:
+            logger.warning(
+                "Using text-only fallback for %d large/expensive PDF(s) before Docling: %s",
+                len(docling_text_fallback_reasons),
+                "; ".join(
+                    f"{Path(path).name} ({reason})"
+                    for path, reason in list(docling_text_fallback_reasons.items())[:8]
+                ),
+            )
+        existing_pdf_results: Dict[str, Dict[str, Any]] = {}
+        pdf_files_needing_docling: List[Path] = []
+        for fp in pdf_files_for_docling:
+            relative = fp.relative_to(download_dir) if download_dir else Path(fp.name)
+            output_md_path = (md_dir / relative.with_suffix(".md")).resolve()
+            output_image_dir = (images_dir / relative.with_suffix("")).resolve()
+            output_structured_doc_path = (structured_docs_dir / relative.with_suffix(".docling.json")).resolve()
+            existing_result = _existing_conversion_result(
+                fp,
+                output_md_path,
+                output_image_dir,
+                output_structured_doc_path,
+                config,
+                expected_engine="docling",
+                require_structured=True,
+            )
+            if existing_result:
+                existing_pdf_results[str(fp.resolve())] = existing_result
+            else:
+                pdf_files_needing_docling.append(fp)
+        if existing_pdf_results:
+            logger.info(
+                "Reusing %d existing PDF conversion(s); %d direct PDF(s) still need Docling.",
+                len(existing_pdf_results),
+                len(pdf_files_needing_docling),
+            )
+        pdf_files_for_docling = pdf_files_needing_docling
         output_targets = {
             str(fp.resolve()): {
                 "source_key": str(fp.resolve()),
@@ -1318,11 +1797,11 @@ class DoclingConverter(ConverterStage):
                 "image_dir": (images_dir / (fp.relative_to(download_dir) if download_dir else Path(fp.name)).with_suffix("")).resolve(),
                 "structured_doc_path": (structured_docs_dir / (fp.relative_to(download_dir) if download_dir else Path(fp.name)).with_suffix(".docling.json")).resolve(),
             }
-            for fp in pdf_files
+            for fp in pdf_files_for_docling
         }
         shared_docling_converter = None
         shared_pdf_options = None
-        if pdf_files:
+        if pdf_files_for_docling:
             try:
                 shared_docling_converter, shared_pdf_options = _build_docling_pdf_converter(config)
             except ImportError as exc:
@@ -1330,9 +1809,9 @@ class DoclingConverter(ConverterStage):
             except Exception as exc:
                 logger.error("Failed to initialize shared Docling converter: %s", exc, exc_info=True)
         batch_pdf_results: Optional[Dict[str, Optional[Dict[str, Any]]]] = None
-        if pdf_files:
+        if pdf_files_for_docling:
             batch_pdf_results = _convert_pdf_batch_with_docling(
-                pdf_files,
+                pdf_files_for_docling,
                 output_targets,
                 config,
                 converter=shared_docling_converter,
@@ -1350,7 +1829,35 @@ class DoclingConverter(ConverterStage):
             quarantine_report_path = quarantine_reports_dir / relative.with_suffix(".validation.json")
 
             result: Optional[Dict[str, Any]] = None
-            if fp.suffix.lower() == ".pdf" and batch_pdf_results is not None:
+            pdf_key = str(fp.resolve())
+            if fp.suffix.lower() == ".pdf" and pdf_key in docling_window_reasons:
+                existing_result = _existing_conversion_result(
+                    fp,
+                    output_md_path,
+                    output_image_dir,
+                    output_structured_doc_path,
+                    config,
+                    expected_engine="docling_page_windows",
+                    require_structured=True,
+                )
+                result = existing_result or _convert_large_pdf_with_docling_windows(
+                    fp,
+                    output_md_path,
+                    output_image_dir,
+                    output_structured_doc_path,
+                    config,
+                    converter=shared_docling_converter,
+                    pdf_options=shared_pdf_options,
+                )
+            elif fp.suffix.lower() == ".pdf" and pdf_key in docling_text_fallback_reasons:
+                logger.warning(
+                    "Using text-only fallback for %s before Docling: %s",
+                    fp.name,
+                    docling_text_fallback_reasons[pdf_key],
+                )
+            elif fp.suffix.lower() == ".pdf" and pdf_key in existing_pdf_results:
+                result = existing_pdf_results[pdf_key]
+            elif fp.suffix.lower() == ".pdf" and batch_pdf_results is not None:
                 result = batch_pdf_results.get(str(fp.resolve()))
             else:
                 result = _convert_with_docling(
@@ -1393,7 +1900,11 @@ class DoclingConverter(ConverterStage):
                 fallback_text = None
                 if fp.suffix.lower() == ".pdf" and (
                     not docling_assessment["accepted"]
-                    or (compare_fallback and docling_assessment["warnings"])
+                    or (
+                        selected_backend != "docling_page_windows"
+                        and compare_fallback
+                        and docling_assessment["warnings"]
+                    )
                 ):
                     fallback_text = _fallback_extract_text(fp)
                     if fallback_text:
@@ -1454,8 +1965,10 @@ class DoclingConverter(ConverterStage):
                     )
 
                     converted += 1
-                    if selected_backend == "docling":
+                    if selected_backend in {"docling", "docling_page_windows"}:
                         docling_converted += 1
+                        if selected_backend == "docling_page_windows":
+                            docling_window_converted += 1
                     elif selected_backend == "office_fallback":
                         office_fallback_converted += 1
                     elif selected_backend == "fallback_pdf_text":
@@ -1646,10 +2159,11 @@ class DoclingConverter(ConverterStage):
         )
 
         logger.info(
-            "Docling converter done: converted=%d failed=%d docling=%d fallback=%d quarantined=%d images_extracted=%d",
+            "Docling converter done: converted=%d failed=%d docling=%d docling_windowed=%d fallback=%d quarantined=%d images_extracted=%d",
             converted,
             failed,
             docling_converted,
+            docling_window_converted,
             fallback_converted,
             validation_failed,
             total_images,
@@ -1671,6 +2185,7 @@ class DoclingConverter(ConverterStage):
                 "converted": converted,
                 "failed": failed,
                 "docling_converted": docling_converted,
+                "docling_window_converted": docling_window_converted,
                 "office_fallback_converted": office_fallback_converted,
                 "fallback_converted": fallback_converted,
                 "fallback_selected": fallback_selected,

@@ -336,6 +336,7 @@ def adjudicate_factual_evidence(
     retries: int = 2,
     retry_delay_sec: float = 1.0,
     per_request_delay_sec: float = 0.0,
+    provider_timeout_sec: float | None = None,
     max_answer_ids: int = 4,
     max_fact_ids: int = 4,
     max_chunk_ids: int = 6,
@@ -352,7 +353,7 @@ def adjudicate_factual_evidence(
     )
 
     try:
-        client = make_openai_client()
+        client = make_openai_client(timeout_sec=provider_timeout_sec)
     except RuntimeError:
         return fallback
 

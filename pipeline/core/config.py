@@ -8,9 +8,13 @@ Environment variables can override any config value via ``PIPELINE_<SECTION>__<K
 (double-underscore separates nesting levels).
 """
 
+import hashlib
 import json
 import logging
 import os
+import re
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +24,309 @@ logger = logging.getLogger(__name__)
 
 # Default search path for config files
 _CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
+_PIPELINE_CONTROL_ENV_KEYS = {
+    "PIPELINE_ARGS_JSON",
+    "PIPELINE_CONFIG",
+    "PIPELINE_IMAGE",
+    "PIPELINE_PREFLIGHT",
+    "PIPELINE_RESTART_FROM_STAGE",
+    "PIPELINE_RESUME",
+}
+
+
+class ProductionConfigMismatchError(ValueError):
+    """Raised when a run was indexed with a different production contract."""
+
+
+_INDEXING_CONTRACT_SECTIONS = (
+    "pipeline",
+    "crawler",
+    "cleaner",
+    "converter",
+    "chunker",
+    "summarizer",
+    "quality",
+    "assertions",
+    "formatter",
+    "embedder",
+    "graph",
+)
+_PIPELINE_RUNTIME_ONLY_KEYS = {"active_release_file"}
+_GRAPH_RUNTIME_ONLY_KEYS = {
+    "neo4j_uri",
+    "neo4j_username",
+    "neo4j_password",
+    "neo4j_database",
+    "neo4j_http_timeout_sec",
+}
+_SERVING_IMPLEMENTATION_FILES = (
+    "core/evidence_adjudicator.py",
+    "core/query_expansion.py",
+    "core/query_planner.py",
+    "retrieval/adaptive_hybrid.py",
+    "retrieval/evidence_packer.py",
+    "retrieval/graph_rag.py",
+    "retrieval/routed_hybrid.py",
+)
+_INDEXING_CORE_IMPLEMENTATION_FILES = (
+    "core/answer_records.py",
+    "core/artifact_contracts.py",
+    "core/assertions.py",
+    "core/graph_artifacts.py",
+    "core/knowledge_graph.py",
+    "core/mbzuai_indexing.py",
+)
+_SECRET_CONFIG_KEYS = {
+    "api_key",
+    "authorization_header",
+    "access_key_id",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "authorization",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "neo4j_password",
+    "password",
+    "private_key",
+    "secret",
+    "secret_access_key",
+    "token",
+    "x_api_key",
+}
+_SECRET_CONFIG_SUFFIXES = (
+    "_access_key_id",
+    "_api_key",
+    "_auth_token",
+    "_credential",
+    "_credentials",
+    "_password",
+    "_private_key",
+    "_secret",
+    "_secret_access_key",
+    "_token",
+)
+
+
+def _normalized_config_key(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _is_secret_config_key(key: Any) -> bool:
+    normalized = _normalized_config_key(key)
+    # Capacity/quality settings such as ``max_postings_per_token`` describe
+    # lexical tokens; they are not authentication tokens and must remain in
+    # the immutable production snapshot.
+    if normalized.endswith("_per_token"):
+        return False
+    return normalized in _SECRET_CONFIG_KEYS or normalized.endswith(_SECRET_CONFIG_SUFFIXES)
+
+
+def sanitized_config_snapshot(value: Any) -> Any:
+    """Return a deep copy safe for run snapshots and release archives."""
+    if isinstance(value, dict):
+        return {
+            str(key): sanitized_config_snapshot(item)
+            for key, item in value.items()
+            if not _is_secret_config_key(key)
+        }
+    if isinstance(value, list):
+        return [sanitized_config_snapshot(item) for item in value]
+    if isinstance(value, tuple):
+        return [sanitized_config_snapshot(item) for item in value]
+    return value
+
+
+def configured_secret_paths(value: Any, *, prefix: str = "") -> List[str]:
+    """List non-empty secret-bearing config paths without returning their values."""
+    paths: List[str] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            if _is_secret_config_key(key):
+                if item not in (None, "", [], {}, ()):
+                    paths.append(path)
+                continue
+            paths.extend(configured_secret_paths(item, prefix=path))
+    elif isinstance(value, (list, tuple)):
+        for index, item in enumerate(value):
+            paths.extend(configured_secret_paths(item, prefix=f"{prefix}[{index}]"))
+    return paths
+
+
+@lru_cache(maxsize=1)
+def indexing_implementation_hashes() -> Dict[str, str]:
+    pipeline_root = Path(__file__).resolve().parents[1]
+    paths = [pipeline_root / relative for relative in _INDEXING_CORE_IMPLEMENTATION_FILES]
+    paths.extend(sorted((pipeline_root / "stages").rglob("*.py")))
+    hashes: Dict[str, str] = {}
+    for path in sorted(set(paths)):
+        relative = str(path.relative_to(pipeline_root))
+        hashes[relative] = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
+    return dict(hashes)
+
+
+def indexing_build_identity() -> Dict[str, Any]:
+    """Resolve the source revision and dirty-tree state without exposing paths."""
+    project_root = Path(__file__).resolve().parents[2]
+    commit_sha = ""
+    dirty = True
+    source = "unavailable"
+    try:
+        commit = subprocess.run(
+            ["git", "-C", str(project_root), "rev-parse", "HEAD"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=5,
+        )
+        status = subprocess.run(
+            ["git", "-C", str(project_root), "status", "--porcelain", "--untracked-files=normal"],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        if commit.returncode == 0 and status.returncode == 0:
+            commit_sha = commit.stdout.strip().lower()
+            dirty = bool(status.stdout.strip())
+            source = "git"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", commit_sha):
+        environment_commit = str(os.getenv("RELEASE_COMMIT_SHA") or "").strip().lower()
+        if re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", environment_commit):
+            commit_sha = environment_commit
+            dirty = os.getenv("INDEXING_SOURCE_DIRTY", "false").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+            source = "environment"
+    return {
+        "commit_sha": commit_sha,
+        "dirty": bool(dirty),
+        "source": source,
+        "implementation_sha256": indexing_implementation_hashes(),
+    }
+
+
+def production_indexing_contract_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the immutable configuration that determines indexed artifacts.
+
+    Retrieval routing and serving limits are intentionally excluded: they may
+    be tuned without rebuilding vectors.  Content processing, stage order,
+    embedding targets, namespace strategy, and graph construction are bound to
+    the run and must match the explicitly requested production profile.
+    """
+
+    safe_config = sanitized_config_snapshot(config)
+    payload: Dict[str, Any] = {
+        "project_name": safe_config.get("project_name"),
+        "stages": safe_config.get("stages") or [],
+        "implementation_sha256": indexing_implementation_hashes(),
+    }
+    for section in _INDEXING_CONTRACT_SECTIONS:
+        value = safe_config.get(section)
+        if not isinstance(value, dict):
+            continue
+        section_payload = dict(value)
+        if section == "pipeline":
+            for key in _PIPELINE_RUNTIME_ONLY_KEYS:
+                section_payload.pop(key, None)
+        elif section == "graph":
+            for key in _GRAPH_RUNTIME_ONLY_KEYS:
+                section_payload.pop(key, None)
+        payload[section] = section_payload
+    return payload
+
+
+def production_indexing_contract_fingerprint(config: Dict[str, Any]) -> str:
+    raw = json.dumps(
+        production_indexing_contract_payload(config),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def production_serving_contract_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Return runtime behavior that must be answer-evaluated as one release.
+
+    Unlike the indexing contract, this intentionally includes retrieval
+    routing/planner/adjudicator settings and an implementation digest.  A code
+    or configuration change therefore cannot silently reuse answer-readiness
+    gates from an older serving behavior.
+    """
+
+    pipeline_root = Path(__file__).resolve().parents[1]
+    implementation_hashes: Dict[str, str] = {}
+    for relative_path in _SERVING_IMPLEMENTATION_FILES:
+        path = pipeline_root / relative_path
+        digest = hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else "missing"
+        implementation_hashes[relative_path] = digest
+
+    safe_config = sanitized_config_snapshot(config)
+    embedder = safe_config.get("embedder") if isinstance(safe_config.get("embedder"), dict) else {}
+    graph = safe_config.get("graph") if isinstance(safe_config.get("graph"), dict) else {}
+    pipeline = safe_config.get("pipeline") if isinstance(safe_config.get("pipeline"), dict) else {}
+    return {
+        "project_name": safe_config.get("project_name"),
+        "pipeline": {
+            key: pipeline.get(key)
+            for key in (
+                "production_profile",
+                "require_query_planner",
+                "require_assertion_first",
+            )
+        },
+        "retrieval": dict(safe_config.get("retrieval") or {}),
+        "serving": dict(safe_config.get("serving") or {}),
+        "embedder_runtime": {
+            key: embedder.get(key)
+            for key in (
+                "model",
+                "output_dimensionality",
+                "pinecone_index",
+                "pinecone_sparse_index",
+                "namespace_strategy",
+                "namespace_release_template",
+                "namespace_chunks",
+                "namespace_parents",
+                "namespace_media",
+                "namespace_facts",
+                "namespace_evidence_spans",
+                "namespace_summaries",
+                "namespace_assertions",
+                "namespace_entities",
+                "namespace_communities",
+            )
+        },
+        "graph_runtime": {
+            key: graph.get(key)
+            for key in (
+                "store_backend",
+                "graph_store_backend",
+                "neo4j_database",
+                "community_summary_min_coverage_ratio",
+                "community_summary_min_characters",
+            )
+        },
+        "implementation_sha256": implementation_hashes,
+    }
+
+
+def production_serving_contract_fingerprint(config: Dict[str, Any]) -> str:
+    raw = json.dumps(
+        production_serving_contract_payload(config),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 def _deep_merge(base: Dict, override: Dict) -> Dict:
@@ -37,14 +344,30 @@ def _deep_merge(base: Dict, override: Dict) -> Dict:
     return merged
 
 
-def _resolve_config_path(name: str, search_dirs: Optional[List[Path]] = None) -> Path:
-    """Find a config file by name, checking search dirs in order."""
+def _resolve_config_path(
+    name: str,
+    search_dirs: Optional[List[Path]] = None,
+    *,
+    allow_cwd_relative: bool = True,
+) -> Path:
+    """Find a config file by name, checking search dirs in order.
+
+    ``allow_cwd_relative`` is intentionally enabled only for the top-level
+    config supplied by the caller. Inherited config names must resolve against
+    the child config directory (or explicit search directories), otherwise a
+    same-named file in the process working directory could silently replace a
+    trusted parent config.
+    """
     search_dirs = search_dirs or [_CONFIG_DIR]
 
-    # If it's already an absolute path, use it directly
-    p = Path(name)
+    # Accept an existing path exactly as supplied. Deployment scripts commonly
+    # pass repository-relative paths such as ``pipeline/configs/foo.yaml``;
+    # joining those to ``_CONFIG_DIR`` would duplicate the path segments.
+    p = Path(name).expanduser()
     if p.is_absolute() and p.exists():
-        return p
+        return p.resolve()
+    if allow_cwd_relative and p.exists():
+        return p.resolve()
 
     # Try adding .yaml extension if not present
     candidates = [name]
@@ -81,7 +404,7 @@ def _apply_env_overrides(config: Dict[str, Any]) -> Dict[str, Any]:
     """
     prefix = "PIPELINE_"
     for env_key, env_val in os.environ.items():
-        if not env_key.startswith(prefix):
+        if not env_key.startswith(prefix) or env_key in _PIPELINE_CONTROL_ENV_KEYS:
             continue
         parts = env_key[len(prefix):].lower().split("__")
         # Navigate to the right nesting level
@@ -142,8 +465,8 @@ def load_config(
     return config
 
 
-def load_resolved_run_config(work_dir: str | Path) -> Optional[Dict[str, Any]]:
-    """Load a run-local resolved config snapshot written by the orchestrator."""
+def load_resolved_run_snapshot(work_dir: str | Path) -> Optional[Dict[str, Any]]:
+    """Load the complete run-local config snapshot written by the orchestrator."""
     path = Path(work_dir) / "resolved_config.json"
     if not path.exists():
         return None
@@ -152,6 +475,14 @@ def load_resolved_run_config(work_dir: str | Path) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     if not isinstance(payload, dict):
+        return None
+    return dict(payload)
+
+
+def load_resolved_run_config(work_dir: str | Path) -> Optional[Dict[str, Any]]:
+    """Load the config mapping from a run-local resolved snapshot."""
+    payload = load_resolved_run_snapshot(work_dir)
+    if payload is None:
         return None
     config = payload.get("config")
     return dict(config) if isinstance(config, dict) else None
@@ -164,15 +495,67 @@ def load_effective_config(
     search_dirs: Optional[List[Path]] = None,
     overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Load a config, preferring a run-local resolved snapshot when available."""
-    config: Optional[Dict[str, Any]] = None
-    if work_dir:
-        config = load_resolved_run_config(work_dir)
-    if config is None:
-        config = load_config(name, search_dirs=search_dirs, overrides=None)
+    """Load the effective config without allowing production-profile drift.
+
+    Historical and development config names retain the legacy behavior of
+    preferring a run-local snapshot.  An explicitly requested
+    ``mbzuai_production`` profile is different: the current canonical profile
+    remains authoritative for runtime capabilities, but its immutable indexing
+    contract must match the run snapshot exactly.  A mismatch fails closed and
+    requires a new run or the explicit migration workflow.
+    """
+
+    snapshot_path = Path(work_dir) / "resolved_config.json" if work_dir else None
+    snapshot = load_resolved_run_snapshot(work_dir) if work_dir else None
+    canonical_production_requested = Path(str(name or "")).stem == "mbzuai_production"
+    if canonical_production_requested:
+        if snapshot_path is not None and snapshot_path.exists() and snapshot is None:
+            raise ProductionConfigMismatchError(
+                f"Run resolved_config.json is unreadable or invalid: {snapshot_path}"
+            )
+    snapshot_config = (
+        dict(snapshot.get("config"))
+        if isinstance(snapshot, dict) and isinstance(snapshot.get("config"), dict)
+        else None
+    )
+    if not canonical_production_requested:
+        config = snapshot_config
+        if config is None:
+            config = load_config(name, search_dirs=search_dirs, overrides=None)
+        if overrides:
+            config = _deep_merge(config, overrides)
+        return config
+
+    requested_config = load_config(name, search_dirs=search_dirs, overrides=None)
     if overrides:
-        config = _deep_merge(config, overrides)
-    return config
+        requested_config = _deep_merge(requested_config, overrides)
+    pipeline_cfg = requested_config.get("pipeline")
+    if not isinstance(pipeline_cfg, dict) or not bool(pipeline_cfg.get("production_profile", False)):
+        raise ProductionConfigMismatchError(
+            "The explicitly requested mbzuai_production config is not marked as a production profile"
+        )
+    if snapshot_config is None:
+        return requested_config
+
+    actual_snapshot_fingerprint = production_indexing_contract_fingerprint(snapshot_config)
+    recorded_snapshot_fingerprint = str(
+        (snapshot or {}).get("production_indexing_contract_fingerprint") or ""
+    ).strip()
+    if recorded_snapshot_fingerprint and recorded_snapshot_fingerprint != actual_snapshot_fingerprint:
+        raise ProductionConfigMismatchError(
+            "Run resolved_config.json failed its recorded production indexing fingerprint; "
+            "the snapshot may have been modified after indexing"
+        )
+
+    requested_fingerprint = production_indexing_contract_fingerprint(requested_config)
+    if actual_snapshot_fingerprint != requested_fingerprint:
+        raise ProductionConfigMismatchError(
+            "Run indexing config does not match the explicitly requested canonical production profile "
+            f"(run={actual_snapshot_fingerprint}, requested={requested_fingerprint}). "
+            "Create a fresh mbzuai_production run or use the explicit migrate-release workflow; "
+            "the saved run config will not silently override production."
+        )
+    return requested_config
 
 
 def _load_config_recursive(
@@ -192,7 +575,11 @@ def _load_config_recursive(
     if inherit:
         # Also search in the same directory as the current file
         extra_dirs = [path.parent] + (search_dirs or [_CONFIG_DIR])
-        parent_path = _resolve_config_path(inherit, extra_dirs)
+        parent_path = _resolve_config_path(
+            inherit,
+            extra_dirs,
+            allow_cwd_relative=False,
+        )
         parent_data = _load_config_recursive(parent_path, search_dirs, seen)
         data = _deep_merge(parent_data, data)
 

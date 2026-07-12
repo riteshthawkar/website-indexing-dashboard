@@ -16,13 +16,17 @@ import logging
 import os
 import re
 import threading
+import time
+from collections.abc import Mapping, MutableMapping
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import unquote, urlparse
 
 try:
     from rank_bm25 import BM25Okapi
@@ -55,6 +59,208 @@ from pipeline.core.media import build_retrieval_documents, response_agent_media_
 
 logger = logging.getLogger(__name__)
 _GEMINI_CLIENT_STATE = threading.local()
+_DEFAULT_GEMINI_REQUEST_TIMEOUT_MS = 120_000
+_LEGACY_VECTORSTORE_CONTRACT = "mbzuai_chatbot_legacy_v1"
+_PINECONE_INDEX_HOST_CACHE: Dict[str, str] = {}
+_PINECONE_INDEX_HOST_CACHE_LOCK = threading.Lock()
+_QUERY_EMBEDDING_CACHE_MAX = max(0, int(os.getenv("RETRIEVAL_QUERY_EMBEDDING_CACHE_SIZE", "4096") or "0"))
+_QUERY_EMBEDDING_RETRIES = max(0, int(os.getenv("RETRIEVAL_QUERY_EMBEDDING_RETRIES", "1") or "0"))
+_QUERY_EMBEDDING_RETRY_DELAY_SECONDS = max(
+    0.0,
+    float(os.getenv("RETRIEVAL_QUERY_EMBEDDING_RETRY_DELAY_SECONDS", "0.75") or "0"),
+)
+_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS = max(
+    0.0,
+    float(os.getenv("RETRIEVAL_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS", "300") or "0"),
+)
+_TOKENIZE_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_TOKENIZE_CACHE_SIZE", "32768") or "0"))
+_TOKEN_SET_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_TOKEN_SET_CACHE_SIZE", "32768") or "0"))
+_SYMBOLIC_TOKENIZE_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_SYMBOLIC_TOKENIZE_CACHE_SIZE", "32768") or "0"))
+_SYMBOLIC_TOKEN_SET_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_SYMBOLIC_TOKEN_SET_CACHE_SIZE", "32768") or "0"))
+_QUERY_EMBEDDING_CACHE: "OrderedDict[Tuple[str, int | None, str, str], List[float]]" = OrderedDict()
+_QUERY_EMBEDDING_CACHE_LOCK = threading.Lock()
+_QUERY_EMBEDDING_FAILURE_STATE: Dict[Tuple[str, int | None, str], Tuple[float, str]] = {}
+_QUERY_EMBEDDING_FAILURE_LOCK = threading.Lock()
+_SHARED_LANE_EXECUTORS: Dict[Tuple[str, int], ThreadPoolExecutor] = {}
+_SHARED_LANE_EXECUTORS_LOCK = threading.Lock()
+
+
+def _shared_lane_executor(kind: str, max_workers: int) -> ThreadPoolExecutor:
+    bounded_workers = max(1, int(max_workers or 1))
+    key = (str(kind or "lane"), bounded_workers)
+    with _SHARED_LANE_EXECUTORS_LOCK:
+        executor = _SHARED_LANE_EXECUTORS.get(key)
+        if executor is None:
+            executor = ThreadPoolExecutor(
+                max_workers=bounded_workers,
+                thread_name_prefix=f"retrieval-{key[0]}-{bounded_workers}",
+            )
+            _SHARED_LANE_EXECUTORS[key] = executor
+        return executor
+
+
+def _is_local_lane_name(name: str) -> bool:
+    return str(name or "").startswith("local_")
+
+
+def _first_existing_stage_file(work_dir: Path, stage_ids: Sequence[str], filename: str) -> Path:
+    for stage_id in stage_ids:
+        candidate = work_dir / "stage_outputs" / stage_id / filename
+        if candidate.exists():
+            return candidate
+    return work_dir / "stage_outputs" / stage_ids[0] / filename
+
+
+def _legacy_vector_manifest_path(work_dir: Path) -> Path:
+    return work_dir / "stage_outputs" / "upload_legacy_vectorstores" / "legacy_pinecone_upload_manifest.json"
+
+
+def _modern_vector_manifest_path(work_dir: Path) -> Path:
+    return work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json"
+
+
+def _apply_modern_vector_manifest_config(payload: Dict[str, Any], manifest: Dict[str, Any]) -> Dict[str, Any]:
+    index_name = str(manifest.get("index_name") or "").strip()
+    if not index_name:
+        return payload
+
+    embed_cfg = dict(payload.get("embedder") or {})
+    retrieval_cfg = dict(payload.get("retrieval") or {})
+    sparse_index_name = str(manifest.get("sparse_index_name") or "").strip()
+
+    embed_cfg["pinecone_index"] = index_name
+    embed_cfg["pinecone_sparse_index"] = sparse_index_name
+    embed_cfg.pop("pinecone_text_index", None)
+    embed_cfg.pop("pinecone_summary_index", None)
+    embed_cfg.pop("namespace", None)
+    retrieval_cfg["pinecone_index"] = index_name
+    retrieval_cfg["pinecone_sparse_index"] = sparse_index_name
+
+    namespaces = manifest.get("namespaces") if isinstance(manifest.get("namespaces"), dict) else {}
+    for key in (
+        "chunks",
+        "parents",
+        "media",
+        "facts",
+        "evidence_spans",
+        "summaries",
+        "assertions",
+        "entities",
+        "communities",
+    ):
+        namespace = str(namespaces.get(key) or "").strip()
+        if namespace:
+            embed_cfg[f"namespace_{key}"] = namespace
+            retrieval_cfg[f"namespace_{key}"] = namespace
+
+    if manifest.get("model"):
+        embed_cfg["model"] = manifest.get("model")
+    dimension = manifest.get("output_dimensionality") or manifest.get("dimension")
+    if dimension:
+        embed_cfg["output_dimensionality"] = dimension
+
+    stages = payload.get("stages")
+    if isinstance(stages, list) and stages:
+        has_modern_upload_stage = any(
+            isinstance(stage, dict)
+            and (
+                str(stage.get("id") or "") == "upload_retrieval"
+                or str(stage.get("plugin") or "") == "gemini_pinecone"
+            )
+            for stage in stages
+        )
+        if not has_modern_upload_stage:
+            payload["stages"] = [
+                *stages,
+                {"id": "upload_retrieval", "type": "embedder", "plugin": "gemini_pinecone"},
+            ]
+
+    retrieval_cfg["enable_sparse"] = bool(sparse_index_name)
+    for key in (
+        "legacy_vectorstore_contract",
+        "legacy_summary_index",
+        "legacy_text_index",
+        "legacy_namespace",
+        "legacy_bm25_model_file",
+    ):
+        retrieval_cfg.pop(key, None)
+    retrieval_cfg["legacy_hybrid_sparse_enabled"] = False
+
+    payload["embedder"] = embed_cfg
+    payload["retrieval"] = retrieval_cfg
+    return payload
+
+
+def apply_vector_upload_manifest_config(config: Dict[str, Any], work_dir: str | Path) -> Dict[str, Any]:
+    """
+    Align retrieval runtime config with the vectorstore contract that was actually uploaded.
+
+    Older MBZUAI runs may carry a stale resolved_config.json with per-namespace
+    Pinecone settings, while the production chatbot vectorstores are the legacy
+    two-index contract: summary index + text index, both in the default namespace,
+    with dense and sparse values stored together. The upload manifest is the
+    authoritative release artifact for that deployed contract.
+    """
+    payload = deepcopy(config or {})
+    resolved_work_dir = Path(work_dir).resolve()
+    modern_manifest = load_json_safe(_modern_vector_manifest_path(resolved_work_dir), {}) or {}
+    if isinstance(modern_manifest, dict) and str(modern_manifest.get("index_name") or "").strip():
+        return _apply_modern_vector_manifest_config(payload, modern_manifest)
+
+    manifest = load_json_safe(_legacy_vector_manifest_path(resolved_work_dir), {}) or {}
+    if not isinstance(manifest, dict):
+        return payload
+    if str(manifest.get("vectorstore_contract") or "").strip() != _LEGACY_VECTORSTORE_CONTRACT:
+        return payload
+
+    text_index = str(manifest.get("text_index_name") or "").strip()
+    summary_index = str(manifest.get("summary_index_name") or "").strip()
+    namespace = str(manifest.get("namespace") or "").strip()
+    if not text_index:
+        return payload
+
+    embed_cfg = dict(payload.get("embedder") or {})
+    retrieval_cfg = dict(payload.get("retrieval") or {})
+
+    embed_cfg["pinecone_index"] = text_index
+    embed_cfg["pinecone_text_index"] = text_index
+    if summary_index:
+        embed_cfg["pinecone_summary_index"] = summary_index
+    embed_cfg["pinecone_sparse_index"] = ""
+    embed_cfg["namespace"] = namespace
+    for key in (
+        "namespace_chunks",
+        "namespace_parents",
+        "namespace_media",
+        "namespace_facts",
+        "namespace_evidence_spans",
+        "namespace_summaries",
+        "namespace_assertions",
+    ):
+        embed_cfg[key] = namespace
+    if manifest.get("model"):
+        embed_cfg["model"] = manifest.get("model")
+    dimension = manifest.get("output_dimensionality") or manifest.get("dimension")
+    if dimension:
+        embed_cfg["output_dimensionality"] = dimension
+
+    retrieval_cfg["legacy_vectorstore_contract"] = _LEGACY_VECTORSTORE_CONTRACT
+    retrieval_cfg["legacy_summary_index"] = summary_index
+    retrieval_cfg["legacy_text_index"] = text_index
+    retrieval_cfg["legacy_namespace"] = namespace
+    retrieval_cfg["legacy_hybrid_sparse_enabled"] = bool(manifest.get("use_sparse_embeddings"))
+    retrieval_cfg["legacy_bm25_model_file"] = str(
+        manifest.get("bm25_model_file") or manifest.get("legacy_bm25_model_file") or ""
+    )
+    retrieval_cfg.setdefault("hybrid_alpha", 0.5)
+    # The legacy store keeps sparse values in the same Pinecone indexes. Do not
+    # query a guessed sidecar sparse index; local lexical and hybrid dense lanes
+    # cover sparse recall for this contract.
+    retrieval_cfg["enable_sparse"] = False
+
+    payload["embedder"] = embed_cfg
+    payload["retrieval"] = retrieval_cfg
+    return payload
 
 
 _NAMESPACE_RECORD_TYPES = {
@@ -62,6 +268,8 @@ _NAMESPACE_RECORD_TYPES = {
     "parents": {"parent"},
     "media": {"media"},
     "facts": {"fact"},
+    "evidence_spans": {"evidence_span"},
+    "summaries": {"summary"},
     "assertions": {"assertion"},
 }
 
@@ -69,6 +277,82 @@ _QUERY_STOPWORDS = {
     "a", "an", "and", "are", "at", "be", "by", "can", "do", "does", "for", "from",
     "have", "has", "how", "in", "is", "it", "many", "much", "of", "on", "or", "the",
     "their", "this", "to", "was", "were", "what", "when", "where", "which", "who", "why", "with",
+}
+
+_SOURCE_ANCHOR_STOPWORDS = {
+    *_QUERY_STOPWORDS,
+    "about",
+    "academics",
+    "ac",
+    "ae",
+    "ar",
+    "en",
+    "html",
+    "https",
+    "http",
+    "mbzuai",
+    "old",
+    "page",
+    "pages",
+    "program",
+    "programs",
+    "resources",
+    "study",
+    "www",
+}
+
+_INSTITUTION_CONTEXT_TOKENS = {"mbzuai"}
+
+_ANSWER_FOCUS_STOPWORDS = {
+    *_SOURCE_ANCHOR_STOPWORDS,
+    "bachelor",
+    "comprehensive",
+    "current",
+    "detail",
+    "details",
+    "doctor",
+    "include",
+    "including",
+    "master",
+    "mbzuai",
+    "msc",
+    "number",
+    "offer",
+    "offered",
+    "phd",
+    "philosophy",
+    "provide",
+    "requirement",
+    "requirements",
+    "science",
+    "specific",
+}
+
+_EVIDENCE_SPAN_ANCHOR_STOPWORDS = {
+    *_SOURCE_ANCHOR_STOPWORDS,
+    "application",
+    "applications",
+    "apply",
+    "date",
+    "dates",
+    "deadline",
+    "deadlines",
+    "detail",
+    "details",
+    "document",
+    "documents",
+    "eligibility",
+    "fee",
+    "fees",
+    "give",
+    "important",
+    "include",
+    "includes",
+    "including",
+    "key",
+    "requirement",
+    "requirements",
+    "tell",
 }
 
 _FACT_ATTRIBUTE_TOKENS = {
@@ -601,20 +885,228 @@ def _token_variants(token: str) -> List[str]:
     return list(dict.fromkeys(item for item in variants if item))
 
 
-def _tokenize(text: str) -> List[str]:
+@lru_cache(maxsize=_TOKENIZE_CACHE_SIZE)
+def _tokenize_cached(text: str) -> Tuple[str, ...]:
     tokens: List[str] = []
     for token in _clean_text(text).split():
         tokens.extend(_token_variants(token))
-    return [token for token in tokens if token]
+    return tuple(token for token in tokens if token)
 
 
-def _symbolic_tokens(text: str) -> List[str]:
+@lru_cache(maxsize=_TOKEN_SET_CACHE_SIZE)
+def _token_set_cached(text: str) -> frozenset[str]:
+    return frozenset(_tokenize_cached(text))
+
+
+def _tokenize(text: str) -> List[str]:
+    return list(_tokenize_cached(str(text or "")))
+
+
+def _token_set(text: str) -> frozenset[str]:
+    return _token_set_cached(str(text or ""))
+
+
+@lru_cache(maxsize=_SYMBOLIC_TOKENIZE_CACHE_SIZE)
+def _symbolic_tokens_cached(text: str) -> Tuple[str, ...]:
     tokens: List[str] = []
     for raw in re.split(r"[^a-z0-9]+", _clean_text(text).lower()):
         if not raw:
             continue
         tokens.extend(_token_variants(raw))
-    return [token for token in tokens if token]
+    return tuple(token for token in tokens if token)
+
+
+@lru_cache(maxsize=_SYMBOLIC_TOKEN_SET_CACHE_SIZE)
+def _symbolic_token_set_cached(text: str) -> frozenset[str]:
+    return frozenset(_symbolic_tokens_cached(text))
+
+
+def _symbolic_tokens(text: str) -> List[str]:
+    return list(_symbolic_tokens_cached(str(text or "")))
+
+
+def _symbolic_token_set(text: str) -> frozenset[str]:
+    return _symbolic_token_set_cached(str(text or ""))
+
+
+def _source_anchor_tokens(text: str) -> List[str]:
+    return [
+        token
+        for token in _symbolic_tokens(text)
+        if len(token) >= 3 and token not in _SOURCE_ANCHOR_STOPWORDS
+    ]
+
+
+def _evidence_span_anchor_tokens(query: str) -> List[str]:
+    tokens = [
+        token
+        for token in [*_named_query_tokens(query), *_source_anchor_tokens(query)]
+        if len(token) >= 3
+        and token not in _EVIDENCE_SPAN_ANCHOR_STOPWORDS
+        and token not in _INSTITUTION_CONTEXT_TOKENS
+    ]
+    return list(dict.fromkeys(tokens))
+
+
+def _record_matches_anchor_tokens(record: Mapping[str, Any], anchor_tokens: Sequence[str]) -> bool:
+    if not anchor_tokens:
+        return True
+    text = " ".join(
+        str(record.get(key) or "")
+        for key in (
+            "text",
+            "dense_text",
+            "embedding_text",
+            "sparse_text",
+            "source_url",
+            "canonical_url",
+            "language_normalized_url",
+            "document_title",
+            "section_heading",
+            "breadcrumb",
+        )
+    ).lower()
+    if not text:
+        return False
+    symbolic = set(_symbolic_tokens(text))
+    return any(token in symbolic or token in text for token in anchor_tokens)
+
+
+def _source_url_path_text(source_url: str) -> str:
+    try:
+        parsed = urlparse(str(source_url or ""))
+        value = unquote(parsed.path or str(source_url or ""))
+    except Exception:
+        value = str(source_url or "")
+    return re.sub(r"[^a-z0-9]+", " ", value.lower()).strip()
+
+
+_OFFICIAL_SOURCE_URL_RE = re.compile(
+    r"https?://(?:www\.)?mbzuai\.ac\.ae/[^\s\]\)\"'<>,]+",
+    re.IGNORECASE,
+)
+
+
+def _extract_official_source_url_from_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "")
+        if not text:
+            continue
+        match = _OFFICIAL_SOURCE_URL_RE.search(text)
+        if match:
+            return match.group(0).rstrip(".,;:")
+    return ""
+
+
+def _record_source_url(record: Mapping[str, Any] | None, *fallback_records: Mapping[str, Any] | None) -> str:
+    records = [record, *fallback_records]
+    metadata_records: List[Mapping[str, Any]] = []
+    for candidate in records:
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in (
+            "source_url",
+            "language_normalized_url",
+            "canonical_url",
+            "document_source",
+            "page_source",
+            "source",
+            "url",
+        ):
+            value = str(candidate.get(key) or "").strip()
+            if value:
+                return value
+        metadata = candidate.get("metadata")
+        if isinstance(metadata, Mapping):
+            metadata_records.append(metadata)
+    for metadata in metadata_records:
+        for key in (
+            "source_url",
+            "language_normalized_url",
+            "canonical_url",
+            "document_source",
+            "page_source",
+            "source",
+            "url",
+        ):
+            value = str(metadata.get(key) or "").strip()
+            if value:
+                return value
+    text_candidates: List[Any] = []
+    for candidate in [*records, *metadata_records]:
+        if not isinstance(candidate, Mapping):
+            continue
+        for key in (
+            "text",
+            "dense_text",
+            "embedding_text",
+            "sparse_text",
+            "document_title",
+            "section_heading",
+            "breadcrumb",
+        ):
+            text_candidates.append(candidate.get(key))
+    return _extract_official_source_url_from_text(*text_candidates)
+
+
+def _ensure_record_source_url(record: MutableMapping[str, Any], *fallback_records: Mapping[str, Any] | None) -> str:
+    source_url = _record_source_url(record, *fallback_records)
+    if source_url:
+        record["source_url"] = source_url
+    return source_url
+
+
+def _source_phrase_bonus(query: str, source_anchor_text: str) -> float:
+    query_tokens = _source_anchor_tokens(query)
+    if len(query_tokens) < 2 or not source_anchor_text:
+        return 0.0
+    bonus = 0.0
+    seen_phrases: set[str] = set()
+    for width in range(min(5, len(query_tokens)), 1, -1):
+        for idx in range(0, len(query_tokens) - width + 1):
+            phrase_tokens = query_tokens[idx : idx + width]
+            phrase = " ".join(phrase_tokens)
+            if phrase in seen_phrases:
+                continue
+            seen_phrases.add(phrase)
+            if phrase in source_anchor_text:
+                if width >= 4:
+                    bonus += 1.10
+                elif width == 3:
+                    bonus += 0.82
+                else:
+                    bonus += 0.52
+    return min(bonus, 1.65)
+
+
+def _answer_focus_tokens(query: str) -> List[str]:
+    tokens = [
+        token
+        for token in _symbolic_tokens(query)
+        if len(token) >= 4 and token not in _ANSWER_FOCUS_STOPWORDS
+    ]
+    return list(dict.fromkeys(tokens))
+
+
+def _answer_focus_match_bonus(query: str, text: str) -> float:
+    focus_tokens = _answer_focus_tokens(query)
+    if not focus_tokens:
+        return 0.0
+    text_tokens = _symbolic_token_set(text)
+    if not text_tokens:
+        return 0.0
+    hits = [token for token in focus_tokens if token in text_tokens]
+    if not hits:
+        return 0.0
+    hit_ratio = len(hits) / float(len(focus_tokens))
+    bonus = (0.22 * len(hits)) + (0.85 * hit_ratio)
+    lower_text = _clean_text(text).lower()
+    for phrase in ("screening exam", "research statement", "collaborative learning", "operating hours", "library contact"):
+        if phrase in _clean_text(query).lower() and phrase in lower_text:
+            bonus += 0.55
+    if "operating hours" in _clean_text(query).lower() and "hours of operation" in lower_text:
+        bonus += 0.55
+    return min(bonus, 2.10)
 
 
 def _email_local_part_tokens(value: str) -> set[str]:
@@ -680,8 +1172,17 @@ def _lookup_query_profile(query: str) -> LookupQueryProfile:
         if ambiguous_address_lookup and not explicit_location_signal:
             answer_types = [answer_type for answer_type in answer_types if answer_type != "location"]
 
-    if not answer_types and query_tokens & _GENERIC_CONTACT_QUERY_TOKENS:
-        answer_types = ["email"]
+    if _is_generic_contact_query(query):
+        # Email is the safest default for an unspecified contact request. Do
+        # not broaden it to phone/website records, which can retrieve unrelated
+        # offices and reduce citation precision. Preserve other requested
+        # attributes such as opening hours in compound questions.
+        non_contact_answer_types = [
+            answer_type for answer_type in answer_types if answer_type not in _CONTACT_LOOKUP_TYPES
+        ]
+        answer_types = non_contact_answer_types + (
+            ["email", "phone", "website"] if non_contact_answer_types else ["email"]
+        )
         strict_answer_required = True
 
     if not answer_types:
@@ -1143,14 +1644,87 @@ def _structured_answer_types(query: str) -> Tuple[str, ...]:
     return tuple(dict.fromkeys(str(value) for value in answer_types if str(value)))
 
 
+def _synthesis_structured_lane_enabled(
+    query: str,
+    *,
+    mode: QueryMode,
+    lookup_profile: LookupQueryProfile | None = None,
+    structured_answer_types: Sequence[str] | None = None,
+) -> bool:
+    if mode != QueryMode.SYNTHESIS:
+        return False
+    profile = lookup_profile or _lookup_query_profile(query)
+    answer_types = set(structured_answer_types or _structured_answer_types(query))
+    return bool(
+        profile.is_contact_lookup
+        or bool({"affiliation", "legal_basis", "named_after", "role_holder"} & answer_types)
+    )
+
+
 def _token_overlap(query: str, text: str) -> float:
-    query_tokens = set(_tokenize(query))
+    query_tokens = _token_set(query)
     if not query_tokens:
         return 0.0
-    text_tokens = set(_tokenize(text))
+    text_tokens = _token_set(text)
     if not text_tokens:
         return 0.0
     return len(query_tokens & text_tokens) / float(len(query_tokens))
+
+
+def _fact_lookup_text(fact: Mapping[str, Any]) -> str:
+    return _clean_text(
+        " ".join(
+            str(fact.get(key) or "")
+            for key in ("text", "dense_text", "document_title", "heading", "section_heading", "source_url")
+        )
+    )
+
+
+def _contextual_contact_fact_match(query: str, fact_text: str, fact_lookup_text: str) -> bool:
+    if not _EMAIL_RE.search(fact_text):
+        return False
+    query_tokens = set(_tokenize(query))
+    lookup_lower = _clean_text(fact_lookup_text).lower()
+    screening_query = bool({"screening", "exam", "online"} & query_tokens) or "screening exam" in query.lower()
+    support_query = bool({"it", "support", "technical", "help"} & query_tokens) or "it support" in query.lower()
+    if screening_query and support_query:
+        return any(
+            marker in lookup_lower
+            for marker in (
+                "it_external@mbzuai.ac.ae",
+                "it team",
+                "technical support",
+                "online screening exam",
+                "screening exam instructions",
+            )
+        )
+    return False
+
+
+def _contextual_family_accommodation_match(query: str, record_text: str) -> bool:
+    query_lower = _clean_text(query).lower()
+    text_lower = _clean_text(record_text).lower()
+    if not query_lower or not text_lower:
+        return False
+    family_query = bool(re.search(r"\b(family|families|parents?|visitors?|visiting|guests?)\b", query_lower))
+    accommodation_query = bool(
+        re.search(r"\b(accommodation|housing|stay|staying|lodging|visit|campus|student accommodation)\b", query_lower)
+    )
+    if not (family_query and accommodation_query):
+        return False
+    return any(
+        marker in text_lower
+        for marker in (
+            "does not provide housing for parents",
+            "can my parents stay",
+            "parents stay with me on campus",
+            "housing for parents",
+            "visiting parents",
+            "nearby hotels",
+            "airbnbs",
+            "airbnb",
+        )
+    )
 
 
 def _phrase_match_bonus(query_terms: Sequence[str], text: str) -> float:
@@ -1227,6 +1801,515 @@ def _named_query_phrases(query: str) -> List[str]:
     return list(dict.fromkeys(phrase.strip().lower() for phrase in phrases if phrase.strip()))
 
 
+_PERSON_TITLE_TOKENS = {"professor", "prof", "dr", "doctor"}
+_PERSON_NAME_EXCLUDE_TOKENS = {
+    *_PERSON_TITLE_TOKENS,
+    "mbzuai",
+    "mohamed",
+    "bin",
+    "zayed",
+    "university",
+    "artificial",
+    "intelligence",
+}
+
+
+def _person_name_tokens(query: str) -> List[str]:
+    raw_tokens = [
+        "".join(ch for ch in raw_token if ch.isalnum() or ch in {"-", "_", "'"}).strip()
+        for raw_token in str(query or "").split()
+    ]
+    raw_tokens = [token for token in raw_tokens if token]
+    for index, token in enumerate(raw_tokens):
+        if token.lower().strip("'") not in _PERSON_TITLE_TOKENS:
+            continue
+        collected: List[str] = []
+        for candidate in raw_tokens[index + 1 : index + 5]:
+            lower = candidate.lower().strip("'")
+            if lower in _PERSON_NAME_EXCLUDE_TOKENS:
+                continue
+            is_name_like = (
+                any(ch.isupper() for ch in candidate[:1])
+                or any(ch.isupper() for ch in candidate[1:])
+                or candidate.isupper()
+            )
+            if not is_name_like:
+                break
+            collected.extend(
+                variant
+                for variant in _token_variants(lower)
+                if variant and variant not in _PERSON_NAME_EXCLUDE_TOKENS
+            )
+        if len(dict.fromkeys(collected)) >= 2:
+            return list(dict.fromkeys(collected))
+
+    for phrase in _named_query_phrases(query):
+        phrase_tokens = [
+            token
+            for token in _tokenize(phrase)
+            if token not in _PERSON_NAME_EXCLUDE_TOKENS and len(token) >= 3
+        ]
+        if len(phrase_tokens) >= 2:
+            return list(dict.fromkeys(phrase_tokens[:4]))
+    return []
+
+
+def _requested_year_ranges(query: str) -> List[Tuple[int, int]]:
+    ranges: List[Tuple[int, int]] = []
+    for match in re.finditer(r"\b(20\d{2})\s*[-/]\s*(20\d{2})\b", _clean_text(query)):
+        start_year = int(match.group(1))
+        end_year = int(match.group(2))
+        if start_year <= end_year:
+            ranges.append((start_year, end_year))
+    return list(dict.fromkeys(ranges))
+
+
+def _requested_years(query: str) -> List[int]:
+    years = [int(value) for value in re.findall(r"\b(20\d{2})\b", _clean_text(query))]
+    return list(dict.fromkeys(years))
+
+
+def _requires_exact_temporal_evidence(query: str) -> bool:
+    query_tokens = set(_tokenize(query))
+    if not _requested_years(query):
+        return False
+    temporal_scope_tokens = {
+        "academic",
+        "admission",
+        "admissions",
+        "application",
+        "applications",
+        "class",
+        "classes",
+        "deadline",
+        "fall",
+        "intake",
+        "requirement",
+        "requirements",
+        "semester",
+        "spring",
+        "start",
+        "starts",
+        "year",
+    }
+    program_scope_tokens = {
+        "bachelor",
+        "graduate",
+        "master",
+        "msc",
+        "m.sc",
+        "phd",
+        "program",
+        "programs",
+        "undergraduate",
+    }
+    return bool(query_tokens & temporal_scope_tokens) and bool(query_tokens & program_scope_tokens)
+
+
+def _text_has_requested_temporal_anchor(query: str, text: str) -> bool:
+    if not _requires_exact_temporal_evidence(query):
+        return True
+    normalized_text = _clean_text(text).lower()
+    if not normalized_text:
+        return False
+    for start_year, end_year in _requested_year_ranges(query):
+        compact_patterns = {
+            f"{start_year}-{end_year}",
+            f"{start_year}/{end_year}",
+            f"{start_year} {end_year}",
+        }
+        if any(pattern in normalized_text for pattern in compact_patterns):
+            continue
+        if str(start_year) in normalized_text and str(end_year) in normalized_text:
+            continue
+        return False
+    ranged_years = {year for year_range in _requested_year_ranges(query) for year in year_range}
+    for year in _requested_years(query):
+        if year in ranged_years:
+            continue
+        if str(year) not in normalized_text:
+            return False
+    return True
+
+
+def _support_query_intents(query: str) -> set[str]:
+    normalized = _clean_text(query).lower()
+    query_tokens = set(_tokenize(query))
+    intents: set[str] = set()
+    if _person_name_tokens(query) or query_tokens & _PERSON_TITLE_TOKENS:
+        intents.add("faculty_person")
+    statement_tokens = {
+        "age",
+        "background",
+        "believe",
+        "believes",
+        "conversation",
+        "future",
+        "generation",
+        "generations",
+        "interview",
+        "joining",
+        "prepared",
+        "said",
+        "says",
+        "skill",
+        "skills",
+    }
+    if (
+        (_person_name_tokens(query) or query_tokens & ({"president"} | _PERSON_TITLE_TOKENS))
+        and query_tokens & statement_tokens
+    ):
+        intents.add("person_statement")
+    if "president" in query_tokens and query_tokens & {"background", "joining", "professional"}:
+        intents.add("president_background")
+    if (
+        {"first", "cohort"} <= query_tokens
+        or ("first cohort" in normalized and query_tokens & {"current", "expanded", "expansion", "majors", "programs"})
+    ):
+        intents.add("program_expansion_history")
+    if "advisory board" in normalized and query_tokens & {"attended", "meeting", "official", "first"}:
+        intents.add("news_event")
+    if (
+        query_tokens & {"student", "students"}
+        and query_tokens & {"live", "living", "life"}
+        and ("abu dhabi" in normalized or query_tokens & {"cultural", "culture", "entertainment", "city"})
+    ):
+        intents.add("student_life")
+    if "ai reach" in normalized or {"ai", "reach"} <= query_tokens:
+        intents.add("ai_reach")
+    if query_tokens & {"scholarship", "scholarships", "financial", "aid", "tuition", "stipend", "funding", "funded"}:
+        intents.add("scholarship")
+    if (
+        query_tokens & {"start", "starts", "begin", "begins", "class", "classes", "semester", "fall", "academic"}
+        and query_tokens & {"undergraduate", "bachelor", "business", "engineering", "program", "stream"}
+    ):
+        intents.add("start_date")
+    prep_tokens = {
+        "applicant",
+        "applicants",
+        "application",
+        "courses",
+        "course",
+        "exam",
+        "online",
+        "prepare",
+        "preparing",
+        "preparatory",
+        "qualification",
+        "qualifications",
+        "recommended",
+        "referee",
+        "screening",
+    }
+    if query_tokens & prep_tokens:
+        intents.add("application_prep")
+        if query_tokens & {"screening", "exam", "prepare", "preparing", "recommended", "online"}:
+            intents.add("screening_prep")
+    degree_signal_tokens = {
+        "application",
+        "applicant",
+        "applicants",
+        "bachelor",
+        "course",
+        "courses",
+        "curriculum",
+        "deadline",
+        "degree",
+        "doctor",
+        "graduate",
+        "master",
+        "msc",
+        "phd",
+        "program",
+        "programs",
+        "referee",
+        "requirement",
+        "requirements",
+        "screening",
+        "undergraduate",
+    }
+    program_phrase_hit = any(
+        phrase in normalized
+        for phrase in (
+            "computer vision",
+            "machine learning",
+            "computational biology",
+            "natural language processing",
+            "computer science",
+            "statistics and data science",
+            "applied artificial intelligence",
+            "applied ai",
+            "engineering stream",
+            "business stream",
+            "ai reach",
+            "ugrip",
+        )
+    )
+    if (query_tokens & degree_signal_tokens) or (program_phrase_hit and "faculty_person" not in intents):
+        intents.add("degree_program_page")
+    return intents
+
+
+def _degree_program_source_bonus(query: str, lower_url: str, source_blob: str) -> float:
+    normalized = _clean_text(query).lower()
+    query_tokens = set(_tokenize(query))
+    program_aliases: Tuple[Tuple[Tuple[str, ...], Tuple[str, ...]], ...] = (
+        (("computer vision",), ("computer-vision",)),
+        (("machine learning",), ("machine-learning",)),
+        (("computational biology",), ("computational-biology",)),
+        (("natural language processing", "nlp"), ("natural-language-processing",)),
+        (("robotics",), ("robotics",)),
+        (("computer science",), ("computer-science",)),
+        (("statistics and data science", "statistics data science", "data science"), ("statistics-and-data-science",)),
+        (("applied artificial intelligence", "applied ai", "maai"), ("master-in-applied-ai", "applied-ai")),
+        (("artificial intelligence engineering stream", "engineering stream"), ("artificial-intelligence-engineering-stream",)),
+        (("artificial intelligence business stream", "business stream"), ("artificial-intelligence-business-stream",)),
+        (("undergraduate research internship", "ugrip"), ("undergraduate-research-internship-program", "ugrip")),
+        (("ai reach",), ("ai-reach",)),
+    )
+    wanted_slugs: List[str] = []
+    for aliases, slugs in program_aliases:
+        if any(alias in normalized for alias in aliases):
+            wanted_slugs.extend(slugs)
+    degree_or_program_signal = bool(
+        {"application", "applicant", "applicants", "bachelor", "course", "courses", "curriculum", "deadline", "degree", "doctor", "graduate", "master", "msc", "phd", "program", "programs", "referee", "requirement", "requirements", "screening", "undergraduate"}
+        & query_tokens
+    )
+    if not degree_or_program_signal and not wanted_slugs:
+        return 0.0
+
+    bonus = 0.0
+    if wanted_slugs:
+        if any(slug in lower_url for slug in wanted_slugs):
+            bonus += 2.85
+        elif "/study/faculty/" in lower_url:
+            bonus -= 1.85
+        elif "/news/" in lower_url and not ("news" in query_tokens or "announcement" in query_tokens):
+            bonus -= 0.65
+    if degree_or_program_signal:
+        if any(marker in lower_url for marker in ("/study/msc-programs/", "/study/phd-programs/", "/study/master-in-applied-ai", "/study/undergraduate-program")):
+            bonus += 0.75
+        if "/study/faculty/" in lower_url and not (_person_name_tokens(query) or query_tokens & _PERSON_TITLE_TOKENS):
+            bonus -= 1.35
+        if "catalogue" in source_blob or "catalog" in source_blob:
+            bonus -= 0.35
+    if query_tokens & {"deadline", "application", "applicant", "applicants", "referee", "screening", "recommended", "online"}:
+        if wanted_slugs and any(slug in lower_url for slug in wanted_slugs):
+            bonus += 0.80
+        if "/study/faculty/" in lower_url:
+            bonus -= 0.75
+    return bonus
+
+
+def _support_intent_text_bonus(
+    query: str,
+    *,
+    source_url: str = "",
+    document_title: str = "",
+    heading: str = "",
+    text: str = "",
+) -> float:
+    intents = _support_query_intents(query)
+    if not intents:
+        return 0.0
+    lower_url = str(source_url or "").lower()
+    lower_title = _clean_text(document_title).lower()
+    lower_heading = _clean_text(heading).lower()
+    lower_text = _clean_text(text).lower()
+    query_tokens = set(_tokenize(query))
+    blob = " ".join(part for part in (lower_url, lower_title, lower_heading, lower_text) if part)
+    if not blob:
+        return 0.0
+    bonus = 0.0
+    is_news = "/news/" in lower_url or "news-archive" in lower_url or "/the-node/" in lower_url
+    is_program_page = any(marker in lower_url for marker in ("/study/msc-programs/", "/study/phd-programs/", "/undergraduate-program"))
+    is_faculty_profile = "/study/faculty/" in lower_url
+    is_application_page = "application-submission" in lower_url or "admission-process" in lower_url
+
+    if "degree_program_page" in intents:
+        bonus += _degree_program_source_bonus(query, lower_url, blob)
+
+    if "person_statement" in intents:
+        person_tokens = set(_person_name_tokens(query))
+        blob_tokens = set(_source_anchor_tokens(blob))
+        matched = len(person_tokens & blob_tokens)
+        match_ratio = matched / float(len(person_tokens)) if person_tokens else 0.0
+        statement_specific_query = bool(
+            query_tokens
+            & {
+                "believe",
+                "believes",
+                "future",
+                "generation",
+                "generations",
+                "prepared",
+                "skill",
+                "skills",
+            }
+        )
+        statement_page = any(
+            marker in lower_url
+            for marker in (
+                "in-conversation-with-the-president",
+                "interview",
+                "fortune-magazine",
+                "course-to-the-future",
+            )
+        ) or any(
+            marker in blob
+            for marker in (
+                "future generations",
+                "future of education",
+                "future of skills",
+                "age of ai",
+                "ai literacy",
+                "continuously learn",
+                "which skills",
+                "important skill",
+                "interview",
+            )
+        )
+        if is_news and statement_page:
+            bonus += 5.30
+        elif is_news and match_ratio >= 0.50 and not statement_specific_query:
+            bonus += 0.85
+        elif is_news and match_ratio >= 0.50:
+            # A named person appearing in a news story is not enough for quote
+            # or belief questions. These queries need interview/statement text.
+            bonus -= 1.20
+        if is_faculty_profile:
+            bonus -= 2.25
+
+    if "president_background" in intents:
+        if "in-conversation-with-the-president" in lower_url:
+            bonus += 3.25
+        elif "/about/office-of-the-president" in lower_url or "/about/leadership" in lower_url:
+            bonus += 1.45
+        if is_faculty_profile:
+            bonus -= 1.25
+
+    if "program_expansion_history" in intents:
+        if "in-conversation-with-the-president" in lower_url:
+            bonus += 2.60
+        elif "first-cohort" in lower_url:
+            bonus += 1.20
+        if is_faculty_profile:
+            bonus -= 1.10
+
+    if "news_event" in intents:
+        if is_news and "advisory-board-meeting" in lower_url:
+            bonus += 4.20
+        elif is_news and "advisory board" in blob:
+            bonus += 1.60
+        if is_faculty_profile:
+            bonus -= 2.20
+
+    if "student_life" in intents:
+        path = urlparse(lower_url).path.rstrip("/")
+        if path == "/study":
+            bonus += 2.75
+        elif any(marker in lower_url for marker in ("student-resources", "campus-facilities", "educational-affairs")):
+            bonus += 1.05
+        if is_faculty_profile:
+            bonus -= 1.45
+        if is_news:
+            bonus -= 0.50
+
+    if "faculty_person" in intents and "person_statement" not in intents:
+        person_tokens = set(_person_name_tokens(query))
+        blob_tokens = set(_source_anchor_tokens(blob))
+        matched = len(person_tokens & blob_tokens)
+        match_ratio = matched / float(len(person_tokens)) if person_tokens else 0.0
+        if is_faculty_profile and match_ratio >= 0.75:
+            bonus += 2.85
+        elif is_faculty_profile and match_ratio >= 0.50:
+            bonus += 1.35
+        elif is_faculty_profile:
+            bonus += 0.35
+        if person_tokens and not is_faculty_profile and is_program_page:
+            bonus -= 1.35
+        if is_news and match_ratio < 0.75:
+            bonus -= 0.65
+
+    if "ai_reach" in intents:
+        if "/study/ai-reach" in lower_url:
+            bonus += 1.85
+        if any(marker in blob for marker in ("participants will", "high school", "two-week", "fully funded", "on-campus research")):
+            bonus += 1.25
+        if is_news and "/study/ai-reach" not in lower_url:
+            bonus -= 0.75
+
+    if "scholarship" in intents:
+        scholarship_markers = (
+            "scholarship",
+            "scholarships",
+            "financial aid",
+            "full scholarship",
+            "tuition",
+            "living costs",
+            "tahnoon",
+            "stipend",
+        )
+        if any(marker in blob for marker in scholarship_markers):
+            bonus += 3.25
+        if "undergraduate-application-submission" in lower_url:
+            bonus += 0.80
+        if "tahnoon" in lower_url or "scholarship" in lower_url:
+            bonus += 2.60
+        if is_program_page and not any(marker in blob for marker in scholarship_markers):
+            bonus -= 2.45
+
+    if "start_date" in intents:
+        start_markers = (
+            "fall semester begins",
+            "semester begins",
+            "classes begin",
+            "start date",
+            "mid-august",
+            "mid august",
+            "fall 2026",
+            "orientation week",
+            "official enrollment",
+        )
+        if any(marker in blob for marker in start_markers):
+            bonus += 3.45
+        if "undergraduate-application-submission" in lower_url or lower_url.rstrip("/").endswith("/study/undergraduate-program"):
+            bonus += 3.35
+        if "/bachelor-of-science-" in lower_url or "/ar/bachelor-of-science-" in lower_url:
+            if not any(marker in blob for marker in start_markers):
+                bonus -= 3.20
+        if is_news:
+            bonus -= 0.55
+
+    if "application_prep" in intents or "screening_prep" in intents:
+        prep_markers = (
+            "recommended online courses",
+            "online screening exam",
+            "screening exam",
+            "programming for everybody",
+            "python data structures",
+            "mathematics for machine learning",
+            "intuitive introduction to probability",
+            "referee",
+            "application submission",
+            "improve qualification",
+            "improve qualifications",
+        )
+        if any(marker in blob for marker in prep_markers):
+            bonus += 2.25
+        elif any(marker in blob for marker in ("application", "applicant", "admission")):
+            bonus += 0.45
+        if query_tokens & {"age", "limit", "fee"} and is_application_page:
+            bonus += 2.10
+        if query_tokens & {"age", "limit", "fee"} and is_program_page and not is_application_page:
+            bonus -= 0.85
+        curriculum_only = any(marker in blob for marker in ("course description", "mandatory courses", "elective courses", "study plan"))
+        if curriculum_only and not any(marker in blob for marker in prep_markers):
+            bonus -= 0.70
+
+    return bonus
+
+
 def _fallback_subject_tokens_and_phrases(
     query: str,
     *,
@@ -1277,11 +2360,29 @@ def _missing_named_token_ratio(query: str, text: str) -> float:
     named_tokens = set(_named_query_tokens(query))
     if not named_tokens:
         return 0.0
-    text_tokens = set(_tokenize(text))
+    text_tokens = _token_set(text)
     if not text_tokens:
         return 1.0
     missing = sum(1 for token in named_tokens if token not in text_tokens)
     return missing / float(len(named_tokens))
+
+
+def _effective_named_tokens_for_abstention(query: str, evidence_text: str) -> List[str]:
+    named_tokens = _named_query_tokens(query)
+    if "mbzuai.ac.ae" in str(evidence_text or "").lower():
+        named_tokens = [token for token in named_tokens if token not in _INSTITUTION_CONTEXT_TOKENS]
+    return named_tokens
+
+
+def _missing_token_ratio(tokens: Sequence[str], text: str) -> float:
+    token_set = {str(token) for token in tokens if str(token)}
+    if not token_set:
+        return 0.0
+    text_tokens = _token_set(text)
+    if not text_tokens:
+        return 1.0
+    missing = sum(1 for token in token_set if token not in text_tokens)
+    return missing / float(len(token_set))
 
 
 def _is_generic_subject_reference(subject_text: str) -> bool:
@@ -1346,29 +2447,57 @@ def _requested_service_availability_subtypes(query: str) -> set[str]:
     return requested
 
 
-def _truncate_tokens(text: str, *, max_tokens: int) -> str:
+def _truncate_chars(text: str, *, max_chars: int) -> str:
+    value = _clean_text(text)
+    if max_chars <= 0:
+        return ""
+    if len(value) <= max_chars:
+        return value
+    clipped = value[:max_chars].rstrip()
+    if " " in clipped:
+        clipped = clipped.rsplit(" ", 1)[0] or clipped
+    return clipped.strip()
+
+
+def _truncate_tokens(text: str, *, max_tokens: int, max_chars: int | None = None) -> str:
     tokens = _clean_text(text).split()
     if len(tokens) <= max_tokens:
-        return " ".join(tokens)
-    return " ".join(tokens[:max_tokens])
+        value = " ".join(tokens)
+    else:
+        value = " ".join(tokens[:max_tokens])
+    if max_chars is not None:
+        value = _truncate_chars(value, max_chars=max_chars)
+    return value
 
 
-def _truncate_fragments(fragments: Sequence[str], *, max_tokens: int) -> str:
+def _truncate_fragments(
+    fragments: Sequence[str],
+    *,
+    max_tokens: int,
+    max_chars: int | None = None,
+) -> str:
     remaining = max(0, int(max_tokens))
+    remaining_chars = None if max_chars is None else max(0, int(max_chars))
     output: List[str] = []
     for fragment in fragments:
         candidate = _clean_text(fragment)
-        if not candidate or remaining <= 0:
+        if not candidate or remaining <= 0 or remaining_chars == 0:
             continue
         words = candidate.split()
         if not words:
             continue
         if len(words) <= remaining:
-            output.append(" ".join(words))
-            remaining -= len(words)
-            continue
-        output.append(" ".join(words[:remaining]))
-        remaining = 0
+            selected = " ".join(words)
+        else:
+            selected = " ".join(words[:remaining])
+        if remaining_chars is not None:
+            selected = _truncate_chars(selected, max_chars=remaining_chars)
+        if not selected:
+            break
+        output.append(selected)
+        remaining -= len(selected.split())
+        if remaining_chars is not None:
+            remaining_chars -= len(selected)
     return "\n".join(output).strip()
 
 
@@ -1629,19 +2758,137 @@ def classify_query_mode(query: str) -> QueryMode:
     return QueryMode.SCOPED
 
 
-def _make_gemini_client():
-    api_key = os.environ.get("GEMINI_API_KEY")
+def _make_gemini_client(*, request_timeout_ms: int | None = None):
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is required")
+        raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required")
+    timeout_ms = int(
+        _DEFAULT_GEMINI_REQUEST_TIMEOUT_MS
+        if request_timeout_ms is None
+        else request_timeout_ms
+    )
+    if timeout_ms <= 0:
+        raise ValueError("gemini_request_timeout_ms must be greater than zero")
     cached_key = getattr(_GEMINI_CLIENT_STATE, "api_key", None)
+    cached_timeout_ms = getattr(_GEMINI_CLIENT_STATE, "request_timeout_ms", None)
     cached_client = getattr(_GEMINI_CLIENT_STATE, "client", None)
-    if cached_client is not None and cached_key == api_key:
+    if (
+        cached_client is not None
+        and cached_key == api_key
+        and cached_timeout_ms == timeout_ms
+    ):
         return cached_client
     genai = import_genai()
-    client = genai.Client(api_key=api_key)
+    types = import_genai_types()
+    client = genai.Client(
+        api_key=api_key,
+        http_options=types.HttpOptions(timeout=timeout_ms),
+    )
     _GEMINI_CLIENT_STATE.api_key = api_key
+    _GEMINI_CLIENT_STATE.request_timeout_ms = timeout_ms
     _GEMINI_CLIENT_STATE.client = client
     return client
+
+
+def _query_embedding_cache_key(
+    *,
+    model: str,
+    output_dimensionality: int | None,
+    task_type: str,
+    embed_text: str,
+) -> Tuple[str, int | None, str, str]:
+    return (
+        str(model or "").strip(),
+        output_dimensionality,
+        str(task_type or "").strip(),
+        re.sub(r"\s+", " ", embed_text or "").strip(),
+    )
+
+
+def _get_cached_query_embedding(key: Tuple[str, int | None, str, str]) -> List[float] | None:
+    if _QUERY_EMBEDDING_CACHE_MAX <= 0:
+        return None
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        cached = _QUERY_EMBEDDING_CACHE.get(key)
+        if cached is None:
+            return None
+        _QUERY_EMBEDDING_CACHE.move_to_end(key)
+        return list(cached)
+
+
+def _cache_query_embedding(key: Tuple[str, int | None, str, str], vector: Sequence[float]) -> None:
+    if _QUERY_EMBEDDING_CACHE_MAX <= 0:
+        return
+    with _QUERY_EMBEDDING_CACHE_LOCK:
+        _QUERY_EMBEDDING_CACHE[key] = [float(value) for value in vector]
+        _QUERY_EMBEDDING_CACHE.move_to_end(key)
+        while len(_QUERY_EMBEDDING_CACHE) > _QUERY_EMBEDDING_CACHE_MAX:
+            _QUERY_EMBEDDING_CACHE.popitem(last=False)
+
+
+def _query_embedding_failure_key(
+    *,
+    model: str,
+    output_dimensionality: int | None,
+    task_type: str,
+) -> Tuple[str, int | None, str]:
+    return (str(model or "").strip(), output_dimensionality, str(task_type or "").strip())
+
+
+def _recent_query_embedding_failure(key: Tuple[str, int | None, str]) -> str:
+    if _QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS <= 0:
+        return ""
+    now = time.monotonic()
+    with _QUERY_EMBEDDING_FAILURE_LOCK:
+        failure = _QUERY_EMBEDDING_FAILURE_STATE.get(key)
+        if not failure:
+            return ""
+        expires_at, message = failure
+        if expires_at <= now:
+            _QUERY_EMBEDDING_FAILURE_STATE.pop(key, None)
+            return ""
+        return message
+
+
+def _record_query_embedding_failure(key: Tuple[str, int | None, str], exc: Exception) -> None:
+    if _QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS <= 0:
+        return
+    expires_at = time.monotonic() + _QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS
+    message = str(exc)
+    with _QUERY_EMBEDDING_FAILURE_LOCK:
+        _QUERY_EMBEDDING_FAILURE_STATE[key] = (expires_at, message)
+
+
+def _clear_query_embedding_failure(key: Tuple[str, int | None, str]) -> None:
+    with _QUERY_EMBEDDING_FAILURE_LOCK:
+        _QUERY_EMBEDDING_FAILURE_STATE.pop(key, None)
+
+
+def _retryable_query_embedding_error(exc: Exception) -> bool:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    return any(
+        marker in message
+        for marker in (
+            "429",
+            "resource_exhausted",
+            "quota",
+            "rate limit",
+            "rate_limit",
+            "temporarily unavailable",
+            "timeout",
+        )
+    )
+
+
+def _public_query_embedding_error_code(exc: Exception) -> str:
+    message = f"{type(exc).__name__}: {exc}".lower()
+    if any(marker in message for marker in ("429", "resource_exhausted", "quota", "rate limit", "rate_limit")):
+        return "query_embedding_rate_limited"
+    if "timeout" in message:
+        return "query_embedding_timeout"
+    if "temporarily unavailable" in message or "unavailable" in message:
+        return "query_embedding_unavailable"
+    return "query_embedding_failed"
 
 
 def _embed_query(
@@ -1650,27 +2897,69 @@ def _embed_query(
     model: str,
     output_dimensionality: int | None,
     task_type: str = "RETRIEVAL_QUERY",
+    request_timeout_ms: int | None = None,
 ) -> List[float]:
+    use_prompt_instruction = str(model or "").strip().lower() == "gemini-embedding-2"
+    embed_text = f"task: search result | query: {query}" if use_prompt_instruction else query
+    cache_key = _query_embedding_cache_key(
+        model=model,
+        output_dimensionality=output_dimensionality,
+        task_type=task_type,
+        embed_text=embed_text,
+    )
+    cached = _get_cached_query_embedding(cache_key)
+    if cached is not None:
+        return cached
+    failure_key = _query_embedding_failure_key(
+        model=model,
+        output_dimensionality=output_dimensionality,
+        task_type=task_type,
+    )
+    recent_failure = _recent_query_embedding_failure(failure_key)
+    if recent_failure:
+        raise RuntimeError(f"query embedding temporarily disabled after recent provider failure: {recent_failure}")
+
     try:
         types = import_genai_types()
-        config = types.EmbedContentConfig(
-            task_type=task_type,
-            output_dimensionality=output_dimensionality,
-        )
+        config_kwargs = {"output_dimensionality": output_dimensionality}
+        if not use_prompt_instruction:
+            config_kwargs["task_type"] = task_type
+        config = types.EmbedContentConfig(**config_kwargs)
     except Exception:
         from types import SimpleNamespace
-        config = SimpleNamespace(
-            task_type=task_type,
-            output_dimensionality=output_dimensionality,
-        )
+        config_kwargs = {"output_dimensionality": output_dimensionality}
+        if not use_prompt_instruction:
+            config_kwargs["task_type"] = task_type
+        config = SimpleNamespace(**config_kwargs)
 
-    client = _make_gemini_client()
-    response = client.models.embed_content(
-        model=model,
-        contents=query,
-        config=config,
+    client = (
+        _make_gemini_client(request_timeout_ms=request_timeout_ms)
+        if request_timeout_ms is not None
+        else _make_gemini_client()
     )
-    return list(response.embeddings[0].values)
+    attempts = max(1, _QUERY_EMBEDDING_RETRIES + 1)
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            response = client.models.embed_content(
+                model=model,
+                contents=embed_text,
+                config=config,
+            )
+            vector = list(response.embeddings[0].values)
+            _cache_query_embedding(cache_key, vector)
+            _clear_query_embedding_failure(failure_key)
+            return vector
+        except Exception as exc:
+            last_exc = exc
+            if _retryable_query_embedding_error(exc):
+                _record_query_embedding_failure(failure_key, exc)
+            if attempt >= attempts - 1 or not _retryable_query_embedding_error(exc):
+                raise
+            delay = _QUERY_EMBEDDING_RETRY_DELAY_SECONDS * (2 ** attempt)
+            if delay > 0:
+                time.sleep(delay)
+    raise RuntimeError(f"query embedding failed: {last_exc}")
 
 
 def _embed_queries(
@@ -1679,26 +2968,36 @@ def _embed_queries(
     model: str,
     output_dimensionality: int | None,
     task_type: str = "RETRIEVAL_QUERY",
+    request_timeout_ms: int | None = None,
 ) -> List[List[float]]:
     if not queries:
         return []
+    use_prompt_instruction = str(model or "").strip().lower() == "gemini-embedding-2"
+    embed_queries = [
+        f"task: search result | query: {query}"
+        for query in queries
+    ] if use_prompt_instruction else list(queries)
     try:
         types = import_genai_types()
-        config = types.EmbedContentConfig(
-            task_type=task_type,
-            output_dimensionality=output_dimensionality,
-        )
+        config_kwargs = {"output_dimensionality": output_dimensionality}
+        if not use_prompt_instruction:
+            config_kwargs["task_type"] = task_type
+        config = types.EmbedContentConfig(**config_kwargs)
     except Exception:
         from types import SimpleNamespace
-        config = SimpleNamespace(
-            task_type=task_type,
-            output_dimensionality=output_dimensionality,
-        )
+        config_kwargs = {"output_dimensionality": output_dimensionality}
+        if not use_prompt_instruction:
+            config_kwargs["task_type"] = task_type
+        config = SimpleNamespace(**config_kwargs)
 
-    client = _make_gemini_client()
+    client = (
+        _make_gemini_client(request_timeout_ms=request_timeout_ms)
+        if request_timeout_ms is not None
+        else _make_gemini_client()
+    )
     response = client.models.embed_content(
         model=model,
-        contents=list(queries),
+        contents=embed_queries,
         config=config,
     )
     return [list(embedding.values) for embedding in response.embeddings]
@@ -1714,34 +3013,54 @@ class RetrievedRecord:
 
 class AdaptiveHybridRetriever:
     def __init__(self, *, config: Dict[str, Any], work_dir: str | Path):
-        self.config = config
         self.work_dir = Path(work_dir).resolve()
-        retrieval_cfg = config.get("retrieval", {}) or {}
-        embed_cfg = config.get("embedder", {}) or {}
+        self.config = apply_vector_upload_manifest_config(config, self.work_dir)
+        self.runtime_artifact_contract = dict(
+            self.config.get("_runtime_artifact_contract") or {}
+        )
+        retrieval_cfg = self.config.get("retrieval", {}) or {}
+        embed_cfg = self.config.get("embedder", {}) or {}
 
         self.index_name = str(embed_cfg.get("pinecone_index") or "").strip()
         if not self.index_name:
             raise ValueError("embedder.pinecone_index is required for retrieval")
 
-        self.model = str(embed_cfg.get("model") or "gemini-embedding-2-preview")
+        self.model = str(embed_cfg.get("model") or "gemini-embedding-2")
         self.output_dimensionality = int(embed_cfg.get("output_dimensionality") or 1536)
+        self.gemini_request_timeout_ms = int(
+            embed_cfg.get("gemini_request_timeout_ms")
+            if embed_cfg.get("gemini_request_timeout_ms") is not None
+            else _DEFAULT_GEMINI_REQUEST_TIMEOUT_MS
+        )
+        if self.gemini_request_timeout_ms <= 0:
+            raise ValueError("embedder.gemini_request_timeout_ms must be greater than zero")
         self.namespace_chunks = str(embed_cfg.get("namespace_chunks") or "chunks")
         self.namespace_parents = str(embed_cfg.get("namespace_parents") or "parents")
         self.namespace_media = str(embed_cfg.get("namespace_media") or "media")
         self.namespace_facts = str(embed_cfg.get("namespace_facts") or "facts")
+        self.namespace_evidence_spans = str(
+            embed_cfg.get("namespace_evidence_spans")
+            or retrieval_cfg.get("namespace_evidence_spans")
+            or "evidence_spans"
+        )
+        self.namespace_summaries = str(embed_cfg.get("namespace_summaries") or retrieval_cfg.get("namespace_summaries") or "summaries")
         self.namespace_assertions = str(embed_cfg.get("namespace_assertions") or "assertions")
-        self.sparse_index_name = str(embed_cfg.get("pinecone_sparse_index") or f"{self.index_name}-sparse")
+        self.sparse_index_name = str(embed_cfg.get("pinecone_sparse_index") or "").strip()
 
         self.dense_chunk_top_k = int(retrieval_cfg.get("dense_chunk_top_k", 12))
         self.dense_parent_top_k = int(retrieval_cfg.get("dense_parent_top_k", 6))
         self.dense_media_top_k = int(retrieval_cfg.get("dense_media_top_k", 6))
         self.dense_fact_top_k = int(retrieval_cfg.get("dense_fact_top_k", 8))
+        self.dense_evidence_span_top_k = int(retrieval_cfg.get("dense_evidence_span_top_k", max(8, self.dense_fact_top_k)))
+        self.dense_summary_top_k = int(retrieval_cfg.get("dense_summary_top_k", max(4, self.dense_parent_top_k)))
         self.dense_assertion_top_k = int(retrieval_cfg.get("dense_assertion_top_k", max(8, self.dense_fact_top_k)))
         self.lexical_top_k = int(retrieval_cfg.get("lexical_top_k", 12))
         self.sparse_chunk_top_k = int(retrieval_cfg.get("sparse_chunk_top_k", self.lexical_top_k))
         self.sparse_parent_top_k = int(retrieval_cfg.get("sparse_parent_top_k", max(4, self.lexical_top_k // 2)))
         self.sparse_media_top_k = int(retrieval_cfg.get("sparse_media_top_k", max(4, self.lexical_top_k // 2)))
         self.sparse_fact_top_k = int(retrieval_cfg.get("sparse_fact_top_k", max(6, self.lexical_top_k)))
+        self.sparse_evidence_span_top_k = int(retrieval_cfg.get("sparse_evidence_span_top_k", max(8, self.sparse_fact_top_k)))
+        self.sparse_summary_top_k = int(retrieval_cfg.get("sparse_summary_top_k", max(4, self.sparse_parent_top_k)))
         self.sparse_assertion_top_k = int(retrieval_cfg.get("sparse_assertion_top_k", max(8, self.sparse_fact_top_k)))
         self.rrf_k = int(retrieval_cfg.get("rrf_k", 60))
         self.fact_neighbor_window = int(retrieval_cfg.get("fact_neighbor_window", 1))
@@ -1750,6 +3069,17 @@ class AdaptiveHybridRetriever:
         self.max_media_results = int(retrieval_cfg.get("max_media_results", 4))
         self.same_parent_expand_threshold = int(retrieval_cfg.get("same_parent_expand_threshold", 2))
         self.enable_sparse = bool(retrieval_cfg.get("enable_sparse", True))
+        self.external_lanes_on_embedding_failure = bool(
+            retrieval_cfg.get("external_lanes_on_embedding_failure", False)
+        )
+        self.pinecone_query_timeout_seconds = max(
+            1.0,
+            float(retrieval_cfg.get("pinecone_query_timeout_seconds", 10.0) or 10.0),
+        )
+        self.legacy_vectorstore_contract = str(retrieval_cfg.get("legacy_vectorstore_contract") or "").strip()
+        self.legacy_hybrid_sparse_enabled = bool(retrieval_cfg.get("legacy_hybrid_sparse_enabled", False))
+        self.legacy_bm25_model_file = str(retrieval_cfg.get("legacy_bm25_model_file") or "").strip()
+        self.hybrid_alpha = float(retrieval_cfg.get("hybrid_alpha") or 0.5)
         self.enable_rerank = bool(retrieval_cfg.get("enable_rerank", True))
         self.rerank_model = str(retrieval_cfg.get("rerank_model") or "pinecone-rerank-v0")
         self.rerank_top_n = int(retrieval_cfg.get("rerank_top_n", 24))
@@ -1760,6 +3090,8 @@ class AdaptiveHybridRetriever:
         )
         self.rerank_query_max_tokens = int(retrieval_cfg.get("rerank_query_max_tokens", 32))
         self.rerank_doc_max_tokens = int(retrieval_cfg.get("rerank_doc_max_tokens", 96))
+        self.rerank_doc_max_chars = int(retrieval_cfg.get("rerank_doc_max_chars", 800))
+        self.rerank_request_max_chars = int(retrieval_cfg.get("rerank_request_max_chars", 9000))
         self.rerank_retry_doc_max_tokens = [
             int(value)
             for value in (retrieval_cfg.get("rerank_retry_doc_max_tokens") or [72, 56, 40])
@@ -1776,6 +3108,10 @@ class AdaptiveHybridRetriever:
         self.fact_abstain_min_token_overlap = float(retrieval_cfg.get("fact_abstain_min_token_overlap", 0.20))
         self.fact_require_fact_support_overlap = float(retrieval_cfg.get("fact_require_fact_support_overlap", 0.35))
         self.abstain_min_support_score = float(retrieval_cfg.get("abstain_min_support_score", 0.05))
+        self.temporal_exact_year_guard_enabled = bool(
+            retrieval_cfg.get("temporal_exact_year_guard_enabled", True)
+        )
+        self.temporal_guard_top_k = max(1, int(retrieval_cfg.get("temporal_guard_top_k", 5) or 5))
         self.parent_candidate_top_k = int(retrieval_cfg.get("parent_candidate_top_k", 3))
         self.source_weights = {
             "dense_chunks": float(retrieval_cfg.get("weight_dense_chunks", 1.0)),
@@ -1791,17 +3127,35 @@ class AdaptiveHybridRetriever:
             "local_media": float(retrieval_cfg.get("weight_local_media", 1.4)),
             "dense_facts": float(retrieval_cfg.get("weight_dense_facts", 1.3)),
             "sparse_facts": float(retrieval_cfg.get("weight_sparse_facts", 1.5)),
+            "dense_evidence_spans": float(retrieval_cfg.get("weight_dense_evidence_spans", 1.8)),
+            "sparse_evidence_spans": float(retrieval_cfg.get("weight_sparse_evidence_spans", 2.0)),
+            "local_evidence_spans": float(retrieval_cfg.get("weight_local_evidence_spans", 2.1)),
+            "dense_summaries": float(retrieval_cfg.get("weight_dense_summaries", 1.15)),
+            "sparse_summaries": float(retrieval_cfg.get("weight_sparse_summaries", 1.25)),
             "dense_assertions": float(retrieval_cfg.get("weight_dense_assertions", 2.0)),
             "sparse_assertions": float(retrieval_cfg.get("weight_sparse_assertions", 2.2)),
             "local_facts": float(retrieval_cfg.get("weight_local_facts", 1.9)),
             "local_answers": float(retrieval_cfg.get("weight_local_answers", 2.1)),
             "graph_relation_facts": float(retrieval_cfg.get("weight_graph_relation_facts", 2.4)),
+            "support_parents": float(retrieval_cfg.get("weight_support_parents", 1.8)),
         }
         self._dense_index = None
         self._sparse_index = None
         self._pinecone_client = None
+        self._legacy_bm25_encoder = None
         self._thread_state = threading.local()
         self.parallel_lane_workers = max(1, int(retrieval_cfg.get("parallel_lane_workers", 6) or 6))
+        default_local_lane_workers = max(1, min(4, self.parallel_lane_workers))
+        self.persistent_lane_executors = bool(retrieval_cfg.get("persistent_lane_executors", True))
+        self.split_lane_executors = bool(retrieval_cfg.get("split_lane_executors", True))
+        self.parallel_remote_lane_workers = max(
+            1,
+            int(retrieval_cfg.get("parallel_remote_lane_workers", self.parallel_lane_workers) or self.parallel_lane_workers),
+        )
+        self.parallel_local_lane_workers = max(
+            1,
+            int(retrieval_cfg.get("parallel_local_lane_workers", default_local_lane_workers) or default_local_lane_workers),
+        )
         self.enable_local_bm25_fallback = bool(retrieval_cfg.get("enable_local_bm25_fallback", False))
         self.local_index_max_postings_per_token = max(
             16,
@@ -1827,9 +3181,21 @@ class AdaptiveHybridRetriever:
             8,
             int(retrieval_cfg.get("local_media_candidate_pool", 64) or 64),
         )
+        self.local_evidence_span_candidate_pool = max(
+            12,
+            int(retrieval_cfg.get("local_evidence_span_candidate_pool", 128) or 128),
+        )
 
-        bundle_path = self.work_dir / "stage_outputs" / "format_retrieval" / "retrieval_bundle.json"
-        lexical_path = self.work_dir / "stage_outputs" / "format_retrieval" / "lexical_corpus.json"
+        bundle_path = _first_existing_stage_file(
+            self.work_dir,
+            ("finalize_retrieval_bundle", "format_retrieval", "build_retrieval_bundle"),
+            "retrieval_bundle.json",
+        )
+        lexical_path = _first_existing_stage_file(
+            self.work_dir,
+            ("finalize_retrieval_bundle", "format_retrieval", "build_retrieval_bundle"),
+            "lexical_corpus.json",
+        )
         promoted_assertions_path = self.work_dir / "stage_outputs" / "promote_assertions" / "promoted_assertions.json"
         self.bundle = load_json_safe(bundle_path, {}) or {}
         self.lexical_records = load_json_safe(lexical_path, []) or []
@@ -1845,6 +3211,16 @@ class AdaptiveHybridRetriever:
         self.parent_map = {record["id"]: record for record in self.bundle.get("parent_records", []) if isinstance(record, dict)}
         self.media_map = {record["id"]: record for record in self.bundle.get("media_records", []) if isinstance(record, dict)}
         self.fact_map = {record["id"]: record for record in self.bundle.get("fact_records", []) if isinstance(record, dict)}
+        self.evidence_span_map = {
+            record["id"]: record
+            for record in self.bundle.get("evidence_span_records", [])
+            if isinstance(record, dict) and str(record.get("id") or "")
+        }
+        self.summary_map = {
+            record["id"]: record
+            for record in self.bundle.get("summary_records", [])
+            if isinstance(record, dict) and str(record.get("id") or "")
+        }
         self.assertion_map = {
             record["id"]: record
             for record in self.bundle.get("assertion_records", [])
@@ -1903,7 +3279,7 @@ class AdaptiveHybridRetriever:
             fact_text = _clean_text(fact.get("text") or fact.get("dense_text") or "")
             if not fact_text:
                 continue
-            fact_tokens = _tokenize(fact_text)
+            fact_tokens = _tokenize(_fact_lookup_text(fact) or fact_text)
             self.fact_tokens_by_id[str(fact["id"])] = fact_tokens
             for token in dict.fromkeys(fact_tokens):
                 self.fact_token_index[token].append(str(fact["id"]))
@@ -2028,12 +3404,29 @@ class AdaptiveHybridRetriever:
                     [str(record.get("id") or "") for record in scoped_records],
                     BM25Okapi(tokenized_corpus),
                 )
+        if self.namespace_summaries != "summaries" and "summaries" in self._namespace_token_index:
+            self._namespace_token_index[self.namespace_summaries] = self._namespace_token_index["summaries"]
+            self._namespace_tokens_by_id[self.namespace_summaries] = self._namespace_tokens_by_id.get("summaries", {})
+            if "summaries" in self._bm25_by_namespace:
+                self._bm25_by_namespace[self.namespace_summaries] = self._bm25_by_namespace["summaries"]
+        if self.namespace_evidence_spans != "evidence_spans" and "evidence_spans" in self._namespace_token_index:
+            self._namespace_token_index[self.namespace_evidence_spans] = self._namespace_token_index["evidence_spans"]
+            self._namespace_tokens_by_id[self.namespace_evidence_spans] = self._namespace_tokens_by_id.get("evidence_spans", {})
+            if "evidence_spans" in self._bm25_by_namespace:
+                self._bm25_by_namespace[self.namespace_evidence_spans] = self._bm25_by_namespace["evidence_spans"]
 
     @classmethod
     def from_config(cls, *, config_name: str, work_dir: str | Path) -> "AdaptiveHybridRetriever":
         from ..core.config import load_effective_config
+        from ..core.runtime_contract import validate_runtime_artifact_contract
 
-        config = load_effective_config(config_name, work_dir=work_dir)
+        try:
+            config = load_effective_config(config_name, work_dir=work_dir)
+        except FileNotFoundError:
+            config = load_config(config_name)
+        runtime_contract = validate_runtime_artifact_contract(config, work_dir)
+        config = apply_vector_upload_manifest_config(config, work_dir)
+        config["_runtime_artifact_contract"] = runtime_contract
         backend = str((config.get("retrieval") or {}).get("retriever_backend") or "vector").strip().lower()
         if backend == "graph_hybrid":
             from .graph_rag import GraphRAGRetriever
@@ -2062,23 +3455,21 @@ class AdaptiveHybridRetriever:
             return index
 
         client = self._pinecone_client_obj()
-        host_cache = getattr(self._thread_state, "pinecone_index_hosts", None)
-        if host_cache is None:
-            host_cache = {}
-            self._thread_state.pinecone_index_hosts = host_cache
-
-        host = host_cache.get(index_name)
-        if not host:
-            try:
-                description = client.describe_index(index_name)
-                if isinstance(description, dict):
-                    host = description.get("host")
-                else:
-                    host = getattr(description, "host", None)
-            except Exception:
-                host = None
+        with _PINECONE_INDEX_HOST_CACHE_LOCK:
+            host = _PINECONE_INDEX_HOST_CACHE.get(index_name)
+            if not host:
+                try:
+                    description = client.describe_index(index_name)
+                    if isinstance(description, dict):
+                        host = description.get("host")
+                    else:
+                        host = getattr(description, "host", None)
+                except Exception:
+                    host = None
+                if host:
+                    _PINECONE_INDEX_HOST_CACHE[index_name] = str(host)
             if host:
-                host_cache[index_name] = str(host)
+                host = str(host)
 
         if host:
             index = client.Index(host=str(host))
@@ -2099,12 +3490,54 @@ class AdaptiveHybridRetriever:
             return override
         return self._pinecone_index_handle(self.sparse_index_name, cache_attr="sparse_index")
 
+    def _legacy_bm25_encoder_obj(self):
+        encoder = getattr(self, "_legacy_bm25_encoder", None)
+        if encoder is not None:
+            return encoder
+        if not self.legacy_bm25_model_file:
+            return None
+        try:
+            from pinecone_text.sparse import BM25Encoder
+
+            encoder = BM25Encoder().load(self.legacy_bm25_model_file)
+        except Exception as exc:
+            logger.warning("Failed to load legacy BM25 model %s: %s", self.legacy_bm25_model_file, exc)
+            encoder = None
+        self._legacy_bm25_encoder = encoder
+        return encoder
+
+    def _legacy_hybrid_query_payload(
+        self,
+        *,
+        query: str | None,
+        query_vector: List[float],
+    ) -> Tuple[List[float], Dict[str, Any] | None]:
+        if (
+            not self.legacy_hybrid_sparse_enabled
+            or self.legacy_vectorstore_contract != _LEGACY_VECTORSTORE_CONTRACT
+            or not query
+        ):
+            return query_vector, None
+        encoder = self._legacy_bm25_encoder_obj()
+        if encoder is None:
+            return query_vector, None
+        try:
+            from pinecone_text.hybrid import hybrid_convex_scale
+
+            sparse_vector = encoder.encode_queries(query)
+            dense_vector, sparse_vector = hybrid_convex_scale(query_vector, sparse_vector, alpha=self.hybrid_alpha)
+            return list(dense_vector), sparse_vector
+        except Exception as exc:
+            logger.warning("Failed to build legacy hybrid query vector: %s", exc)
+            return query_vector, None
+
     def embed_query(self, query: str) -> List[float]:
         return _embed_query(
             query,
             model=self.model,
             output_dimensionality=self.output_dimensionality,
             task_type="RETRIEVAL_QUERY",
+            request_timeout_ms=self.gemini_request_timeout_ms,
         )
 
     def embed_queries(self, queries: Sequence[str]) -> List[List[float]]:
@@ -2113,17 +3546,31 @@ class AdaptiveHybridRetriever:
             model=self.model,
             output_dimensionality=self.output_dimensionality,
             task_type="RETRIEVAL_QUERY",
+            request_timeout_ms=self.gemini_request_timeout_ms,
         )
 
-    def _dense_query_ids(self, *, query_vector: List[float], namespace: str, top_k: int) -> List[str]:
+    def _dense_query_ids(
+        self,
+        *,
+        query_vector: List[float],
+        namespace: str,
+        top_k: int,
+        query: str | None = None,
+    ) -> List[str]:
         if top_k <= 0:
             return []
+        dense_vector, sparse_vector = self._legacy_hybrid_query_payload(query=query, query_vector=query_vector)
+        kwargs: Dict[str, Any] = {}
+        if sparse_vector:
+            kwargs["sparse_vector"] = sparse_vector
         matches = self._pinecone_index().query(
-            vector=query_vector,
+            vector=dense_vector,
             top_k=top_k,
             namespace=namespace,
             include_metadata=False,
             include_values=False,
+            timeout=self.pinecone_query_timeout_seconds,
+            **kwargs,
         ).matches
         return [str(match.id) for match in matches if getattr(match, "id", None)]
 
@@ -2211,7 +3658,7 @@ class AdaptiveHybridRetriever:
         informative_tokens = list(dict.fromkeys(self._informative_query_tokens(query)))
         if not informative_tokens:
             return 0.0
-        text_tokens = set(_tokenize(text))
+        text_tokens = _token_set(text)
         if not text_tokens:
             return 0.0
         overlap = len(text_tokens & set(informative_tokens)) / float(len(informative_tokens))
@@ -2240,6 +3687,7 @@ class AdaptiveHybridRetriever:
             score = self._score_text_match(query, chunk_text)
             score += _lookup_signal_bonus(query, chunk_text)
             score += self._fact_query_bonus(query, chunk_text)
+            score += _answer_focus_match_bonus(query, chunk_text)
             if score <= 0.0:
                 continue
             scored.append((chunk_id, score))
@@ -2466,9 +3914,11 @@ class AdaptiveHybridRetriever:
         mode: QueryMode | None = None,
     ) -> float:
         mode = mode or classify_query_mode(query)
+        normalized = _clean_text(query).lower()
         query_tokens = set(_tokenize(query))
         if not query_tokens:
             return 0.0
+        support_intents = _support_query_intents(query)
         lower_url = str(source_url or "").lower()
         lower_title = _clean_text(document_title).lower()
         lower_heading = _clean_text(heading).lower()
@@ -2476,6 +3926,10 @@ class AdaptiveHybridRetriever:
         source_blob = " ".join(part for part in (lower_url, lower_title, lower_heading, lower_text) if part)
         if not source_blob:
             return 0.0
+        source_path_text = _source_url_path_text(lower_url)
+        source_anchor_text = " ".join(
+            part for part in (source_path_text, lower_title, lower_heading) if part
+        )
 
         is_news = (
             "/news/" in lower_url
@@ -2520,7 +3974,12 @@ class AdaptiveHybridRetriever:
                 "mohamed bin zayed university of artificial intelligence began",
             )
         ) or "/about/" in lower_url
-        is_catalogue = "catalogue" in lower_title or "catalog" in lower_title
+        is_catalogue = (
+            "catalogue" in lower_title
+            or "catalog" in lower_title
+            or "catalogue" in lower_url
+            or "catalog" in lower_url
+        )
         is_leadership = any(
             marker in source_blob
             for marker in (
@@ -2591,15 +4050,69 @@ class AdaptiveHybridRetriever:
             "site",
         }
         hours_tokens = {"hour", "hours", "working", "operating", "office"}
+        library_query = "library" in query_tokens
+
+        query_anchor_tokens = set(_source_anchor_tokens(query))
+        source_path_tokens = set(_source_anchor_tokens(source_path_text))
+        if query_anchor_tokens and source_path_tokens:
+            overlap = query_anchor_tokens & source_path_tokens
+            if overlap:
+                overlap_ratio = len(overlap) / float(max(1, min(len(query_anchor_tokens), len(source_path_tokens))))
+                bonus += min(1.20, (0.16 * len(overlap)) + (0.70 * overlap_ratio))
+        bonus += _source_phrase_bonus(query, source_anchor_text)
+        bonus += _support_intent_text_bonus(
+            query,
+            source_url=source_url,
+            document_title=document_title,
+            heading=heading,
+            text=text,
+        )
+
+        degree_program_query = bool(
+            {"master", "msc", "m.sc", "phd", "doctor", "philosophy", "bachelor", "undergraduate"} & query_tokens
+        )
+        if degree_program_query:
+            wants_msc = bool({"master", "msc", "m.sc"} & query_tokens) or "master of science" in normalized
+            wants_phd = bool({"phd", "doctor", "philosophy"} & query_tokens) or "doctor of philosophy" in normalized
+            wants_undergraduate = bool({"bachelor", "undergraduate"} & query_tokens)
+            is_msc_url = "/study/msc-programs/" in lower_url or "master-of-science" in lower_url
+            is_phd_url = "/study/phd-programs/" in lower_url or "doctor-of-philosophy" in lower_url or "/phd-" in lower_url
+            is_undergraduate_url = "/undergraduate" in lower_url or "bachelor-of-science" in lower_url
+            if wants_msc:
+                bonus += 0.42 if is_msc_url else (-0.42 if is_phd_url or is_undergraduate_url else 0.0)
+            if wants_phd:
+                bonus += 0.42 if is_phd_url else (-0.42 if is_msc_url or is_undergraduate_url else 0.0)
+            if wants_undergraduate:
+                bonus += 0.42 if is_undergraduate_url else (-0.36 if is_msc_url or is_phd_url else 0.0)
+
+        if {"faculty", "professor", "dr"} & query_tokens and "person_statement" not in support_intents:
+            is_faculty_profile = "/study/faculty/" in lower_url
+            if is_faculty_profile:
+                bonus += 0.46
+            if is_news and not is_faculty_profile:
+                bonus -= 0.72
 
         if query_tokens & institutional_relation_tokens:
             if is_news:
                 bonus -= 0.95
             if is_institutional or is_faq or is_catalogue:
                 bonus += 0.42
+            if is_catalogue:
+                years = [
+                    int(match)
+                    for match in re.findall(r"\b20\d{2}\b", " ".join([lower_url, lower_title]))
+                ]
+                latest_year = max(years) if years else 0
+                bonus += 0.72
+                if latest_year >= 2024:
+                    bonus += 0.68
+                elif 0 < latest_year <= 2022:
+                    bonus -= 0.34
+            if "factsheet" in source_blob or "fact sheet" in source_blob:
+                bonus -= 0.28
 
         if query_tokens & leadership_tokens:
-            if is_news:
+            if is_news and not (support_intents & {"person_statement", "president_background", "program_expansion_history"}):
                 bonus -= 0.95
             if is_leadership or is_institutional or is_catalogue:
                 bonus += 0.56
@@ -2632,8 +4145,30 @@ class AdaptiveHybridRetriever:
             if is_application and not (query_tokens & (transport_tokens | accommodation_tokens)):
                 bonus -= 0.24
 
+        if library_query:
+            library_detail_hit = any(
+                marker in source_blob
+                for marker in (
+                    "library hours",
+                    "hours of operation",
+                    "library contact",
+                    "libraryservices",
+                    "library.mbzuai",
+                )
+            )
+            if library_detail_hit:
+                bonus += 1.85
+            elif "library" in source_blob:
+                bonus += 0.28
+            else:
+                bonus -= 0.72
+            if any(marker in lower_url for marker in ("/event/", "/news/", "/alumni", "/sitemap")):
+                bonus -= 1.05
+            if "emergency contact numbers" in source_blob or "mbzuai management.contact number" in source_blob:
+                bonus -= 1.15
+
         if mode == QueryMode.SYNTHESIS:
-            if is_news:
+            if is_news and not (support_intents & {"person_statement", "president_background", "program_expansion_history"}):
                 bonus -= 0.72
             if is_contact or is_campus or is_faq or is_catalogue:
                 bonus += 0.22
@@ -3073,6 +4608,11 @@ class AdaptiveHybridRetriever:
         if answer_type == "hours" and lookup_profile.is_exact_lookup and "hours" in lookup_profile.answer_types:
             support_hours_query = bool(set(_tokenize(query)) & {"support", "screening", "internship", "organization", "event", "conference", "technical", "it", "helpdesk", "exam"})
             official_hours_query = bool(set(_tokenize(query)) & {"official", "working", "operating", "weekday", "weekdays"})
+            if "library" in query_tokens:
+                if "library" in lower_context or "library" in lower_combined:
+                    score += 0.72
+                else:
+                    return -1.0
             if support_hours_query:
                 support_markers = ("technical support", "screening exam", "online screening exam", "internship", "host organization", "it team", "helpdesk", "support hours")
                 if any(term in lower_context or term in lower_combined for term in support_markers):
@@ -3340,13 +4880,35 @@ class AdaptiveHybridRetriever:
             if not fact_tokens:
                 continue
             overlap = len(fact_tokens & informative_token_set) / float(len(informative_token_set))
-            fact_text = _clean_text(self.fact_map[fact_id].get("text") or self.fact_map[fact_id].get("dense_text") or "")
+            fact = self.fact_map[fact_id]
+            fact_text = _clean_text(fact.get("text") or fact.get("dense_text") or "")
+            fact_lookup_text = _fact_lookup_text(fact) or fact_text
+            lookup_bonus = _lookup_signal_bonus(query, fact_text)
+            context_lookup_bonus = _lookup_signal_bonus(query, fact_lookup_text)
+            contextual_contact_match = _contextual_contact_fact_match(query, fact_text, fact_lookup_text)
+            contextual_family_match = _contextual_family_accommodation_match(query, fact_lookup_text)
             if lookup_profile.is_exact_lookup:
                 if not any(_text_matches_answer_type(fact_text, answer_type) for answer_type in lookup_profile.answer_types):
                     continue
-                if _lookup_signal_bonus(query, fact_text) <= 0.0:
+                if max(lookup_bonus, context_lookup_bonus) <= 0.0 and not contextual_contact_match and not contextual_family_match:
                     continue
-            scored.append((fact_id, overlap + self._fact_query_bonus(query, fact_text)))
+            scored.append(
+                (
+                    fact_id,
+                    overlap
+                    + self._fact_query_bonus(query, fact_text)
+                    + max(lookup_bonus, context_lookup_bonus)
+                    + (0.85 if contextual_contact_match else 0.0)
+                    + (1.15 if contextual_family_match else 0.0)
+                    + self._source_query_bonus(
+                        query,
+                        source_url=str(fact.get("source_url") or ""),
+                        document_title=str(fact.get("document_title") or ""),
+                        heading=str(fact.get("heading") or fact.get("section_heading") or ""),
+                        text=fact_lookup_text,
+                    ),
+                )
+            )
         scored.sort(key=lambda item: item[1], reverse=True)
         return [fact_id for fact_id, score in scored[:top_k] if score > 0.0]
 
@@ -3421,9 +4983,11 @@ class AdaptiveHybridRetriever:
                 bonus += 0.12
         if {"family", "families", "parents", "parent"} & query_tokens:
             if any(term in lower_text for term in ("parents stay", "parents stay with me", "housing for parents", "visiting parents")):
-                bonus += 0.22
+                bonus += 0.42
             if any(term in lower_text for term in ("hotels", "airbnbs", "airbnb")):
-                bonus += 0.12
+                bonus += 0.22
+        if _contextual_family_accommodation_match(query, text):
+            bonus += 0.85
         if _is_generic_contact_query(query):
             narrow_scope_hits = [
                 token for token in _CONTACT_NARROW_SCOPE_TOKENS
@@ -3563,12 +5127,17 @@ class AdaptiveHybridRetriever:
             if not fact_text:
                 continue
             score = self._score_text_match(query, fact_text) + self._fact_query_bonus(query, fact_text)
+            fact_lookup_text = _fact_lookup_text(fact) or fact_text
+            if _contextual_contact_fact_match(query, fact_text, fact_lookup_text):
+                score += 0.85
+            if _contextual_family_accommodation_match(query, fact_lookup_text):
+                score += 1.15
             score += self._source_query_bonus(
                 query,
                 source_url=str(fact.get("source_url") or ""),
                 document_title=str(fact.get("document_title") or ""),
                 heading=str(fact.get("heading") or ""),
-                text=fact_text,
+                text=fact_lookup_text,
             )
             if lookup_profile.is_exact_lookup:
                 answer_matches = any(
@@ -3584,6 +5153,46 @@ class AdaptiveHybridRetriever:
                 scored.append((fact_id, score))
         scored.sort(key=lambda item: item[1], reverse=True)
         return [fact_id for fact_id, _score in scored[:top_k]]
+
+    def _local_evidence_span_query_ids(self, query: str, *, top_k: int) -> List[str]:
+        if top_k <= 0 or not self.evidence_span_map:
+            return []
+        candidate_ids = self._lexical_query_ids(
+            query,
+            max(top_k, self.local_evidence_span_candidate_pool),
+            namespace=self.namespace_evidence_spans,
+        )
+        if not candidate_ids:
+            return []
+        scored: List[Tuple[str, float]] = []
+        for span_id in candidate_ids:
+            span = self.evidence_span_map.get(str(span_id))
+            if not span:
+                continue
+            text = _clean_text(
+                " ".join(
+                    str(span.get(key) or "")
+                    for key in (
+                        "document_title",
+                        "section_heading",
+                        "breadcrumb",
+                        "span_type",
+                        "sparse_text",
+                        "text",
+                    )
+                )
+            )
+            score = self._score_text_match(query, text)
+            score += _lookup_signal_bonus(query, text)
+            score += self._fact_query_bonus(query, text)
+            score += _answer_focus_match_bonus(query, text)
+            if _contextual_family_accommodation_match(query, text):
+                score += 1.15
+            if score <= 0.0:
+                continue
+            scored.append((str(span_id), score))
+        scored.sort(key=lambda item: (-item[1], item[0]))
+        return [span_id for span_id, _score in scored[:top_k]]
 
     def _extract_search_ids(self, response: Any) -> List[str]:
         hits = None
@@ -3612,13 +5221,10 @@ class AdaptiveHybridRetriever:
         try:
             response = self._pinecone_sparse_index().search(
                 namespace=namespace,
-                query={
-                    "top_k": top_k,
-                    "inputs": {
-                        "text": query,
-                    },
-                },
+                top_k=top_k,
+                inputs={"text": query},
                 fields=[],
+                timeout=self.pinecone_query_timeout_seconds,
             )
             result = self._extract_search_ids(response)
             merged = _rrf_merge([result, lexical_ids], k=self.rrf_k)
@@ -3642,12 +5248,103 @@ class AdaptiveHybridRetriever:
             if record_id in self.parent_map:
                 chunk_ids.extend(self.parent_map[record_id].get("child_chunk_ids") or [])
                 continue
+            if record_id in self.summary_map:
+                chunk_ids.extend(self.summary_map[record_id].get("linked_chunk_ids") or [])
+                continue
+            if record_id in self.evidence_span_map:
+                span = self.evidence_span_map[record_id]
+                chunk_ids.extend(span.get("linked_chunk_ids") or [])
+                if span.get("chunk_id"):
+                    chunk_ids.append(str(span.get("chunk_id")))
+                continue
             if record_id in self.media_map:
                 chunk_ids.extend(self.media_map[record_id].get("linked_chunk_ids") or [])
                 continue
             if record_id in self.fact_map:
                 chunk_ids.extend(self.fact_map[record_id].get("linked_chunk_ids") or [])
         return list(dict.fromkeys(chunk_ids))
+
+    def _span_anchor_chunk_ids(self, span_ids: Iterable[str]) -> List[str]:
+        chunk_ids: List[str] = []
+        for span_id in span_ids:
+            span = self.evidence_span_map.get(str(span_id))
+            if not span:
+                continue
+            chunk_ids.extend(str(value) for value in (span.get("linked_chunk_ids") or []) if str(value))
+            if span.get("chunk_id"):
+                chunk_ids.append(str(span.get("chunk_id")))
+        return list(dict.fromkeys(chunk_ids))
+
+    def _select_evidence_span_ids_for_query(
+        self,
+        query: str,
+        ranked_span_ids: Sequence[str],
+        *,
+        mode: QueryMode,
+    ) -> List[str]:
+        if not ranked_span_ids:
+            return []
+        anchor_tokens = _evidence_span_anchor_tokens(query)
+        if anchor_tokens:
+            anchored_span_ids = [
+                str(span_id)
+                for span_id in ranked_span_ids
+                if _record_matches_anchor_tokens(self.evidence_span_map.get(str(span_id)) or {}, anchor_tokens)
+            ]
+            if anchored_span_ids:
+                ranked_span_ids = anchored_span_ids
+        query_lower = query.lower()
+        aggregation_query = bool(
+            re.search(r"\b(compare|all|list|across|multiple|programs|departments|schools|faculty members|aggregate)\b", query_lower)
+        )
+        max_items = (
+            max(12, self.parent_candidate_top_k + 6)
+            if aggregation_query
+            else max(6, self.parent_candidate_top_k + 4)
+            if mode != QueryMode.SYNTHESIS
+            else max(4, self.parent_candidate_top_k + 1)
+        )
+        max_per_source = 2 if aggregation_query else 3
+        source_counts: Dict[str, int] = {}
+        selected: List[str] = []
+
+        def _span_source(span_id: str) -> str:
+            span = self.evidence_span_map.get(str(span_id)) or {}
+            return str(
+                span.get("language_normalized_url")
+                or span.get("canonical_url")
+                or span.get("source_url")
+                or span.get("page_id")
+                or "local"
+            )
+
+        if aggregation_query:
+            seen_sources = set()
+            for span_id in ranked_span_ids:
+                span_id = str(span_id)
+                if span_id in selected or span_id not in self.evidence_span_map:
+                    continue
+                source = _span_source(span_id)
+                if source in seen_sources:
+                    continue
+                selected.append(span_id)
+                seen_sources.add(source)
+                source_counts[source] = 1
+                if len(selected) >= max_items:
+                    return selected
+
+        for span_id in ranked_span_ids:
+            span_id = str(span_id)
+            if span_id in selected or span_id not in self.evidence_span_map:
+                continue
+            source = _span_source(span_id)
+            if source_counts.get(source, 0) >= max_per_source:
+                continue
+            selected.append(span_id)
+            source_counts[source] = source_counts.get(source, 0) + 1
+            if len(selected) >= max_items:
+                break
+        return selected
 
     def _accumulate_chunk_support(self, rankings: Dict[str, Sequence[str]]) -> Dict[str, Dict[str, Any]]:
         support: Dict[str, Dict[str, Any]] = {}
@@ -3664,7 +5361,13 @@ class AdaptiveHybridRetriever:
                     payload["record_ids"].add(record_id)
         return support
 
-    def _build_rerank_text(self, chunk_id: str, *, max_tokens: int) -> str:
+    def _build_rerank_text(
+        self,
+        chunk_id: str,
+        *,
+        max_tokens: int,
+        max_chars: int | None = None,
+    ) -> str:
         chunk = self.chunk_map.get(chunk_id, {})
         lines = []
         if chunk.get("document_title"):
@@ -3682,7 +5385,7 @@ class AdaptiveHybridRetriever:
         for media_text in (self.media_texts_by_chunk.get(chunk_id) or [])[:2]:
             lines.append(f"MEDIA: {media_text}")
         lines.append(chunk.get("text") or chunk.get("dense_text") or "")
-        return _truncate_fragments(lines, max_tokens=max_tokens)
+        return _truncate_fragments(lines, max_tokens=max_tokens, max_chars=max_chars)
 
     def _parse_rerank_results(self, response: Any, documents: List[Dict[str, Any]]) -> List[Tuple[str, float]]:
         results = getattr(response, "data", None) or getattr(response, "results", None)
@@ -3723,6 +5426,7 @@ class AdaptiveHybridRetriever:
             overlap = self._score_text_match(query, chunk_text)
             overlap += _lookup_signal_bonus(query, chunk_text)
             overlap += self._fact_query_bonus(query, chunk_text)
+            overlap += _answer_focus_match_bonus(query, chunk_text)
             overlap += self._source_query_bonus(
                 query,
                 source_url=str(chunk.get("source_url") or ""),
@@ -3765,6 +5469,49 @@ class AdaptiveHybridRetriever:
                 continue
             merged.append((chunk_id, float(score)))
         return merged
+
+    def _promote_source_matched_chunks(
+        self,
+        query: str,
+        ranked_chunks: Sequence[Tuple[str, float]],
+        support: Dict[str, Dict[str, Any]],
+    ) -> List[Tuple[str, float]]:
+        mode = classify_query_mode(query)
+        rescored: List[Tuple[str, float, int]] = []
+        for rank, (chunk_id, score) in enumerate(ranked_chunks):
+            chunk = self.chunk_map.get(chunk_id)
+            if not chunk:
+                continue
+            chunk_text = _clean_text(chunk.get("dense_text") or chunk.get("text") or "")
+            source_bonus = self._source_query_bonus(
+                query,
+                source_url=str(chunk.get("source_url") or ""),
+                document_title=str(chunk.get("document_title") or ""),
+                heading=str(chunk.get("heading") or ""),
+                text=chunk_text,
+                mode=mode,
+            )
+            text_score = self._score_text_match(query, chunk_text)
+            focus_score = _answer_focus_match_bonus(query, chunk_text)
+            support_score = float((support.get(chunk_id) or {}).get("score") or 0.0)
+            exact_source_bonus = 0.0
+            if source_bonus >= 1.0 and (text_score >= 0.16 or focus_score >= 0.6):
+                exact_source_bonus += 0.95
+            if source_bonus >= 1.5:
+                exact_source_bonus += 0.45
+            if focus_score >= 1.9:
+                exact_source_bonus += 0.90
+            boosted = (
+                float(score)
+                + (1.85 * source_bonus)
+                + (0.45 * text_score)
+                + (2.65 * focus_score)
+                + (1.35 * support_score)
+                + exact_source_bonus
+            )
+            rescored.append((chunk_id, boosted, rank))
+        rescored.sort(key=lambda item: (-item[1], item[2]))
+        return [(chunk_id, score) for chunk_id, score, _rank in rescored]
 
     def _promote_fact_supported_chunks(
         self,
@@ -4022,7 +5769,22 @@ class AdaptiveHybridRetriever:
         mode: QueryMode | None = None,
         graph_seed_chunk_ids: Sequence[str] | None = None,
         graph_seed_fact_ids: Sequence[str] | None = None,
+        force_fallback: bool = False,
+        diagnostics: Dict[str, Any] | None = None,
     ) -> List[Tuple[str, float]]:
+        started = time.perf_counter()
+
+        def _record_rerank(method: str) -> None:
+            latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
+            if diagnostics is not None:
+                diagnostics["rerank_latency_ms"] = latency_ms
+                diagnostics["rerank_method"] = method
+            else:
+                # Compatibility for direct callers. Production retrieval passes a
+                # request-local diagnostics object and never relies on these fields.
+                self._last_rerank_latency_ms = latency_ms
+                self._last_rerank_method = method
+
         mode = mode or classify_query_mode(query)
         rerank_top_n = self.rerank_top_n
         rerank_return_top_k = self.rerank_return_top_k
@@ -4033,9 +5795,14 @@ class AdaptiveHybridRetriever:
 
         candidate_chunk_ids = list(dict.fromkeys(candidate_chunk_ids))[: max(rerank_top_n, self.max_context_chunks)]
         if not candidate_chunk_ids:
+            _record_rerank("none")
             return []
         fallback_ranked = self._fallback_rerank(query, candidate_chunk_ids, support)
+        if force_fallback:
+            _record_rerank("fallback_external_lanes_disabled")
+            return fallback_ranked
         if not self.enable_rerank:
+            _record_rerank("fallback_disabled")
             return fallback_ranked
         if self._should_skip_rerank(
             query=query,
@@ -4046,6 +5813,7 @@ class AdaptiveHybridRetriever:
             graph_seed_fact_ids=graph_seed_fact_ids,
             lightweight_fact_rerank=lightweight_fact_rerank,
         ):
+            _record_rerank("fallback_high_confidence_fact")
             return fallback_ranked
         rerank_query = _truncate_tokens(query, max_tokens=self.rerank_query_max_tokens)
         token_caps = [self.rerank_doc_max_tokens, *self.rerank_retry_doc_max_tokens]
@@ -4054,10 +5822,18 @@ class AdaptiveHybridRetriever:
             if token_cap in seen_caps:
                 continue
             seen_caps.add(token_cap)
+            doc_char_cap = max(0, self.rerank_doc_max_chars)
+            if self.rerank_request_max_chars > 0 and candidate_chunk_ids:
+                request_cap = max(180, self.rerank_request_max_chars // max(len(candidate_chunk_ids), 1))
+                doc_char_cap = min(doc_char_cap or request_cap, request_cap)
             documents = [
                 {
                     "id": chunk_id,
-                    "text": self._build_rerank_text(chunk_id, max_tokens=token_cap),
+                    "text": self._build_rerank_text(
+                        chunk_id,
+                        max_tokens=token_cap,
+                        max_chars=doc_char_cap or None,
+                    ),
                 }
                 for chunk_id in candidate_chunk_ids
                 if chunk_id in self.chunk_map
@@ -4076,6 +5852,7 @@ class AdaptiveHybridRetriever:
                 )
                 ranked = self._parse_rerank_results(response, documents)
                 if ranked:
+                    _record_rerank("pinecone")
                     return self._merge_reranked_with_remaining(ranked, fallback_ranked)
             except Exception as exc:
                 if "exceeds the maximum token limit" in str(exc).lower():
@@ -4086,6 +5863,7 @@ class AdaptiveHybridRetriever:
                     continue
                 logger.warning("Reranking failed, using fallback ranking: %s", exc)
                 break
+        _record_rerank("fallback_error")
         return fallback_ranked
 
     def _is_lightweight_fact_rerank_query(self, query: str, *, mode: QueryMode) -> bool:
@@ -4203,16 +5981,109 @@ class AdaptiveHybridRetriever:
                 break
         return list(dict.fromkeys(selected))[: self.max_context_chunks]
 
+    def _should_use_support_parent_scan(self, query: str, *, mode: QueryMode) -> bool:
+        if mode == QueryMode.FACT:
+            return False
+        return bool(_support_query_intents(query))
+
+    def _support_parent_ids_for_query(self, query: str, *, top_k: int) -> List[str]:
+        mode = classify_query_mode(query)
+        if top_k <= 0 or not self._should_use_support_parent_scan(query, mode=mode):
+            return []
+        scored: List[Tuple[str, float, int]] = []
+        for index, parent in enumerate(self.parent_map.values()):
+            parent_id = str(parent.get("id") or "")
+            if not parent_id:
+                continue
+            text = _clean_text(parent.get("dense_text") or parent.get("text") or "")
+            heading = " > ".join(str(value) for value in (parent.get("section_path") or []))
+            support_bonus = self._source_query_bonus(
+                query,
+                source_url=str(parent.get("source_url") or ""),
+                document_title=str(parent.get("document_title") or ""),
+                heading=heading,
+                text=text,
+                mode=mode,
+            )
+            lexical_score = self._score_text_match(query, " ".join([heading, text]))
+            score = support_bonus + (0.35 * lexical_score)
+            if parent.get("parent_type") == "page":
+                score += 0.08
+            if score < 0.90:
+                continue
+            scored.append((parent_id, score, index))
+        scored.sort(key=lambda item: (-item[1], item[2], item[0]))
+        return [parent_id for parent_id, _score, _index in scored[:top_k]]
+
+    def _support_chunk_ids_for_query(
+        self,
+        query: str,
+        parent_ids: Sequence[str],
+        *,
+        top_k: int,
+    ) -> List[str]:
+        if top_k <= 0 or not parent_ids:
+            return []
+        per_parent = max(2, min(self.max_parent_chunks, max(3, top_k // max(1, min(len(parent_ids), 3)))))
+        selected: List[str] = []
+        for parent_id in parent_ids[: max(2, self.parent_candidate_top_k + 1)]:
+            selected.extend(self._rank_parent_child_chunk_ids(query, str(parent_id), top_k=per_parent))
+            if len(dict.fromkeys(selected)) >= top_k:
+                break
+        return list(dict.fromkeys(selected))[:top_k]
+
+    def _rank_parent_child_chunk_ids(self, query: str, parent_id: str, *, top_k: int) -> List[str]:
+        parent = self.parent_map.get(str(parent_id))
+        if not parent:
+            return []
+        child_ids = [str(value) for value in (parent.get("child_chunk_ids") or []) if str(value) in self.chunk_map]
+        if not child_ids:
+            return []
+        query = str(query or "")
+        scored: List[Tuple[str, float, int]] = []
+        for index, chunk_id in enumerate(child_ids):
+            chunk = self.chunk_map.get(chunk_id) or {}
+            text = str(chunk.get("dense_text") or chunk.get("text") or "")
+            heading = str(chunk.get("heading") or "")
+            source_url = str(chunk.get("source_url") or "")
+            document_title = str(chunk.get("document_title") or "")
+            content_score = self._score_text_match(query, " ".join([heading, text]))
+            source_score = self._source_query_bonus(
+                query,
+                source_url=source_url,
+                document_title=document_title,
+                heading=heading,
+                text=text,
+                mode=classify_query_mode(query),
+            )
+            # The first child of MBZUAI web pages usually contains the page overview,
+            # deadline, credits, and other high-value fields hidden by repeated course sections.
+            lead_bonus = max(0.0, 0.55 - (0.06 * index))
+            if _support_query_intents(query):
+                # Support-style questions usually need FAQ/application/scholarship
+                # detail chunks, not just the lead curriculum/overview chunk.
+                lead_bonus = min(lead_bonus, 0.16)
+            scored.append((chunk_id, content_score + (0.78 * source_score) + lead_bonus, index))
+        scored.sort(key=lambda item: (-item[1], item[2], item[0]))
+        return [chunk_id for chunk_id, _score, _index in scored[: max(1, int(top_k or 1))]]
+
     def _expand_scoped_or_synthesis(
         self,
         seed_chunk_ids: List[str],
         *,
+        query: str = "",
         mode: QueryMode,
         explicit_parent_ids: Sequence[str] | None = None,
         prioritize_explicit_parents: bool = False,
         prefer_explicit_parent_chunks_first: bool = False,
     ) -> List[str]:
-        preserve_seed_limit = max(4, min(self.max_context_chunks // 2, 8))
+        support_intents = _support_query_intents(query)
+        if mode == QueryMode.SYNTHESIS:
+            preserve_seed_limit = max(4, min(self.max_context_chunks // 2, 8))
+        else:
+            preserve_seed_limit = max(4, min(self.max_context_chunks // 2, 8))
+        if support_intents & {"person_statement", "president_background", "program_expansion_history", "news_event"}:
+            preserve_seed_limit = max(preserve_seed_limit, self.max_context_chunks)
         preserved_seed_ids: List[str] = list(dict.fromkeys(seed_chunk_ids))[:preserve_seed_limit]
         selected: List[str] = list(preserved_seed_ids)
         by_section: Dict[str, List[str]] = {}
@@ -4239,11 +6110,13 @@ class AdaptiveHybridRetriever:
                 if not parent:
                     continue
                 added_explicit_parent_chunks = True
-                explicit_parent_chunk_ids.extend((parent.get("child_chunk_ids") or [])[: per_parent_limit])
+                explicit_parent_chunk_ids.extend(
+                    self._rank_parent_child_chunk_ids(query, parent_id, top_k=per_parent_limit)
+                )
                 if prefer_explicit_parent_chunks_first:
                     selected = list(dict.fromkeys([*explicit_parent_chunk_ids, *preserved_seed_ids]))
                 else:
-                    selected.extend((parent.get("child_chunk_ids") or [])[: per_parent_limit])
+                    selected.extend(self._rank_parent_child_chunk_ids(query, parent_id, top_k=per_parent_limit))
                 if len(dict.fromkeys(selected)) >= self.max_context_chunks:
                     return list(dict.fromkeys(selected))[: self.max_context_chunks]
             if added_explicit_parent_chunks and mode != QueryMode.SYNTHESIS:
@@ -4267,7 +6140,7 @@ class AdaptiveHybridRetriever:
             explicit_hit = section_id in explicit_parent_rank
             if hit_count < self.same_parent_expand_threshold and mode != QueryMode.SYNTHESIS and not explicit_hit:
                 continue
-            selected.extend(self.chunk_ids_by_section.get(section_id, [])[: self.max_parent_chunks])
+            selected.extend(self._rank_parent_child_chunk_ids(query, section_id, top_k=self.max_parent_chunks))
             if len(dict.fromkeys(selected)) >= self.max_context_chunks:
                 return list(dict.fromkeys(selected))[: self.max_context_chunks]
 
@@ -4288,7 +6161,7 @@ class AdaptiveHybridRetriever:
                 explicit_hit = page_id in explicit_parent_rank
                 if hit_count < self.same_parent_expand_threshold and mode != QueryMode.SYNTHESIS and not explicit_hit:
                     continue
-                selected.extend(self.chunk_ids_by_page.get(page_id, [])[: self.max_parent_chunks])
+                selected.extend(self._rank_parent_child_chunk_ids(query, page_id, top_k=self.max_parent_chunks))
                 if len(dict.fromkeys(selected)) >= self.max_context_chunks:
                     return list(dict.fromkeys(selected))[: self.max_context_chunks]
 
@@ -4370,6 +6243,112 @@ class AdaptiveHybridRetriever:
             key=lambda parent_id: (-parent_scores[parent_id], parent_first_seen.get(parent_id, 10_000), parent_id),
         )
         return ordered[:limit]
+
+    def _promote_selected_chunk_parent_ids(
+        self,
+        query: str,
+        selected_parent_ids: Sequence[str],
+        selected_chunk_ids: Sequence[str],
+    ) -> List[str]:
+        limit = max(4, self.parent_candidate_top_k * 2)
+        existing = [str(parent_id) for parent_id in selected_parent_ids if str(parent_id)]
+        parent_candidates: List[Tuple[str, float, int]] = []
+        for chunk_rank, chunk_id in enumerate(selected_chunk_ids[: self.max_context_chunks]):
+            chunk = self.chunk_map.get(str(chunk_id))
+            if not chunk:
+                continue
+            chunk_text = _clean_text(chunk.get("dense_text") or chunk.get("text") or "")
+            source_bonus = self._source_query_bonus(
+                query,
+                source_url=str(chunk.get("source_url") or ""),
+                document_title=str(chunk.get("document_title") or ""),
+                heading=str(chunk.get("heading") or ""),
+                text=chunk_text,
+                mode=classify_query_mode(query),
+            )
+            text_score = self._score_text_match(query, chunk_text)
+            focus_score = _answer_focus_match_bonus(query, chunk_text)
+            top_evidence_anchor = chunk_rank < max(3, self.parent_candidate_top_k)
+            if not top_evidence_anchor and (source_bonus < 2.4 or max(text_score, focus_score) < 0.55):
+                continue
+            rank_bonus = max(0.0, 1.0 - (0.08 * float(chunk_rank)))
+            parent_score = (1.25 * source_bonus) + (0.55 * text_score) + (0.90 * focus_score) + rank_bonus
+            if top_evidence_anchor:
+                parent_score = max(parent_score, 4.35 - (0.08 * float(chunk_rank)))
+            for parent_offset, parent_id in enumerate((str(chunk.get("section_key") or ""), str(chunk.get("page_key") or ""))):
+                if parent_id and parent_id in self.parent_map:
+                    parent_candidates.append((parent_id, parent_score - (0.05 * parent_offset), chunk_rank))
+
+        if not parent_candidates:
+            return self._diversify_parent_ids_for_query(query, existing, limit=limit)
+        best_by_parent: Dict[str, Tuple[float, int]] = {}
+        for parent_id, score, rank in parent_candidates:
+            previous = best_by_parent.get(parent_id)
+            if previous is None or (score, -rank) > (previous[0], -previous[1]):
+                best_by_parent[parent_id] = (score, rank)
+        promoted = [
+            parent_id
+            for parent_id, (score, rank) in sorted(
+                best_by_parent.items(),
+                key=lambda item: (-item[1][0], item[1][1], item[0]),
+            )
+            if score >= 3.8
+        ]
+        return self._diversify_parent_ids_for_query(
+            query,
+            list(dict.fromkeys([*promoted, *existing])),
+            limit=limit,
+        )
+
+    def _diversify_parent_ids_for_query(
+        self,
+        query: str,
+        parent_ids: Sequence[str],
+        *,
+        limit: int,
+    ) -> List[str]:
+        ordered = [str(parent_id) for parent_id in parent_ids if str(parent_id) in self.parent_map]
+        if not ordered or limit <= 0:
+            return []
+        query_tokens = set(_tokenize(query))
+        legal_relation_tokens = {
+            "law",
+            "legal",
+            "basis",
+            "established",
+            "created",
+            "affiliated",
+            "affiliation",
+            "authority",
+            "institutional",
+        }
+        should_diversify = classify_query_mode(query) in {QueryMode.SCOPED, QueryMode.SYNTHESIS} or bool(
+            query_tokens & legal_relation_tokens
+        )
+        if not should_diversify:
+            return list(dict.fromkeys(ordered))[:limit]
+
+        max_per_source = 2 if query_tokens & legal_relation_tokens else 3
+        selected: List[str] = []
+        overflow: List[str] = []
+        source_counts: Dict[str, int] = {}
+        seen = set()
+        for parent_id in ordered:
+            if parent_id in seen:
+                continue
+            seen.add(parent_id)
+            parent = self.parent_map.get(parent_id) or {}
+            source_key = _clean_text(
+                str(parent.get("source_url") or parent.get("canonical_url") or parent.get("document_title") or parent_id)
+            ).lower().rstrip("/")
+            count = source_counts.get(source_key, 0)
+            if count < max_per_source:
+                selected.append(parent_id)
+                source_counts[source_key] = count + 1
+            else:
+                overflow.append(parent_id)
+
+        return [*selected, *overflow][:limit]
 
     def _media_parent_hints(self, query: str, media_ids: Sequence[str], *, top_k: int) -> List[str]:
         ranked_media: List[Tuple[str, float]] = []
@@ -4510,12 +6489,30 @@ class AdaptiveHybridRetriever:
                 *list(self.fact_texts_by_chunk.get(top_chunk_id) or [])[:2],
             ]
         ).lower()
+        if self.temporal_exact_year_guard_enabled and _requires_exact_temporal_evidence(query):
+            temporal_fragments: List[str] = []
+            for chunk_id, _score in ranked_chunks[: self.temporal_guard_top_k]:
+                chunk = self.chunk_map.get(str(chunk_id))
+                if not chunk:
+                    continue
+                temporal_fragments.extend(
+                    [
+                        str(chunk.get("source_url") or ""),
+                        str(chunk.get("document_title") or ""),
+                        str(chunk.get("heading") or ""),
+                        str(chunk.get("dense_text") or chunk.get("text") or ""),
+                    ]
+                )
+                temporal_fragments.extend(list(self.answer_texts_by_chunk.get(str(chunk_id)) or [])[:2])
+                temporal_fragments.extend(list(self.fact_texts_by_chunk.get(str(chunk_id)) or [])[:2])
+            if not _text_has_requested_temporal_anchor(query, " ".join(temporal_fragments)):
+                return True
         if mode == QueryMode.FACT:
             has_fact_support = bool(
                 {"dense_facts", "sparse_facts", "dense_assertions", "sparse_assertions", "local_facts", "local_answers"}
                 & set(support_sources)
             )
-            named_tokens = _named_query_tokens(query)
+            named_tokens = _effective_named_tokens_for_abstention(query, evidence_text)
             lookup_profile = _lookup_query_profile(query)
             informative_tokens = self._informative_query_tokens(query)
             required_fact_overlap = self.fact_abstain_min_token_overlap
@@ -4525,11 +6522,20 @@ class AdaptiveHybridRetriever:
                 required_fact_overlap = max(required_fact_overlap, 0.45)
             evidence_overlap = max(overlap, fact_overlap, answer_overlap)
             structured_fact_overlap = max(fact_overlap, answer_overlap)
-            missing_named_ratio = _missing_named_token_ratio(query, evidence_text)
+            missing_named_ratio = _missing_token_ratio(named_tokens, evidence_text)
             missing_named_phrases = [
                 phrase for phrase in _named_query_phrases(query)
-                if phrase not in evidence_text
+                if phrase not in evidence_text and not all(token in evidence_text for token in _tokenize(phrase))
             ]
+            source_match = self._source_query_bonus(
+                query,
+                source_url=str(top_chunk.get("source_url") or ""),
+                document_title=str(top_chunk.get("document_title") or ""),
+                heading=str(top_chunk.get("heading") or ""),
+                text=evidence_text,
+                mode=mode,
+            )
+            legacy_text_only = self.legacy_vectorstore_contract == _LEGACY_VECTORSTORE_CONTRACT
             allow_implicit_subject = (
                 lookup_profile.is_exact_lookup
                 and not lookup_profile.strict_answer_required
@@ -4550,6 +6556,11 @@ class AdaptiveHybridRetriever:
                 return True
             if has_fact_support and structured_fact_overlap >= required_fact_overlap:
                 return False
+            if legacy_text_only and lookup_profile.is_exact_lookup:
+                if evidence_overlap >= self.fact_require_fact_support_overlap:
+                    return False
+                if source_match >= 0.75 and evidence_overlap >= self.fact_abstain_min_token_overlap:
+                    return False
             if named_tokens and any(token not in evidence_text for token in named_tokens):
                 return True
             if not has_fact_support and evidence_overlap < self.fact_require_fact_support_overlap:
@@ -4568,38 +6579,114 @@ class AdaptiveHybridRetriever:
         query_vector: Optional[List[float]] = None,
         seed_overrides: Optional[Dict[str, Sequence[str]]] = None,
     ) -> Dict[str, Any]:
+        retrieval_started = time.perf_counter()
+        stage_started = retrieval_started
+        stage_latency_ms: Dict[str, float] = {}
+        request_diagnostics: Dict[str, Any] = {
+            "lane_latency_ms": {},
+            "rerank_latency_ms": 0.0,
+            "rerank_method": "",
+        }
+
+        def _mark_stage(name: str) -> None:
+            nonlocal stage_started
+            now = time.perf_counter()
+            stage_latency_ms[name] = round((now - stage_started) * 1000.0, 3)
+            stage_started = now
+
         mode = classify_query_mode(query)
         media_query = _is_media_query(query)
         lookup_profile = _lookup_query_profile(query)
         exact_lookup = mode == QueryMode.FACT and lookup_profile.is_exact_lookup
-        query_vector = list(query_vector) if query_vector is not None else self.embed_query(query)
+        legacy_text_only = self.legacy_vectorstore_contract == _LEGACY_VECTORSTORE_CONTRACT
+        query_embedding_status = "ok"
+        query_embedding_error = ""
+        if query_vector is None:
+            try:
+                query_vector = self.embed_query(query)
+            except Exception as exc:
+                query_embedding_status = "failed_sparse_local_fallback"
+                query_embedding_error = _public_query_embedding_error_code(exc)
+                query_vector = []
+                logger.warning(
+                    "Dense query embedding failed; continuing with sparse/local retrieval fallback: %s",
+                    exc,
+                )
+        else:
+            query_vector = list(query_vector)
+            if not query_vector:
+                query_embedding_status = "skipped_dense_no_query_vector"
+        _mark_stage("query_embedding_ms")
         seed_overrides = dict(seed_overrides or {})
         graph_seed_chunk_ids = [str(value) for value in (seed_overrides.get("graph_relation_chunk_ids") or []) if str(value)]
         graph_seed_parent_ids = [str(value) for value in (seed_overrides.get("graph_relation_parent_ids") or []) if str(value)]
         graph_seed_fact_ids = [str(value) for value in (seed_overrides.get("graph_relation_fact_ids") or []) if str(value)]
 
         lane_top_ks = self._lane_top_ks(query=query, mode=mode, media_query=media_query)
+        disable_external_lanes_after_embedding_failure = (
+            not query_vector
+            and not self.external_lanes_on_embedding_failure
+        )
+        if not query_vector:
+            for dense_lane in (
+                "chunk_dense",
+                "assertion_dense",
+                "parent_dense",
+                "summary_dense",
+                "media_dense",
+                "fact_dense",
+                "evidence_span_dense",
+            ):
+                lane_top_ks[dense_lane] = 0
+        if disable_external_lanes_after_embedding_failure:
+            for sparse_lane in (
+                "chunk_sparse",
+                "assertion_sparse",
+                "parent_sparse",
+                "summary_sparse",
+                "media_sparse",
+                "fact_sparse",
+                "evidence_span_sparse",
+            ):
+                lane_top_ks[sparse_lane] = 0
         lane_results = self._run_query_lanes(
             query=query,
             query_vector=query_vector,
             lane_top_ks=lane_top_ks,
             mode=mode,
+            diagnostics=request_diagnostics,
         )
+        _mark_stage("lane_query_ms")
         chunk_dense_ids = lane_results["chunk_dense_ids"]
         sparse_chunk_ids = lane_results["sparse_chunk_ids"]
         parent_dense_ids = lane_results["parent_dense_ids"]
         sparse_parent_ids = lane_results["sparse_parent_ids"]
         local_parent_ids = lane_results["local_parent_ids"]
+        summary_dense_ids = lane_results["summary_dense_ids"]
+        sparse_summary_ids = lane_results["sparse_summary_ids"]
         media_dense_ids = lane_results["media_dense_ids"]
         sparse_media_ids = lane_results["sparse_media_ids"]
         local_media_ids = lane_results["local_media_ids"]
         fact_dense_ids = lane_results["fact_dense_ids"]
         sparse_fact_ids = lane_results["sparse_fact_ids"]
         local_fact_ids = lane_results["local_fact_ids"]
+        dense_evidence_span_ids = lane_results["dense_evidence_span_ids"]
+        sparse_evidence_span_ids = lane_results["sparse_evidence_span_ids"]
+        local_evidence_span_ids = lane_results["local_evidence_span_ids"]
         dense_assertion_ids = lane_results["dense_assertion_ids"]
         sparse_assertion_ids = lane_results["sparse_assertion_ids"]
         local_answer_ids = lane_results["local_answer_ids"]
-        structured_answer_query = bool(_structured_answer_types(query)) and mode != QueryMode.SYNTHESIS
+        structured_answer_types = _structured_answer_types(query)
+        synthesis_structured_lane_enabled = _synthesis_structured_lane_enabled(
+            query,
+            mode=mode,
+            lookup_profile=lookup_profile,
+            structured_answer_types=structured_answer_types,
+        )
+        structured_answer_query = bool(structured_answer_types) and (
+            mode != QueryMode.SYNTHESIS or synthesis_structured_lane_enabled
+        )
+        fact_selection_query = mode == QueryMode.FACT or synthesis_structured_lane_enabled
         ranked_answer_ids = self._rank_answer_ids(
             query,
             [*dense_assertion_ids, *sparse_assertion_ids, *local_answer_ids],
@@ -4614,17 +6701,37 @@ class AdaptiveHybridRetriever:
             query,
             [*graph_seed_fact_ids, *local_fact_ids, *sparse_fact_ids, *fact_dense_ids],
             top_k=max(4, self.parent_candidate_top_k + 2),
-        ) if mode == QueryMode.FACT else []
+        ) if fact_selection_query else []
+        ranked_evidence_span_ids = [
+            span_id
+            for span_id, _score in _rrf_merge(
+                [dense_evidence_span_ids, sparse_evidence_span_ids, local_evidence_span_ids],
+                k=self.rrf_k,
+            )
+            if span_id in self.evidence_span_map
+        ]
+        evidence_span_anchor_chunk_ids = self._span_anchor_chunk_ids(
+            ranked_evidence_span_ids[: max(4, self.parent_candidate_top_k + 3)]
+        )
         fact_anchor_chunk_ids = self._rank_fact_anchor_chunk_ids(
             query,
             ranked_fact_ids or [*local_fact_ids, *sparse_fact_ids, *fact_dense_ids],
             top_k=max(4, self.parent_candidate_top_k + 1),
-        ) if mode == QueryMode.FACT else []
+        ) if fact_selection_query else []
         local_chunk_ids = lane_results["local_chunk_ids"]
         if mode == QueryMode.SYNTHESIS and (chunk_dense_ids or sparse_chunk_ids):
             local_chunk_ids = []
-        if mode == QueryMode.FACT and not any((fact_dense_ids, sparse_fact_ids, local_fact_ids)):
+        if mode == QueryMode.FACT and not legacy_text_only and not any((fact_dense_ids, sparse_fact_ids, local_fact_ids)):
             local_chunk_ids = []
+        support_parent_ids = self._support_parent_ids_for_query(
+            query,
+            top_k=max(3, self.parent_candidate_top_k + 2),
+        )
+        support_parent_chunk_ids = self._support_chunk_ids_for_query(
+            query,
+            support_parent_ids,
+            top_k=max(6, min(self.max_context_chunks, self.parent_candidate_top_k * 3 + 3)),
+        )
 
         rankings = {
             "dense_chunks": chunk_dense_ids,
@@ -4637,13 +6744,19 @@ class AdaptiveHybridRetriever:
             "dense_parents": parent_dense_ids,
             "sparse_parents": sparse_parent_ids,
             "local_parents": local_parent_ids,
+            "support_parents": support_parent_ids,
             "graph_relation_parents": graph_seed_parent_ids,
+            "dense_summaries": summary_dense_ids,
+            "sparse_summaries": sparse_summary_ids,
             "dense_media": media_dense_ids,
             "sparse_media": sparse_media_ids,
             "local_media": local_media_ids,
             "dense_facts": fact_dense_ids,
             "sparse_facts": sparse_fact_ids,
             "local_facts": local_fact_ids,
+            "dense_evidence_spans": dense_evidence_span_ids,
+            "sparse_evidence_spans": sparse_evidence_span_ids,
+            "local_evidence_spans": local_evidence_span_ids,
             "graph_relation_facts": graph_seed_fact_ids,
         }
         fused = _rrf_merge(
@@ -4653,6 +6766,13 @@ class AdaptiveHybridRetriever:
         fused_ids = [record_id for record_id, _score in fused]
         support = self._accumulate_chunk_support(rankings)
         candidate_chunk_ids = self._seed_chunk_ids(fused_ids[: max(self.dense_chunk_top_k, self.sparse_chunk_top_k, 24)])
+        if evidence_span_anchor_chunk_ids:
+            candidate_chunk_ids = list(dict.fromkeys([*evidence_span_anchor_chunk_ids, *candidate_chunk_ids]))
+        if support_parent_chunk_ids:
+            candidate_chunk_ids = list(dict.fromkeys([*support_parent_chunk_ids, *candidate_chunk_ids]))
+        if mode == QueryMode.SYNTHESIS and (summary_dense_ids or sparse_summary_ids):
+            summary_seed_chunk_ids = self._seed_chunk_ids([*summary_dense_ids, *sparse_summary_ids])
+            candidate_chunk_ids = list(dict.fromkeys([*summary_seed_chunk_ids, *candidate_chunk_ids]))
         if graph_seed_chunk_ids:
             candidate_chunk_ids = list(dict.fromkeys([*graph_seed_chunk_ids, *candidate_chunk_ids]))
         if media_query:
@@ -4665,6 +6785,7 @@ class AdaptiveHybridRetriever:
                         *graph_seed_chunk_ids,
                         *answer_anchor_chunk_ids,
                         *fact_anchor_chunk_ids,
+                        *evidence_span_anchor_chunk_ids,
                         *self._seed_chunk_ids(
                             [
                                 *dense_assertion_ids,
@@ -4674,12 +6795,17 @@ class AdaptiveHybridRetriever:
                                 *fact_dense_ids,
                                 *sparse_fact_ids,
                                 *local_fact_ids,
+                                *dense_evidence_span_ids,
+                                *sparse_evidence_span_ids,
+                                *local_evidence_span_ids,
                             ]
                         ),
                     ]
                 )
             )
             candidate_chunk_ids = list(dict.fromkeys([*fact_seed_chunk_ids, *candidate_chunk_ids]))
+        elif fact_selection_query and fact_anchor_chunk_ids:
+            candidate_chunk_ids = list(dict.fromkeys([*fact_anchor_chunk_ids, *candidate_chunk_ids]))
         elif structured_answer_query and answer_anchor_chunk_ids:
             candidate_chunk_ids = list(
                 dict.fromkeys(
@@ -4697,7 +6823,10 @@ class AdaptiveHybridRetriever:
             mode=mode,
             graph_seed_chunk_ids=graph_seed_chunk_ids,
             graph_seed_fact_ids=graph_seed_fact_ids,
+            force_fallback=disable_external_lanes_after_embedding_failure,
+            diagnostics=request_diagnostics,
         )
+        ranked_chunks = self._promote_source_matched_chunks(query, ranked_chunks, support)
         if mode == QueryMode.FACT:
             ranked_chunks = self._promote_fact_supported_chunks(
                 query,
@@ -4711,8 +6840,9 @@ class AdaptiveHybridRetriever:
                 ranked_chunks,
                 [*local_media_ids, *sparse_media_ids, *media_dense_ids],
             )
+        _mark_stage("candidate_ranking_ms")
         ranked_chunk_ids = [chunk_id for chunk_id, _score in ranked_chunks]
-        if mode == QueryMode.FACT and (answer_anchor_chunk_ids or fact_anchor_chunk_ids):
+        if fact_selection_query and (answer_anchor_chunk_ids or fact_anchor_chunk_ids):
             if _is_generic_contact_query(query):
                 ranked_chunk_ids = list(dict.fromkeys([*answer_anchor_chunk_ids, *fact_anchor_chunk_ids, *ranked_chunk_ids]))
             else:
@@ -4733,12 +6863,18 @@ class AdaptiveHybridRetriever:
                 "local_answer_ids": [],
                 "dense_parent_ids": [],
                 "sparse_parent_ids": [],
+                "dense_summary_ids": [],
+                "sparse_summary_ids": [],
                 "dense_media_ids": [],
                 "sparse_media_ids": [],
                 "local_media_ids": [],
                 "dense_fact_ids": [],
                 "sparse_fact_ids": [],
                 "local_fact_ids": [],
+                "dense_evidence_span_ids": [],
+                "sparse_evidence_span_ids": [],
+                "local_evidence_span_ids": [],
+                "selected_evidence_span_ids": [],
                 "selected_answer_ids": [],
                 "answer_documents": [],
                 "graph_relation_chunk_ids": graph_seed_chunk_ids,
@@ -4746,11 +6882,19 @@ class AdaptiveHybridRetriever:
                 "graph_relation_fact_ids": graph_seed_fact_ids,
                 "selected_fact_ids": [],
                 "fact_documents": [],
+                "evidence_span_documents": [],
                 "selected_parent_ids": [],
                 "selected_media_ids": [],
                 "retrieval_documents": [],
                 "media": [],
                 "abstained": True,
+                "query_embedding_status": query_embedding_status,
+                "query_embedding_error": query_embedding_error,
+                "lane_latency_ms": dict(request_diagnostics.get("lane_latency_ms") or {}),
+                "rerank_latency_ms": float(request_diagnostics.get("rerank_latency_ms") or 0.0),
+                "rerank_method": str(request_diagnostics.get("rerank_method") or ""),
+                "stage_latency_ms": dict(stage_latency_ms),
+                "vector_backend_latency_ms": round((time.perf_counter() - retrieval_started) * 1000.0, 3),
                 "debug_candidates": {
                     "dense_chunk_ids": chunk_dense_ids,
                     "sparse_chunk_ids": sparse_chunk_ids,
@@ -4761,12 +6905,19 @@ class AdaptiveHybridRetriever:
                     "dense_parent_ids": parent_dense_ids,
                     "sparse_parent_ids": sparse_parent_ids,
                     "local_parent_ids": local_parent_ids,
+                    "support_parent_ids": support_parent_ids,
+                    "support_parent_chunk_ids": support_parent_chunk_ids,
+                    "dense_summary_ids": summary_dense_ids,
+                    "sparse_summary_ids": sparse_summary_ids,
                     "dense_media_ids": media_dense_ids,
                     "sparse_media_ids": sparse_media_ids,
                     "local_media_ids": local_media_ids,
                     "dense_fact_ids": fact_dense_ids,
                     "sparse_fact_ids": sparse_fact_ids,
                     "local_fact_ids": local_fact_ids,
+                    "dense_evidence_span_ids": dense_evidence_span_ids,
+                    "sparse_evidence_span_ids": sparse_evidence_span_ids,
+                    "local_evidence_span_ids": local_evidence_span_ids,
                     "graph_relation_chunk_ids": graph_seed_chunk_ids,
                     "graph_relation_parent_ids": graph_seed_parent_ids,
                     "graph_relation_fact_ids": graph_seed_fact_ids,
@@ -4776,8 +6927,13 @@ class AdaptiveHybridRetriever:
 
         selected_fact_ids = (
             ranked_fact_ids[: max(3, min(6, self.parent_candidate_top_k + 1))]
-            if mode == QueryMode.FACT
+            if fact_selection_query
             else []
+        )
+        selected_evidence_span_ids = self._select_evidence_span_ids_for_query(
+            query,
+            ranked_evidence_span_ids,
+            mode=mode,
         )
         selected_answer_ids = (
             self._select_answer_ids_for_query(
@@ -4790,7 +6946,7 @@ class AdaptiveHybridRetriever:
         )
         explicit_parent_ids = self._rank_parent_candidates(
             query,
-            [*graph_seed_parent_ids, *local_parent_ids, *parent_dense_ids, *sparse_parent_ids],
+            [*support_parent_ids, *graph_seed_parent_ids, *local_parent_ids, *parent_dense_ids, *sparse_parent_ids],
         )
         if media_query:
             media_parent_ids = self._media_parent_hints(
@@ -4805,6 +6961,7 @@ class AdaptiveHybridRetriever:
         else:
             selected_chunk_ids = self._expand_scoped_or_synthesis(
                 seed_chunk_ids,
+                query=query,
                 mode=mode,
                 explicit_parent_ids=explicit_parent_ids,
                 prioritize_explicit_parents=bool(explicit_parent_ids) and (media_query or mode == QueryMode.SCOPED),
@@ -4814,7 +6971,7 @@ class AdaptiveHybridRetriever:
                     media_query=media_query,
                 ),
             )
-        if mode == QueryMode.FACT and (selected_answer_ids or selected_fact_ids):
+        if fact_selection_query and (selected_answer_ids or selected_fact_ids):
             if _is_generic_contact_query(query) or _lookup_query_profile(query).is_exact_lookup:
                 promoted_chunk_ids = [
                     *self._rank_answer_anchor_chunk_ids(
@@ -4843,11 +7000,21 @@ class AdaptiveHybridRetriever:
                 ]
             if promoted_chunk_ids:
                 selected_chunk_ids = list(dict.fromkeys([*promoted_chunk_ids, *selected_chunk_ids]))
+        if selected_evidence_span_ids:
+            selected_chunk_ids = list(
+                dict.fromkeys([*self._span_anchor_chunk_ids(selected_evidence_span_ids), *selected_chunk_ids])
+            )
         selected_parent_ids = self._select_parent_ids(
             selected_chunk_ids,
             explicit_parent_ids=explicit_parent_ids,
             prefer_explicit_parents=bool(explicit_parent_ids) and (mode == QueryMode.SCOPED or media_query),
         )
+        selected_parent_ids = self._promote_selected_chunk_parent_ids(
+            query,
+            selected_parent_ids,
+            selected_chunk_ids,
+        )
+        _mark_stage("selection_expansion_ms")
 
         explicit_media_hits = list(dict.fromkeys([*media_dense_ids, *sparse_media_ids, *local_media_ids]))
         selected_media = self._attach_media(selected_chunk_ids, explicit_media_hits, query)
@@ -4929,9 +7096,11 @@ class AdaptiveHybridRetriever:
                         "subject_text": str(answer.get("subject_text") or ""),
                         "qualifiers": list(answer.get("qualifiers") or []),
                         "linked_chunk_ids": [str(value) for value in (answer.get("linked_chunk_ids") or []) if str(value)],
+                        "linked_span_ids": [str(value) for value in (answer.get("linked_span_ids") or answer.get("source_span_ids") or []) if str(value)],
+                        "source_span_ids": [str(value) for value in (answer.get("source_span_ids") or answer.get("linked_span_ids") or []) if str(value)],
                         "linked_fact_ids": [str(value) for value in (answer.get("linked_fact_ids") or []) if str(value)],
                         "linked_parent_ids": [str(value) for value in (answer.get("linked_parent_ids") or []) if str(value)],
-                        "source_url": str(answer.get("source_url") or (linked_chunk or {}).get("source_url") or ""),
+                        "source_url": _record_source_url(answer, linked_chunk),
                         "document_title": str(answer.get("document_title") or (linked_chunk or {}).get("document_title") or ""),
                         "document_summary": "",
                         "media": [],
@@ -4952,14 +7121,71 @@ class AdaptiveHybridRetriever:
                     {
                         "id": str(fact.get("id") or fact_id),
                         "text": str(fact.get("text") or fact.get("dense_text") or ""),
-                        "source_url": str((linked_chunk or {}).get("source_url") or ""),
+                        "source_url": _record_source_url(fact, linked_chunk),
                         "document_title": str((linked_chunk or {}).get("document_title") or ""),
                         "document_summary": "",
                         "media": [],
                     }
                 )
-        if answer_payload or fact_payload:
-            retrieval_payload = [*answer_payload, *fact_payload, *retrieval_payload]
+        evidence_span_payload: List[Dict[str, Any]] = []
+        if selected_evidence_span_ids:
+            for span_id in selected_evidence_span_ids:
+                span = self.evidence_span_map.get(str(span_id))
+                if not span or str(span.get("validity_status") or "active") == "quarantined":
+                    continue
+                linked_chunk = None
+                for chunk_id in [
+                    *[str(value) for value in (span.get("linked_chunk_ids") or []) if str(value)],
+                    str(span.get("chunk_id") or ""),
+                ]:
+                    if not chunk_id:
+                        continue
+                    linked_chunk = self.chunk_map.get(chunk_id)
+                    if linked_chunk:
+                        break
+                evidence_span_payload.append(
+                    {
+                        "id": str(span.get("id") or span_id),
+                        "text": str(span.get("text") or span.get("dense_text") or ""),
+                        "span_type": str(span.get("span_type") or "general"),
+                        "source_url": _record_source_url(span, linked_chunk),
+                        "canonical_url": str(span.get("canonical_url") or ""),
+                        "document_title": str(span.get("document_title") or (linked_chunk or {}).get("document_title") or ""),
+                        "section_heading": str(span.get("section_heading") or span.get("heading") or ""),
+                        "breadcrumb": str(span.get("breadcrumb") or ""),
+                        "linked_chunk_ids": [str(value) for value in (span.get("linked_chunk_ids") or []) if str(value)],
+                        "linked_parent_ids": [str(value) for value in (span.get("linked_parent_ids") or []) if str(value)],
+                        "page_id": str(span.get("page_id") or span.get("page_key") or ""),
+                        "section_id": str(span.get("section_id") or span.get("section_key") or ""),
+                        "authority_class": str(span.get("authority_class") or ""),
+                        "source_last_seen": str(span.get("source_last_seen") or ""),
+                        "validity_status": str(span.get("validity_status") or "active"),
+                        "document_summary": "",
+                        "media": [],
+                    }
+                )
+        if answer_payload or fact_payload or evidence_span_payload:
+            retrieval_payload = [*answer_payload, *fact_payload, *evidence_span_payload, *retrieval_payload]
+        chunk_source_fallbacks: Dict[str, Dict[str, str]] = {}
+        for span_id in selected_evidence_span_ids:
+            span = self.evidence_span_map.get(str(span_id))
+            if not isinstance(span, Mapping):
+                continue
+            source_url = _record_source_url(span)
+            if not source_url:
+                continue
+            for chunk_id in [
+                *[str(value) for value in (span.get("linked_chunk_ids") or []) if str(value)],
+                str(span.get("chunk_id") or ""),
+            ]:
+                if chunk_id:
+                    chunk_source_fallbacks.setdefault(chunk_id, {"source_url": source_url})
+        for document in [*answer_payload, *fact_payload, *evidence_span_payload, *retrieval_payload]:
+            if isinstance(document, MutableMapping):
+                document_id = str(document.get("id") or "")
+                fallback_chunk = self.chunk_map.get(document_id) if hasattr(self, "chunk_map") else None
+                _ensure_record_source_url(document, chunk_source_fallbacks.get(document_id), fallback_chunk)
+        _mark_stage("payload_build_ms")
 
         return {
             "query": query,
@@ -4968,6 +7194,7 @@ class AdaptiveHybridRetriever:
             "selected_chunk_ids": selected_chunk_ids,
             "selected_answer_ids": selected_answer_ids,
             "selected_fact_ids": selected_fact_ids,
+            "selected_evidence_span_ids": selected_evidence_span_ids,
             "selected_parent_ids": selected_parent_ids,
             "selected_media_ids": selected_media_ids,
             "dense_chunk_ids": chunk_dense_ids,
@@ -4978,31 +7205,60 @@ class AdaptiveHybridRetriever:
             "local_answer_ids": local_answer_ids,
             "dense_parent_ids": parent_dense_ids,
             "sparse_parent_ids": sparse_parent_ids,
+            "support_parent_ids": support_parent_ids,
+            "support_parent_chunk_ids": support_parent_chunk_ids,
+            "dense_summary_ids": summary_dense_ids,
+            "sparse_summary_ids": sparse_summary_ids,
             "dense_media_ids": media_dense_ids,
             "sparse_media_ids": sparse_media_ids,
             "local_media_ids": local_media_ids,
             "dense_fact_ids": fact_dense_ids,
             "sparse_fact_ids": sparse_fact_ids,
             "local_fact_ids": local_fact_ids,
+            "dense_evidence_span_ids": dense_evidence_span_ids,
+            "sparse_evidence_span_ids": sparse_evidence_span_ids,
+            "local_evidence_span_ids": local_evidence_span_ids,
             "graph_relation_chunk_ids": graph_seed_chunk_ids,
             "graph_relation_parent_ids": graph_seed_parent_ids,
             "graph_relation_fact_ids": graph_seed_fact_ids,
             "answer_documents": answer_payload,
             "fact_documents": fact_payload,
+            "evidence_span_documents": evidence_span_payload,
             "retrieval_documents": retrieval_payload,
             "media": selected_media[: self.max_media_results],
             "abstained": False,
+            "query_embedding_status": query_embedding_status,
+            "query_embedding_error": query_embedding_error,
+            "lane_latency_ms": dict(request_diagnostics.get("lane_latency_ms") or {}),
+            "rerank_latency_ms": float(request_diagnostics.get("rerank_latency_ms") or 0.0),
+            "rerank_method": str(request_diagnostics.get("rerank_method") or ""),
+            "stage_latency_ms": dict(stage_latency_ms),
+            "vector_backend_latency_ms": round((time.perf_counter() - retrieval_started) * 1000.0, 3),
             "response_agent_instructions": response_agent_media_instructions(),
         }
 
     def _lane_top_ks(self, *, query: str, mode: QueryMode, media_query: bool) -> Dict[str, int]:
         lookup_profile = _lookup_query_profile(query)
         exact_lookup = mode == QueryMode.FACT and lookup_profile.is_exact_lookup
-        answer_lane_enabled = bool(self.answer_map) and mode != QueryMode.SYNTHESIS and bool(_structured_answer_types(query))
-        parent_lane_enabled = bool(self.parent_map) and mode != QueryMode.FACT
+        legacy_text_only = self.legacy_vectorstore_contract == _LEGACY_VECTORSTORE_CONTRACT
+        structured_answer_types = _structured_answer_types(query)
+        synthesis_structured_lane_enabled = _synthesis_structured_lane_enabled(
+            query,
+            mode=mode,
+            lookup_profile=lookup_profile,
+            structured_answer_types=structured_answer_types,
+        )
+        answer_lane_enabled = bool(self.answer_map) and bool(structured_answer_types) and (
+            mode != QueryMode.SYNTHESIS or synthesis_structured_lane_enabled
+        )
+        parent_lane_enabled = bool(self.parent_map) and mode != QueryMode.FACT and not legacy_text_only
+        summary_lane_enabled = bool(self.summary_map) and mode == QueryMode.SYNTHESIS and not legacy_text_only
         local_parent_lane_enabled = self._should_use_local_parent_lane(query, mode=mode)
-        media_lane_enabled = bool(self.media_map) and (media_query or mode == QueryMode.SYNTHESIS)
-        fact_lane_enabled = bool(self.fact_map) and mode != QueryMode.SYNTHESIS
+        media_lane_enabled = bool(self.media_map) and (media_query or mode == QueryMode.SYNTHESIS) and not legacy_text_only
+        fact_lane_enabled = bool(self.fact_map) and (
+            mode != QueryMode.SYNTHESIS or synthesis_structured_lane_enabled
+        ) and not legacy_text_only
+        evidence_span_lane_enabled = bool(self.evidence_span_map) and not legacy_text_only
         answer_local_top_k = self.local_answer_top_k if answer_lane_enabled else 0
         local_chunk_top_k = self.sparse_chunk_top_k if mode != QueryMode.SYNTHESIS else max(self.sparse_chunk_top_k, self.dense_chunk_top_k)
         if exact_lookup:
@@ -5015,6 +7271,9 @@ class AdaptiveHybridRetriever:
         fact_dense_top_k = self.dense_fact_top_k
         fact_sparse_top_k = self.sparse_fact_top_k
         fact_local_top_k = self.sparse_fact_top_k
+        evidence_span_dense_top_k = self.dense_evidence_span_top_k
+        evidence_span_sparse_top_k = self.sparse_evidence_span_top_k
+        evidence_span_local_top_k = self.sparse_evidence_span_top_k
         assertion_dense_top_k = self.dense_assertion_top_k
         assertion_sparse_top_k = self.sparse_assertion_top_k
         if exact_lookup:
@@ -5023,18 +7282,27 @@ class AdaptiveHybridRetriever:
             fact_dense_top_k = max(self.dense_fact_top_k, 12)
             fact_sparse_top_k = max(self.sparse_fact_top_k, 12)
             fact_local_top_k = max(self.sparse_fact_top_k, 12)
+            evidence_span_dense_top_k = max(self.dense_evidence_span_top_k, 12)
+            evidence_span_sparse_top_k = max(self.sparse_evidence_span_top_k, 12)
+            evidence_span_local_top_k = max(self.sparse_evidence_span_top_k, 12)
             assertion_dense_top_k = max(self.dense_assertion_top_k, 12)
             assertion_sparse_top_k = max(self.sparse_assertion_top_k, 12)
+        elif mode == QueryMode.SYNTHESIS:
+            evidence_span_dense_top_k = max(4, self.dense_evidence_span_top_k // 2)
+            evidence_span_sparse_top_k = max(4, self.sparse_evidence_span_top_k // 2)
+            evidence_span_local_top_k = max(4, self.sparse_evidence_span_top_k // 2)
         return {
             "chunk_dense": chunk_dense_top_k,
             "chunk_sparse": chunk_sparse_top_k,
             "chunk_local": local_chunk_top_k,
-            "assertion_dense": assertion_dense_top_k if answer_lane_enabled else 0,
-            "assertion_sparse": assertion_sparse_top_k if answer_lane_enabled else 0,
+            "assertion_dense": assertion_dense_top_k if answer_lane_enabled and not legacy_text_only else 0,
+            "assertion_sparse": assertion_sparse_top_k if answer_lane_enabled and not legacy_text_only else 0,
             "answer_local": answer_local_top_k,
             "parent_dense": self.dense_parent_top_k if parent_lane_enabled else 0,
             "parent_sparse": self.sparse_parent_top_k if parent_lane_enabled else 0,
             "parent_local": self.sparse_parent_top_k if local_parent_lane_enabled else 0,
+            "summary_dense": self.dense_summary_top_k if summary_lane_enabled else 0,
+            "summary_sparse": self.sparse_summary_top_k if summary_lane_enabled else 0,
             "media_dense": self.dense_media_top_k if media_lane_enabled else 0,
             "media_sparse": self.sparse_media_top_k if media_lane_enabled else 0,
             "media_local": self.sparse_media_top_k if media_lane_enabled else 0,
@@ -5053,14 +7321,18 @@ class AdaptiveHybridRetriever:
                 if fact_lane_enabled and mode == QueryMode.FACT
                 else scoped_sparse_fact_top_k if fact_lane_enabled else 0
             ),
+            "evidence_span_dense": evidence_span_dense_top_k if evidence_span_lane_enabled else 0,
+            "evidence_span_sparse": evidence_span_sparse_top_k if evidence_span_lane_enabled else 0,
+            "evidence_span_local": evidence_span_local_top_k if evidence_span_lane_enabled else 0,
         }
 
-    def _run_lane_task(self, name: str, func, **kwargs) -> Tuple[str, List[str]]:
+    def _run_lane_task(self, name: str, func, **kwargs) -> Tuple[str, List[str], float]:
+        started = time.perf_counter()
         try:
-            return name, list(func(**kwargs))
+            return name, list(func(**kwargs)), round((time.perf_counter() - started) * 1000.0, 3)
         except Exception as exc:
             logger.warning("Retrieval lane %s failed: %s", name, exc)
-            return name, []
+            return name, [], round((time.perf_counter() - started) * 1000.0, 3)
 
     def _run_query_lanes(
         self,
@@ -5069,11 +7341,12 @@ class AdaptiveHybridRetriever:
         query_vector: List[float],
         lane_top_ks: Dict[str, int],
         mode: QueryMode,
+        diagnostics: Dict[str, Any] | None = None,
     ) -> Dict[str, List[str]]:
         tasks: Dict[str, Tuple[Any, Dict[str, Any]]] = {
             "chunk_dense_ids": (
                 self._dense_query_ids,
-                {"query_vector": query_vector, "namespace": self.namespace_chunks, "top_k": lane_top_ks["chunk_dense"]},
+                {"query_vector": query_vector, "namespace": self.namespace_chunks, "top_k": lane_top_ks["chunk_dense"], "query": query},
             ),
             "sparse_chunk_ids": (
                 self._sparse_query_ids,
@@ -5089,7 +7362,7 @@ class AdaptiveHybridRetriever:
             ),
             "dense_assertion_ids": (
                 self._dense_query_ids,
-                {"query_vector": query_vector, "namespace": self.namespace_assertions, "top_k": lane_top_ks["assertion_dense"]},
+                {"query_vector": query_vector, "namespace": self.namespace_assertions, "top_k": lane_top_ks["assertion_dense"], "query": query},
             ),
             "sparse_assertion_ids": (
                 self._sparse_query_ids,
@@ -5099,7 +7372,7 @@ class AdaptiveHybridRetriever:
         if self.parent_map:
             tasks["parent_dense_ids"] = (
                 self._dense_query_ids,
-                {"query_vector": query_vector, "namespace": self.namespace_parents, "top_k": lane_top_ks["parent_dense"]},
+                {"query_vector": query_vector, "namespace": self.namespace_parents, "top_k": lane_top_ks["parent_dense"], "query": query},
             )
             tasks["sparse_parent_ids"] = (
                 self._sparse_query_ids,
@@ -5109,10 +7382,19 @@ class AdaptiveHybridRetriever:
                 self._local_parent_query_ids,
                 {"query": query, "top_k": lane_top_ks["parent_local"]},
             )
+        if self.summary_map:
+            tasks["summary_dense_ids"] = (
+                self._dense_query_ids,
+                {"query_vector": query_vector, "namespace": self.namespace_summaries, "top_k": lane_top_ks["summary_dense"], "query": query},
+            )
+            tasks["sparse_summary_ids"] = (
+                self._sparse_query_ids,
+                {"namespace": self.namespace_summaries, "query": query, "top_k": lane_top_ks["summary_sparse"]},
+            )
         if self.media_map:
             tasks["media_dense_ids"] = (
                 self._dense_query_ids,
-                {"query_vector": query_vector, "namespace": self.namespace_media, "top_k": lane_top_ks["media_dense"]},
+                {"query_vector": query_vector, "namespace": self.namespace_media, "top_k": lane_top_ks["media_dense"], "query": query},
             )
             tasks["sparse_media_ids"] = (
                 self._sparse_query_ids,
@@ -5125,7 +7407,7 @@ class AdaptiveHybridRetriever:
         if self.fact_map:
             tasks["fact_dense_ids"] = (
                 self._dense_query_ids,
-                {"query_vector": query_vector, "namespace": self.namespace_facts, "top_k": lane_top_ks["fact_dense"]},
+                {"query_vector": query_vector, "namespace": self.namespace_facts, "top_k": lane_top_ks["fact_dense"], "query": query},
             )
             tasks["sparse_fact_ids"] = (
                 self._sparse_query_ids,
@@ -5134,6 +7416,19 @@ class AdaptiveHybridRetriever:
             tasks["local_fact_ids"] = (
                 self._local_fact_query_ids,
                 {"query": query, "top_k": lane_top_ks["fact_local"]},
+            )
+        if self.evidence_span_map:
+            tasks["dense_evidence_span_ids"] = (
+                self._dense_query_ids,
+                {"query_vector": query_vector, "namespace": self.namespace_evidence_spans, "top_k": lane_top_ks["evidence_span_dense"], "query": query},
+            )
+            tasks["sparse_evidence_span_ids"] = (
+                self._sparse_query_ids,
+                {"namespace": self.namespace_evidence_spans, "query": query, "top_k": lane_top_ks["evidence_span_sparse"]},
+            )
+            tasks["local_evidence_span_ids"] = (
+                self._local_evidence_span_query_ids,
+                {"query": query, "top_k": lane_top_ks["evidence_span_local"]},
             )
 
         defaults = {
@@ -5146,12 +7441,17 @@ class AdaptiveHybridRetriever:
             "parent_dense_ids": [],
             "sparse_parent_ids": [],
             "local_parent_ids": [],
+            "summary_dense_ids": [],
+            "sparse_summary_ids": [],
             "media_dense_ids": [],
             "sparse_media_ids": [],
             "local_media_ids": [],
             "fact_dense_ids": [],
             "sparse_fact_ids": [],
             "local_fact_ids": [],
+            "dense_evidence_span_ids": [],
+            "sparse_evidence_span_ids": [],
+            "local_evidence_span_ids": [],
         }
         enabled = {
             name: (func, kwargs)
@@ -5159,25 +7459,69 @@ class AdaptiveHybridRetriever:
             if int(kwargs.get("top_k") or 0) > 0
         }
         if not enabled:
+            if diagnostics is not None:
+                diagnostics["lane_latency_ms"] = {}
+            else:
+                self._last_lane_latency_ms = {}
             return defaults
-        if len(enabled) == 1 or self.parallel_lane_workers <= 1:
+        lane_latency_ms: Dict[str, float] = {}
+        parallel_lane_workers = max(1, int(getattr(self, "parallel_lane_workers", 1) or 1))
+        if len(enabled) == 1 or parallel_lane_workers <= 1:
             for name, (func, kwargs) in enabled.items():
-                _name, values = self._run_lane_task(name, func, **kwargs)
+                _name, values, elapsed_ms = self._run_lane_task(name, func, **kwargs)
                 defaults[name] = values
+                lane_latency_ms[name] = elapsed_ms
+            if diagnostics is not None:
+                diagnostics["lane_latency_ms"] = dict(lane_latency_ms)
+            else:
+                self._last_lane_latency_ms = lane_latency_ms
             return defaults
 
-        max_workers = min(self.parallel_lane_workers, len(enabled))
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {}
+        persistent_lane_executors = bool(getattr(self, "persistent_lane_executors", True))
+        split_lane_executors = bool(getattr(self, "split_lane_executors", True))
+        if persistent_lane_executors and split_lane_executors:
+            remote_workers = max(
+                1,
+                int(getattr(self, "parallel_remote_lane_workers", parallel_lane_workers) or parallel_lane_workers),
+            )
+            local_workers = max(
+                1,
+                int(getattr(self, "parallel_local_lane_workers", max(1, min(4, parallel_lane_workers))) or 1),
+            )
+            for name, (func, kwargs) in enabled.items():
+                if _is_local_lane_name(name):
+                    executor = _shared_lane_executor("local-lane", min(local_workers, len(enabled)))
+                else:
+                    executor = _shared_lane_executor("remote-lane", min(remote_workers, len(enabled)))
+                future_map[executor.submit(self._run_lane_task, name, func, **kwargs)] = name
+        elif persistent_lane_executors:
+            executor = _shared_lane_executor("lane", min(parallel_lane_workers, len(enabled)))
             future_map = {
                 executor.submit(self._run_lane_task, name, func, **kwargs): name
                 for name, (func, kwargs) in enabled.items()
             }
-            for future in as_completed(future_map):
-                name = future_map[future]
-                try:
-                    _name, values = future.result()
-                except Exception as exc:  # pragma: no cover - defensive fallback
-                    logger.warning("Retrieval lane %s failed: %s", name, exc)
-                    values = []
-                defaults[name] = list(values)
+        else:
+            executor = ThreadPoolExecutor(max_workers=min(parallel_lane_workers, len(enabled)))
+            try:
+                future_map = {
+                    executor.submit(self._run_lane_task, name, func, **kwargs): name
+                    for name, (func, kwargs) in enabled.items()
+                }
+            finally:
+                executor.shutdown(wait=False)
+        for future in as_completed(future_map):
+            name = future_map[future]
+            try:
+                _name, values, elapsed_ms = future.result()
+            except Exception as exc:  # pragma: no cover - defensive fallback
+                logger.warning("Retrieval lane %s failed: %s", name, exc)
+                values = []
+                elapsed_ms = 0.0
+            defaults[name] = list(values)
+            lane_latency_ms[name] = elapsed_ms
+        if diagnostics is not None:
+            diagnostics["lane_latency_ms"] = dict(lane_latency_ms)
+        else:
+            self._last_lane_latency_ms = lane_latency_ms
         return defaults

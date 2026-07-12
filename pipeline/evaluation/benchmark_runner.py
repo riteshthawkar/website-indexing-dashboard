@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
 
-from pipeline.core.config import load_effective_config
+from pipeline.core.config import load_config, load_effective_config
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.evaluation.benchmark_io import (
     _load_jsonl,
@@ -205,9 +205,12 @@ def run_standard_benchmark_retrieval(
     corpus_rows = _load_jsonl(dataset_dir / "corpus.jsonl")
     query_rows = _load_jsonl(dataset_dir / "queries.jsonl")
 
-    config = load_effective_config(config_name, work_dir=work_dir)
+    try:
+        config = load_effective_config(config_name, work_dir=work_dir)
+    except FileNotFoundError:
+        config = load_config(config_name)
     embed_cfg = dict(config.get("embedder") or {})
-    model = str(embed_cfg.get("model") or "gemini-embedding-2-preview")
+    model = str(embed_cfg.get("model") or "gemini-embedding-2")
     output_dimensionality = int(embed_cfg.get("output_dimensionality") or 1536)
 
     doc_cache_file, doc_cache = _load_embedding_cache(

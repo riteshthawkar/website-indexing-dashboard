@@ -69,6 +69,109 @@ Run the stricter `v4` gate:
   --output /tmp/mbzuai_retrieval_report_v4.json
 ```
 
+## Release Readiness Evaluation
+
+Production promotion uses the governed LLM-generated v1 suite and strict gates by default:
+
+- `eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl`
+- `eval/gates/retrieval_gate.v5_span_strict.json`
+- `eval/gates/answer_readiness_gate.llm_generated_v1.json`
+
+The production policy requires at least 50 retrieval queries and 50 judged answers. The release-readiness v2 suite remains available as a supplemental regression set for PDF-derived, multi-document, and multimodal coverage, but it is not the promotion policy.
+
+The v2 suite is generated from the internal v4 gold set with:
+
+```bash
+./env/bin/python scripts/generate_mbzuai_release_readiness_v2.py
+```
+
+You can also generate a fresh LLM-assisted QA suite from a completed indexed run. This uses sampled retrieval-bundle evidence plus the provider's web-search grounding tool, then writes evaluation rows with reference answers, expected response structure, required coverage, source/citation requirements, expected follow-up topics, suggested actions, and gold ids from the local bundle:
+
+```bash
+GOOGLE_API_KEY=... ./env/bin/python scripts/generate_llm_qa_eval_set.py \
+  --provider gemini \
+  --model gemini-2.5-flash \
+  --work-dir runs/mbzuai_main/<run_id> \
+  --count 50 \
+  --output eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl \
+  --manifest eval/mbzuai_gold/mbzuai_llm_generated_v1.manifest.json
+```
+
+OpenAI is also supported:
+
+```bash
+OPENAI_API_KEY=... ./env/bin/python scripts/generate_llm_qa_eval_set.py \
+  --provider openai \
+  --model gpt-5-mini \
+  --work-dir runs/mbzuai_main/<run_id> \
+  --count 50 \
+  --output eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl
+```
+
+Review generated rows before using them as a promotion gate. The script constrains gold ids to the local retrieval bundle, but an LLM-generated reference answer should still be spot-checked against official source pages/PDFs before it becomes a release benchmark.
+
+Run the full release gate against a completed candidate run:
+
+```bash
+./env/bin/python -m pipeline release-check \
+  --config pipeline/configs/default.yaml \
+  --work-dir runs/mbzuai_indexing/<run_id> \
+  --promote
+```
+
+`release-check` now gates both retrieval quality and generated-answer readiness. Production release checks default to the live HTTP chat path, so start the backend against the candidate retrieval configuration and pass `--answer-endpoint` or set `MBZUAI_CHAT_EVAL_ENDPOINT`. Use `--answer-eval-mode local` only for indexing-side dry runs.
+
+Generated-answer readiness uses an LLM-as-judge by default for production release checks. The judge evaluates the final response plus supporting evidence, references/sources, expected reference URLs, citation requirements, response structure, UI payload, injected components, suggested actions, follow-up questions, and response contract fields. Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` before running a production release gate.
+
+To exercise the exact live widget/chatbot HTTP path, start the backend against the candidate retrieval configuration, then run:
+
+```bash
+./env/bin/python -m pipeline release-check \
+  --config pipeline/configs/default.yaml \
+  --work-dir runs/mbzuai_indexing/<run_id> \
+  --answer-endpoint http://127.0.0.1:8000/telegram-chat \
+  --answer-auth-token "$OPERATIONS_API_TOKEN" \
+  --promote
+```
+
+The HTTP evaluator does not send `X-Health-Probe` by default because probe mode can intentionally bypass normal user-facing responses. Use `--answer-probe-mode` only when you explicitly want a health-probe style check instead of production answer grading.
+
+To grade the LLM-generated 50-query suite, use its matching answer gate:
+
+```bash
+./env/bin/python -m pipeline eval-answer-readiness \
+  --config pipeline/configs/default.yaml \
+  --work-dir runs/mbzuai_indexing/<run_id> \
+  --dataset eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl \
+  --gates eval/gates/answer_readiness_gate.llm_generated_v1.json \
+  --mode http \
+  --endpoint http://127.0.0.1:8000/telegram-chat \
+  --output eval/reports/answer_readiness_llm_generated_v1_report.json
+```
+
+For local deterministic dry runs only, you can skip the LLM judge, but the default production answer gate will still fail because it requires judge metrics. Use a non-LLM gate file for deterministic-only checks:
+
+```bash
+./env/bin/python -m pipeline release-check \
+  --config pipeline/configs/default.yaml \
+  --work-dir runs/mbzuai_indexing/<run_id> \
+  --answer-gates eval/gates/answer_readiness_deterministic_only.json \
+  --skip-llm-judge
+```
+
+You can run only the generated-answer readiness check with:
+
+```bash
+./env/bin/python -m pipeline eval-answer-readiness \
+  --config pipeline/configs/default.yaml \
+  --work-dir runs/mbzuai_indexing/<run_id> \
+  --dataset eval/mbzuai_gold/mbzuai_release_readiness_v2.jsonl \
+  --gates eval/gates/answer_readiness_gate.v2.json \
+  --output eval/reports/answer_readiness_report.json
+```
+
+That command also runs the LLM judge by default. Use `--skip-llm-judge` only with non-production gates when checking deterministic include/exclude rules without production promotion confidence.
+
 Summarize and validate an eval set:
 
 ```bash

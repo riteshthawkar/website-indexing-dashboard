@@ -429,6 +429,7 @@ def build_assertion_record(
     source_url: str = "",
     source_markdown_path: str = "",
     document_title: str = "",
+    source_last_seen: str = "",
     validator_decision: str = "supported",
     assertion_id: str | None = None,
 ) -> Dict[str, Any]:
@@ -490,6 +491,11 @@ def build_assertion_record(
         "source_url": clean_text(source_url),
         "source_markdown_path": clean_text(source_markdown_path),
         "document_title": clean_text(document_title),
+        "source_last_seen": clean_text(source_last_seen),
+        "canonical_subject": subject_entity_id,
+        "canonical_predicate": predicate,
+        "canonical_object": object_value.casefold(),
+        "validity_status": "active",
         "text": assertion_text(
             subject_name=subject_name,
             predicate=predicate,
@@ -579,6 +585,8 @@ def build_answer_records_from_assertions(assertions: Sequence[Mapping[str, Any]]
     for assertion in assertions or []:
         if not isinstance(assertion, Mapping):
             continue
+        if clean_text(assertion.get("validity_status") or "active").lower() not in {"active", "valid"}:
+            continue
         answer_type = normalize_predicate(assertion.get("answer_type") or assertion.get("predicate"))
         answer_subtype = normalize_answer_subtype(
             answer_type,
@@ -630,9 +638,13 @@ def build_answer_records_from_assertions(assertions: Sequence[Mapping[str, Any]]
             "authority_class": clean_text(assertion.get("authority_class")),
             "authority_score": coerce_confidence(assertion.get("authority_score"), default=0.0),
             "freshness_score": coerce_confidence(assertion.get("freshness_score"), default=0.0),
+            "source_last_seen": clean_text(assertion.get("source_last_seen")),
+            "validity_status": clean_text(assertion.get("validity_status") or "active").lower(),
             "source_record_type": "assertion",
             "source_record_id": clean_text(assertion.get("id")),
             "linked_chunk_ids": unique_strings(assertion.get("source_chunk_ids") or []),
+            "linked_span_ids": unique_strings(assertion.get("source_span_ids") or assertion.get("linked_span_ids") or []),
+            "source_span_ids": unique_strings(assertion.get("source_span_ids") or assertion.get("linked_span_ids") or []),
             "linked_parent_ids": unique_strings(assertion.get("source_parent_ids") or []),
             "linked_fact_ids": unique_strings(assertion.get("source_fact_ids") or []),
             "document_title": clean_text(assertion.get("document_title")),
@@ -659,6 +671,8 @@ def build_assertion_embedding_records(assertions: Sequence[Mapping[str, Any]]) -
     records: List[Dict[str, Any]] = []
     for assertion in assertions or []:
         if not isinstance(assertion, Mapping):
+            continue
+        if clean_text(assertion.get("validity_status") or "active").lower() not in {"active", "valid"}:
             continue
         record_id = clean_text(assertion.get("id"))
         text = clean_text(assertion.get("text") or assertion.get("evidence"))
@@ -706,7 +720,14 @@ def build_assertion_embedding_records(assertions: Sequence[Mapping[str, Any]]) -
                 "authority_class": clean_text(assertion.get("authority_class")),
                 "authority_score": coerce_confidence(assertion.get("authority_score"), default=0.0),
                 "freshness_score": coerce_confidence(assertion.get("freshness_score"), default=0.0),
+                "source_last_seen": clean_text(assertion.get("source_last_seen")),
+                "validity_status": clean_text(assertion.get("validity_status") or "active").lower(),
+                "canonical_subject": clean_text(assertion.get("canonical_subject") or assertion.get("subject_entity_id")),
+                "canonical_predicate": clean_text(assertion.get("canonical_predicate") or answer_type),
+                "canonical_object": clean_text(assertion.get("canonical_object") or assertion.get("object_value") or assertion.get("object_name")).casefold(),
                 "source_chunk_ids": unique_strings(assertion.get("source_chunk_ids") or []),
+                "source_span_ids": unique_strings(assertion.get("source_span_ids") or assertion.get("linked_span_ids") or []),
+                "linked_span_ids": unique_strings(assertion.get("source_span_ids") or assertion.get("linked_span_ids") or []),
                 "source_parent_ids": unique_strings(assertion.get("source_parent_ids") or []),
                 "source_fact_ids": unique_strings(assertion.get("source_fact_ids") or []),
                 "document_title": clean_text(assertion.get("document_title")),

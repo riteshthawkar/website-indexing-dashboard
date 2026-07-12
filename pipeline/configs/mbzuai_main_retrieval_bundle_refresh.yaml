@@ -1,11 +1,38 @@
 _inherit: mbzuai_main_gemini_retrieval.yaml
 
-project_name: "mbzuai_main_processing"
+project_name: "mbzuai_main"
+
+summarizer:
+  provider: extractive
+  concurrency: 8
+  use_existing_summaries: true
+  extractive_summary_max_chars: 2600
+  extractive_key_facts: 12
+
+graph:
+  gliner_enabled: false
+  gliner_fail_open: true
+  gliner_max_items: 5000
+  gliner_max_items_per_document: 3
+  gliner_progress_interval: 250
+  gliner_timeout_seconds: 900
+  extraction_source: "facts_only"
+  extraction_batch_size: 16
+  extraction_parallelism: 3
+  extraction_max_items: 800
+  extraction_max_items_per_document: 3
+  extraction_min_score: 5.0
+  extraction_priority_host_suffixes:
+    - "mbzuai.ac.ae"
+  extraction_include_chunk_fallback: false
 
 stages:
   - id: crawl_web
     type: crawler
     plugin: crawl4ai
+  - id: prepare_mbzuai_index
+    type: formatter
+    plugin: mbzuai_index_readiness
   - id: score_raw_content
     type: quality_gate
     plugin: quality_scorer
@@ -24,6 +51,36 @@ stages:
   - id: chunk_content
     type: chunker
     plugin: hybrid
-  - id: format_retrieval
+  - id: summarize_content
+    type: summarizer
+    plugin: openai_summarizer
+  - id: build_retrieval_bundle
     type: formatter
     plugin: gemini_retrieval
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: gliner_extract_graph
+    type: formatter
+    plugin: gliner_extract
+  - id: extract_semantic_graph
+    type: formatter
+    plugin: semantic_graph_extract
+  - id: canonicalize_semantic_graph
+    type: formatter
+    plugin: semantic_graph_canonicalize
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: finalize_retrieval_bundle
+    type: formatter
+    plugin: gemini_retrieval
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone

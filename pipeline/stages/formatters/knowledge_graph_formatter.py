@@ -19,14 +19,14 @@ from hashlib import sha1
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
+from pipeline.core.artifact_contracts import ArtifactContract, resolve_artifact_path
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import load_json_safe
 from pipeline.core.knowledge_graph import (
     build_graph_bundle,
-    build_graph_index,
     make_graph_edge,
     make_graph_node,
-    save_graph_bundle,
+    save_graph_bundle_with_index,
 )
 from pipeline.core.registry import register_stage
 
@@ -70,11 +70,16 @@ class KnowledgeGraphFormatter(FormatterStage):
     description = "Builds a deterministic knowledge graph bundle from retrieval artifacts."
 
     async def execute(self, ctx: StageContext) -> StageResult:
-        retrieval_bundle_file = ctx.previous_outputs.get("retrieval_bundle_file")
-        if not retrieval_bundle_file:
-            bundle_artifacts = ctx.find_artifacts(artifact_type="retrieval_bundle")
-            if bundle_artifacts and bundle_artifacts[-1].local_path:
-                retrieval_bundle_file = bundle_artifacts[-1].local_path
+        retrieval_bundle = resolve_artifact_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="retrieval_bundle",
+                role="retrieval_corpus",
+                legacy_output_key="retrieval_bundle_file",
+                label="retrieval bundle",
+            ),
+        )
+        retrieval_bundle_file = retrieval_bundle.path if retrieval_bundle else ""
         if not retrieval_bundle_file:
             return StageResult.failure("No retrieval_bundle available for knowledge graph formatting")
 
@@ -86,6 +91,7 @@ class KnowledgeGraphFormatter(FormatterStage):
         parent_records = list(retrieval_bundle.get("parent_records") or [])
         media_records = list(retrieval_bundle.get("media_records") or [])
         fact_records = list(retrieval_bundle.get("fact_records") or [])
+        evidence_span_records = list(retrieval_bundle.get("evidence_span_records") or [])
 
         if not chunk_records:
             return StageResult.failure("retrieval_bundle contains no chunk_records")
@@ -264,6 +270,53 @@ class KnowledgeGraphFormatter(FormatterStage):
                 edge_type = "PAGE_HAS_FACT" if parent_id in page_map else "SECTION_HAS_FACT"
                 _add_edge(make_graph_edge(edge_type=edge_type, source_id=str(parent_id), target_id=fact_id))
 
+        for record in evidence_span_records:
+            span_id = str(record.get("id") or "")
+            if not span_id:
+                continue
+            document_node_id = _ensure_document_node(record)
+            _add_node(
+                make_graph_node(
+                    node_id=span_id,
+                    node_type="evidence_span",
+                    label=_clean_text(record.get("text"))[:120],
+                    properties={
+                        "text": record.get("text"),
+                        "span_type": record.get("span_type"),
+                        "authority_class": record.get("authority_class"),
+                        "source_last_seen": record.get("source_last_seen"),
+                        "validity_status": record.get("validity_status") or "active",
+                        "heading": record.get("heading"),
+                        "section_heading": record.get("section_heading"),
+                        "breadcrumb": record.get("breadcrumb"),
+                        "page_numbers": list(record.get("page_numbers") or []),
+                        "source_markdown_path": record.get("source_markdown_path"),
+                        "source_url": record.get("source_url"),
+                        "canonical_url": record.get("canonical_url"),
+                        "language_normalized_url": record.get("language_normalized_url"),
+                        "document_node_id": document_node_id,
+                        "page_key": record.get("page_key") or record.get("page_id"),
+                        "section_key": record.get("section_key") or record.get("section_id"),
+                        "chunk_id": record.get("chunk_id"),
+                    },
+                )
+            )
+            _add_edge(make_graph_edge(edge_type="DOCUMENT_HAS_EVIDENCE_SPAN", source_id=document_node_id, target_id=span_id))
+            for chunk_id in list(record.get("linked_chunk_ids") or [record.get("chunk_id")]):
+                if chunk_id:
+                    _add_edge(
+                        make_graph_edge(
+                            edge_type="CHUNK_HAS_EVIDENCE_SPAN",
+                            source_id=str(chunk_id),
+                            target_id=span_id,
+                        )
+                    )
+            for parent_id in list(record.get("linked_parent_ids") or []):
+                if not parent_id:
+                    continue
+                edge_type = "PAGE_HAS_EVIDENCE_SPAN" if parent_id in page_map else "SECTION_HAS_EVIDENCE_SPAN"
+                _add_edge(make_graph_edge(edge_type=edge_type, source_id=str(parent_id), target_id=span_id))
+
         for record in media_records:
             media_id = str(record.get("id") or "")
             if not media_id:
@@ -301,6 +354,55 @@ class KnowledgeGraphFormatter(FormatterStage):
                 edge_type = "PAGE_HAS_MEDIA" if parent_id in page_map else "SECTION_HAS_MEDIA"
                 _add_edge(make_graph_edge(edge_type=edge_type, source_id=str(parent_id), target_id=media_id))
 
+        page_link_graph_file = (
+            ctx.previous_outputs.get("canonical_page_link_graph_file")
+            or ctx.previous_outputs.get("page_link_graph_file")
+        )
+        page_link_graph = load_json_safe(page_link_graph_file, {}) if page_link_graph_file else {}
+        if isinstance(page_link_graph, dict):
+            for node in page_link_graph.get("nodes") or []:
+                if not isinstance(node, dict):
+                    continue
+                node_id = str(node.get("id") or "")
+                if not node_id:
+                    continue
+                _add_node(
+                    make_graph_node(
+                        node_id=node_id,
+                        node_type="website_page",
+                        label=_clean_text(node.get("label")) or _clean_text(node.get("url")) or node_id,
+                        properties={
+                            **dict(node.get("properties") or {}),
+                            "url": node.get("url"),
+                            "canonical_url": node.get("canonical_url"),
+                            "canonical_family_url": node.get("canonical_family_url"),
+                            "source_graph_node_type": node.get("node_type"),
+                        },
+                    )
+                )
+            for edge in page_link_graph.get("edges") or []:
+                if not isinstance(edge, dict):
+                    continue
+                source_id = str(edge.get("source_id") or "")
+                target_id = str(edge.get("target_id") or "")
+                if not source_id or not target_id:
+                    continue
+                _add_edge(
+                    make_graph_edge(
+                        edge_type="WEBSITE_LINKS_TO",
+                        source_id=source_id,
+                        target_id=target_id,
+                        qualifier=str(edge.get("id") or ""),
+                        properties={
+                            **dict(edge.get("properties") or {}),
+                            "source_url": edge.get("source_url"),
+                            "target_url": edge.get("target_url"),
+                            "source_family_url": edge.get("source_family_url"),
+                            "target_family_url": edge.get("target_family_url"),
+                        },
+                    )
+                )
+
         valid_node_ids = set(nodes_by_id.keys())
         invalid_edge_count = 0
         filtered_edges_by_id: Dict[str, Any] = {}
@@ -317,12 +419,9 @@ class KnowledgeGraphFormatter(FormatterStage):
             schema_version=1,
             graph_type="deterministic_content_graph",
         )
-        graph_index = build_graph_index(graph_bundle)
-
         graph_file = ctx.stage_work_dir / "knowledge_graph.json"
         graph_index_file = ctx.stage_work_dir / "knowledge_graph_index.json"
-        save_graph_bundle(graph_bundle, graph_file)
-        save_graph_bundle(graph_index, graph_index_file)
+        save_graph_bundle_with_index(graph_bundle, graph_file, graph_index_file)
 
         logger.info(
             "Knowledge graph formatter: %d nodes, %d edges",
@@ -361,7 +460,10 @@ class KnowledgeGraphFormatter(FormatterStage):
                 "section_nodes": graph_bundle["stats"]["node_type_counts"].get("section", 0),
                 "chunk_nodes": graph_bundle["stats"]["node_type_counts"].get("chunk", 0),
                 "fact_nodes": graph_bundle["stats"]["node_type_counts"].get("fact", 0),
+                "evidence_span_nodes": graph_bundle["stats"]["node_type_counts"].get("evidence_span", 0),
                 "media_nodes": graph_bundle["stats"]["node_type_counts"].get("media", 0),
+                "website_page_nodes": graph_bundle["stats"]["node_type_counts"].get("website_page", 0),
+                "website_link_edges": graph_bundle["stats"]["edge_type_counts"].get("WEBSITE_LINKS_TO", 0),
                 "graph_invalid_edges_dropped": invalid_edge_count,
             },
             artifacts=artifacts,

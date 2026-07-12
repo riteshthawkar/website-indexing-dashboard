@@ -1,177 +1,199 @@
-# Website Indexing Dashboard
+# MBZUAI Website Indexing Pipeline
 
-This repository contains the full website indexing product:
+This repository contains the terminal-first indexing pipeline for the MBZUAI chatbot knowledge base.
 
-- the modular scraping and indexing pipeline
-- the assertion-first Pinecone + Neo4j knowledge-base build
-- the React dashboard control plane
-- the retrieval and evaluation tooling
-
-The product is launched from a single user-facing config file:
-
-- [`pipeline/configs/default.yaml`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/pipeline/configs/default.yaml)
-
-The dashboard creates a per-run snapshot of that config and executes the snapshot, so launch-time edits are reproducible.
+The production path scrapes the MBZUAI website, normalizes website and document content, creates assertion-first retrieval artifacts, uploads dense and sparse Pinecone namespaces scoped to one release, and promotes a local JSON semantic knowledge graph. Neo4j remains an optional connector for deployments that explicitly enable graph upload.
 
 ## Stack
 
-- Python pipeline and dashboard backend
-- Next.js + shadcn/ui dashboard frontend
-- OpenAI for structured assertion extraction, validation, planning, and adjudication
+- Python pipeline and CLI
+- Crawl4AI, Trafilatura, MarkItDown, and Docling for website/document processing
+- OpenAI for structured assertion extraction and validation
 - Gemini embeddings for Pinecone upload
 - Pinecone for vector retrieval
-- Neo4j for the promoted semantic graph
+- Local JSON artifacts for the promoted semantic graph; optional Neo4j connector support
 
 ## Repository Layout
 
-- [`pipeline/`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/pipeline): pipeline stages, retrieval, evaluation, CLI
-- [`dashboard/`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard): FastAPI control plane and worker management
-- [`dashboard-ui/`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui): React dashboard UI
-- [`docs/`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs): product and system docs
-- [`scripts/`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/scripts): local bootstrap and launch helpers
+- [`pipeline/`](pipeline/): pipeline stages, retrieval, evaluation, CLI
+- [`pipeline/configs/mbzuai_production.yaml`](pipeline/configs/mbzuai_production.yaml): canonical production contract
+- [`pipeline/configs/default.yaml`](pipeline/configs/default.yaml): shared defaults inherited by environment-specific configs
+- [`docs/`](docs/): operator and system docs
+- [`scripts/`](scripts/): bootstrap and CLI helpers
 
 ## Prerequisites
 
 - Linux or macOS workstation
-- Python `3.10`
-- Node.js `20+`
-- npm `10+`
-- outbound access to:
-  - OpenAI
-  - Google Gemini
-  - Pinecone
-  - Neo4j
+- Python `3.10` to `3.12`
+- outbound access to OpenAI, Google Gemini, and Pinecone
 
 ## Setup
 
-1. Create the environment file.
-
 ```bash
 cp .env.example .env
-```
-
-2. Fill in the required secrets in `.env`.
-
-3. Bootstrap the workstation.
-
-```bash
 bash scripts/bootstrap.sh
 ```
 
-This script:
+Fill in these required values in `.env` before a production run:
 
-- creates `env/` if it does not exist
-- installs Python dependencies from [`requirements.txt`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/requirements.txt)
-- installs Chromium for Crawl4AI / Playwright
-- installs frontend dependencies with `npm ci`
+- `OPENAI_API_KEY`
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY`
+- `PINECONE_API_KEY`
 
-## Start The Dashboard
+Neo4j values are optional and only needed when `graph.store_backend: neo4j` is configured.
 
-Backend:
+## Terminal Workflow
+
+Run the production preflight first:
 
 ```bash
-bash scripts/dashboard.sh
+bash scripts/pipeline.sh doctor --config mbzuai_production
 ```
 
-Frontend development server:
+Show the exact stage order:
 
 ```bash
-cd dashboard-ui
-npm run dev -- --hostname 0.0.0.0 --port 3000
+bash scripts/pipeline.sh dry-run --config mbzuai_production
 ```
 
-Open:
-
-- `http://127.0.0.1:3000`
-
-Production-like local frontend serve:
+Validate registered stages and required dependencies:
 
 ```bash
-cd dashboard-ui
-npm run build
-npx serve out -l 3000
+bash scripts/pipeline.sh validate-config --config mbzuai_production
 ```
 
-## Run The Pipeline From CLI
-
-Validate the current product config:
+Run the production pipeline:
 
 ```bash
-bash scripts/pipeline.sh validate-config --config default
+bash scripts/pipeline.sh run --config mbzuai_production
 ```
 
-Show the planned stages:
+Run through one stage and persist a resumable checkpoint for inspection:
 
 ```bash
-bash scripts/pipeline.sh dry-run --config default
+bash scripts/pipeline.sh run --config mbzuai_production \
+  --run-id <run_id> \
+  --stop-after-stage <stage_id>
 ```
 
-Run the pipeline:
+Continue the same run through the next checkpoint:
 
 ```bash
-bash scripts/pipeline.sh run --config default
+bash scripts/pipeline.sh run --config mbzuai_production \
+  --run-id <run_id> \
+  --resume \
+  --stop-after-stage <next_stage_id>
 ```
 
 Resume a run:
 
 ```bash
-bash scripts/pipeline.sh run --config default --resume --run-id <run_id>
+bash scripts/pipeline.sh run --config mbzuai_production --resume --run-id <run_id>
 ```
 
 Restart from a stage:
 
 ```bash
-bash scripts/pipeline.sh run --config default --restart-from-stage <stage_id> --run-id <run_id>
+bash scripts/pipeline.sh run --config mbzuai_production --restart-from-stage <stage_id> --run-id <run_id>
 ```
 
-## Retriever Service
-
-Start the long-lived retriever service for a completed run:
+Audit a completed run:
 
 ```bash
-bash scripts/pipeline.sh serve-retriever --config default --work-dir <run_work_dir> --host 0.0.0.0 --port 8663
+bash scripts/pipeline.sh audit-run --work-dir runs/<project>/<run_id>
 ```
 
-The dashboard can also start and stop the retriever service from the run detail page.
+Run a retrieval smoke query:
 
-## Required Environment Variables
+```bash
+bash scripts/pipeline.sh retrieve --work-dir runs/<project>/<run_id> --query "Who is the president of MBZUAI?" --trace
+```
 
-Required for the default product path:
+Start the retriever HTTP service for agents:
 
-- `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
-- `PINECONE_API_KEY`
-- `NEO4J_URI`
-- `NEO4J_DATABASE`
-- `NEO4J_USERNAME`
-- `NEO4J_PASSWORD`
+```bash
+bash scripts/pipeline.sh serve-retriever --work-dir runs/<project>/<run_id> --host 127.0.0.1 --port 8663
+```
 
-Optional but supported:
+Migrate an existing indexed run into the current v2 retrieval contract without re-scraping:
 
-- `OPENAI_TIMEOUT_SEC`
-- `NEO4J_NAMESPACE`
-- `NEXT_PUBLIC_API_URL`
-- `NEXT_PUBLIC_WS_URL`
-- `FASTTEXT_LID_MODEL`
-- any config override using `PIPELINE_<SECTION>__<KEY>`
+```bash
+bash scripts/pipeline.sh migrate-release \
+  --config mbzuai_production \
+  --source-work-dir runs/<project>/<old_run_id> \
+  --target-work-dir runs/<project>/<old_run_id>-v2-migrated \
+  --dry-run
 
-See:
+bash scripts/pipeline.sh migrate-release \
+  --config mbzuai_production \
+  --source-work-dir runs/<project>/<old_run_id> \
+  --target-work-dir runs/<project>/<old_run_id>-v2-migrated \
+  --force
+```
 
-- [`.env.example`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/.env.example)
-- [`docs/setup.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/setup.md)
+Upload or resume a migrated run to the configured v3 Pinecone indexes:
 
-## Default Stores
+```bash
+bash scripts/pipeline.sh migrate-release \
+  --config mbzuai_production \
+  --source-work-dir runs/<project>/<old_run_id> \
+  --target-work-dir runs/<project>/<old_run_id>-v2-migrated \
+  --upload-existing \
+  --embed-batch-size 96 \
+  --media-text-batch-size 96
+```
 
-The default config currently targets:
+Gate and promote a completed retrieval release through the protected release-check flow. The protected control plane must supply the exact candidate commits, candidate service URLs, operations token, and shared retrieval-service token:
 
-- Pinecone dense index: `mbzuai-gemini-retrieval-v2`
-- Pinecone sparse index: `mbzuai-gemini-retrieval-v2-sparse`
+```bash
+RELEASE_WORK_DIR=/data/releases/runs/mbzuai_main/$RUN_ID \
+RELEASE_COMMIT_SHA="$RETRIEVER_COMMIT_SHA" \
+CANDIDATE_BACKEND_COMMIT_SHA="$BACKEND_COMMIT_SHA" \
+CANDIDATE_BACKEND_OPERATIONS_TOKEN="$OPERATIONS_TOKEN" \
+RETRIEVAL_SERVICE_TOKEN="$RETRIEVER_TOKEN" \
+ANSWER_EVAL_ENDPOINT=ws://backend-candidate:8080/chat \
+CANDIDATE_BACKEND_DETAILED_URL=http://backend-candidate:8080/health/detailed \
+CANDIDATE_RETRIEVER_ATTESTATION_URL=http://retriever-candidate:8060/attestationz \
+bash scripts/deploy/release-check-promote.sh
 
-Neo4j namespace is per-run unless explicitly overridden.
+bash scripts/pipeline.sh show-release --config mbzuai_production
+```
+
+Do not bypass the protected wrapper with the lower-level promotion subcommand; the wrapper validates immutable artifacts, both candidate identities, the canonical retrieval and answer gates, and the locked active-release pointer.
+
+## Production Checks
+
+The default config enables:
+
+- assertion-first extraction before retrieval formatting
+- Pinecone dense and sparse uploads under release-scoped `chunks`, `parents`, `media`, `facts`, `evidence_spans`, `summaries`, `assertions`, `entities`, and `communities` lanes
+- post-upload Pinecone namespace count verification
+- guarded v2 migration from existing runs, including summary/assertion/entity enrichment and no-regression record-count checks
+- local promoted graph artifact verification
+- optional Neo4j graph upload and node/edge verification when `graph.store_backend: neo4j` is configured
+- release manifests with retrieval eval gates and an active release pointer
+- retrieval confidence, routing traces, and bounded evidence packs for terminal and agent use
+- stage and run audits that fail the run on integrity errors
+
+Default stores:
+
+- Pinecone dense index: `mbzuai-gemini-retrieval-v3`
+- Pinecone sparse index: `mbzuai-gemini-retrieval-v3-sparse`
+- Knowledge graph store: promoted local JSON artifact under the run directory
+
+## Useful Config Overrides
+
+Any config value can be overridden through environment variables using `PIPELINE_<SECTION>__<KEY>`.
+
+Examples:
+
+```bash
+PIPELINE_CRAWLER__MAX_PAGES=500 bash scripts/pipeline.sh run
+PIPELINE_GRAPH__NEO4J_NAMESPACE=mbzuai-prod-2026-05 bash scripts/pipeline.sh run
+PIPELINE_EMBEDDER__VERIFY_INDEX_MIN_COUNT_ONLY=true bash scripts/pipeline.sh run
+```
 
 ## Key Docs
 
-- setup guide: [`docs/setup.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/setup.md)
-- dashboard control plane: [`docs/dashboard_control_plane.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/dashboard_control_plane.md)
-- retriever system handoff: [`docs/retriever_system.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/retriever_system.md)
-- structured logs: [`docs/structured_logs.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/structured_logs.md)
+- setup guide: [`docs/setup.md`](docs/setup.md)
+- retriever handoff: [`docs/retriever_system.md`](docs/retriever_system.md)

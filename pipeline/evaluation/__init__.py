@@ -1,4 +1,6 @@
 from .answer_generation import generate_answer_predictions
+from .answer_readiness import evaluate_answer_readiness
+from .ablation import compare_retrieval_report_files, compare_retrieval_reports
 from .benchmark_io import (
     evaluate_standard_rankings,
     export_hf_benchmark,
@@ -16,7 +18,10 @@ __all__ = [
     "DEFAULT_RAGAS_METRICS",
     "EVALUATION_PRESETS",
     "EvalExample",
+    "compare_retrieval_report_files",
+    "compare_retrieval_reports",
     "evaluate_retrieval_dataset",
+    "evaluate_answer_readiness",
     "evaluate_standard_rankings",
     "export_hf_benchmark",
     "export_ir_datasets_benchmark",

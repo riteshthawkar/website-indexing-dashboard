@@ -1,0 +1,402 @@
+name: mbzuai-agentic-chatbot
+
+# This is the production App Platform contract for the public backend and its
+# private retriever. Replace every CHANGE_ME value in the DigitalOcean control
+# plane before applying the spec. A placeholder deployment fails closed.
+alerts:
+  - rule: DEPLOYMENT_FAILED
+  - rule: DOMAIN_FAILED
+
+envs:
+  - key: OPENAI_API_KEY
+    value: CHANGE_ME_IN_DIGITALOCEAN
+    scope: RUN_TIME
+    type: SECRET
+  - key: RETRIEVAL_SERVICE_TOKEN
+    value: CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS
+    scope: RUN_TIME
+    type: SECRET
+
+services:
+  - name: backend
+    github:
+      repo: riteshthawkar/lawa-mbzuai-demo
+      branch: main
+      deploy_on_push: false
+    source_dir: /
+    dockerfile_path: Dockerfile
+    http_port: 8080
+    instance_count: 1
+    instance_size_slug: apps-d-2vcpu-4gb
+    envs:
+      - key: SERVICE_ENVIRONMENT
+        value: production
+        scope: RUN_TIME
+        type: GENERAL
+      - key: SERVICE_IDENTIFIER
+        value: mbzuai-chatbot-backend
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_COMMIT_SHA
+        value: ${_self.COMMIT_HASH}
+        scope: RUN_TIME
+        type: GENERAL
+      - key: PORT
+        value: "8080"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: WEB_CONCURRENCY
+        value: "1"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_SERVICE_URL
+        value: http://retriever:8060
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_SERVICE_MODE
+        value: required
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_SERVICE_REQUIRE_READY
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_SERVICE_TIMEOUT_SECONDS
+        value: "125"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_SERVICE_STARTUP_TIMEOUT_SECONDS
+        value: "1500"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_SERVICE_READINESS_TIMEOUT_SECONDS
+        value: "5"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: EXPECTED_RETRIEVAL_COMMIT_SHA
+        value: ${retriever.COMMIT_HASH}
+        scope: RUN_TIME
+        type: GENERAL
+      - key: EXPECTED_RETRIEVAL_RUN_ID
+        value: CHANGE_ME_TO_PROMOTED_RUN_ID
+        scope: RUN_TIME
+        type: GENERAL
+      - key: EXPECTED_RETRIEVAL_BUNDLE_SHA256
+        value: CHANGE_ME_TO_PROMOTED_BUNDLE_SHA256
+        scope: RUN_TIME
+        type: GENERAL
+      - key: EMBEDDING_PROVIDER
+        value: google
+        scope: RUN_TIME
+        type: GENERAL
+      - key: EMBEDDING_MODEL_NAME
+        value: gemini-embedding-2
+        scope: RUN_TIME
+        type: GENERAL
+      - key: EMBEDDING_OUTPUT_DIMENSIONALITY
+        value: "1536"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: GENERATION_MODEL
+        value: gpt-5.4-2026-03-05
+        scope: RUN_TIME
+        type: GENERAL
+      - key: QUERY_REWRITE_MODEL
+        value: gpt-5.4-mini-2026-03-17
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RERANKER_MODEL
+        value: gpt-5.4-mini-2026-03-17
+        scope: RUN_TIME
+        type: GENERAL
+      - key: GROUNDED_FINALIZER_MODEL
+        value: gpt-5.4-mini-2026-03-17
+        scope: RUN_TIME
+        type: GENERAL
+      - key: FOLLOWUP_SUGGESTION_MODEL
+        value: gpt-5.4-mini-2026-03-17
+        scope: RUN_TIME
+        type: GENERAL
+      - key: PRESENTATION_BLOCK_MODEL
+        value: gpt-5.4-mini-2026-03-17
+        scope: RUN_TIME
+        type: GENERAL
+      - key: JWT_SECRET
+        value: CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS
+        scope: RUN_TIME
+        type: SECRET
+      - key: DATABASE_URL
+        value: CHANGE_ME_TO_MANAGED_POSTGRES_PRIVATE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: RATE_LIMIT_BACKEND
+        value: redis
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RATE_LIMIT_REDIS_URL
+        value: CHANGE_ME_TO_MANAGED_REDIS_PRIVATE_URL
+        scope: RUN_TIME
+        type: SECRET
+      - key: RATE_LIMIT_FAIL_OPEN
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RATE_LIMIT_ALLOW_MEMORY_IN_PRODUCTION
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: ALLOWED_ORIGINS
+        value: https://mbzuai.ac.ae,https://www.mbzuai.ac.ae
+        scope: RUN_TIME
+        type: GENERAL
+      - key: CORS_ALLOW_ORIGINS
+        value: https://mbzuai.ac.ae,https://www.mbzuai.ac.ae
+        scope: RUN_TIME
+        type: GENERAL
+      - key: ALLOW_CREDENTIALS
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: ALLOW_MISSING_WS_ORIGIN
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: REQUIRE_WIDGET_KEY
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: WIDGET_PUBLIC_KEYS
+        value: CHANGE_ME_TO_WIDGET_PUBLIC_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: OPERATIONS_API_TOKEN
+        value: CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS
+        scope: RUN_TIME
+        type: SECRET
+      - key: TELEGRAM_SHARED_SECRET
+        value: CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS
+        scope: RUN_TIME
+        type: SECRET
+      - key: STORE_CLIENT_IP_FOR_ANALYTICS
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: LOG_QUERY_TEXT
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+    health_check:
+      initial_delay_seconds: 1500
+      period_seconds: 30
+      timeout_seconds: 10
+      success_threshold: 2
+      failure_threshold: 10
+      http_path: /readyz
+      port: 8080
+    liveness_health_check:
+      initial_delay_seconds: 1500
+      period_seconds: 30
+      timeout_seconds: 10
+      success_threshold: 1
+      failure_threshold: 10
+      http_path: /livez
+      port: 8080
+    termination:
+      drain_seconds: 30
+      grace_period_seconds: 180
+
+  - name: retriever
+    github:
+      repo: riteshthawkar/website-indexing-dashboard
+      branch: main
+      deploy_on_push: false
+    source_dir: /
+    dockerfile_path: Dockerfile.retriever
+    internal_ports:
+      - 8060
+    instance_count: 1
+    instance_size_slug: apps-d-4vcpu-16gb
+    envs:
+      - key: SERVICE_ENVIRONMENT
+        value: production
+        scope: RUN_TIME
+        type: GENERAL
+      - key: PIPELINE_CONFIG
+        value: mbzuai_production
+        scope: RUN_TIME
+        type: GENERAL
+      - key: GOOGLE_API_KEY
+        value: CHANGE_ME_IN_DIGITALOCEAN
+        scope: RUN_TIME
+        type: SECRET
+      - key: PINECONE_API_KEY
+        value: CHANGE_ME_IN_DIGITALOCEAN
+        scope: RUN_TIME
+        type: SECRET
+      - key: RELEASE_COMMIT_SHA
+        value: ${_self.COMMIT_HASH}
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_STORAGE_MODE
+        value: hydrate
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_TARGET_ROOT
+        value: /data/releases/current
+        scope: RUN_TIME
+        type: GENERAL
+      - key: ACTIVE_RELEASE_FILE
+        value: /data/releases/current/mbzuai_main/active_release.json
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_RUNS_ROOT
+        value: /data/releases/current/runs/mbzuai_main
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_STORAGE_MARKER_FILE
+        value: /data/releases/current/.mbzuai-release-storage
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_S3_URI
+        value: CHANGE_ME_TO_S3_URI_FOR_IMMUTABLE_RELEASE_ARCHIVE
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_S3_ENDPOINT_URL
+        value: https://CHANGE_ME_TO_SPACES_REGION.digitaloceanspaces.com
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_S3_REGION
+        value: CHANGE_ME_TO_SPACES_REGION
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_S3_ACCESS_KEY_ID
+        value: CHANGE_ME_TO_READ_ONLY_SPACES_ACCESS_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: RELEASE_ARCHIVE_S3_SECRET_ACCESS_KEY
+        value: CHANGE_ME_TO_READ_ONLY_SPACES_SECRET_KEY
+        scope: RUN_TIME
+        type: SECRET
+      - key: RELEASE_ARCHIVE_SHA256
+        value: CHANGE_ME_TO_ARCHIVE_SHA256
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_ALLOWED_HOSTS
+        value: CHANGE_ME_TO_EXACT_SPACES_ENDPOINT_HOSTNAME,CHANGE_ME_TO_EXACT_BUCKET_SPACES_HOSTNAME
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_TIMEOUT_SECONDS
+        value: "600"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_VALIDATION_TIMEOUT_SECONDS
+        value: "600"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_MAX_BYTES
+        value: "2147483648"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES
+        value: "2147483648"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_MAX_FILES
+        value: "64"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_ALLOW_HTTP
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RELEASE_ARCHIVE_ALLOW_REPLACE
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_REQUIRE_STORAGE_MARKER
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_ALLOW_WAIVED_RELEASE
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_REQUIRE_GRAPH
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_EXPECTED_EMBEDDING_MODEL
+        value: gemini-embedding-2
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_EXPECTED_EMBEDDING_DIMENSIONALITY
+        value: "1536"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_HOST
+        value: 0.0.0.0
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_PORT
+        value: "8060"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_MAX_CONCURRENCY
+        value: "1"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_REQUEST_TIMEOUT_SECONDS
+        value: "110"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_QUEUE_TIMEOUT_SECONDS
+        value: "10"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_QUERY_EMBEDDING_RETRIES
+        value: "1"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVAL_QUERY_EMBEDDING_RETRY_DELAY_SECONDS
+        value: "0.75"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_STARTUP_PROBE_REQUIRED
+        value: "true"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_STARTUP_PROBE_QUERY
+        value: Where is MBZUAI located?
+        scope: RUN_TIME
+        type: GENERAL
+      - key: RETRIEVER_STARTUP_PROBE_TIMEOUT_SECONDS
+        value: "120"
+        scope: RUN_TIME
+        type: GENERAL
+    health_check:
+      initial_delay_seconds: 1350
+      period_seconds: 30
+      timeout_seconds: 10
+      success_threshold: 2
+      failure_threshold: 10
+      http_path: /readyz
+      port: 8060
+    liveness_health_check:
+      initial_delay_seconds: 1350
+      period_seconds: 30
+      timeout_seconds: 10
+      success_threshold: 1
+      failure_threshold: 10
+      http_path: /healthz
+      port: 8060
+    termination:
+      drain_seconds: 30
+      grace_period_seconds: 180
+
+ingress:
+  rules:
+    - component:
+        name: backend
+      match:
+        path:
+          prefix: /

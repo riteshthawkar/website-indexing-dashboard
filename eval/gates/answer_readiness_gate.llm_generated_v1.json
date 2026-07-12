@@ -1,0 +1,184 @@
+{
+  "overall": {
+    "answerable_query_count": {
+      "min": 45
+    },
+    "no_answer_query_count": {
+      "min": 5
+    },
+    "pass_rate": {
+      "min": 0.90
+    },
+    "answerable_pass_rate": {
+      "min": 0.90
+    },
+    "support_present_rate": {
+      "min": 0.92
+    },
+    "expected_reference_url_pass_rate": {
+      "min": 0.88
+    },
+    "must_include_pass_rate": {
+      "min": 0.88
+    },
+    "must_include_coverage_mean": {
+      "min": 0.90
+    },
+    "must_not_include_pass_rate": {
+      "min": 1.0
+    },
+    "no_answer_pass_rate": {
+      "min": 1.0
+    },
+    "llm_judge_pass_rate": {
+      "min": 0.90
+    },
+    "llm_overall_mean": {
+      "min": 0.80
+    },
+    "llm_correctness_mean": {
+      "min": 0.80
+    },
+    "llm_groundedness_mean": {
+      "min": 0.80
+    },
+    "llm_relevance_mean": {
+      "min": 0.82
+    },
+    "llm_helpfulness_mean": {
+      "min": 0.80
+    },
+    "llm_completeness_mean": {
+      "min": 0.80
+    },
+    "llm_citation_quality_mean": {
+      "min": 0.80
+    },
+    "llm_component_quality_mean": {
+      "min": 0.74
+    },
+    "llm_safety_mean": {
+      "min": 0.86
+    },
+    "llm_judge_error_rate": {
+      "max": 0.0
+    },
+    "prediction_integrity_error_rate": {
+      "max": 0.0
+    },
+    "prediction_missing_rate": {
+      "max": 0.0
+    },
+    "prediction_duplicate_rate": {
+      "max": 0.0
+    },
+    "prediction_unknown_rate": {
+      "max": 0.0
+    },
+    "error_rate": {
+      "max": 0.0
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "pass_rate": {
+        "min": 0.88
+      },
+      "llm_correctness_mean": {
+        "min": 0.80
+      }
+    },
+    "scoped": {
+      "pass_rate": {
+        "min": 0.75
+      },
+      "llm_groundedness_mean": {
+        "min": 0.80
+      }
+    },
+    "synthesis": {
+      "pass_rate": {
+        "min": 0.88
+      },
+      "llm_completeness_mean": {
+        "min": 0.80
+      },
+      "llm_helpfulness_mean": {
+        "min": 0.80
+      }
+    }
+  },
+  "by_source_type": {
+    "webpage": {
+      "support_present_rate": {
+        "min": 0.90
+      },
+      "expected_reference_url_pass_rate": {
+        "min": 0.88
+      }
+    },
+    "mixed": {
+      "support_present_rate": {
+        "min": 0.75
+      }
+    },
+    "none": {
+      "no_answer_pass_rate": {
+        "min": 1.0
+      },
+      "must_not_include_pass_rate": {
+        "min": 1.0
+      }
+    }
+  },
+  "by_benchmark_tag": {
+    "llm_generated_v1": {
+      "pass_rate": {
+        "min": 0.90
+      },
+      "llm_judge_pass_rate": {
+        "min": 0.90
+      }
+    },
+    "deep_answer": {
+      "pass_rate": {
+        "min": 0.86
+      },
+      "llm_completeness_mean": {
+        "min": 0.82
+      },
+      "llm_groundedness_mean": {
+        "min": 0.80
+      }
+    },
+    "citation_quality": {
+      "llm_citation_quality_mean": {
+        "min": 0.80
+      },
+      "expected_reference_url_pass_rate": {
+        "min": 0.88
+      }
+    },
+    "followup_quality": {
+      "llm_component_quality_mean": {
+        "min": 0.74
+      }
+    },
+    "abstention": {
+      "no_answer_pass_rate": {
+        "min": 1.0
+      },
+      "must_not_include_pass_rate": {
+        "min": 1.0
+      }
+    },
+    "hard": {
+      "pass_rate": {
+        "min": 0.80
+      },
+      "llm_completeness_mean": {
+        "min": 0.78
+      }
+    }
+  }
+}

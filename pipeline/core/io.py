@@ -67,6 +67,17 @@ def sha256_file(filepath: str | Path, chunk_size: int = 1024 * 1024) -> str:
     return digest.hexdigest()
 
 
+def combine_sha256_digests(*digests: str) -> str:
+    """Bind an ordered set of artifact SHA-256 digests into one digest."""
+
+    combined = hashlib.sha256()
+    for value in digests:
+        normalized = str(value or "").strip().lower()
+        if normalized:
+            combined.update(normalized.encode("ascii"))
+    return combined.hexdigest()
+
+
 def safe_filename(name: str, max_length: int = 200) -> str:
     """Convert an arbitrary string into a safe filename."""
     # Replace problematic characters

@@ -10,9 +10,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from hashlib import sha1
 from pathlib import Path
+import re
 from typing import Any, Dict, Iterable, List
 
-from .io import atomic_write_json, load_json_safe
+from .io import atomic_write_json, load_json_safe, sha256_file
 
 
 def _stable_graph_id(kind: str, *parts: Any) -> str:
@@ -121,7 +122,18 @@ def build_graph_bundle(
     }
 
 
-def build_graph_index(graph_bundle: Dict[str, Any]) -> Dict[str, Any]:
+def build_graph_index(
+    graph_bundle: Dict[str, Any],
+    *,
+    source_graph_sha256: str = "",
+) -> Dict[str, Any]:
+    """Build the deterministic adjacency index for ``graph_bundle``.
+
+    ``source_graph_sha256`` binds the derived index to the exact serialized
+    graph file it indexes.  Callers writing a production artifact pair should
+    use :func:`save_graph_bundle_with_index`, which writes the graph first and
+    supplies its file digest automatically.
+    """
     outgoing: Dict[str, List[str]] = {}
     incoming: Dict[str, List[str]] = {}
     node_type_by_id: Dict[str, str] = {}
@@ -145,20 +157,138 @@ def build_graph_index(graph_bundle: Dict[str, Any]) -> Dict[str, Any]:
         outgoing.setdefault(source_id, []).append(edge_id)
         incoming.setdefault(target_id, []).append(edge_id)
 
-    return {
+    payload: Dict[str, Any] = {}
+    if source_graph_sha256:
+        # Keep the binding in the small JSON prefix so runtime validation can
+        # verify it without materializing an ~86 MB adjacency index.
+        payload["source_graph_sha256"] = str(source_graph_sha256).strip().lower()
+    payload.update({
+        "index_schema_version": 1,
         "schema_version": int(graph_bundle.get("schema_version") or 1),
         "graph_type": str(graph_bundle.get("graph_type") or "deterministic_content_graph"),
         "node_type_by_id": node_type_by_id,
         "edge_type_by_id": edge_type_by_id,
         "outgoing_edge_ids": outgoing,
         "incoming_edge_ids": incoming,
-    }
+    })
+    return payload
 
 
 def save_graph_bundle(graph_bundle: Dict[str, Any], path: str | Path) -> Path:
     path = Path(path)
     atomic_write_json(path, graph_bundle)
     return path
+
+
+def save_graph_bundle_with_index(
+    graph_bundle: Dict[str, Any],
+    graph_path: str | Path,
+    index_path: str | Path,
+) -> tuple[Path, Path]:
+    """Atomically write a graph and a cryptographically bound derived index."""
+
+    graph_file = save_graph_bundle(graph_bundle, graph_path)
+    graph_sha256 = sha256_file(graph_file)
+    index_file = save_graph_bundle(
+        build_graph_index(graph_bundle, source_graph_sha256=graph_sha256),
+        index_path,
+    )
+    return graph_file, index_file
+
+
+def validate_graph_index_derivation(
+    graph_path: str | Path,
+    index_path: str | Path,
+) -> List[Dict[str, Any]]:
+    """Verify an index is a complete deterministic derivation of its graph.
+
+    Independent file hashes only prove that two files have not changed.  This
+    check additionally proves that the index names the exact graph digest and
+    that every derived mapping equals a fresh deterministic rebuild.
+    """
+
+    graph_file = Path(graph_path)
+    index_file = Path(index_path)
+    issues: List[Dict[str, Any]] = []
+    graph_bundle = load_json_safe(graph_file, None)
+    graph_index = load_json_safe(index_file, None)
+    if not isinstance(graph_bundle, dict):
+        return [{
+            "code": "invalid_graph_bundle",
+            "message": f"Knowledge-graph bundle is missing or invalid: {graph_file}",
+        }]
+    if not isinstance(graph_index, dict):
+        return [{
+            "code": "invalid_graph_index",
+            "message": f"Knowledge-graph index is missing or invalid: {index_file}",
+        }]
+
+    source_graph_sha256 = sha256_file(graph_file)
+    recorded_source_sha256 = str(graph_index.get("source_graph_sha256") or "").strip().lower()
+    if not recorded_source_sha256:
+        issues.append({
+            "code": "graph_index_missing_source_hash",
+            "message": "Knowledge-graph index is missing source_graph_sha256",
+        })
+    elif recorded_source_sha256 != source_graph_sha256:
+        issues.append({
+            "code": "graph_index_source_hash_mismatch",
+            "message": "Knowledge-graph index source_graph_sha256 does not match its graph file",
+            "expected": source_graph_sha256,
+            "actual": recorded_source_sha256,
+        })
+
+    expected_index = build_graph_index(
+        graph_bundle,
+        source_graph_sha256=source_graph_sha256,
+    )
+    if graph_index != expected_index:
+        issues.append({
+            "code": "graph_index_derivation_mismatch",
+            "message": "Knowledge-graph index is not the deterministic derivation of its graph file",
+        })
+    return issues
+
+
+def validate_graph_index_binding(
+    graph_path: str | Path,
+    index_path: str | Path,
+) -> List[Dict[str, Any]]:
+    """Cheaply verify the index names the exact graph file it accompanies.
+
+    Producers place ``source_graph_sha256`` in the index JSON prefix. Runtime
+    uses this streaming-friendly binding plus the independently recorded index
+    file hash. Release construction/promotion additionally calls
+    :func:`validate_graph_index_derivation` once for a full deterministic
+    rebuild comparison.
+    """
+
+    graph_file = Path(graph_path)
+    index_file = Path(index_path)
+    try:
+        with index_file.open("rb") as handle:
+            prefix = handle.read(4096)
+    except OSError:
+        prefix = b""
+    match = re.search(
+        rb'"source_graph_sha256"\s*:\s*"([0-9a-fA-F]{64})"',
+        prefix,
+    )
+    if match is None:
+        return [{
+            "code": "graph_index_missing_source_hash",
+            "message": "Knowledge-graph index JSON prefix is missing source_graph_sha256",
+        }]
+    recorded_source_sha256 = match.group(1).decode("ascii").lower()
+    actual_source_sha256 = sha256_file(graph_file)
+    if recorded_source_sha256 != actual_source_sha256:
+        return [{
+            "code": "graph_index_source_hash_mismatch",
+            "message": "Knowledge-graph index source_graph_sha256 does not match its graph file",
+            "expected": actual_source_sha256,
+            "actual": recorded_source_sha256,
+        }]
+    return []
 
 
 def load_graph_bundle(path: str | Path) -> Dict[str, Any]:
@@ -222,3 +352,38 @@ def validate_graph_bundle(graph_bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
             issues.append({"code": "graph_edge_missing_target_node", "message": "Graph edge references a missing target node", "edge_id": edge_id, "node_id": target_id})
 
     return issues
+
+
+def community_summary_quality(
+    graph_bundle: Dict[str, Any],
+    *,
+    min_characters: int = 40,
+) -> Dict[str, Any]:
+    """Return deterministic completeness metrics for community summaries."""
+
+    communities = [
+        node
+        for node in (graph_bundle.get("nodes") or [])
+        if isinstance(node, dict) and str(node.get("node_type") or "") == "community"
+    ]
+    invalid_ids: List[str] = []
+    for node in communities:
+        properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+        summary = " ".join(str(properties.get("summary") or "").split()).strip()
+        if (
+            len(summary) < max(1, int(min_characters))
+            or summary.casefold() in {
+                "summary generation failed.",
+                "no entity details available to summarize.",
+            }
+        ):
+            invalid_ids.append(str(node.get("id") or "<missing>"))
+    total = len(communities)
+    valid = total - len(invalid_ids)
+    return {
+        "total_communities": total,
+        "valid_summaries": valid,
+        "invalid_summary_community_ids": invalid_ids,
+        "coverage_ratio": (valid / total) if total else 0.0,
+        "minimum_summary_characters": max(1, int(min_characters)),
+    }

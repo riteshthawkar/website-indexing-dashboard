@@ -10,4 +10,8 @@ if [[ -f "$VENV_PATH/bin/activate" ]]; then
 fi
 
 cd "$ROOT_DIR"
-exec python -m pipeline "$@"
+if command -v python >/dev/null 2>&1; then
+  exec python -m pipeline "$@"
+fi
+
+exec python3 -m pipeline "$@"

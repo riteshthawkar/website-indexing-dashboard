@@ -62,6 +62,53 @@ def _remove_artifact_local_path(local_path: str) -> None:
         parent = parent.parent
 
 
+def _strip_boilerplate(text: str) -> str:
+    """Strip navigation links, headers, footers, and boilerplate text before LSH signature generation."""
+    if not text:
+        return ""
+
+    # If the text looks like HTML, use BeautifulSoup to clean it up
+    if "<html" in text.lower() or "<body" in text.lower() or ("<div" in text.lower() and "</div" in text.lower()) or "<p" in text.lower():
+        try:
+            from bs4 import BeautifulSoup
+            soup = BeautifulSoup(text, "html.parser")
+            # Decompose common boilerplate tags
+            for tag in ["nav", "header", "footer", "aside", "script", "style", "iframe", "noscript"]:
+                for element in soup.find_all(tag):
+                    element.decompose()
+            # Also decompose elements with boilerplate class/id names
+            for element in soup.find_all(lambda t: t.has_attr('class') or t.has_attr('id')):
+                attrs = (element.get('class') or []) + [element.get('id') or ""]
+                attrs_str = " ".join(str(a) for a in attrs).lower()
+                if any(k in attrs_str for k in ["menu", "nav", "header", "footer", "sidebar", "widget", "social", "share", "cookie", "banner"]):
+                    element.decompose()
+            text = soup.get_text(" ")
+        except Exception:
+            pass
+
+    # If the text is markdown (or after HTML extraction), let's strip standard markdown boilerplate
+    # e.g., links lists, navigation headers, extremely short lines, social sharing templates
+    lines = text.splitlines()
+    cleaned_lines = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        # Skip markdown link lists (e.g. "* [Home](/home)" or "- [Contact](/contact)")
+        if (stripped.startswith("*") or stripped.startswith("-") or stripped.startswith("1.")) and "[" in stripped and "](" in stripped:
+            continue
+        # Skip purely navigation lines (e.g. "Home | About | Contact Us | Privacy Policy")
+        if "|" in stripped and len(stripped.split("|")) > 3:
+            continue
+        # Skip social shares
+        if any(social in stripped.lower() for social in ["facebook", "twitter", "linkedin", "share this", "follow us"]):
+            if len(stripped) < 100:
+                continue
+        cleaned_lines.append(line)
+
+    return "\n".join(cleaned_lines)
+
+
 def _word_ngrams(text: str, n: int = 5) -> List[str]:
     """Extract stable shingles for near-duplicate detection.
 
@@ -156,7 +203,8 @@ class DedupFilter(QualityGate):
             except Exception:
                 continue
 
-            ngrams = _word_ngrams(text, ngram_size)
+            cleaned_text = _strip_boilerplate(text)
+            ngrams = _word_ngrams(cleaned_text, ngram_size)
             if not ngrams:
                 continue
 

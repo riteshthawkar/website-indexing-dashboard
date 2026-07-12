@@ -16,6 +16,17 @@ logger = logging.getLogger(__name__)
 
 # Global registry: {stage_type: {name: class}}
 _REGISTRY: Dict[str, Dict[str, Type[PipelineStage]]] = {}
+_IMPORT_ERRORS: Dict[str, str] = {}
+
+
+def _format_import_errors() -> str:
+    if not _IMPORT_ERRORS:
+        return ""
+    details = "; ".join(
+        f"{module}: {error}"
+        for module, error in sorted(_IMPORT_ERRORS.items())
+    )
+    return f" Stage modules failed to import. Install the pipeline requirements and retry. Details: {details}"
 
 
 def register_stage(cls: Type[PipelineStage]) -> Type[PipelineStage]:
@@ -50,12 +61,16 @@ def get_stage(stage_type: str, name: str) -> Type[PipelineStage]:
     bucket = _REGISTRY.get(stage_type)
     if not bucket:
         available = list(_REGISTRY.keys())
-        raise KeyError(f"Unknown stage type {stage_type!r}. Available: {available}")
+        raise KeyError(
+            f"Unknown stage type {stage_type!r}. Available: {available}."
+            f"{_format_import_errors()}"
+        )
     cls = bucket.get(name)
     if not cls:
         available = list(bucket.keys())
         raise KeyError(
-            f"Unknown {stage_type} plugin {name!r}. Available: {available}"
+            f"Unknown {stage_type} plugin {name!r}. Available: {available}."
+            f"{_format_import_errors()}"
         )
     return cls
 
@@ -83,6 +98,7 @@ def auto_discover():
     """Import all modules under pipeline.stages to trigger @register_stage decorators."""
     import pipeline.stages as stages_pkg
 
+    _IMPORT_ERRORS.clear()
     for importer, modname, ispkg in pkgutil.walk_packages(
         stages_pkg.__path__, prefix=stages_pkg.__name__ + "."
     ):
@@ -90,6 +106,8 @@ def auto_discover():
             importlib.import_module(modname)
         except ImportError as e:
             # Don't fail if optional dependencies are missing (e.g., crawl4ai not installed)
+            _IMPORT_ERRORS[modname] = str(e)
             logger.debug("Could not import stage module %s: %s", modname, e)
         except Exception as e:
+            _IMPORT_ERRORS[modname] = str(e)
             logger.warning("Error importing stage module %s: %s", modname, e)

@@ -19,6 +19,7 @@ class EvalExample:
     no_answer: bool = False
     reference_answer: str = ""
     gold_chunk_ids: List[str] = field(default_factory=list)
+    gold_span_ids: List[str] = field(default_factory=list)
     gold_parent_ids: List[str] = field(default_factory=list)
     gold_media_ids: List[str] = field(default_factory=list)
     notes: str = ""
@@ -43,6 +44,7 @@ class EvalExample:
             no_answer=bool(self.no_answer),
             reference_answer=str(self.reference_answer or "").strip(),
             gold_chunk_ids=[str(item).strip() for item in self.gold_chunk_ids if str(item).strip()],
+            gold_span_ids=[str(item).strip() for item in self.gold_span_ids if str(item).strip()],
             gold_parent_ids=[str(item).strip() for item in self.gold_parent_ids if str(item).strip()],
             gold_media_ids=[str(item).strip() for item in self.gold_media_ids if str(item).strip()],
             notes=str(self.notes or "").strip(),

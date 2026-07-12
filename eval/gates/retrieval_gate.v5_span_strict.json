@@ -1,0 +1,137 @@
+{
+  "overall": {
+    "no_answer_query_count": {
+      "min": 5
+    },
+    "span_hit_at_10": {
+      "min": 0.85
+    },
+    "span_source_ndcg_at_10": {
+      "min": 0.75
+    },
+    "required_entity_coverage": {
+      "min": 0.90
+    },
+    "required_page_coverage": {
+      "min": 0.90
+    },
+    "citation_support_rate": {
+      "min": 0.90
+    },
+    "multi_page_coverage_rate": {
+      "min": 0.90
+    },
+    "unsupported_abstention_rate": {
+      "min": 1.0
+    },
+    "no_answer_violation_rate": {
+      "max": 0.0
+    },
+    "chunk_source_hit_at_10": {
+      "min": 0.85
+    },
+    "chunk_source_ndcg_at_10": {
+      "min": 0.74
+    },
+    "parent_hit_at_5": {
+      "min": 0.80
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "span_hit_at_10": {
+        "min": 0.85
+      },
+      "citation_support_rate": {
+        "min": 0.90
+      },
+      "chunk_source_hit_at_10": {
+        "min": 0.85
+      }
+    },
+    "scoped": {
+      "span_hit_at_10": {
+        "min": 0.85
+      },
+      "required_entity_coverage": {
+        "min": 0.90
+      },
+      "required_page_coverage": {
+        "min": 0.90
+      },
+      "parent_hit_at_5": {
+        "min": 0.85
+      }
+    },
+    "synthesis": {
+      "span_hit_at_10": {
+        "min": 0.80
+      },
+      "required_entity_coverage": {
+        "min": 0.85
+      },
+      "required_page_coverage": {
+        "min": 0.90
+      },
+      "citation_support_rate": {
+        "min": 0.90
+      },
+      "chunk_source_hit_at_10": {
+        "min": 0.85
+      }
+    }
+  },
+  "by_source_type": {
+    "webpage": {
+      "span_hit_at_10": {
+        "min": 0.85
+      },
+      "citation_support_rate": {
+        "min": 0.90
+      }
+    },
+    "mixed": {
+      "span_hit_at_10": {
+        "min": 0.80
+      },
+      "required_entity_coverage": {
+        "min": 0.85
+      }
+    },
+    "none": {
+      "query_count": {
+        "min": 5
+      },
+      "unsupported_abstention_rate": {
+        "min": 1.0
+      },
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    }
+  },
+  "by_benchmark_tag": {
+    "deep_answer": {
+      "span_hit_at_10": {
+        "min": 0.80
+      },
+      "required_entity_coverage": {
+        "min": 0.85
+      },
+      "citation_support_rate": {
+        "min": 0.90
+      }
+    },
+    "citation_quality": {
+      "span_hit_at_10": {
+        "min": 0.85
+      },
+      "span_source_ndcg_at_10": {
+        "min": 0.75
+      },
+      "citation_support_rate": {
+        "min": 0.90
+      }
+    }
+  }
+}

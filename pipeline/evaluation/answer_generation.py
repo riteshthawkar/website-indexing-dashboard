@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -15,11 +17,79 @@ _EXACT_LOOKUP_ANSWER_TYPES = {"email", "phone", "website", "hours", "date", "ser
 
 
 def _make_gemini_client():
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is required")
+        raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required")
     genai = import_genai()
     return genai.Client(api_key=api_key)
+
+
+def _read_prediction_rows(path: Path) -> List[Dict[str, Any]]:
+    if not path.exists():
+        return []
+    rows: List[Dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            rows.append(payload)
+    return rows
+
+
+def _write_prediction_rows(path: Path, rows: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        "\n".join(json.dumps(row, ensure_ascii=True, default=str) for row in rows) + ("\n" if rows else ""),
+        encoding="utf-8",
+    )
+
+
+def _row_error(row: Dict[str, Any]) -> str:
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    return str(row.get("error") or metadata.get("error") or "").strip()
+
+
+def _call_generate_content_with_timeout(client: Any, *, model: str, prompt: str, timeout_seconds: float) -> str:
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(lambda: client.models.generate_content(model=model, contents=prompt))
+    try:
+        response = future.result(timeout=max(1.0, float(timeout_seconds or 1.0)))
+    except FutureTimeoutError as exc:
+        future.cancel()
+        raise TimeoutError(f"Answer generation timed out after {timeout_seconds} seconds") from exc
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+    return str(getattr(response, "text", "") or "").strip()
+
+
+def _generate_content_with_retry(
+    *,
+    prompt: str,
+    model: str,
+    timeout_seconds: float,
+    max_retries: int,
+) -> str:
+    attempts = max(1, int(max_retries or 0) + 1)
+    last_error = ""
+    for attempt in range(attempts):
+        try:
+            client = _make_gemini_client()
+            return _call_generate_content_with_timeout(
+                client,
+                model=model,
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt + 1 >= attempts:
+                break
+            time.sleep(min(8.0, 1.5 * (2**attempt)))
+    raise RuntimeError(last_error or "answer generation failed")
 
 
 def _selected_answer_records(retriever: Any, retrieval_result: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -214,7 +284,16 @@ def _compose_structured_answer(
 
 
 def _bundle_maps(work_dir: str | Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    bundle_path = Path(work_dir) / "stage_outputs" / "format_retrieval" / "retrieval_bundle.json"
+    run_dir = Path(work_dir)
+    bundle_path = run_dir / "stage_outputs" / "finalize_retrieval_bundle" / "retrieval_bundle.json"
+    if not bundle_path.exists():
+        candidate = run_dir / "stage_outputs" / "format_retrieval" / "retrieval_bundle.json"
+        if candidate.exists():
+            bundle_path = candidate
+    if not bundle_path.exists():
+        candidate = run_dir / "stage_outputs" / "build_retrieval_bundle" / "retrieval_bundle.json"
+        if candidate.exists():
+            bundle_path = candidate
     bundle = load_json_safe(bundle_path, {}) or {}
     if not isinstance(bundle, dict):
         raise ValueError(f"Invalid retrieval bundle at {bundle_path}")
@@ -256,25 +335,44 @@ def _build_answer_prompt(
     retrieval_documents: List[Dict[str, Any]],
     answer_documents: List[Dict[str, Any]] | None = None,
     fact_documents: List[Dict[str, Any]] | None = None,
+    evidence_pack: Dict[str, Any] | None = None,
 ) -> str:
     structured_blocks = []
-    for i, doc in enumerate((answer_documents or [])[:6], start=1):
-        text = str(doc.get("text") or "").strip()
-        if not text:
-            continue
-        structured_blocks.append(f"[Answer {i}] {text}")
-    for i, doc in enumerate((fact_documents or [])[:6], start=1):
-        text = str(doc.get("text") or "").strip()
-        if not text:
-            continue
-        structured_blocks.append(f"[Fact {i}] {text}")
     context_blocks = []
-    for i, doc in enumerate(retrieval_documents[:8], start=1):
-        source = doc.get("source_url") or doc.get("document_title") or doc.get("id") or f"doc-{i}"
-        text = str(doc.get("text") or "").strip()
-        if not text:
-            continue
-        context_blocks.append(f"[Source {i}: {source}]\n{text}")
+    pack_items = (
+        list(evidence_pack.get("items") or [])
+        if isinstance(evidence_pack, dict)
+        else []
+    )
+    pack_items = [item for item in pack_items if isinstance(item, dict)]
+    if pack_items:
+        for item in pack_items:
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            rank = int(item.get("rank") or (len(context_blocks) + 1))
+            kind = str(item.get("kind") or "evidence").strip().title()
+            source = item.get("source_url") or item.get("document_title") or item.get("id") or f"evidence-{rank}"
+            if kind.lower() in {"answer", "fact"}:
+                structured_blocks.append(f"[{kind} {rank}] {text}")
+            context_blocks.append(f"[Evidence {rank}: {kind}; {source}]\n{text}")
+    else:
+        for i, doc in enumerate((answer_documents or [])[:6], start=1):
+            text = str(doc.get("text") or "").strip()
+            if not text:
+                continue
+            structured_blocks.append(f"[Answer {i}] {text}")
+        for i, doc in enumerate((fact_documents or [])[:6], start=1):
+            text = str(doc.get("text") or "").strip()
+            if not text:
+                continue
+            structured_blocks.append(f"[Fact {i}] {text}")
+        for i, doc in enumerate(retrieval_documents[:8], start=1):
+            source = doc.get("source_url") or doc.get("document_title") or doc.get("id") or f"doc-{i}"
+            text = str(doc.get("text") or "").strip()
+            if not text:
+                continue
+            context_blocks.append(f"[Source {i}: {source}]\n{text}")
     joined_context = "\n\n".join(context_blocks)
     joined_structured = "\n".join(structured_blocks)
     return (
@@ -289,6 +387,61 @@ def _build_answer_prompt(
     )
 
 
+def _retrieved_contexts_from_result(retrieval_result: Dict[str, Any]) -> List[str]:
+    evidence_pack = retrieval_result.get("evidence_pack")
+    if isinstance(evidence_pack, dict):
+        items = [item for item in (evidence_pack.get("items") or []) if isinstance(item, dict)]
+        contexts = [str(item.get("text") or "") for item in items if str(item.get("text") or "").strip()]
+        if contexts:
+            return contexts
+    return [
+        str(item.get("text") or "")
+        for item in (retrieval_result.get("retrieval_documents") or [])
+        if isinstance(item, dict) and str(item.get("text") or "").strip()
+    ]
+
+
+def _sources_from_result(retrieval_result: Dict[str, Any], *, limit: int = 12) -> List[Dict[str, Any]]:
+    sources: List[Dict[str, Any]] = []
+    seen = set()
+
+    def add_source(kind: str, item: Dict[str, Any]) -> None:
+        if len(sources) >= limit:
+            return
+        source_url = str(item.get("source_url") or "").strip()
+        title = str(item.get("document_title") or item.get("title") or "").strip()
+        source_id = str(item.get("id") or item.get("source_id") or "").strip()
+        key = (source_url, title, source_id)
+        if not any(key) or key in seen:
+            return
+        seen.add(key)
+        sources.append(
+            {
+                "id": source_id,
+                "kind": kind,
+                "title": title,
+                "url": source_url,
+                "text_preview": str(item.get("text") or "").strip()[:400],
+            }
+        )
+
+    evidence_pack = retrieval_result.get("evidence_pack")
+    if isinstance(evidence_pack, dict):
+        for item in evidence_pack.get("items") or []:
+            if isinstance(item, dict):
+                add_source(str(item.get("kind") or "evidence"), item)
+    for key, kind in (
+        ("answer_documents", "answer"),
+        ("fact_documents", "fact"),
+        ("retrieval_documents", "chunk"),
+        ("media", "media"),
+    ):
+        for item in retrieval_result.get(key) or []:
+            if isinstance(item, dict):
+                add_source(kind, item)
+    return sources
+
+
 def generate_answer_predictions(
     *,
     config_name: str,
@@ -296,70 +449,99 @@ def generate_answer_predictions(
     dataset_path: str | Path,
     output_path: str | Path,
     model: str = "gemini-2.5-flash",
+    timeout_seconds: float = 120.0,
+    max_retries: int = 2,
+    resume_predictions: bool = False,
 ) -> Dict[str, Any]:
     retriever = AdaptiveHybridRetriever.from_config(config_name=config_name, work_dir=work_dir)
     examples = load_eval_examples(dataset_path)
     maps = _bundle_maps(work_dir)
-    client = None
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    rows: List[Dict[str, Any]] = []
-    for example in examples:
-        retrieval_result = retriever.retrieve(example.query)
-        if retrieval_result.get("abstained"):
-            answer = "Insufficient evidence."
-        else:
-            structured_answer = _compose_structured_answer(
-                query=example.query,
-                retriever=retriever,
-                retrieval_result=retrieval_result,
-            )
-            if structured_answer is not None:
-                answer = structured_answer
-            else:
-                if client is None:
-                    client = _make_gemini_client()
-                prompt = _build_answer_prompt(
-                    query=example.query,
-                    retrieval_documents=retrieval_result.get("retrieval_documents") or [],
-                    answer_documents=retrieval_result.get("answer_documents") or [],
-                    fact_documents=retrieval_result.get("fact_documents") or [],
-                )
-                response = client.models.generate_content(model=model, contents=prompt)
-                answer = str(getattr(response, "text", "") or "").strip()
-        rows.append(
-            {
-                "id": example.id,
-                "query_type": example.query_type,
-                "source_type": example.source_type,
-                "user_input": example.query,
-                "response": answer,
-                "reference": example.reference_answer,
-                "retrieved_contexts": [
-                    str(item.get("text") or "")
-                    for item in (retrieval_result.get("retrieval_documents") or [])
-                    if isinstance(item, dict) and str(item.get("text") or "").strip()
-                ],
-                "reference_contexts": _reference_contexts(example, maps),
-                "retrieved_context_ids": list(retrieval_result.get("selected_chunk_ids") or []),
-                "reference_context_ids": list(example.gold_chunk_ids),
-                "metadata": {
-                    "mode": retrieval_result.get("mode"),
-                    "seed_chunk_ids": list(retrieval_result.get("seed_chunk_ids") or []),
-                    "selected_answer_ids": list(retrieval_result.get("selected_answer_ids") or []),
-                    "dense_parent_ids": list(retrieval_result.get("dense_parent_ids") or []),
-                    "media_ids": [str(item.get("id") or "") for item in (retrieval_result.get("media") or []) if isinstance(item, dict)],
-                },
-            }
-        )
+    rows_by_id: Dict[str, Dict[str, Any]] = {}
+    if resume_predictions:
+        for row in _read_prediction_rows(output_path):
+            row_id = str(row.get("id") or "").strip()
+            if row_id and not _row_error(row):
+                rows_by_id[row_id] = row
+    else:
+        _write_prediction_rows(output_path, [])
 
-    output_path.write_text(
-        "\n".join(json.dumps(row, ensure_ascii=True) for row in rows) + ("\n" if rows else ""),
-        encoding="utf-8",
-    )
+    def ordered_rows() -> List[Dict[str, Any]]:
+        return [rows_by_id[example.id] for example in examples if example.id in rows_by_id]
+
+    for example in examples:
+        if example.id in rows_by_id:
+            continue
+        started = time.perf_counter()
+        retrieval_result: Dict[str, Any] = {}
+        error = ""
+        try:
+            retrieval_result = retriever.retrieve(example.query)
+            if retrieval_result.get("abstained"):
+                answer = "Insufficient evidence."
+            else:
+                structured_answer = _compose_structured_answer(
+                    query=example.query,
+                    retriever=retriever,
+                    retrieval_result=retrieval_result,
+                )
+                if structured_answer is not None:
+                    answer = structured_answer
+                else:
+                    prompt = _build_answer_prompt(
+                        query=example.query,
+                        retrieval_documents=retrieval_result.get("retrieval_documents") or [],
+                        answer_documents=retrieval_result.get("answer_documents") or [],
+                        fact_documents=retrieval_result.get("fact_documents") or [],
+                        evidence_pack=retrieval_result.get("evidence_pack") or {},
+                    )
+                    answer = _generate_content_with_retry(
+                        prompt=prompt,
+                        model=model,
+                        timeout_seconds=timeout_seconds,
+                        max_retries=max_retries,
+                    )
+        except Exception as exc:
+            answer = ""
+            error = str(exc)
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
+        metadata = {
+            "mode": retrieval_result.get("mode"),
+            "seed_chunk_ids": list(retrieval_result.get("seed_chunk_ids") or []),
+            "selected_answer_ids": list(retrieval_result.get("selected_answer_ids") or []),
+            "dense_parent_ids": list(retrieval_result.get("dense_parent_ids") or []),
+            "media_ids": [str(item.get("id") or "") for item in (retrieval_result.get("media") or []) if isinstance(item, dict)],
+            "backend": "local_indexing_answer_generation",
+            "latency_ms": latency_ms,
+            "error": error,
+        }
+        row = {
+            "id": example.id,
+            "query_type": example.query_type,
+            "source_type": example.source_type,
+            "user_input": example.query,
+            "response": answer,
+            "reference": example.reference_answer,
+            "sources": _sources_from_result(retrieval_result),
+            "retrieved_contexts": _retrieved_contexts_from_result(retrieval_result),
+            "reference_contexts": _reference_contexts(example, maps),
+            "retrieved_context_ids": list(retrieval_result.get("selected_chunk_ids") or []),
+            "reference_context_ids": list(example.gold_chunk_ids),
+            "metadata": metadata,
+            "latency_ms": latency_ms,
+            "error": error,
+        }
+        rows_by_id[example.id] = row
+        _write_prediction_rows(output_path, ordered_rows())
+
+    rows = ordered_rows()
+    _write_prediction_rows(output_path, rows)
+    error_count = sum(1 for row in rows if _row_error(row))
     return {
         "output_path": str(output_path.resolve()),
         "row_count": len(rows),
+        "error_count": error_count,
         "model": model,
     }

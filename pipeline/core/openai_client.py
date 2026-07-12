@@ -15,7 +15,7 @@ def _sanitize_json(raw: str) -> str:
     return re.sub(r",(\s*[\]}])", r"\1", str(raw or ""))
 
 
-def make_openai_client() -> Any:
+def make_openai_client(*, timeout_sec: float | None = None) -> Any:
     try:
         import openai
     except ImportError as exc:  # pragma: no cover - import path validated in stage config
@@ -25,11 +25,23 @@ def make_openai_client() -> Any:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY environment variable is not set")
 
-    client = getattr(_OPENAI_STATE, "client", None)
+    resolved_timeout_sec = max(
+        0.1,
+        float(timeout_sec) if timeout_sec is not None else float(os.getenv("OPENAI_TIMEOUT_SEC", "120")),
+    )
+    clients = getattr(_OPENAI_STATE, "clients", None)
+    if clients is None:
+        clients = {}
+        _OPENAI_STATE.clients = clients
+    cache_key = round(resolved_timeout_sec, 3)
+    client = clients.get(cache_key)
     if client is None:
-        timeout_sec = float(os.getenv("OPENAI_TIMEOUT_SEC", "120"))
-        client = openai.OpenAI(api_key=api_key, timeout=timeout_sec)
-        _OPENAI_STATE.client = client
+        client = openai.OpenAI(api_key=api_key, timeout=resolved_timeout_sec)
+        clients[cache_key] = client
+        if timeout_sec is None:
+            # Preserve the legacy attribute for callers that inspect thread-local
+            # state while allowing deadline-specific clients to coexist safely.
+            _OPENAI_STATE.client = client
     return client
 
 

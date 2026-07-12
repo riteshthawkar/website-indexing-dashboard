@@ -65,7 +65,7 @@ class PipelineState:
 
     run_id: str
     project_name: str
-    status: str = "pending"  # "pending" | "running" | "completed" | "failed"
+    status: str = "pending"  # "pending" | "running" | "paused" | "completed" | "failed"
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     stages: List[StageState] = field(default_factory=list)
@@ -77,7 +77,7 @@ class PipelineState:
         if any(stage.status == "running" for stage in self.stages):
             self.status = "running"
             self.finished_at = None
-        elif self.status in {"pending", "running"}:
+        elif self.status in {"pending", "running", "paused"}:
             self.finished_at = None
 
         first_non_terminal = next(

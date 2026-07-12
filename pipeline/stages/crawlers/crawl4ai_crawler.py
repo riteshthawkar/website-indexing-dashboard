@@ -13,13 +13,17 @@ import contextlib
 import gzip
 import hashlib
 import inspect
+import ipaddress
 import json
 import logging
 import mimetypes
 import re
+import socket
 import time
 import xml.etree.ElementTree as ET
+from functools import lru_cache
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 
@@ -172,15 +176,154 @@ VIDEO_EMBED_HOSTS = {
 }
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 CRAWL_SKIP_EXTENSIONS = DOWNLOADABLE_EXTENSIONS | EXCLUDED_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | TEXT_TRACK_EXTENSIONS
+GENERIC_MBZUAI_PAGE_TITLES = {
+    "mbzuai mohamed bin zayed university of artificial intelligence",
+    "mbzuai - mohamed bin zayed university of artificial intelligence",
+    "mohamed bin zayed university of artificial intelligence",
+}
+GENERIC_SITE_SHELL_PHRASES = {
+    "thoughtcurators for ai creators",
+    "explore our ai degrees",
+    "staff login student login careers contact quick links",
+}
+COMMON_NAVIGATION_LABELS = {
+    "about",
+    "study",
+    "research",
+    "innovate",
+    "sustainability",
+    "careers",
+    "contact",
+    "quick links",
+    "faculty directory",
+    "fast facts",
+    "student login",
+    "staff login",
+    "نبذة عن الجامعة",
+    "الدراسة",
+    "الأبحاث",
+    "البحوث",
+    "الابتكار",
+    "الاستدامة",
+    "الموارد الطلابية",
+    "الأخبار والفعاليات",
+    "اتصل بنا",
+}
+BOILERPLATE_ATTR_TOKENS = (
+    "nav",
+    "navigation",
+    "navbar",
+    "menu",
+    "mega-menu",
+    "header",
+    "footer",
+    "breadcrumb",
+    "cookie",
+    "modal",
+    "popup",
+    "overlay",
+    "skip-link",
+    "quick-link",
+    "quicklink",
+    "social",
+    "newsletter",
+)
+CONTENT_ERROR_PATTERNS = (
+    re.compile(r"\b403\s+forbidden\b", re.I),
+    re.compile(r"\b404\s+not\s+found\b", re.I),
+    re.compile(r"\b500\s+internal\s+server\s+error\b", re.I),
+    re.compile(r"\baccess\s+denied\b", re.I),
+    re.compile(r"\bcss\s+error\b", re.I),
+    re.compile(r"\bsorry\s+to\s+interrupt\b", re.I),
+    re.compile(r"\benable\s+javascript\s+and\s+cookies\b", re.I),
+    re.compile(r"\bjust\s+a\s+moment\b", re.I),
+)
+URL_TOKEN_STOPWORDS = {
+    "www",
+    "http",
+    "https",
+    "html",
+    "php",
+    "asp",
+    "aspx",
+    "index",
+    "page",
+    "pages",
+    "about",
+    "study",
+    "research",
+    "news",
+    "events",
+    "resources",
+    "resource",
+    "student",
+    "students",
+    "faculty",
+    "directory",
+    "mbzuai",
+    "ac",
+    "ae",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "our",
+    "your",
+    "of",
+}
 
 CRAWL_STATE_FILENAME = "crawl_state.json"
 MAPPINGS_FILENAME = "mappings.json"
 PAGE_IMAGES_FILENAME = "page_images.json"
 PAGE_VIDEOS_FILENAME = "page_videos.json"
 PAGE_MEDIA_FILENAME = "page_media.json"
+PAGE_METADATA_FILENAME = "page_metadata.json"
+PAGE_LINK_GRAPH_FILENAME = "page_link_graph.json"
 URL_TO_MD_FILENAME = "url_to_md_mapping.json"
 RUNTIME_STATE_FILENAME = "crawler_checkpoint.json"
 SITEMAP_STATE_FILENAME = "sitemap_discovery.json"
+
+
+def _compact_failure_reason(value: Any, *, max_chars: int = 220) -> str:
+    text = " ".join(str(value or "").split())
+    if not text:
+        return ""
+    return text[:max_chars]
+
+
+def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
+    text = str(value or "").lower()
+    if not text.startswith("skipped"):
+        return False
+    recoverable_tokens = (
+        "browser has been closed",
+        "target page, context or browser has been closed",
+        "browsercontext.add_init_script",
+        "page.goto: timeout",
+        "net::err_internet_disconnected",
+        "net::err_network_changed",
+        "net::err_connection_reset",
+        "net::err_connection_aborted",
+        "net::err_connection_closed",
+        "net::err_connection_timed_out",
+        "skipped_no_result",
+        "skipped_http_403:content_quality",
+        "skipped_low_quality:content_quality:blocked_or_error_page",
+    )
+    return any(token in text for token in recoverable_tokens)
+
+
+def _is_benign_browser_close_error(exc: BaseException) -> bool:
+    text = str(exc or "").lower()
+    return (
+        "browser.close" in text
+        and (
+            "connection closed" in text
+            or "target page, context or browser has been closed" in text
+            or "browser has been closed" in text
+        )
+    )
 
 
 def _normalize_http_url(url: str | None, base_url: str | None = None) -> Optional[str]:
@@ -279,6 +422,40 @@ def _url_digest(url: str) -> str:
     return hashlib.sha1(url.encode("utf-8")).hexdigest()
 
 
+def _is_private_or_reserved_address(address: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(address.strip("[]"))
+    except ValueError:
+        return False
+    return (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+@lru_cache(maxsize=2048)
+def _host_resolves_to_private_or_reserved(host: str) -> bool:
+    if not host:
+        return True
+    if host.lower().strip(".") == "localhost":
+        return True
+    if _is_private_or_reserved_address(host):
+        return True
+    try:
+        infos = socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
+    except socket.gaierror:
+        # DNS failures should not turn an outbound URL into an allowed URL.
+        return True
+    except Exception:
+        logger.debug("Failed to resolve host for egress validation: %s", host, exc_info=True)
+        return True
+    return any(_is_private_or_reserved_address(info[4][0]) for info in infos if info and info[4])
+
+
 def _strip_namespace(tag: str) -> str:
     return tag.rsplit("}", 1)[-1] if "}" in tag else tag
 
@@ -299,6 +476,455 @@ def _tokenize_path(url: str) -> set[str]:
     tokens = set(re.split(r"[^a-z0-9]+", urlparse(url).path.lower()))
     tokens.discard("")
     return tokens
+
+
+def _semantic_tokens(text: str) -> set[str]:
+    tokens = set()
+    for token in re.split(r"[^a-z0-9]+", str(text or "").lower()):
+        if len(token) < 3 or token in URL_TOKEN_STOPWORDS:
+            continue
+        tokens.add(token)
+    return tokens
+
+
+def _url_semantic_tokens(url: str) -> set[str]:
+    return _semantic_tokens(urlparse(url).path)
+
+
+def _token_coverage(required: set[str], observed: set[str]) -> float:
+    if not required:
+        return 1.0
+    return len(required & observed) / len(required)
+
+
+def _extract_html_title(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.title:
+            return " ".join(soup.title.get_text(" ", strip=True).split())
+    except Exception:
+        return ""
+    return ""
+
+
+def _visible_text_from_html(html: str) -> str:
+    if not html:
+        return ""
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "template", "noscript", "svg"]):
+            tag.decompose()
+        return " ".join(soup.get_text(" ", strip=True).split())
+    except Exception:
+        return " ".join(str(html or "").split())
+
+
+def _contains_error_or_block_text(text: str) -> bool:
+    if not text:
+        return False
+    return any(pattern.search(text) for pattern in CONTENT_ERROR_PATTERNS)
+
+
+def _is_generic_mbzuai_title(title: str) -> bool:
+    normalized = re.sub(r"\s+", " ", str(title or "").strip().lower())
+    return normalized in GENERIC_MBZUAI_PAGE_TITLES
+
+
+def _normalize_path_prefix(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    return "/" + text.strip("/")
+
+
+def _url_matches_path_prefix(url: str, prefixes: Iterable[str]) -> bool:
+    normalized = _normalize_http_url(url)
+    if not normalized:
+        return False
+    path = "/" + urlparse(normalized).path.strip("/")
+    for prefix in prefixes:
+        clean_prefix = _normalize_path_prefix(prefix)
+        if not clean_prefix:
+            continue
+        if path == clean_prefix or path.startswith(f"{clean_prefix}/"):
+            return True
+    return False
+
+
+def _html_quality_report(html: str, page_url: str, markdown: str = "") -> Dict[str, Any]:
+    title = _extract_html_title(html)
+    visible_text = _visible_text_from_html(html)
+    combined_text = " ".join(part for part in (title, visible_text, markdown) if part)
+    path_tokens = _url_semantic_tokens(page_url)
+    combined_tokens = _semantic_tokens(combined_text)
+    title_tokens = _semantic_tokens(title)
+    token_coverage = _token_coverage(path_tokens, combined_tokens)
+    title_token_coverage = _token_coverage(path_tokens, title_tokens)
+    lower_text = combined_text.lower()
+
+    reasons: List[str] = []
+    critical = False
+    if not html or not str(html).strip():
+        reasons.append("empty_html")
+        critical = True
+    if _contains_error_or_block_text(combined_text):
+        reasons.append("blocked_or_error_page")
+        critical = True
+    if path_tokens and _is_generic_mbzuai_title(title):
+        reasons.append("generic_mbzuai_title")
+    if path_tokens and any(phrase in lower_text for phrase in GENERIC_SITE_SHELL_PHRASES) and token_coverage < 0.5:
+        reasons.append("generic_site_shell")
+    if path_tokens and token_coverage < 0.34 and title_token_coverage < 0.34:
+        reasons.append("url_token_mismatch")
+    if path_tokens and 0 < len(visible_text) < 120:
+        reasons.append("thin_html")
+    if (
+        path_tokens
+        and "generic_mbzuai_title" in reasons
+        and "url_token_mismatch" in reasons
+        and ("thin_html" in reasons or len(visible_text) < 300)
+    ):
+        critical = True
+
+    score = min(len(visible_text) / 100.0, 60.0)
+    score += token_coverage * 30.0
+    score += title_token_coverage * 10.0
+    if "generic_mbzuai_title" in reasons:
+        score -= 15.0
+    if "generic_site_shell" in reasons:
+        score -= 35.0
+    if "url_token_mismatch" in reasons:
+        score -= 20.0
+    if critical:
+        score -= 100.0
+
+    return {
+        "title": title,
+        "visible_text_chars": len(visible_text),
+        "path_tokens": sorted(path_tokens),
+        "token_coverage": round(token_coverage, 3),
+        "title_token_coverage": round(title_token_coverage, 3),
+        "reasons": reasons,
+        "score": round(score, 3),
+        "usable": not critical,
+    }
+
+
+def _select_preferred_page_capture(
+    page_url: str,
+    rendered_html: str,
+    raw_source_html: str = "",
+    rendered_markdown: str = "",
+) -> Tuple[str, str, Dict[str, Any]]:
+    """Select the HTML capture that best represents the requested page."""
+    rendered_report = _html_quality_report(rendered_html, page_url, markdown=rendered_markdown)
+    raw_report = _html_quality_report(raw_source_html, page_url) if raw_source_html else {}
+    selected_html = rendered_html
+    selected_source = "rendered"
+    selection_reason = "rendered_capture_accepted"
+
+    if raw_source_html and raw_report.get("usable"):
+        rendered_reasons = set(rendered_report.get("reasons") or [])
+        raw_reasons = set(raw_report.get("reasons") or [])
+        if not rendered_report.get("usable"):
+            selection_reason = "rendered_capture_unusable"
+            selected_html = raw_source_html
+            selected_source = "raw_source"
+        elif "generic_mbzuai_title" in rendered_reasons and "generic_mbzuai_title" not in raw_reasons:
+            selection_reason = "raw_source_has_page_specific_title"
+            selected_html = raw_source_html
+            selected_source = "raw_source"
+        elif "generic_site_shell" in rendered_reasons and "generic_site_shell" not in raw_reasons:
+            selection_reason = "raw_source_avoids_generic_site_shell"
+            selected_html = raw_source_html
+            selected_source = "raw_source"
+        elif "url_token_mismatch" in rendered_reasons and "url_token_mismatch" not in raw_reasons:
+            selection_reason = "raw_source_matches_requested_url"
+            selected_html = raw_source_html
+            selected_source = "raw_source"
+        elif float(raw_report.get("score") or 0.0) >= float(rendered_report.get("score") or 0.0) + 12.0:
+            selection_reason = "raw_source_has_higher_content_quality"
+            selected_html = raw_source_html
+            selected_source = "raw_source"
+
+    selected_report = raw_report if selected_source == "raw_source" else rendered_report
+    return selected_html, selected_source, {
+        "selected_source": selected_source,
+        "selection_reason": selection_reason,
+        "selected": selected_report,
+        "rendered": rendered_report,
+        "raw_source": raw_report,
+    }
+
+
+def _markdown_plain_text(markdown: str) -> str:
+    text = re.sub(r"!\[[^\]]*\]\([^)]+\)", " ", str(markdown or ""))
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"[#*_`>|-]+", " ", text)
+    return " ".join(text.split())
+
+
+def _clean_page_title_for_markdown(title: str) -> str:
+    title = " ".join(str(title or "").split()).strip()
+    return re.sub(r"\s+-\s+MBZUAI$", "", title, flags=re.I).strip() or title
+
+
+def _ensure_markdown_has_page_title(markdown: str, html: str) -> str:
+    markdown = str(markdown or "").strip()
+    if not markdown:
+        return ""
+    title = _clean_page_title_for_markdown(_extract_html_title(html))
+    if not title:
+        return markdown
+    plain = _markdown_plain_text(markdown).lower()
+    if title.lower() in plain[:600]:
+        return markdown
+    return f"# {title}\n\n{markdown}"
+
+
+def _starts_with_generic_site_shell(markdown: str) -> bool:
+    plain = _markdown_plain_text(markdown).lower()
+    return plain.startswith("thought curators for ai creators") or plain.startswith("thoughtcurators for ai creators")
+
+
+def _markdown_has_navigation_prefix(markdown: str) -> bool:
+    lines = [line.strip() for line in str(markdown or "").splitlines() if line.strip()]
+    if len(lines) < 5:
+        return False
+
+    first_lines = lines[:24]
+    link_lines = [line for line in first_lines if re.search(r"\[[^\]]+\]\([^)]+\)", line)]
+    ordered_link_lines = [
+        line for line in link_lines if re.match(r"^\s*\d+[.)]\s+\[[^\]]+\]\([^)]+\)", line)
+    ]
+    section_label_hits = 0
+    for line in first_lines:
+        normalized = re.sub(r"[^a-z ]+", " ", line.lower())
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        if normalized in COMMON_NAVIGATION_LABELS:
+            section_label_hits += 1
+
+    return (
+        len(ordered_link_lines) >= 6
+        or (section_label_hits >= 2 and len(link_lines) >= 4)
+        or (section_label_hits >= 1 and len(ordered_link_lines) >= 4)
+    )
+
+
+def _markdown_looks_navigation_heavy(markdown: str) -> bool:
+    lines = [line.strip() for line in str(markdown or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    if _markdown_has_navigation_prefix(markdown):
+        return True
+    link_lines = [line for line in lines if re.search(r"\[[^\]]+\]\([^)]+\)", line)]
+    initial_lines = [
+        re.sub(r"^\s*(?:[-*]|\d+[.)])\s*", "", line).strip().lower()
+        for line in lines[:12]
+    ]
+    nav_label_hits = 0
+    for line in initial_lines:
+        compact = re.sub(r"\s+", " ", line)
+        if compact in COMMON_NAVIGATION_LABELS:
+            nav_label_hits += 1
+        elif any(label in compact for label in COMMON_NAVIGATION_LABELS if " " in label):
+            nav_label_hits += 1
+    if len(lines) >= 5 and nav_label_hits >= 3:
+        return True
+    if len(lines) >= 8 and len(link_lines) / len(lines) > 0.55:
+        return True
+    plain = _markdown_plain_text(markdown)
+    link_text = " ".join(re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", line) for line in link_lines)
+    return bool(plain) and len(link_text) / max(len(plain), 1) > 0.55 and len(link_lines) >= 10
+
+
+def _markdown_looks_thin_boilerplate(markdown: str, page_url: str = "") -> bool:
+    plain = _markdown_plain_text(markdown)
+    if not plain:
+        return False
+
+    word_count = len(re.findall(r"\w+", plain))
+    if word_count >= 80:
+        return False
+
+    lower_plain = plain.lower()
+    has_cookie_banner = "we use cookies" in lower_plain and "necessary and analytics cookies" in lower_plain
+    has_contact_cta = (
+        "interested in working with our faculty" in lower_plain
+        or "fill out the form below" in lower_plain
+        or "مهتم بالعمل مع أعضاء هيئة التدريس لدينا" in plain
+        or "قم بتعبئة النموذج أدناه" in plain
+    )
+    if not (has_cookie_banner and has_contact_cta):
+        return False
+
+    path = urlparse(page_url).path.lower()
+    return "/study/faculty/" in path or "/ar/study/faculty/" in path
+
+
+def _markdown_quality_reason(markdown: str, page_url: str, *, html: str = "") -> str:
+    plain = _markdown_plain_text(markdown)
+    if not plain:
+        return "empty_markdown"
+    if _contains_error_or_block_text(plain):
+        return "blocked_or_error_page"
+    if urlparse(page_url).path.strip("/") and _starts_with_generic_site_shell(markdown):
+        return "generic_site_shell"
+    if _markdown_looks_navigation_heavy(markdown):
+        return "navigation_heavy"
+    if _markdown_looks_thin_boilerplate(markdown, page_url):
+        return "thin_boilerplate"
+
+    path_tokens = _url_semantic_tokens(page_url)
+    if not path_tokens:
+        return ""
+
+    markdown_tokens = _semantic_tokens(plain)
+    markdown_coverage = _token_coverage(path_tokens, markdown_tokens)
+    lower_plain = plain.lower()
+    if _is_generic_mbzuai_title(plain) and markdown_coverage < 0.34:
+        return "generic_mbzuai_title"
+    if any(phrase in lower_plain for phrase in GENERIC_SITE_SHELL_PHRASES) and markdown_coverage < 0.5:
+        return "generic_site_shell"
+
+    if html:
+        html_report = _html_quality_report(html, page_url)
+        if (
+            html_report.get("usable")
+            and float(html_report.get("token_coverage") or 0.0) >= 0.67
+            and markdown_coverage < 0.34
+        ):
+            return "url_token_mismatch"
+    return ""
+
+
+def _best_content_node(soup: BeautifulSoup) -> Any:
+    candidates: List[Any] = []
+    for selector in (
+        "main",
+        "article",
+        "[role='main']",
+        ".page-main-content",
+        ".entry-content",
+        ".page-content",
+        ".post-content",
+        ".content",
+    ):
+        candidates.extend(soup.select(selector))
+
+    for node in soup.find_all(["section", "div"]):
+        text = node.get_text(" ", strip=True)
+        if len(text) < 300:
+            continue
+        paragraphs = node.find_all(["p", "h1", "h2", "h3", "li"])
+        if len(paragraphs) < 2:
+            continue
+        candidates.append(node)
+
+    if not candidates and soup.body:
+        candidates.append(soup.body)
+    if not candidates:
+        candidates.append(soup)
+
+    def score(node: Any) -> int:
+        text = node.get_text(" ", strip=True) if node else ""
+        link_text = " ".join(anchor.get_text(" ", strip=True) for anchor in node.find_all("a")) if node else ""
+        paragraphs = len(node.find_all("p")) if node else 0
+        headings = len(node.find_all(["h1", "h2", "h3"])) if node else 0
+        return len(text) - int(len(link_text) * 1.5) + (paragraphs * 120) + (headings * 80)
+
+    return max(candidates, key=score)
+
+
+def _remove_boilerplate_nodes(soup: BeautifulSoup) -> None:
+    for tag in soup(["script", "style", "template", "noscript", "svg", "nav", "header", "footer", "form"]):
+        tag.decompose()
+
+    for tag in list(soup.find_all(True)):
+        if tag.parent is None or not isinstance(getattr(tag, "attrs", None), dict):
+            continue
+        if tag.name in {"html", "body", "main", "article"}:
+            continue
+        attr_parts = [
+            str(tag.get("id") or ""),
+            " ".join(str(value) for value in (tag.get("class") or [])),
+            str(tag.get("role") or ""),
+            str(tag.get("aria-label") or ""),
+        ]
+        attr_text = " ".join(attr_parts).lower()
+        if not attr_text:
+            continue
+        if any(token in attr_text for token in BOILERPLATE_ATTR_TOKENS):
+            text = tag.get_text(" ", strip=True)
+            link_text = " ".join(anchor.get_text(" ", strip=True) for anchor in tag.find_all("a"))
+            link_ratio = len(link_text) / max(len(text), 1)
+            paragraph_count = len(tag.find_all("p"))
+            if link_ratio >= 0.35 or paragraph_count <= 2 or len(text) < 2500:
+                tag.decompose()
+
+
+def _bs4_html_to_markdown(html: str) -> str:
+    soup = BeautifulSoup(html or "", "html.parser")
+    _remove_boilerplate_nodes(soup)
+
+    node = _best_content_node(soup)
+    lines: List[str] = []
+    seen: set[str] = set()
+    block_tags = {"h1", "h2", "h3", "h4", "p", "li", "blockquote", "figcaption", "td", "th"}
+    for element in node.find_all(list(block_tags), recursive=True):
+        if element.find_parent(block_tags):
+            continue
+        text = " ".join(element.get_text(" ", strip=True).split())
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        if element.name == "h1":
+            lines.append(f"# {text}")
+        elif element.name == "h2":
+            lines.append(f"## {text}")
+        elif element.name in {"h3", "h4"}:
+            lines.append(f"### {text}")
+        elif element.name == "li":
+            lines.append(f"- {text}")
+        else:
+            lines.append(text)
+
+    if not lines:
+        text = " ".join(node.get_text(" ", strip=True).split())
+        if text:
+            lines.append(text)
+    return "\n\n".join(lines).strip()
+
+
+def _html_to_markdown(html: str, page_url: str = "") -> str:
+    if not html or not str(html).strip():
+        return ""
+
+    extracted = ""
+    try:
+        import trafilatura
+
+        extracted = trafilatura.extract(
+            html,
+            url=page_url or None,
+            output_format="markdown",
+            include_tables=True,
+            include_links=True,
+            include_images=False,
+            favor_recall=True,
+        ) or ""
+    except Exception:
+        extracted = ""
+
+    if extracted and not _markdown_looks_navigation_heavy(extracted):
+        return _ensure_markdown_has_page_title(extracted, html)
+
+    fallback = _bs4_html_to_markdown(html)
+    if fallback:
+        return _ensure_markdown_has_page_title(fallback, html)
+    return _ensure_markdown_has_page_title(extracted, html)
 
 
 def _decode_sitemap_payload(payload: bytes, source_url: str = "", content_type: str = "") -> bytes:
@@ -348,6 +974,7 @@ def _build_initial_crawl_state(
     discovered_urls: Sequence[str],
     max_pages: int,
     frontier_seed_limit: Optional[int] = None,
+    priority_urls: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Seed the crawl frontier from the start URL and sitemap-discovered URLs."""
     normalized_start = _normalize_http_url(start_url)
@@ -361,7 +988,8 @@ def _build_initial_crawl_state(
     if frontier_seed_limit is not None:
         remaining = min(remaining, max(0, int(frontier_seed_limit)))
 
-    for candidate in discovered_urls:
+    ordered_candidates = [*(priority_urls or []), *discovered_urls]
+    for candidate in ordered_candidates:
         normalized = _normalize_http_url(candidate)
         if not normalized or normalized in seen:
             continue
@@ -656,6 +1284,290 @@ def _json_ld_items(soup: BeautifulSoup) -> List[Dict[str, Any]]:
     return items
 
 
+def _compact_json_ld(value: Any, *, max_items: int = 20, max_string_len: int = 2000, depth: int = 0) -> Any:
+    if depth > 5:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text[:max_string_len]
+    if isinstance(value, list):
+        compacted = [
+            _compact_json_ld(item, max_items=max_items, max_string_len=max_string_len, depth=depth + 1)
+            for item in value[:max_items]
+        ]
+        return [item for item in compacted if item not in (None, "", [], {})]
+    if isinstance(value, dict):
+        compacted = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= max_items:
+                break
+            compact = _compact_json_ld(item, max_items=max_items, max_string_len=max_string_len, depth=depth + 1)
+            if compact not in (None, "", [], {}):
+                compacted[str(key)] = compact
+        return compacted
+    return value
+
+
+def _page_graph_node_id(url: str) -> str:
+    return f"page:{_url_digest(url)[:24]}"
+
+
+def _page_graph_edge_id(source_url: str, target_url: str) -> str:
+    return f"edge:{_url_digest(f'{source_url}|{target_url}')[:24]}"
+
+
+def _append_meta_value(target: Dict[str, Any], key: str, value: str) -> None:
+    normalized_key = (key or "").strip().lower()
+    normalized_value = " ".join(str(value or "").split()).strip()
+    if not normalized_key or not normalized_value:
+        return
+    current = target.get(normalized_key)
+    if current is None:
+        target[normalized_key] = normalized_value
+    elif isinstance(current, list):
+        if normalized_value not in current:
+            current.append(normalized_value)
+    elif current != normalized_value:
+        target[normalized_key] = [current, normalized_value]
+
+
+def _extract_page_metadata(
+    html: str,
+    page_url: str,
+    *,
+    status_code: Any = None,
+    html_path: str = "",
+    markdown_path: str = "",
+    depth: Any = None,
+    images_count: int = 0,
+    videos_count: int = 0,
+    media_count: int = 0,
+    capture_source: str = "",
+    content_quality: Optional[Dict[str, Any]] = None,
+    markdown_source: str = "",
+    markdown_quality_reason: str = "",
+) -> Dict[str, Any]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    title = ""
+    if soup.title:
+        title = " ".join(soup.title.get_text(" ", strip=True).split())
+
+    meta_tags: Dict[str, Any] = {}
+    for tag in soup.find_all("meta"):
+        key = tag.get("name") or tag.get("property") or tag.get("http-equiv") or tag.get("itemprop")
+        content = tag.get("content")
+        if key and content:
+            _append_meta_value(meta_tags, str(key), str(content))
+
+    canonical_url = ""
+    canonical_tag = soup.find("link", rel=lambda value: value and "canonical" in str(value).lower())
+    if canonical_tag:
+        canonical_url = _normalize_http_url(canonical_tag.get("href"), base_url=page_url) or ""
+
+    alternate_urls: List[Dict[str, str]] = []
+    for link in soup.find_all("link"):
+        rel_value = " ".join(link.get("rel") or []) if isinstance(link.get("rel"), list) else str(link.get("rel") or "")
+        if "alternate" not in rel_value.lower():
+            continue
+        href = _normalize_http_url(link.get("href"), base_url=page_url)
+        if not href:
+            continue
+        alternate_urls.append(
+            {
+                "url": href,
+                "hreflang": str(link.get("hreflang") or ""),
+                "type": str(link.get("type") or ""),
+            }
+        )
+
+    headings = {
+        tag_name: [
+            " ".join(tag.get_text(" ", strip=True).split())[:240]
+            for tag in soup.find_all(tag_name)
+            if tag.get_text(" ", strip=True)
+        ][:50]
+        for tag_name in ("h1", "h2", "h3")
+    }
+
+    json_ld = []
+    for item in _json_ld_items(soup):
+        compact = _compact_json_ld(item)
+        if compact:
+            json_ld.append(compact)
+
+    parsed = urlparse(page_url)
+    return {
+        "url": page_url,
+        "status_code": status_code,
+        "host": parsed.hostname or "",
+        "path": parsed.path or "/",
+        "depth": depth,
+        "title": title,
+        "description": meta_tags.get("description") or meta_tags.get("og:description") or "",
+        "canonical_url": canonical_url,
+        "language": str((soup.html or {}).get("lang") or ""),
+        "robots": meta_tags.get("robots") or "",
+        "meta_tags": meta_tags,
+        "alternate_urls": alternate_urls,
+        "headings": headings,
+        "json_ld": json_ld[:20],
+        "html_path": html_path,
+        "markdown_path": markdown_path,
+        "content_bytes": len((html or "").encode("utf-8")),
+        "images_count": images_count,
+        "videos_count": videos_count,
+        "media_count": media_count,
+        "capture_source": capture_source,
+        "content_quality": content_quality or {},
+        "markdown_source": markdown_source,
+        "markdown_quality_reason": markdown_quality_reason,
+    }
+
+
+def _link_type_for_url(url: str, allowed_domains: set[str]) -> str:
+    extension = _url_extension(url)
+    if extension in DOWNLOADABLE_EXTENSIONS:
+        return "document"
+    host = (urlparse(url).hostname or "").lower()
+    if any(_host_matches_domain(host, allowed) for allowed in allowed_domains):
+        return "internal"
+    return "external"
+
+
+def _extract_page_links(
+    result: Any,
+    html: str,
+    base_url: str,
+    *,
+    allowed_domains: set[str],
+) -> List[Dict[str, Any]]:
+    links_by_target: Dict[str, Dict[str, Any]] = {}
+
+    def add_link(href: Any, *, anchor_text: str = "", rel: Any = None, source: str = "") -> None:
+        target_url = _normalize_http_url(str(href or ""), base_url=base_url)
+        if not target_url or target_url == base_url:
+            return
+        item = links_by_target.setdefault(
+            target_url,
+            {
+                "source_url": base_url,
+                "target_url": target_url,
+                "link_type": _link_type_for_url(target_url, allowed_domains),
+                "anchor_texts": [],
+                "rels": [],
+                "sources": [],
+            },
+        )
+        text = " ".join(str(anchor_text or "").split()).strip()
+        if text and text not in item["anchor_texts"]:
+            item["anchor_texts"].append(text[:180])
+        rel_values = rel if isinstance(rel, list) else [rel] if rel else []
+        for value in rel_values:
+            rel_text = str(value or "").strip()
+            if rel_text and rel_text not in item["rels"]:
+                item["rels"].append(rel_text[:80])
+        if source and source not in item["sources"]:
+            item["sources"].append(source)
+
+    links = getattr(result, "links", None) or {}
+    for group in ("internal", "external"):
+        for item in links.get(group, []) or []:
+            if isinstance(item, dict):
+                add_link(
+                    item.get("href"),
+                    anchor_text=str(item.get("text") or item.get("title") or ""),
+                    rel=item.get("rel"),
+                    source=f"crawl4ai:{group}",
+                )
+
+    if html:
+        soup = BeautifulSoup(html, "html.parser")
+        for anchor in soup.find_all("a", href=True):
+            add_link(
+                anchor.get("href"),
+                anchor_text=anchor.get_text(" ", strip=True),
+                rel=anchor.get("rel"),
+                source="html:a",
+            )
+
+    return list(links_by_target.values())
+
+
+def _build_page_link_graph_payload(
+    *,
+    page_metadata: Dict[str, Dict[str, Any]],
+    page_links: Dict[str, List[Dict[str, Any]]],
+) -> Dict[str, Any]:
+    node_urls: set[str] = set(page_metadata.keys())
+    for source_url, links in page_links.items():
+        node_urls.add(source_url)
+        for link in links or []:
+            target_url = str(link.get("target_url") or "")
+            if target_url:
+                node_urls.add(target_url)
+
+    nodes = []
+    for url in sorted(node_urls):
+        metadata = page_metadata.get(url) or {}
+        nodes.append(
+            {
+                "id": _page_graph_node_id(url),
+                "url": url,
+                "node_type": "page" if url in page_metadata else "discovered_url",
+                "label": metadata.get("title") or url,
+                "properties": {
+                    "status_code": metadata.get("status_code"),
+                    "canonical_url": metadata.get("canonical_url"),
+                    "depth": metadata.get("depth"),
+                    "description": metadata.get("description"),
+                    "path": metadata.get("path"),
+                    "host": metadata.get("host"),
+                },
+            }
+        )
+
+    edges = []
+    for source_url, links in sorted(page_links.items()):
+        for link in links or []:
+            target_url = str(link.get("target_url") or "")
+            if not target_url:
+                continue
+            edges.append(
+                {
+                    "id": _page_graph_edge_id(source_url, target_url),
+                    "edge_type": "LINKS_TO",
+                    "source_id": _page_graph_node_id(source_url),
+                    "target_id": _page_graph_node_id(target_url),
+                    "source_url": source_url,
+                    "target_url": target_url,
+                    "properties": {
+                        "link_type": link.get("link_type"),
+                        "anchor_texts": list(link.get("anchor_texts") or [])[:5],
+                        "rels": list(link.get("rels") or [])[:5],
+                        "sources": list(link.get("sources") or [])[:5],
+                    },
+                }
+            )
+
+    link_type_counts: Dict[str, int] = {}
+    for edge in edges:
+        link_type = str((edge.get("properties") or {}).get("link_type") or "unknown")
+        link_type_counts[link_type] = link_type_counts.get(link_type, 0) + 1
+
+    return {
+        "schema_version": 1,
+        "graph_type": "website_page_link_graph",
+        "nodes": nodes,
+        "edges": edges,
+        "stats": {
+            "node_count": len(nodes),
+            "edge_count": len(edges),
+            "crawled_page_count": len(page_metadata),
+            "link_type_counts": link_type_counts,
+        },
+    }
+
+
 def _merge_media_item(base: Dict[str, Any], extra: Dict[str, Any]) -> Dict[str, Any]:
     merged = dict(base)
     for key, value in extra.items():
@@ -914,6 +1826,23 @@ def _build_stable_output_path(destination_dir: Path, url: str, content_type: str
     return destination_dir / f"{stem[:80]}_{digest}{ext.lower()}"
 
 
+def _raw_source_candidate_urls(page_url: str) -> List[str]:
+    normalized = _normalize_http_url(page_url)
+    if not normalized:
+        return []
+    candidates = [normalized]
+    parsed = urlparse(normalized)
+    if parsed.query:
+        return candidates
+
+    path = parsed.path or ""
+    if path and not path.endswith("/") and not Path(path).suffix:
+        candidates.append(urlunparse((parsed.scheme, parsed.netloc, f"{path}/", "", "", "")))
+    elif path.endswith("/") and path != "/":
+        candidates.append(urlunparse((parsed.scheme, parsed.netloc, path.rstrip("/"), "", "", "")))
+    return list(dict.fromkeys(candidates))
+
+
 def _is_content_image(url: str, alt: str, width: Any, height: Any, caption: str = "", context: str = "") -> bool:
     """Heuristic filter for meaningful content images."""
     if not url or str(url).startswith("data:"):
@@ -1002,7 +1931,11 @@ class AllowedDomainFilter(URLFilter):
         host = (urlparse(url).hostname or "").lower()
         if not host:
             return False
-        if any(_host_matches_domain(host, excluded) for excluded in self.excluded_subdomains):
+        # Helper-level tests and resume recovery can construct a crawler from
+        # persisted state before the full execute() initialization path runs.
+        # Missing optional policy collections must default closed/safely.
+        excluded_subdomains = getattr(self, "excluded_subdomains", set()) or set()
+        if any(_host_matches_domain(host, excluded) for excluded in excluded_subdomains):
             return False
         return any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
 
@@ -1049,6 +1982,21 @@ class SkipQueryFilter(URLFilter):
             if str(key).strip()
         }
         return query_names.issubset(self.allowed_query_param_names)
+
+
+class PathPrefixFilter(URLFilter):
+    """Reject configured low-value path prefixes from the crawl frontier."""
+
+    def __init__(self, excluded_path_prefixes: Iterable[str] | None = None):
+        super().__init__(name="PathPrefixFilter")
+        self.excluded_path_prefixes = {
+            _normalize_path_prefix(value)
+            for value in (excluded_path_prefixes or [])
+            if _normalize_path_prefix(value)
+        }
+
+    def apply(self, url: str) -> bool:
+        return not _url_matches_path_prefix(url, self.excluded_path_prefixes)
 
 
 @register_stage
@@ -1128,8 +2076,31 @@ class Crawl4AICrawler(CrawlerStage):
             return StageResult.failure("crawl4ai is not installed")
 
         self.timeout = float(self.config.get("timeout", 30))
+        self.respect_robots_txt = bool(self.config.get("respect_robots_txt", True))
         self.fetch_concurrency = max(1, int(self.config.get("fetch_concurrency", 5)))
         self.download_concurrency = max(1, int(self.config.get("download_concurrency", 10)))
+        self.sitemap_batch_crawl = bool(self.config.get("sitemap_batch_crawl", False))
+        self.sitemap_crawl_batch_size = max(
+            1,
+            int(
+                self.config.get(
+                    "sitemap_crawl_batch_size",
+                    max(self.fetch_concurrency * 4, 20),
+                )
+            ),
+        )
+        self.sitemap_failed_url_retry_attempts = max(
+            0, int(self.config.get("sitemap_failed_url_retry_attempts", 2))
+        )
+        self.sitemap_failed_retry_backoff = max(
+            0.0, float(self.config.get("sitemap_failed_retry_backoff_sec", 2.0))
+        )
+        self.retry_recoverable_skipped_on_resume = bool(
+            self.config.get("retry_recoverable_skipped_on_resume", True)
+        )
+        self.recoverable_skip_max_retries = max(
+            0, int(self.config.get("recoverable_skip_max_retries", 2))
+        )
         self.max_pages = max(1, int(self.config.get("max_pages", 1000)))
         self.max_depth = max(0, int(self.config.get("max_depth", 10)))
         self.max_file_size_bytes = int(float(self.config.get("max_file_size_mb", 100)) * 1024 * 1024)
@@ -1141,6 +2112,8 @@ class Crawl4AICrawler(CrawlerStage):
         self.max_videos_per_page = max(0, int(self.config.get("max_videos_per_page", 10)))
         self.retry_attempts = max(1, int(self.config.get("download_retry_attempts", 3)))
         self.retry_backoff = max(0.1, float(self.config.get("download_retry_backoff_sec", 2.0)))
+        self.raw_source_retry_attempts = max(1, int(self.config.get("raw_source_retry_attempts", 2)))
+        self.raw_source_retry_backoff = max(0.0, float(self.config.get("raw_source_retry_backoff_sec", 0.75)))
         self.checkpoint_flush_interval = max(
             0.0, float(self.config.get("checkpoint_flush_interval_sec", 5.0))
         )
@@ -1149,8 +2122,13 @@ class Crawl4AICrawler(CrawlerStage):
         self.download_page_images = bool(self.config.get("download_page_images", True))
         self.fetch_video_transcripts = bool(self.config.get("fetch_video_transcripts", True))
         self.parse_source_html_for_media = bool(self.config.get("parse_source_html_for_media", True))
+        self.validate_source_html = bool(self.config.get("validate_source_html", True))
+        self.validate_source_html_mode = str(
+            self.config.get("validate_source_html_mode", "on_quality_warning") or "on_quality_warning"
+        ).strip().lower()
         self.headless = bool(self.config.get("headless", True))
-        self.ignore_https_errors = bool(self.config.get("ignore_https_errors", True))
+        self.ignore_https_errors = bool(self.config.get("ignore_https_errors", False))
+        self.require_https = bool(self.config.get("require_https", True))
         self.enable_stealth = bool(self.config.get("enable_stealth", False))
         self.allowed_domains = self._resolve_allowed_domains()
         self.excluded_subdomains = {
@@ -1166,8 +2144,23 @@ class Crawl4AICrawler(CrawlerStage):
             for value in (self.config.get("allowed_query_param_names") or [])
             if str(value).strip()
         }
+        self.excluded_path_prefixes = {
+            _normalize_path_prefix(value)
+            for value in (self.config.get("excluded_path_prefixes") or [])
+            if _normalize_path_prefix(value)
+        }
         self.frontier_empty_timeout = max(30, int(self.config.get("frontier_empty_timeout_sec", 180) or 180))
         self.crawl_stall_timeout = max(self.frontier_empty_timeout, int(self.config.get("crawl_stall_timeout_sec", 900) or 900))
+        self.priority_seed_urls = []
+        for value in self.config.get("priority_seed_urls") or self.config.get("required_seed_urls") or []:
+            url = _normalize_http_url(value, self.start_url)
+            host = (urlparse(url).hostname or "").lower() if url else ""
+            if (
+                url
+                and self._allow_frontier_url(url)
+                and any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
+            ):
+                self.priority_seed_urls.append(url)
 
         self.html_dir = ensure_dir(ctx.work_dir / "html")
         self.md_dir = ensure_dir(ctx.work_dir / "markdown")
@@ -1178,6 +2171,8 @@ class Crawl4AICrawler(CrawlerStage):
         self.page_images_file = ctx.work_dir / PAGE_IMAGES_FILENAME
         self.page_videos_file = ctx.work_dir / PAGE_VIDEOS_FILENAME
         self.page_media_file = ctx.work_dir / PAGE_MEDIA_FILENAME
+        self.page_metadata_file = ctx.work_dir / PAGE_METADATA_FILENAME
+        self.page_link_graph_file = ctx.work_dir / PAGE_LINK_GRAPH_FILENAME
         self.url_to_md_mapping_file = ctx.work_dir / URL_TO_MD_FILENAME
         self.crawl_state_file = ctx.work_dir / CRAWL_STATE_FILENAME
         self.runtime_state_file = ctx.work_dir / RUNTIME_STATE_FILENAME
@@ -1188,20 +2183,32 @@ class Crawl4AICrawler(CrawlerStage):
             "pages_failed": 0,
             "markdown_written": 0,
             "documents_downloaded": 0,
+            "http_fallback_pages": 0,
+            "http_fallback_retries": 0,
+            "source_html_validations": 0,
+            "source_html_replacements": 0,
+            "low_quality_markdown_suppressed": 0,
+            "content_quality_warnings": 0,
             "images_extracted": 0,
             "images_downloaded": 0,
             "videos_extracted": 0,
             "video_transcripts_fetched": 0,
             "bytes_downloaded": 0,
             "sitemap_urls_seeded": 0,
+            "sitemap_batches_completed": 0,
             "skipped_urls": 0,
+            "excluded_frontier_urls": 0,
+            "recoverable_skips_exhausted": 0,
         }
         self.url_mapping: Dict[str, str] = {}
         self.url_to_md_mapping: Dict[str, str] = {}
         self.page_images: Dict[str, List[Dict[str, str]]] = {}
         self.page_videos: Dict[str, List[Dict[str, Any]]] = {}
         self.page_media: Dict[str, List[Dict[str, Any]]] = {}
+        self.page_metadata: Dict[str, Dict[str, Any]] = {}
+        self.page_links: Dict[str, List[Dict[str, Any]]] = {}
         self.downloaded_images: Dict[str, str] = {}
+        self.recoverable_skip_retries: Dict[str, int] = {}
         self.crawl_state: Dict[str, Any] = {}
         self.discovered_sitemaps: Dict[str, Any] = {"sources": [], "urls": []}
         self._last_flush_at = 0.0
@@ -1212,9 +2219,13 @@ class Crawl4AICrawler(CrawlerStage):
         self._crawl_watchdog_error: Optional[str] = None
 
         self._load_runtime_state(ctx.checkpoint)
+        if self.retry_recoverable_skipped_on_resume:
+            self._requeue_recoverable_skipped_urls()
 
         try:
             await self._open_http_session()
+            if not self._allow_frontier_url(self.start_url):
+                raise ValueError("crawler.start_url is outside the allowed egress policy")
 
             if not _has_resumable_crawl_state(self.crawl_state):
                 sitemap_urls = []
@@ -1226,28 +2237,42 @@ class Crawl4AICrawler(CrawlerStage):
                     sitemap_urls,
                     self.max_pages,
                     frontier_seed_limit=self.config.get("sitemap_frontier_seed_limit"),
+                    priority_urls=self.priority_seed_urls,
                 )
                 self._write_crawl_state_file()
 
             browser_config = self._build_browser_config()
             run_config = self._build_run_config()
 
-            async with AsyncWebCrawler(config=browser_config) as crawler:
-                results = crawler.arun(url=self.start_url, config=run_config)
-                if asyncio.iscoroutine(results):
-                    crawl_task = asyncio.create_task(results)
-                    watchdog = asyncio.create_task(self._watch_crawl_health(crawl_task))
-                    try:
-                        results = await crawl_task
-                    except asyncio.CancelledError:
-                        if self._crawl_watchdog_error:
-                            raise RuntimeError(self._crawl_watchdog_error) from None
+            crawler_holder = {"crawler": AsyncWebCrawler(config=browser_config)}
+            await crawler_holder["crawler"].__aenter__()
+            try:
+                if self._should_use_seed_batch_crawl():
+                    await self._crawl_seed_frontier(crawler_holder, run_config, browser_config)
+                else:
+                    results = crawler_holder["crawler"].arun(url=self.start_url, config=run_config)
+                    if asyncio.iscoroutine(results):
+                        crawl_task = asyncio.create_task(results)
+                        watchdog = asyncio.create_task(self._watch_crawl_health(crawl_task))
+                        try:
+                            results = await crawl_task
+                        except asyncio.CancelledError:
+                            if self._crawl_watchdog_error:
+                                raise RuntimeError(self._crawl_watchdog_error) from None
+                            raise
+                        finally:
+                            watchdog.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await watchdog
+                    await self._consume_crawl_results(results)
+            finally:
+                try:
+                    await crawler_holder["crawler"].__aexit__(None, None, None)
+                except Exception as close_exc:
+                    if _is_benign_browser_close_error(close_exc):
+                        logger.warning("Ignoring benign browser shutdown error after crawler checkpoint flush: %s", close_exc)
+                    else:
                         raise
-                    finally:
-                        watchdog.cancel()
-                        with contextlib.suppress(asyncio.CancelledError):
-                            await watchdog
-                await self._consume_crawl_results(results)
 
             self._flush_runtime_state(force=True)
 
@@ -1266,11 +2291,32 @@ class Crawl4AICrawler(CrawlerStage):
                     "page_images_file": str(self.page_images_file),
                     "page_videos_file": str(self.page_videos_file),
                     "page_media_file": str(self.page_media_file),
+                    "page_metadata_file": str(self.page_metadata_file),
+                    "page_link_graph_file": str(self.page_link_graph_file),
+                    "runtime_state_file": str(self.runtime_state_file),
+                    "crawler_runtime_state_file": str(self.runtime_state_file),
                     "images_dir": str(self.images_dir),
                     "md_mapping_file": str(self.url_to_md_mapping_file),
                 },
                 metrics=self._build_metrics(),
                 checkpoint={"runtime_state_file": str(self.runtime_state_file)},
+                artifacts=[
+                    ctx.make_artifact(
+                        self.page_metadata_file,
+                        artifact_type="page_metadata",
+                        role="website_page_metadata",
+                        metadata={"records": len(self.page_metadata)},
+                    ),
+                    ctx.make_artifact(
+                        self.page_link_graph_file,
+                        artifact_type="page_link_graph",
+                        role="website_page_connections",
+                        metadata={
+                            "nodes": len(self.page_metadata),
+                            "edges": sum(len(links) for links in self.page_links.values()),
+                        },
+                    ),
+                ],
             )
         except Exception as exc:
             logger.exception("Crawler stage failed: %s", exc)
@@ -1338,6 +2384,38 @@ class Crawl4AICrawler(CrawlerStage):
                 if combined:
                     self.page_media[page_url] = dedupe_media_items(combined)
 
+        self.page_metadata = load_json_safe(self.page_metadata_file, {}) or {}
+        self.page_metadata.update(state.get("page_metadata") or {})
+        self.recoverable_skip_retries = {
+            str(url): int(count)
+            for url, count in (state.get("recoverable_skip_retries") or {}).items()
+            if str(url)
+        }
+
+        graph_payload = load_json_safe(self.page_link_graph_file, {}) or {}
+        graph_links: Dict[str, List[Dict[str, Any]]] = {}
+        if isinstance(graph_payload, dict):
+            for edge in graph_payload.get("edges") or []:
+                if not isinstance(edge, dict):
+                    continue
+                source_url = str(edge.get("source_url") or "")
+                target_url = str(edge.get("target_url") or "")
+                if not source_url or not target_url:
+                    continue
+                properties = edge.get("properties") if isinstance(edge.get("properties"), dict) else {}
+                graph_links.setdefault(source_url, []).append(
+                    {
+                        "source_url": source_url,
+                        "target_url": target_url,
+                        "link_type": properties.get("link_type") or _link_type_for_url(target_url, self.allowed_domains),
+                        "anchor_texts": list(properties.get("anchor_texts") or []),
+                        "rels": list(properties.get("rels") or []),
+                        "sources": list(properties.get("sources") or []),
+                    }
+                )
+        self.page_links = graph_links
+        self.page_links.update(state.get("page_links") or {})
+
         self.downloaded_images = dict(state.get("downloaded_images") or {})
         loaded_stats = state.get("stats") or {}
         self.stats = _merge_counter_dict(self.stats, loaded_stats)
@@ -1355,12 +2433,112 @@ class Crawl4AICrawler(CrawlerStage):
             if _has_resumable_crawl_state(normalized_crawl_state)
             else {}
         )
+        if self.crawl_state:
+            self.crawl_state["pending"] = self._filter_pending_items(
+                self.crawl_state.get("pending") or []
+            )
 
         sitemap_state = load_json_safe(self.sitemap_state_file, {}) or {}
         self.discovered_sitemaps = {
             "sources": sitemap_state.get("sources", []),
             "urls": sitemap_state.get("urls", []),
         }
+
+    def _mark_url_excluded_from_frontier(self, page_url: str, reason: str = "path_prefix") -> None:
+        normalized = _normalize_http_url(page_url)
+        if not normalized:
+            return
+        existing = str(self.url_mapping.get(normalized) or "")
+        if existing.startswith("SKIPPED_EXCLUDED_FRONTIER"):
+            return
+        already_skipped = existing.startswith("SKIPPED")
+        self.url_mapping[normalized] = f"SKIPPED_EXCLUDED_FRONTIER:{reason}"
+        if not already_skipped:
+            self.stats["skipped_urls"] += 1
+        self.stats["excluded_frontier_urls"] += 1
+
+    def _filter_pending_items(
+        self,
+        items: Iterable[Dict[str, Any]],
+    ) -> List[Dict[str, Optional[str]]]:
+        filtered: List[Dict[str, Optional[str]]] = []
+        seen: set[str] = set()
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            normalized = _normalize_http_url(item.get("url"))
+            if not normalized or normalized in seen:
+                continue
+            if not self._allow_frontier_url(normalized):
+                self._mark_url_excluded_from_frontier(normalized)
+                continue
+            filtered.append(
+                {
+                    "url": normalized,
+                    "parent_url": _normalize_http_url(item.get("parent_url")),
+                }
+            )
+            seen.add(normalized)
+        return filtered
+
+    def _requeue_recoverable_skipped_urls(self) -> List[str]:
+        if not self.crawl_state or not self.url_mapping:
+            return []
+
+        pending = self._filter_pending_items(self.crawl_state.get("pending") or [])
+        pending_urls = {
+            _normalize_http_url(item.get("url"))
+            for item in pending
+            if isinstance(item, dict)
+        }
+        visited = [
+            str(url)
+            for url in (self.crawl_state.get("visited") or [])
+            if isinstance(url, str) and url
+        ]
+        requeued: List[str] = []
+        exhausted = 0
+        for url, reason in list(self.url_mapping.items()):
+            normalized = _normalize_http_url(url)
+            if not normalized or not _is_recoverable_crawl_skip_reason(reason):
+                continue
+            if not self._allow_frontier_url(normalized):
+                self._mark_url_excluded_from_frontier(normalized)
+                continue
+            attempts = int(self.recoverable_skip_retries.get(normalized) or 0)
+            if attempts >= self.recoverable_skip_max_retries:
+                exhausted += 1
+                continue
+            self.recoverable_skip_retries[normalized] = attempts + 1
+            self.url_mapping.pop(url, None)
+            self.url_mapping.pop(normalized, None)
+            if normalized not in pending_urls:
+                pending.insert(0, {"url": normalized, "parent_url": None})
+                pending_urls.add(normalized)
+            requeued.append(normalized)
+
+        if exhausted:
+            self.stats["recoverable_skips_exhausted"] += exhausted
+            logger.warning(
+                "Left %d recoverable skipped URL(s) in skipped state after reaching retry cap=%d.",
+                exhausted,
+                self.recoverable_skip_max_retries,
+            )
+
+        if not requeued:
+            self.crawl_state["pending"] = pending
+            return []
+
+        requeued_set = set(requeued)
+        self.crawl_state["visited"] = [url for url in visited if url not in requeued_set]
+        self.crawl_state["pending"] = pending
+        self.stats["pages_failed"] = max(0, int(self.stats.get("pages_failed", 0)) - len(requeued))
+        self.stats["skipped_urls"] = max(0, int(self.stats.get("skipped_urls", 0)) - len(requeued))
+        logger.info(
+            "Requeued %d recoverable skipped URL(s) from checkpoint for retry.",
+            len(requeued),
+        )
+        return requeued
 
     async def _open_http_session(self) -> None:
         headers = {}
@@ -1400,19 +2578,19 @@ class Crawl4AICrawler(CrawlerStage):
 
         start_parsed = urlparse(self.start_url)
         candidates = []
-        robots_url = urljoin(self.start_url, "/robots.txt")
-
-        try:
-            async with self._session.get(robots_url, proxy=self.proxy) as response:
-                if response.status == 200:
-                    robots_text = await response.text()
-                    for line in robots_text.splitlines():
-                        if line.lower().startswith("sitemap:"):
-                            sitemap_url = line.split(":", 1)[1].strip()
-                            if sitemap_url:
-                                candidates.append(sitemap_url)
-        except Exception as exc:
-            logger.debug("Could not read robots.txt for sitemap discovery: %s", exc)
+        if self.respect_robots_txt:
+            robots_url = urljoin(self.start_url, "/robots.txt")
+            try:
+                async with self._session.get(robots_url, proxy=self.proxy) as response:
+                    if response.status == 200:
+                        robots_text = await response.text()
+                        for line in robots_text.splitlines():
+                            if line.lower().startswith("sitemap:"):
+                                sitemap_url = line.split(":", 1)[1].strip()
+                                if sitemap_url:
+                                    candidates.append(sitemap_url)
+            except Exception as exc:
+                logger.debug("Could not read robots.txt for sitemap discovery: %s", exc)
 
         root_url = f"{start_parsed.scheme}://{start_parsed.netloc}"
         candidates.extend(
@@ -1429,6 +2607,9 @@ class Crawl4AICrawler(CrawlerStage):
         async def _walk(sitemap_url: str) -> None:
             normalized = _normalize_http_url(sitemap_url)
             if not normalized or normalized in seen_sitemaps:
+                return
+            if not self._url_allowed_for_fetch(normalized):
+                logger.debug("Skipping sitemap outside allowed egress policy: %s", normalized)
                 return
             seen_sitemaps.add(normalized)
 
@@ -1481,9 +2662,39 @@ class Crawl4AICrawler(CrawlerStage):
         atomic_write_json(self.sitemap_state_file, self.discovered_sitemaps)
         return deduped
 
+    def _url_allowed_for_fetch(self, url: str) -> bool:
+        normalized = _normalize_http_url(url)
+        parsed = urlparse(normalized or "")
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or not host:
+            return False
+        if getattr(self, "require_https", True) and parsed.scheme != "https":
+            return False
+        excluded_subdomains = getattr(self, "excluded_subdomains", set()) or set()
+        if any(_host_matches_domain(host, excluded) for excluded in excluded_subdomains):
+            return False
+        allowed_domains = getattr(self, "allowed_domains", None)
+        if not allowed_domains:
+            configured_host = (
+                urlparse(str(getattr(self, "start_url", "") or "")).hostname or ""
+            ).lower()
+            allowed_domains = {configured_host} if configured_host else set()
+        if not allowed_domains:
+            return False
+        if not any(_host_matches_domain(host, allowed) for allowed in allowed_domains):
+            return False
+        if _host_resolves_to_private_or_reserved(host):
+            return False
+        return True
+
     def _allow_frontier_url(self, url: str) -> bool:
-        parsed = urlparse(_normalize_http_url(url) or "")
+        normalized = _normalize_http_url(url)
+        parsed = urlparse(normalized or "")
         if not parsed.scheme or not parsed.netloc:
+            return False
+        if not self._url_allowed_for_fetch(normalized or ""):
+            return False
+        if _url_matches_path_prefix(normalized or "", self.excluded_path_prefixes):
             return False
         if parsed.query:
             if not self.allow_query_urls:
@@ -1534,6 +2745,7 @@ class Crawl4AICrawler(CrawlerStage):
                     allow_query_urls=self.allow_query_urls,
                     allowed_query_param_names=self.allowed_query_param_names,
                 ),
+                PathPrefixFilter(self.excluded_path_prefixes),
                 SkipExtensionFilter(),
             ]
         )
@@ -1567,7 +2779,7 @@ class Crawl4AICrawler(CrawlerStage):
             "simulate_user": bool(self.config.get("simulate_user", False)),
             "override_navigator": bool(self.config.get("override_navigator", False)),
             "magic": bool(self.config.get("magic", False)),
-            "check_robots_txt": bool(self.config.get("respect_robots_txt", True)),
+            "check_robots_txt": self.respect_robots_txt,
             "markdown_generator": markdown_generator,
             "verbose": False,
         }
@@ -1584,24 +2796,291 @@ class Crawl4AICrawler(CrawlerStage):
         elif results is not None:
             await self._process_result(results)
 
-    async def _process_result(self, result: Any) -> None:
+    async def _collect_crawl_results(self, results: Any) -> List[Any]:
+        collected: List[Any] = []
+        if inspect.isasyncgen(results):
+            async for result in results:
+                collected.append(result)
+        elif isinstance(results, list):
+            collected.extend(results)
+        elif results is not None:
+            collected.append(results)
+        return collected
+
+    def _should_use_seed_batch_crawl(self) -> bool:
+        if not self.sitemap_batch_crawl:
+            return False
+        pending = self.crawl_state.get("pending") or []
+        if len(pending) <= self.sitemap_crawl_batch_size:
+            return False
+        if self.stats.get("sitemap_urls_seeded", 0) > 0:
+            return True
+        return bool(self.config.get("sitemap_enabled", True)) and len(pending) > 1
+
+    def _set_crawl_state(
+        self,
+        *,
+        visited: List[str],
+        pending: List[Dict[str, Optional[str]]],
+        depths: Dict[str, int],
+        pages_crawled: int,
+    ) -> None:
+        self.crawl_state = _trim_crawl_state_to_budget(
+            {
+                "visited": visited,
+                "pending": self._filter_pending_items(pending),
+                "depths": depths,
+                "pages_crawled": pages_crawled,
+            },
+            self.max_pages,
+        )
+        self._last_crawl_state_update_at = time.time()
+
+    async def _crawl_seed_frontier(self, crawler_holder: Dict[str, Any], run_config: CrawlerRunConfig, browser_config: Any) -> None:
+        pending: List[Dict[str, Optional[str]]] = [
+            {"url": item.get("url"), "parent_url": item.get("parent_url")}
+            for item in (self.crawl_state.get("pending") or [])
+            if isinstance(item, dict) and item.get("url")
+        ]
+        visited: List[str] = [
+            str(url)
+            for url in (self.crawl_state.get("visited") or [])
+            if isinstance(url, str) and url
+        ]
+        visited_set = set(visited)
+        depths = dict(self.crawl_state.get("depths") or {})
+        pages_crawled = int(self.crawl_state.get("pages_crawled") or 0)
+        last_recycle_page_count = pages_crawled
+        batch_config = run_config.clone(deep_crawl_strategy=None, stream=False)
+
+        logger.info(
+            "Using bounded sitemap seed crawl: pending=%d batch_size=%d fetch_concurrency=%d",
+            len(pending),
+            self.sitemap_crawl_batch_size,
+            self.fetch_concurrency,
+        )
+
+        while pending and pages_crawled < self.max_pages:
+            batch = pending[: self.sitemap_crawl_batch_size]
+            urls = [str(item["url"]) for item in batch if item.get("url")]
+            if not urls:
+                pending = pending[len(batch):]
+                continue
+
+            self._set_crawl_state(
+                visited=visited,
+                pending=pending,
+                depths=depths,
+                pages_crawled=pages_crawled,
+            )
+            requeued = self._requeue_recoverable_skipped_urls()
+            if requeued:
+                pending = [
+                    item
+                    for item in (self.crawl_state.get("pending") or [])
+                    if isinstance(item, dict) and item.get("url")
+                ]
+                visited = [
+                    str(url)
+                    for url in (self.crawl_state.get("visited") or [])
+                    if isinstance(url, str) and url
+                ]
+                visited_set = set(visited)
+                pages_crawled = int(self.crawl_state.get("pages_crawled") or pages_crawled)
+            self._flush_runtime_state(force=True)
+
+            batch_results = await self._collect_crawl_results(
+                await crawler_holder["crawler"].arun_many(urls=urls, config=batch_config)
+            )
+            returned_urls = {
+                normalized
+                for result in batch_results
+                for normalized in [_normalize_http_url(getattr(result, "url", None))]
+                if normalized
+            }
+
+            failed_batch_urls: Dict[str, Dict[str, Any]] = {}
+            for result in batch_results:
+                result_url = _normalize_http_url(getattr(result, "url", None))
+                if result_url and result_url not in visited_set:
+                    visited.append(result_url)
+                    visited_set.add(result_url)
+                if getattr(result, "success", False):
+                    pages_crawled += 1
+                processed = await self._process_result(result, mark_failure=False)
+                if not processed and result_url:
+                    failed_batch_urls[result_url] = {
+                        "status_code": getattr(result, "status_code", None),
+                        "error_message": getattr(result, "error_message", ""),
+                    }
+
+            for item in batch:
+                url = _normalize_http_url(item.get("url"))
+                if not url:
+                    continue
+                if url not in visited_set:
+                    visited.append(url)
+                    visited_set.add(url)
+                if url not in returned_urls and url not in self.url_mapping:
+                    failed_batch_urls[url] = {
+                        "status_code": None,
+                        "error_message": "SKIPPED_NO_RESULT",
+                    }
+
+            if failed_batch_urls:
+                recovered = 0
+                for url, failure in failed_batch_urls.items():
+                    if await self._recover_url_with_http_retry(url):
+                        recovered += 1
+                    else:
+                        self._mark_url_skipped(
+                            url,
+                            status_code=failure.get("status_code"),
+                            error_message=failure.get("error_message"),
+                            reason="SKIPPED_NO_RESULT" if failure.get("error_message") == "SKIPPED_NO_RESULT" else "SKIPPED_ERROR",
+                        )
+                if recovered:
+                    logger.info(
+                        "Recovered %d/%d failed sitemap batch URL(s) through HTTP retry.",
+                        recovered,
+                        len(failed_batch_urls),
+                    )
+
+            pending = pending[len(batch):]
+            self.stats["sitemap_batches_completed"] = self.stats.get("sitemap_batches_completed", 0) + 1
+            pages_crawled = max(pages_crawled, int(self.stats.get("pages_scraped", 0)))
+            self._set_crawl_state(
+                visited=visited,
+                pending=pending,
+                depths=depths,
+                pages_crawled=pages_crawled,
+            )
+            self._flush_runtime_state(force=True)
+
+            # Playwright headless browser recycling to prevent slow RAM memory leaks
+            pages_since_last_recycle = pages_crawled - last_recycle_page_count
+            if pages_since_last_recycle >= 80:
+                logger.info(
+                    "Recycling Playwright browser context after crawling %d pages (total: %d pages)...",
+                    pages_since_last_recycle,
+                    pages_crawled
+                )
+                try:
+                    await crawler_holder["crawler"].__aexit__(None, None, None)
+                except Exception as recycle_close_exc:
+                    if _is_benign_browser_close_error(recycle_close_exc):
+                        logger.warning("Ignoring benign browser shutdown error during recycling: %s", recycle_close_exc)
+                    else:
+                        logger.warning("Error closing crawler context during recycling (non-fatal): %s", recycle_close_exc)
+
+                # Instantiate and context-enter a fresh crawler instance
+                crawler_holder["crawler"] = AsyncWebCrawler(config=browser_config)
+                await crawler_holder["crawler"].__aenter__()
+                last_recycle_page_count = pages_crawled
+
+            if self.stats["sitemap_batches_completed"] <= 3 or self.stats["sitemap_batches_completed"] % 10 == 0:
+                logger.info(
+                    "Sitemap seed crawl progress: batches=%d pages_scraped=%d pages_failed=%d pending=%d",
+                    self.stats["sitemap_batches_completed"],
+                    self.stats["pages_scraped"],
+                    self.stats["pages_failed"],
+                    len(pending),
+                )
+
+    def _should_validate_source_html(self, page_url: str) -> bool:
+        if not self.validate_source_html:
+            return False
+        normalized = _normalize_http_url(page_url)
+        if not normalized:
+            return False
+        if _url_extension(normalized) in CRAWL_SKIP_EXTENSIONS:
+            return False
+        host = (urlparse(normalized).hostname or "").lower()
+        return any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
+
+    async def _process_result(self, result: Any, *, mark_failure: bool = True) -> bool:
         page_url = _normalize_http_url(getattr(result, "url", None))
         if not page_url:
-            return
+            return False
         self._last_result_seen_at = time.time()
 
         status_code = getattr(result, "status_code", None)
-        html = getattr(result, "html", None) or ""
+        rendered_html = getattr(result, "html", None) or ""
+        html = rendered_html
 
         if not getattr(result, "success", False) or not html:
-            self.stats["pages_failed"] += 1
-            self.stats["skipped_urls"] += 1
-            reason = "SKIPPED_ERROR"
-            if status_code:
-                reason = f"SKIPPED_HTTP_{status_code}"
-            self.url_mapping[page_url] = reason
+            fallback_html, fallback_status = await self._fetch_raw_source_page(page_url)
+            if fallback_html:
+                html = fallback_html
+                rendered_html = fallback_html
+                status_code = fallback_status or status_code or 200
+                self.stats["http_fallback_pages"] += 1
+                logger.info("Recovered crawler failure through HTTP fallback: url=%s", page_url)
+            else:
+                if mark_failure:
+                    self._mark_url_skipped(
+                        page_url,
+                        status_code=status_code,
+                        error_message=getattr(result, "error_message", ""),
+                    )
+                    self._flush_runtime_state()
+                return False
+
+        raw_source_html = ""
+        raw_source_status: Optional[int] = None
+        rendered_markdown = self._extract_crawl4ai_markdown(result)
+        rendered_quality_report = _html_quality_report(rendered_html, page_url, markdown=rendered_markdown)
+        should_fetch_source = (
+            self.validate_source_html_mode == "always"
+            or (
+                self.validate_source_html_mode != "never"
+                and bool(rendered_quality_report.get("reasons"))
+            )
+        )
+        if should_fetch_source and self._should_validate_source_html(page_url):
+            raw_source_html, raw_source_status = await self._fetch_raw_source_page(page_url)
+            if raw_source_html:
+                self.stats["source_html_validations"] += 1
+
+        html, capture_source, quality_report = _select_preferred_page_capture(
+            page_url,
+            rendered_html,
+            raw_source_html=raw_source_html,
+            rendered_markdown=rendered_markdown,
+        )
+        selected_quality_reasons = (quality_report.get("selected") or {}).get("reasons") or []
+        if selected_quality_reasons:
+            self.stats["content_quality_warnings"] += 1
+            logger.warning(
+                "Crawler content quality warning: url=%s source=%s reasons=%s",
+                page_url,
+                capture_source,
+                ",".join(selected_quality_reasons),
+            )
+        if capture_source == "raw_source":
+            self.stats["source_html_replacements"] += 1
+            status_code = raw_source_status or status_code or 200
+            logger.info(
+                "Selected raw page source over rendered capture: url=%s reason=%s",
+                page_url,
+                quality_report.get("selection_reason"),
+            )
+        selected_quality_report = quality_report.get("selected") or {}
+        if not selected_quality_report.get("usable", True):
+            skip_status = None
+            try:
+                if status_code is not None and int(status_code) >= 400:
+                    skip_status = status_code
+            except (TypeError, ValueError):
+                skip_status = None
+            self._mark_url_skipped(
+                page_url,
+                status_code=skip_status,
+                error_message=f"content_quality:{','.join(selected_quality_report.get('reasons') or [])}",
+                reason="SKIPPED_LOW_QUALITY",
+            )
             self._flush_runtime_state()
-            return
+            return False
 
         html_path = self.html_dir / f"{_url_digest(page_url)}.html"
         html_path.write_text(html, encoding="utf-8")
@@ -1619,12 +3098,21 @@ class Crawl4AICrawler(CrawlerStage):
                 page_url,
             )
 
-        md_text = self._extract_markdown(result)
+        md_path: Optional[Path] = None
+        md_text, markdown_source, markdown_quality_reason = self._extract_markdown(
+            result,
+            html=html,
+            page_url=page_url,
+            rendered_markdown=rendered_markdown,
+            capture_source=capture_source,
+        )
         if md_text:
             md_path = self.md_dir / f"{html_path.stem}.md"
             md_path.write_text(md_text, encoding="utf-8")
             self.url_to_md_mapping[page_url] = str(md_path)
             self.stats["markdown_written"] += 1
+        elif markdown_quality_reason:
+            self.stats["low_quality_markdown_suppressed"] += 1
 
         if self.extract_images or self.extract_videos:
             try:
@@ -1638,7 +3126,7 @@ class Crawl4AICrawler(CrawlerStage):
                     (self.extract_videos and not extracted_media["videos"])
                     or (self.extract_images and not extracted_media["images"])
                 ):
-                    raw_html = await self._fetch_raw_source_html(page_url)
+                    raw_html = raw_source_html or await self._fetch_raw_source_html(page_url)
                     if raw_html and raw_html != html:
                         raw_media = _extract_page_media(
                             raw_html,
@@ -1678,6 +3166,33 @@ class Crawl4AICrawler(CrawlerStage):
             except Exception as exc:
                 logger.warning("Skipping media extraction for %s: %s", page_url, exc)
 
+        try:
+            self.page_links[page_url] = _extract_page_links(
+                result,
+                html,
+                page_url,
+                allowed_domains=self.allowed_domains,
+            )
+            page_media = self.page_media.get(page_url, [])
+            depth = (self.crawl_state.get("depths") or {}).get(page_url)
+            self.page_metadata[page_url] = _extract_page_metadata(
+                html,
+                page_url,
+                status_code=status_code,
+                html_path=str(html_path),
+                markdown_path=str(md_path) if md_path else "",
+                depth=depth,
+                images_count=len(self.page_images.get(page_url, [])),
+                videos_count=len(self.page_videos.get(page_url, [])),
+                media_count=len(page_media),
+                capture_source=capture_source,
+                content_quality=quality_report,
+                markdown_source=markdown_source,
+                markdown_quality_reason=markdown_quality_reason,
+            )
+        except Exception as exc:
+            logger.warning("Skipping page graph/metadata extraction for %s: %s", page_url, exc)
+
         downloadable_urls = self._extract_downloadable_urls(result, html=html, base_url=page_url)
         if downloadable_urls:
             await asyncio.gather(
@@ -1686,6 +3201,55 @@ class Crawl4AICrawler(CrawlerStage):
             )
 
         self._flush_runtime_state()
+        return True
+
+    def _mark_url_skipped(
+        self,
+        page_url: str,
+        *,
+        status_code: Any = None,
+        error_message: Any = "",
+        reason: str = "SKIPPED_ERROR",
+    ) -> None:
+        normalized = _normalize_http_url(page_url)
+        if not normalized:
+            return
+        existing = str(self.url_mapping.get(normalized) or "")
+        if existing.startswith("SKIPPED"):
+            return
+        if status_code:
+            skip_reason = f"SKIPPED_HTTP_{status_code}"
+        else:
+            skip_reason = reason
+        compact_error = _compact_failure_reason(error_message)
+        if compact_error and compact_error != skip_reason:
+            skip_reason = f"{skip_reason}:{compact_error}"
+        self.url_mapping[normalized] = skip_reason
+        self.stats["pages_failed"] += 1
+        self.stats["skipped_urls"] += 1
+
+    async def _recover_url_with_http_retry(self, page_url: str) -> bool:
+        normalized = _normalize_http_url(page_url)
+        if not normalized:
+            return False
+        attempts = max(1, self.sitemap_failed_url_retry_attempts)
+        for attempt in range(1, attempts + 1):
+            fallback_html, fallback_status = await self._fetch_raw_source_page(normalized)
+            if fallback_html:
+                self.stats["http_fallback_retries"] += 1
+                self.stats["http_fallback_pages"] += 1
+                result = SimpleNamespace(
+                    url=normalized,
+                    html=fallback_html,
+                    success=True,
+                    status_code=fallback_status or 200,
+                    links={"internal": [], "external": []},
+                    markdown=None,
+                )
+                return await self._process_result(result, mark_failure=True)
+            if attempt < attempts and self.sitemap_failed_retry_backoff:
+                await asyncio.sleep(self.sitemap_failed_retry_backoff)
+        return False
 
     async def _watch_crawl_health(self, crawl_task: "asyncio.Task[Any]") -> None:
         while not crawl_task.done():
@@ -1713,13 +3277,42 @@ class Crawl4AICrawler(CrawlerStage):
                 crawl_task.cancel()
                 return
 
-    def _extract_markdown(self, result: Any) -> str:
+    def _extract_crawl4ai_markdown(self, result: Any) -> str:
         markdown = getattr(result, "markdown", None)
         if markdown is None:
             return ""
         fit_markdown = getattr(markdown, "fit_markdown", "") or ""
         raw_markdown = getattr(markdown, "raw_markdown", "") or ""
         return fit_markdown.strip() or raw_markdown.strip()
+
+    def _extract_markdown(
+        self,
+        result: Any,
+        *,
+        html: str,
+        page_url: str,
+        rendered_markdown: str = "",
+        capture_source: str = "rendered",
+    ) -> Tuple[str, str, str]:
+        crawl_markdown = rendered_markdown if rendered_markdown else self._extract_crawl4ai_markdown(result)
+        crawl_reason = _markdown_quality_reason(crawl_markdown, page_url, html=html) if crawl_markdown else "empty_markdown"
+        if crawl_markdown and capture_source == "rendered" and not crawl_reason:
+            return crawl_markdown, "crawl4ai", ""
+
+        generated_markdown = _html_to_markdown(html, page_url)
+        generated_reason = (
+            _markdown_quality_reason(generated_markdown, page_url, html=html)
+            if generated_markdown
+            else "empty_markdown"
+        )
+        if generated_markdown and not generated_reason:
+            source = "source_html" if capture_source == "raw_source" else "html_fallback"
+            return generated_markdown, source, ""
+
+        if crawl_markdown and not crawl_reason:
+            return crawl_markdown, "crawl4ai", ""
+
+        return "", "", generated_reason or crawl_reason or "low_quality_markdown"
 
     def _extract_downloadable_urls(self, result: Any, html: str, base_url: str) -> List[str]:
         candidates: list[str] = []
@@ -1729,14 +3322,22 @@ class Crawl4AICrawler(CrawlerStage):
             for item in links.get(group, []) or []:
                 href = item.get("href") if isinstance(item, dict) else None
                 normalized = _normalize_http_url(href, base_url=base_url)
-                if normalized and _url_extension(normalized) in DOWNLOADABLE_EXTENSIONS:
+                if (
+                    normalized
+                    and _url_extension(normalized) in DOWNLOADABLE_EXTENSIONS
+                    and self._url_allowed_for_fetch(normalized)
+                ):
                     candidates.append(normalized)
 
         if html:
             soup = BeautifulSoup(html, "html.parser")
             for anchor in soup.find_all("a", href=True):
                 normalized = _normalize_http_url(anchor.get("href"), base_url=base_url)
-                if normalized and _url_extension(normalized) in DOWNLOADABLE_EXTENSIONS:
+                if (
+                    normalized
+                    and _url_extension(normalized) in DOWNLOADABLE_EXTENSIONS
+                    and self._url_allowed_for_fetch(normalized)
+                ):
                     candidates.append(normalized)
 
         return list(dict.fromkeys(candidates))
@@ -1802,17 +3403,58 @@ class Crawl4AICrawler(CrawlerStage):
         except Exception as exc:
             logger.debug("Failed to fetch transcript %s: %s", normalized, exc)
 
-    async def _fetch_raw_source_html(self, page_url: str) -> str:
+    async def _fetch_raw_source_page(self, page_url: str) -> Tuple[str, Optional[int]]:
         if not self._session:
-            return ""
-        try:
-            async with self._session.get(page_url, proxy=self.proxy) as response:
-                if response.status >= 400:
-                    return ""
-                return await response.text()
-        except Exception as exc:
-            logger.debug("Failed to fetch raw page source for %s: %s", page_url, exc)
-            return ""
+            return "", None
+        normalized_page = _normalize_http_url(page_url)
+        if not normalized_page or not self._url_allowed_for_fetch(normalized_page):
+            return "", None
+        last_status: Optional[int] = None
+        candidates = [
+            candidate
+            for candidate in (_raw_source_candidate_urls(normalized_page) or [normalized_page])
+            if self._url_allowed_for_fetch(candidate)
+        ]
+        for attempt in range(1, self.raw_source_retry_attempts + 1):
+            for candidate in candidates:
+                try:
+                    async with self._session.get(candidate, allow_redirects=True, proxy=self.proxy) as response:
+                        last_status = response.status
+                        final_url = _normalize_http_url(str(response.url))
+                        if not final_url or not self._url_allowed_for_fetch(final_url):
+                            logger.warning(
+                                "Blocked raw page source redirect outside allowed egress policy: %s -> %s",
+                                candidate,
+                                final_url or response.url,
+                            )
+                            return "", last_status
+                        if response.status >= 400:
+                            logger.debug(
+                                "Raw page source returned HTTP %s for %s candidate=%s attempt=%d/%d",
+                                response.status,
+                                page_url,
+                                candidate,
+                                attempt,
+                                self.raw_source_retry_attempts,
+                            )
+                            continue
+                        return await response.text(), response.status
+                except Exception as exc:
+                    logger.debug(
+                        "Failed to fetch raw page source for %s candidate=%s attempt=%d/%d: %s",
+                        page_url,
+                        candidate,
+                        attempt,
+                        self.raw_source_retry_attempts,
+                        exc,
+                    )
+            if attempt < self.raw_source_retry_attempts and self.raw_source_retry_backoff:
+                await asyncio.sleep(self.raw_source_retry_backoff * attempt)
+        return "", last_status
+
+    async def _fetch_raw_source_html(self, page_url: str) -> str:
+        html, _status = await self._fetch_raw_source_page(page_url)
+        return html
 
     async def _download_page_images(self, images: List[Dict[str, str]]) -> None:
         await asyncio.gather(
@@ -1859,6 +3501,7 @@ class Crawl4AICrawler(CrawlerStage):
             expected_prefix=None,
             status_on_failure="SKIPPED_DOWNLOAD_FAILED",
             validate_document=True,
+            enforce_allowed_domain=True,
         )
         if path:
             self.url_mapping[url] = str(path)
@@ -1872,12 +3515,18 @@ class Crawl4AICrawler(CrawlerStage):
         expected_prefix: Optional[str],
         status_on_failure: Optional[str],
         validate_document: bool = False,
+        enforce_allowed_domain: bool = False,
     ) -> Optional[Path]:
         if not self._session:
             return None
 
         normalized = _normalize_http_url(url)
         if not normalized:
+            return None
+        if enforce_allowed_domain and not self._url_allowed_for_fetch(normalized):
+            if status_on_failure:
+                self.url_mapping[normalized] = "SKIPPED_EGRESS_POLICY"
+                self.stats["skipped_urls"] += 1
             return None
 
         for attempt in range(1, self.retry_attempts + 1):
@@ -1889,6 +3538,13 @@ class Crawl4AICrawler(CrawlerStage):
                         allow_redirects=True,
                         proxy=self.proxy,
                     ) as response:
+                        if enforce_allowed_domain:
+                            final_url = _normalize_http_url(str(response.url))
+                            if not final_url or not self._url_allowed_for_fetch(final_url):
+                                if status_on_failure:
+                                    self.url_mapping[normalized] = "SKIPPED_EGRESS_POLICY"
+                                    self.stats["skipped_urls"] += 1
+                                return None
                         status = response.status
                         if status in RETRYABLE_STATUSES and attempt < self.retry_attempts:
                             raise aiohttp.ClientResponseError(
@@ -2000,7 +3656,10 @@ class Crawl4AICrawler(CrawlerStage):
             "page_images": self.page_images,
             "page_videos": self.page_videos,
             "page_media": self.page_media,
+            "page_metadata": self.page_metadata,
+            "page_links": self.page_links,
             "downloaded_images": self.downloaded_images,
+            "recoverable_skip_retries": self.recoverable_skip_retries,
             "stats": self.stats,
             "updated_at": time.time(),
         }
@@ -2016,6 +3675,14 @@ class Crawl4AICrawler(CrawlerStage):
         atomic_write_json(self.page_images_file, self.page_images)
         atomic_write_json(self.page_videos_file, self.page_videos)
         atomic_write_json(self.page_media_file, self.page_media)
+        atomic_write_json(self.page_metadata_file, self.page_metadata)
+        atomic_write_json(
+            self.page_link_graph_file,
+            _build_page_link_graph_payload(
+                page_metadata=self.page_metadata,
+                page_links=self.page_links,
+            ),
+        )
         atomic_write_json(self.runtime_state_file, self._serialize_runtime_state())
         if self.discovered_sitemaps["sources"] or self.discovered_sitemaps["urls"]:
             atomic_write_json(self.sitemap_state_file, self.discovered_sitemaps)
@@ -2027,4 +3694,6 @@ class Crawl4AICrawler(CrawlerStage):
             **self.stats,
             "visited_count": visited_count,
             "mapped_urls": len(self.url_mapping),
+            "page_metadata_records": len(self.page_metadata),
+            "page_link_edges": sum(len(links) for links in self.page_links.values()),
         }

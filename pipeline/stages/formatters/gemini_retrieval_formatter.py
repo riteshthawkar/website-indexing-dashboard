@@ -16,9 +16,11 @@ import re
 from collections import defaultdict
 from hashlib import sha1
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from urllib.parse import unquote, urlparse
 
 from pipeline.core.answer_records import derive_answer_records_from_bundle
+from pipeline.core.artifact_contracts import ArtifactContract, resolve_artifact_path
 from pipeline.core.assertions import (
     build_answer_records_from_assertions,
     build_assertion_embedding_records,
@@ -58,6 +60,263 @@ def _stable_id(*parts: Any) -> str:
 
 def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _unique_clean_strings(values: Iterable[Any]) -> List[str]:
+    output: List[str] = []
+    seen = set()
+    for value in values or []:
+        text = _clean_text(value)
+        if not text:
+            continue
+        key = text.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        output.append(text)
+    return output
+
+
+def _assertions_from_promoted_graph(graph_payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
+    """Convert promoted KG assertion nodes into the assertion sidecar shape."""
+
+    nodes = [node for node in graph_payload.get("nodes") or [] if isinstance(node, Mapping)]
+    edges = [edge for edge in graph_payload.get("edges") or [] if isinstance(edge, Mapping)]
+    entities_by_id: Dict[str, Dict[str, Any]] = {}
+    for node in nodes:
+        if str(node.get("node_type") or "") != "entity":
+            continue
+        node_id = _clean_text(node.get("id"))
+        if not node_id:
+            continue
+        properties = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+        entities_by_id[node_id] = {
+            "id": node_id,
+            "canonical_name": _clean_text(properties.get("canonical_name") or node.get("label")),
+            "entity_type": _clean_text(properties.get("entity_type") or "other"),
+            "aliases": _unique_clean_strings(properties.get("aliases") or []),
+        }
+
+    span_ids_by_assertion: Dict[str, List[str]] = defaultdict(list)
+    for edge in edges:
+        if str(edge.get("edge_type") or "") != "ASSERTION_SUPPORTED_BY_SPAN":
+            continue
+        assertion_id = _clean_text(edge.get("source_id"))
+        span_id = _clean_text(edge.get("target_id"))
+        if assertion_id and span_id:
+            span_ids_by_assertion[assertion_id].append(span_id)
+
+    assertions: List[Dict[str, Any]] = []
+    for node in nodes:
+        if str(node.get("node_type") or "") != "relation_assertion":
+            continue
+        assertion_id = _clean_text(node.get("id"))
+        properties = node.get("properties") if isinstance(node.get("properties"), Mapping) else {}
+        validity_status = _clean_text(properties.get("validity_status") or "active").lower()
+        if validity_status not in {"active", "valid"}:
+            continue
+        subject_id = _clean_text(properties.get("subject_entity_id"))
+        object_id = _clean_text(properties.get("object_entity_id"))
+        subject_entity = entities_by_id.get(subject_id, {})
+        object_entity = entities_by_id.get(object_id, {})
+        subject_name = _clean_text(properties.get("subject_name") or subject_entity.get("canonical_name"))
+        object_name = _clean_text(
+            properties.get("object_value")
+            or properties.get("object_name")
+            or object_entity.get("canonical_name")
+            or properties.get("canonical_object")
+        )
+        predicate = _clean_text(properties.get("relation_type") or properties.get("canonical_predicate") or node.get("label"))
+        if not assertion_id or not subject_name or not object_name or not predicate:
+            continue
+        source_span_ids = _unique_clean_strings(
+            [
+                *(properties.get("source_span_ids") or []),
+                *(span_ids_by_assertion.get(assertion_id) or []),
+            ]
+        )
+        assertion = {
+            "id": assertion_id,
+            "subject_name": subject_name,
+            "subject_type": _clean_text(properties.get("subject_type") or subject_entity.get("entity_type") or "organization"),
+            "subject_entity_id": subject_id,
+            "predicate": predicate,
+            "relation_type": predicate,
+            "answer_type": predicate,
+            "answer_subtype": _clean_text(properties.get("answer_subtype") or predicate),
+            "object_name": object_name,
+            "object_value": object_name,
+            "object_type": _clean_text(properties.get("object_type") or object_entity.get("entity_type") or "other"),
+            "object_entity_id": object_id,
+            "qualifiers": _unique_clean_strings(properties.get("qualifiers") or []),
+            "support_span": _clean_text(properties.get("evidence") or properties.get("text")),
+            "evidence": _clean_text(properties.get("evidence") or properties.get("text")),
+            "confidence": properties.get("confidence"),
+            "validator_confidence": properties.get("confidence"),
+            "validator_decision": "supported",
+            "authority_class": _clean_text(properties.get("authority_class")),
+            "authority_score": properties.get("authority_score"),
+            "freshness_score": properties.get("freshness_score"),
+            "source_doc_id": _clean_text(properties.get("source_id")),
+            "source_chunk_ids": _unique_clean_strings(properties.get("source_chunk_ids") or []),
+            "source_span_ids": source_span_ids,
+            "linked_span_ids": source_span_ids,
+            "source_parent_ids": _unique_clean_strings(properties.get("source_parent_ids") or []),
+            "source_fact_ids": _unique_clean_strings(properties.get("source_fact_ids") or []),
+            "source_url": _clean_text(properties.get("source_url")),
+            "source_markdown_path": _clean_text(properties.get("source_markdown_path")),
+            "document_title": _clean_text(properties.get("document_title")),
+            "source_last_seen": _clean_text(properties.get("source_last_seen")),
+            "canonical_subject": _clean_text(properties.get("canonical_subject") or subject_id),
+            "canonical_predicate": _clean_text(properties.get("canonical_predicate") or predicate),
+            "canonical_object": _clean_text(properties.get("canonical_object") or object_name).casefold(),
+            "validity_status": validity_status,
+            "text": _clean_text(properties.get("text")),
+            "source_id": _clean_text(properties.get("source_id")),
+            "source_kind": _clean_text(properties.get("source_kind")),
+        }
+        assertions.append(assertion)
+
+    return assertions
+
+
+def _canonical_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlparse(raw)
+        scheme = parsed.scheme.lower() or "https"
+        netloc = parsed.netloc.lower()
+        path = unquote(parsed.path or "").rstrip("/")
+        if path in {"", "/"}:
+            path = ""
+        return f"{scheme}://{netloc}{path}".rstrip("/")
+    except Exception:
+        return raw.lower().rstrip("/")
+
+
+def _language_normalized_url(value: Any) -> str:
+    canonical = _canonical_url(value)
+    if not canonical:
+        return ""
+    try:
+        parsed = urlparse(canonical)
+        parts = [part for part in (parsed.path or "").split("/") if part]
+        if parts and parts[0].lower() in {"ar", "en"}:
+            path = "/" + "/".join(parts[1:])
+        else:
+            path = parsed.path or ""
+        return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+    except Exception:
+        return canonical
+
+
+def _sentence_spans(text: Any, *, max_sentences: int, max_chars: int) -> List[str]:
+    normalized = _clean_text(text)
+    if not normalized:
+        return []
+    sentences = [
+        _clean_text(sentence)
+        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(])", normalized)
+        if _clean_text(sentence)
+    ]
+    if not sentences:
+        sentences = [normalized]
+    spans: List[str] = []
+    i = 0
+    while i < len(sentences):
+        window: List[str] = []
+        while i < len(sentences) and len(window) < max(1, max_sentences):
+            candidate = _clean_text(" ".join([*window, sentences[i]]))
+            if window and len(candidate) > max_chars:
+                break
+            window.append(sentences[i])
+            i += 1
+            if len(candidate) >= max_chars * 0.65:
+                break
+        span = _truncate_chars(" ".join(window), max_chars)
+        if span:
+            spans.append(span)
+        if not window:
+            i += 1
+    return spans
+
+
+def _span_signal_score(text: str, *, document_title: str, section_path: Iterable[Any], heading: str) -> float:
+    lower = text.lower()
+    score = 0.0
+    if re.search(r"\b\d{4}\b|\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", lower):
+        score += 1.0
+    if re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}\b", text):
+        score += 0.8
+    if any(token in lower for token in ("deadline", "apply", "application", "requirement", "eligibility", "tuition", "scholarship", "fee", "cost")):
+        score += 1.0
+    if any(token in lower for token in ("ph.d", "phd", "master", "msc", "program", "degree", "bachelor", "undergraduate")):
+        score += 0.9
+    if any(token in lower for token in ("faculty", "professor", "research interest", "award", "recognition", "publication")):
+        score += 0.9
+    if any(token in lower for token in ("email", "phone", "contact", "location", "address", "campus", "masdar")):
+        score += 0.9
+    if any(token in lower for token in ("policy", "procedure", "guideline", "visa", "housing", "accommodation")):
+        score += 0.7
+    heading_text = " ".join([document_title, heading, " ".join(str(value) for value in section_path or [])]).lower()
+    if heading_text and any(token in heading_text for token in ("admission", "program", "faculty", "research", "scholarship", "deadline")):
+        score += 0.4
+    return score
+
+
+def _classify_span_type(text: str, *, document_title: str, section_path: Iterable[Any], heading: str) -> str:
+    lower = " ".join([text, document_title, heading, " ".join(str(value) for value in section_path or [])]).lower()
+    if any(token in lower for token in ("deadline", "date", "apply by", "applications close")):
+        return "deadline"
+    if any(token in lower for token in ("email", "phone", "contact", "address")):
+        return "contact"
+    if any(token in lower for token in ("requirement", "eligibility", "required", "admission criteria")):
+        return "requirement"
+    if any(token in lower for token in ("ph.d", "phd", "master", "msc", "bachelor", "program", "degree")):
+        return "program"
+    if any(token in lower for token in ("professor", "faculty", "research interests", "biography")):
+        return "faculty_profile"
+    if any(token in lower for token in ("award", "recognition", "prize", "honor")):
+        return "award"
+    if any(token in lower for token in ("policy", "procedure", "guideline")):
+        return "policy"
+    if any(token in lower for token in ("fact", "founded", "established", "located", "offers")):
+        return "fact"
+    return "general"
+
+
+def _build_span_embedding_text(span: Dict[str, Any]) -> str:
+    lines = []
+    if span.get("document_title"):
+        lines.append(f"TITLE: {span['document_title']}")
+    if span.get("breadcrumb"):
+        lines.append(f"BREADCRUMB: {span['breadcrumb']}")
+    if span.get("section_heading"):
+        lines.append(f"SECTION: {span['section_heading']}")
+    if span.get("canonical_url"):
+        lines.append(f"CANONICAL_URL: {span['canonical_url']}")
+    if span.get("span_type"):
+        lines.append(f"SPAN_TYPE: {span['span_type']}")
+    lines.extend(["", str(span.get("text") or "")])
+    return "\n".join(part for part in lines if part is not None).strip()
+
+
+def _build_span_sparse_text(span: Dict[str, Any], *, max_chars: int) -> str:
+    lines = []
+    if span.get("document_title"):
+        lines.append(f"TITLE: {span['document_title']}")
+    if span.get("breadcrumb"):
+        lines.append(f"BREADCRUMB: {span['breadcrumb']}")
+    if span.get("section_heading"):
+        lines.append(f"SECTION: {span['section_heading']}")
+    if span.get("canonical_url"):
+        lines.append(f"URL: {span['canonical_url']}")
+    if span.get("span_type"):
+        lines.append(f"TYPE: {span['span_type']}")
+    lines.extend(["", str(span.get("text") or "")])
+    return _truncate_chars("\n".join(lines).strip(), max_chars=max_chars)
 
 
 def _is_generic_figure_label(text: str) -> bool:
@@ -129,6 +388,71 @@ def _relative_or_absolute(path: str | Path) -> str:
         return str(Path(path).resolve())
     except Exception:
         return str(path)
+
+
+def _path_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).resolve())
+    except Exception:
+        return text
+
+
+def _document_stem_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stem = Path(text).stem
+    stem = re.sub(r"\.pages_\d+_\d+$", "", stem)
+    return stem.casefold()
+
+
+def _load_download_source_lookup(ctx: StageContext) -> Dict[str, str]:
+    mapping_file = ctx.work_dir / "mappings.json"
+    payload = load_json_safe(mapping_file, {}) if mapping_file.exists() else {}
+    if not isinstance(payload, dict):
+        return {}
+    lookup: Dict[str, str] = {}
+    for source_url, local_path in payload.items():
+        source = _clean_text(source_url)
+        if not source:
+            continue
+        for key in (
+            _path_key(local_path),
+            _document_stem_key(local_path),
+            Path(str(local_path or "")).name.casefold(),
+        ):
+            if key:
+                lookup.setdefault(key, source)
+    return lookup
+
+
+def _resolve_source_url(
+    source_url: Any,
+    *,
+    source_file: Any = "",
+    source_markdown_path: Any = "",
+    document_title: Any = "",
+    download_source_lookup: Mapping[str, str] | None = None,
+) -> str:
+    existing = _clean_text(source_url)
+    if existing:
+        return existing
+    lookup = download_source_lookup or {}
+    for key in (
+        _path_key(source_file),
+        _path_key(source_markdown_path),
+        _document_stem_key(source_file),
+        _document_stem_key(source_markdown_path),
+        _document_stem_key(document_title),
+        Path(str(source_file or "")).name.casefold(),
+        Path(str(source_markdown_path or "")).name.casefold(),
+    ):
+        if key and key in lookup:
+            return lookup[key]
+    return ""
 
 
 def _compact_section_path(values: Iterable[Any]) -> List[str]:
@@ -282,6 +606,52 @@ def _split_sentences(text: str) -> List[str]:
         if candidate:
             output.append(candidate)
     return output
+
+
+def _build_extractive_summary(parent: Dict[str, Any], child_chunks: List[Dict[str, Any]], *, max_chars: int) -> str:
+    heading_lines: List[str] = []
+    for chunk in child_chunks:
+        heading = _clean_text(chunk.get("heading"))
+        if heading and heading not in heading_lines:
+            heading_lines.append(heading)
+        if len(heading_lines) >= 5:
+            break
+
+    sentences: List[str] = []
+    for chunk in child_chunks:
+        for sentence in _split_sentences(str(chunk.get("text") or "")):
+            if len(sentence.split()) < 6:
+                continue
+            sentences.append(sentence)
+            if len(sentences) >= 6:
+                break
+        if len(sentences) >= 6:
+            break
+
+    lines = []
+    if parent.get("document_title"):
+        lines.append(f"TITLE: {parent['document_title']}")
+    if parent.get("section_path"):
+        lines.append(f"SECTION: {' > '.join(parent['section_path'])}")
+    if heading_lines:
+        lines.extend(["HEADINGS:", *[f"- {heading}" for heading in heading_lines]])
+    if sentences:
+        lines.extend(["SUMMARY:", " ".join(sentences)])
+    return _truncate_chars("\n".join(lines).strip(), max_chars=max_chars)
+
+
+def _build_summary_embedding_text(summary_record: Dict[str, Any]) -> str:
+    lines = []
+    if summary_record.get("document_title"):
+        lines.append(f"TITLE: {summary_record['document_title']}")
+    if summary_record.get("summary_type"):
+        lines.append(f"SUMMARY_TYPE: {summary_record['summary_type']}")
+    if summary_record.get("section_path"):
+        lines.append(f"SECTION: {' > '.join(summary_record['section_path'])}")
+    if summary_record.get("source_url"):
+        lines.append(f"SOURCE_URL: {summary_record['source_url']}")
+    lines.extend(["", summary_record.get("text") or ""])
+    return "\n".join(part for part in lines if part is not None).strip()
 
 
 def _normalize_fact_candidate(value: str, *, min_chars: int, max_chars: int) -> str:
@@ -441,14 +811,18 @@ class GeminiRetrievalFormatter(FormatterStage):
     description = "Builds chunk, parent, and media corpora for Gemini multimodal retrieval."
 
     async def execute(self, ctx: StageContext) -> StageResult:
-        chunk_index_artifacts = ctx.find_artifacts(artifact_type="chunk_index")
+        chunk_index_resolution = resolve_artifact_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="chunk_index",
+                role="retrieval_chunks",
+                legacy_output_key="chunks_file",
+                label="chunk index",
+            ),
+        )
         chunk_index_payload: Dict[str, Any] = {}
-        if chunk_index_artifacts:
-            latest = chunk_index_artifacts[-1].local_path
-            if latest:
-                chunk_index_payload = load_chunk_index(latest)
-        elif ctx.previous_outputs.get("chunks_file"):
-            chunk_index_payload = load_chunk_index(ctx.previous_outputs["chunks_file"])
+        if chunk_index_resolution:
+            chunk_index_payload = load_chunk_index(chunk_index_resolution.path)
 
         chunk_records = list(chunk_index_payload.get("chunks") or [])
         if not chunk_records:
@@ -492,10 +866,19 @@ class GeminiRetrievalFormatter(FormatterStage):
         chunk_ids_by_doc_page: Dict[Tuple[str, int], List[str]] = defaultdict(list)
         page_record_map: Dict[str, Dict[str, Any]] = {}
         section_record_map: Dict[str, Dict[str, Any]] = {}
+        download_source_lookup = _load_download_source_lookup(ctx)
 
         for chunk in chunk_records:
             source_markdown_path = _relative_or_absolute(chunk.get("source_markdown_path") or "")
-            source_url = str(chunk.get("source_url") or "")
+            source_url = _resolve_source_url(
+                chunk.get("source_url"),
+                source_file=chunk.get("source_file"),
+                source_markdown_path=source_markdown_path,
+                document_title=chunk.get("document_title"),
+                download_source_lookup=download_source_lookup,
+            )
+            canonical_url = _canonical_url(source_url)
+            language_normalized_url = _language_normalized_url(source_url)
             page_numbers = _normalize_page_numbers(chunk.get("page_numbers") or [])
             section_path = _compact_section_path(chunk.get("section_path") or [])
             page_id = _page_key(source_markdown_path, source_url, page_numbers)
@@ -513,6 +896,8 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "source_file": str(chunk.get("source_file") or ""),
                 "source_markdown_path": source_markdown_path,
                 "source_url": source_url,
+                "canonical_url": canonical_url,
+                "language_normalized_url": language_normalized_url,
                 "chunk_index": int(chunk.get("chunk_index") or 0),
                 "chunk_count": int(chunk.get("chunk_count") or 1),
                 "section_path": section_path,
@@ -545,9 +930,12 @@ class GeminiRetrievalFormatter(FormatterStage):
                     "document_type": record["document_type"],
                     "source_markdown_path": source_markdown_path,
                     "source_url": source_url,
+                    "canonical_url": canonical_url,
+                    "language_normalized_url": language_normalized_url,
                     "page_numbers": page_numbers,
                     "section_path": [],
                     "child_chunk_ids": [],
+                    "child_span_ids": [],
                     "media_ids": [],
                 },
             )
@@ -565,10 +953,13 @@ class GeminiRetrievalFormatter(FormatterStage):
                     "document_type": record["document_type"],
                     "source_markdown_path": source_markdown_path,
                     "source_url": source_url,
+                    "canonical_url": canonical_url,
+                    "language_normalized_url": language_normalized_url,
                     "page_numbers": page_numbers,
                     "section_path": section_path,
                     "page_key": page_id,
                     "child_chunk_ids": [],
+                    "child_span_ids": [],
                     "media_ids": [],
                 },
             )
@@ -766,10 +1157,19 @@ class GeminiRetrievalFormatter(FormatterStage):
         sparse_parent_max_chars = int(ctx.formatter_config.get("sparse_parent_max_chars") or 8000)
         sparse_media_max_chars = int(ctx.formatter_config.get("sparse_media_max_chars") or 4000)
         sparse_fact_max_chars = int(ctx.formatter_config.get("sparse_fact_max_chars") or 480)
+        sparse_evidence_span_max_chars = int(ctx.formatter_config.get("sparse_evidence_span_max_chars") or 900)
+        sparse_summary_max_chars = int(ctx.formatter_config.get("sparse_summary_max_chars") or 3000)
+        summary_max_chars = int(ctx.formatter_config.get("summary_record_max_chars") or 1800)
+        evidence_span_max_chars = int(ctx.formatter_config.get("evidence_span_max_chars") or 700)
+        evidence_span_max_sentences = int(ctx.formatter_config.get("evidence_span_max_sentences") or 4)
+        evidence_span_max_per_chunk = int(ctx.formatter_config.get("evidence_span_max_per_chunk") or 4)
         sparse_parent_max_headings = int(ctx.formatter_config.get("sparse_parent_max_headings") or 12)
         sparse_parent_max_snippets = int(ctx.formatter_config.get("sparse_parent_max_snippets") or 6)
 
         chunk_dense_records: List[Dict[str, Any]] = []
+        evidence_span_records: List[Dict[str, Any]] = []
+        evidence_span_ids_seen: set[str] = set()
+        evidence_span_duplicate_count = 0
         lexical_records: List[Dict[str, Any]] = []
         for record in chunk_map.values():
             media_items = [media_by_id[mid] for mid in record["media_ids"][:3] if mid in media_by_id]
@@ -792,6 +1192,96 @@ class GeminiRetrievalFormatter(FormatterStage):
                     "tokens": _tokenize_for_bm25(sparse_text),
                 }
             )
+            span_candidates = []
+            for span_text in _sentence_spans(
+                record.get("text", ""),
+                max_sentences=evidence_span_max_sentences,
+                max_chars=evidence_span_max_chars,
+            ):
+                if len(span_text) < int(ctx.formatter_config.get("evidence_span_min_chars") or 45):
+                    continue
+                score = _span_signal_score(
+                    span_text,
+                    document_title=record.get("document_title", ""),
+                    section_path=record.get("section_path") or [],
+                    heading=record.get("heading", ""),
+                )
+                span_candidates.append((span_text, score))
+            if not span_candidates and record.get("text"):
+                fallback = _truncate_chars(record.get("text", ""), evidence_span_max_chars)
+                if len(fallback) >= int(ctx.formatter_config.get("evidence_span_min_chars") or 45):
+                    span_candidates.append((fallback, 0.0))
+            span_candidates.sort(key=lambda item: (-item[1], item[0]))
+            for idx, (span_text, _score) in enumerate(span_candidates[: max(1, evidence_span_max_per_chunk)]):
+                section_values = list(record.get("section_path") or [])
+                breadcrumb = " > ".join(str(value) for value in section_values if str(value))
+                section_heading = record.get("heading") or (section_values[-1] if section_values else "")
+                span_id = _stable_id(
+                    "evidence_span",
+                    record.get("language_normalized_url") or record.get("canonical_url") or record.get("source_url"),
+                    record.get("section_key"),
+                    record["id"],
+                    _clean_text(span_text).lower(),
+                )
+                if span_id in evidence_span_ids_seen:
+                    evidence_span_duplicate_count += 1
+                    continue
+                evidence_span_ids_seen.add(span_id)
+                span_record = {
+                    "id": span_id,
+                    "record_type": "evidence_span",
+                    "text": span_text,
+                    "document_id": record.get("document_id", ""),
+                    "document_title": record.get("document_title", ""),
+                    "document_type": record.get("document_type", ""),
+                    "source_markdown_path": record.get("source_markdown_path", ""),
+                    "source_url": record.get("source_url", ""),
+                    "canonical_url": record.get("canonical_url", ""),
+                    "language_normalized_url": record.get("language_normalized_url", ""),
+                    "page_id": record.get("page_key", ""),
+                    "section_id": record.get("section_key", ""),
+                    "parent_id": record.get("section_key", "") or record.get("page_key", ""),
+                    "chunk_id": record["id"],
+                    "page_key": record.get("page_key", ""),
+                    "section_key": record.get("section_key", ""),
+                    "linked_chunk_ids": [record["id"]],
+                    "linked_parent_ids": [record.get("section_key", ""), record.get("page_key", "")],
+                    "section_path": list(record.get("section_path") or []),
+                    "section_heading": section_heading,
+                    "breadcrumb": breadcrumb,
+                    "heading": record.get("heading", ""),
+                    "page_numbers": list(record.get("page_numbers") or []),
+                    "span_type": _classify_span_type(
+                        span_text,
+                        document_title=record.get("document_title", ""),
+                        section_path=record.get("section_path") or [],
+                        heading=record.get("heading", ""),
+                    ),
+                    "authority_class": "official" if "mbzuai.ac.ae" in str(record.get("source_url") or "") else "source",
+                    "source_last_seen": record.get("source_last_seen") or "",
+                    "validity_status": "active",
+                    "span_index": idx,
+                }
+                span_record["dense_text"] = _build_span_embedding_text(span_record)
+                span_record["embedding_text"] = span_record["dense_text"]
+                span_record["lexical_text"] = _build_span_sparse_text(
+                    span_record,
+                    max_chars=sparse_evidence_span_max_chars,
+                )
+                span_record["sparse_text"] = span_record["lexical_text"]
+                evidence_span_records.append(span_record)
+                record.setdefault("evidence_span_ids", []).append(span_id)
+                page_record_map.get(record.get("page_key", ""), {}).setdefault("child_span_ids", []).append(span_id)
+                section_record_map.get(record.get("section_key", ""), {}).setdefault("child_span_ids", []).append(span_id)
+                lexical_records.append(
+                    {
+                        "id": span_id,
+                        "record_type": "evidence_span",
+                        "span_type": span_record["span_type"],
+                        "text": span_record["sparse_text"],
+                        "tokens": _tokenize_for_bm25(span_record["sparse_text"]),
+                    }
+                )
             for idx, snippet in enumerate(
                 _extract_fact_snippets(
                     record,
@@ -826,6 +1316,7 @@ class GeminiRetrievalFormatter(FormatterStage):
                     "page_numbers": list(record.get("page_numbers") or []),
                     "linked_chunk_ids": [record["id"]],
                     "linked_parent_ids": [record.get("section_key", ""), record.get("page_key", "")],
+                    "linked_span_ids": list(record.get("evidence_span_ids") or []),
                     "heading": record.get("heading", ""),
                 }
                 fact_records.append(fact_record)
@@ -882,6 +1373,45 @@ class GeminiRetrievalFormatter(FormatterStage):
                 }
             )
 
+        summary_records: List[Dict[str, Any]] = []
+        for parent in parent_records:
+            child_chunks = [chunk_map[chunk_id] for chunk_id in parent.get("child_chunk_ids", []) if chunk_id in chunk_map]
+            summary_text = _build_extractive_summary(parent, child_chunks, max_chars=summary_max_chars)
+            if not summary_text:
+                continue
+            summary_id = _stable_id("summary", parent.get("id"), parent.get("document_id"), parent.get("source_url"))
+            summary_record = {
+                "id": summary_id,
+                "record_type": "summary",
+                "summary_type": parent.get("parent_type") or "section",
+                "text": summary_text,
+                "document_id": parent.get("document_id", ""),
+                "document_title": parent.get("document_title", ""),
+                "document_type": parent.get("document_type", ""),
+                "source_markdown_path": parent.get("source_markdown_path", ""),
+                "source_url": parent.get("source_url", ""),
+                "page_key": parent.get("page_key") or (parent.get("id") if parent.get("parent_type") == "page" else ""),
+                "section_key": parent.get("id") if parent.get("parent_type") == "section" else "",
+                "section_path": list(parent.get("section_path") or []),
+                "page_numbers": list(parent.get("page_numbers") or []),
+                "linked_parent_ids": [parent.get("id")] if parent.get("id") else [],
+                "linked_chunk_ids": list(parent.get("child_chunk_ids") or []),
+                "linked_span_ids": list(parent.get("child_span_ids") or []),
+            }
+            summary_record["dense_text"] = _build_summary_embedding_text(summary_record)
+            summary_record["lexical_text"] = _truncate_chars(summary_text, sparse_summary_max_chars)
+            summary_record["sparse_text"] = summary_record["lexical_text"]
+            summary_records.append(summary_record)
+            lexical_records.append(
+                {
+                    "id": summary_id,
+                    "record_type": "summary",
+                    "summary_type": summary_record["summary_type"],
+                    "text": summary_record["sparse_text"],
+                    "tokens": _tokenize_for_bm25(summary_record["sparse_text"]),
+                }
+            )
+
         fallback_answer_records = derive_answer_records_from_bundle(
             {
                 "chunk_records": chunk_dense_records,
@@ -891,18 +1421,74 @@ class GeminiRetrievalFormatter(FormatterStage):
 
         promoted_entities_file = ctx.previous_outputs.get("promoted_entities_file")
         promoted_assertions_file = ctx.previous_outputs.get("promoted_assertions_file")
+        promoted_knowledge_graph_file = ctx.previous_outputs.get("promoted_knowledge_graph_file")
         promoted_entities = load_json_safe(promoted_entities_file, []) if promoted_entities_file else []
         promoted_assertions = load_json_safe(promoted_assertions_file, []) if promoted_assertions_file else []
         if not isinstance(promoted_entities, list):
             promoted_entities = []
         if not isinstance(promoted_assertions, list):
             promoted_assertions = []
+        promoted_graph_assertions: List[Dict[str, Any]] = []
+        if promoted_knowledge_graph_file:
+            promoted_graph = load_json_safe(promoted_knowledge_graph_file, {}) or {}
+            if isinstance(promoted_graph, Mapping):
+                promoted_graph_assertions = _assertions_from_promoted_graph(promoted_graph)
+        if promoted_graph_assertions:
+            assertion_by_id = {
+                _clean_text(assertion.get("id")): assertion
+                for assertion in promoted_assertions
+                if isinstance(assertion, Mapping) and _clean_text(assertion.get("id"))
+            }
+            for assertion in promoted_graph_assertions:
+                assertion_id = _clean_text(assertion.get("id"))
+                if assertion_id and assertion_id not in assertion_by_id:
+                    promoted_assertions.append(assertion)
+                    assertion_by_id[assertion_id] = assertion
 
         derived_entity_records = build_entity_records_from_assertions(promoted_assertions)
         entity_records = merge_entity_records(promoted_entities, derived_entity_records)
         assertion_records = build_assertion_embedding_records(promoted_assertions)
         promoted_answer_records = build_answer_records_from_assertions(promoted_assertions)
         answer_records = merge_answer_records(promoted_answer_records, fallback_answer_records)
+
+        span_ids_by_chunk: Dict[str, List[str]] = defaultdict(list)
+        for span_record in evidence_span_records:
+            for chunk_id in span_record.get("linked_chunk_ids") or []:
+                if chunk_id:
+                    span_ids_by_chunk[str(chunk_id)].append(str(span_record["id"]))
+
+        for assertion_record in assertion_records:
+            linked_chunk_ids = list(
+                dict.fromkeys(
+                    [
+                        str(chunk_id)
+                        for chunk_id in (
+                            assertion_record.get("source_chunk_ids")
+                            or assertion_record.get("linked_chunk_ids")
+                            or []
+                        )
+                        if chunk_id
+                    ]
+                )
+            )
+            source_span_ids: List[str] = []
+            for chunk_id in linked_chunk_ids:
+                source_span_ids.extend(span_ids_by_chunk.get(chunk_id, []))
+            source_span_ids = list(dict.fromkeys(source_span_ids))
+            assertion_record["source_span_ids"] = source_span_ids
+            assertion_record["linked_span_ids"] = source_span_ids
+
+        span_ids_by_assertion = {
+            str(assertion_record.get("id") or ""): list(assertion_record.get("source_span_ids") or [])
+            for assertion_record in assertion_records
+            if str(assertion_record.get("id") or "")
+        }
+        for answer_record in answer_records:
+            assertion_id = str(answer_record.get("source_record_id") or answer_record.get("id") or "")
+            source_span_ids = span_ids_by_assertion.get(assertion_id) or []
+            if source_span_ids:
+                answer_record["source_span_ids"] = source_span_ids
+                answer_record["linked_span_ids"] = source_span_ids
 
         for assertion_record in assertion_records:
             lexical_text = assertion_record.get("lexical_text") or assertion_record.get("text") or ""
@@ -916,12 +1502,14 @@ class GeminiRetrievalFormatter(FormatterStage):
             )
 
         bundle = {
-            "version": 4,
+            "version": 5,
             "generated_at": ctx.run_id,
             "chunk_records": chunk_dense_records,
             "parent_records": parent_records,
             "media_records": media_records,
             "fact_records": fact_records,
+            "evidence_span_records": evidence_span_records,
+            "summary_records": summary_records,
             "entity_records": entity_records,
             "assertion_records": assertion_records,
             "answer_records": answer_records,
@@ -930,10 +1518,14 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "parent_count": len(parent_records),
                 "media_count": len(media_records),
                 "fact_count": len(fact_records),
+                "evidence_span_count": len(evidence_span_records),
+                "summary_count": len(summary_records),
                 "entity_count": len(entity_records),
                 "assertion_count": len(assertion_records),
+                "graph_assertion_count": len(promoted_graph_assertions),
                 "answer_count": len(answer_records),
                 "lexical_count": len(lexical_records),
+                "evidence_span_duplicate_count": evidence_span_duplicate_count,
             },
         }
 
@@ -941,6 +1533,8 @@ class GeminiRetrievalFormatter(FormatterStage):
         parent_file = ctx.stage_work_dir / "parent_dense_records.json"
         media_file = ctx.stage_work_dir / "media_dense_records.json"
         fact_file = ctx.stage_work_dir / "fact_dense_records.json"
+        evidence_span_file = ctx.stage_work_dir / "evidence_span_dense_records.json"
+        summary_file = ctx.stage_work_dir / "summary_dense_records.json"
         entity_file = ctx.stage_work_dir / "entity_records.json"
         assertion_file = ctx.stage_work_dir / "assertion_dense_records.json"
         answer_file = ctx.stage_work_dir / "answer_dense_records.json"
@@ -951,6 +1545,8 @@ class GeminiRetrievalFormatter(FormatterStage):
         atomic_write_json(parent_file, parent_records)
         atomic_write_json(media_file, media_records)
         atomic_write_json(fact_file, fact_records)
+        atomic_write_json(evidence_span_file, evidence_span_records)
+        atomic_write_json(summary_file, summary_records)
         atomic_write_json(entity_file, entity_records)
         atomic_write_json(assertion_file, assertion_records)
         atomic_write_json(answer_file, answer_records)
@@ -958,13 +1554,16 @@ class GeminiRetrievalFormatter(FormatterStage):
         atomic_write_json(bundle_file, bundle)
 
         logger.info(
-            "Gemini retrieval formatter: %d chunks, %d parents, %d media records, %d fact records, %d assertions, %d answers",
+            "Gemini retrieval formatter: %d chunks, %d parents, %d media records, %d fact records, %d evidence spans, %d summaries, %d assertions, %d answers, %d duplicate evidence spans skipped",
             len(chunk_dense_records),
             len(parent_records),
             len(media_records),
             len(fact_records),
+            len(evidence_span_records),
+            len(summary_records),
             len(assertion_records),
             len(answer_records),
+            evidence_span_duplicate_count,
         )
 
         artifacts = [
@@ -999,6 +1598,18 @@ class GeminiRetrievalFormatter(FormatterStage):
                 metadata={"records": len(fact_records), "kind": "facts"},
             ),
             ctx.make_artifact(
+                evidence_span_file,
+                artifact_type="formatted_documents",
+                role="embedding_payload_evidence_spans",
+                metadata={"records": len(evidence_span_records), "kind": "evidence_spans"},
+            ),
+            ctx.make_artifact(
+                summary_file,
+                artifact_type="formatted_documents",
+                role="embedding_payload_summaries",
+                metadata={"records": len(summary_records), "kind": "summaries"},
+            ),
+            ctx.make_artifact(
                 entity_file,
                 artifact_type="formatted_documents",
                 role="entity_records",
@@ -1031,6 +1642,8 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "parent_embedding_file": str(parent_file),
                 "media_embedding_file": str(media_file),
                 "fact_embedding_file": str(fact_file),
+                "evidence_span_embedding_file": str(evidence_span_file),
+                "summary_embedding_file": str(summary_file),
                 "entity_records_file": str(entity_file),
                 "assertion_embedding_file": str(assertion_file),
                 "answer_embedding_file": str(answer_file),
@@ -1042,8 +1655,11 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "parent_records": len(parent_records),
                 "media_records": len(media_records),
                 "fact_records": len(fact_records),
+                "evidence_span_records": len(evidence_span_records),
+                "summary_records": len(summary_records),
                 "entity_records": len(entity_records),
                 "assertion_records": len(assertion_records),
+                "graph_assertion_records": len(promoted_graph_assertions),
                 "answer_records": len(answer_records),
                 "lexical_records": len(lexical_records),
             },

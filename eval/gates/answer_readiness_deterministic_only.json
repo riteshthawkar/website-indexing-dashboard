@@ -1,0 +1,59 @@
+{
+  "overall": {
+    "pass_rate": {
+      "min": 0.91
+    },
+    "answerable_pass_rate": {
+      "min": 0.88
+    },
+    "support_present_rate": {
+      "min": 0.90
+    },
+    "must_include_pass_rate": {
+      "min": 0.90
+    },
+    "no_answer_pass_rate": {
+      "min": 1.0
+    },
+    "error_rate": {
+      "max": 0.0
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "pass_rate": {
+        "min": 0.85
+      }
+    },
+    "scoped": {
+      "pass_rate": {
+        "min": 1.0
+      }
+    },
+    "synthesis": {
+      "pass_rate": {
+        "min": 1.0
+      }
+    },
+    "multimodal": {
+      "pass_rate": {
+        "min": 1.0
+      }
+    }
+  },
+  "by_benchmark_tag": {
+    "contact_lookup": {
+      "pass_rate": {
+        "min": 0.66
+      },
+      "no_answer_pass_rate": {
+        "min": 1.0
+      }
+    },
+    "release_readiness": {
+      "pass_rate": {
+        "min": 0.91
+      }
+    }
+  }
+}

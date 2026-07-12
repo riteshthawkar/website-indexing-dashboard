@@ -233,12 +233,37 @@ class OpenAIEmbedder(EmbedderStage):
 
                 vectors.append(vec)
 
-            try:
-                index.upsert(vectors=vectors, namespace=namespace)
-                vectors_uploaded += len(vectors)
-                logger.info("Uploaded batch %d-%d/%d", i, i + len(vectors), len(docs))
-            except Exception as e:
-                logger.error("Upsert failed for batch %d: %s", i, e)
+            import time
+            import random
+
+            max_retries = 5
+            backoff = 1.0
+
+            for attempt in range(max_retries + 1):
+                try:
+                    index.upsert(vectors=vectors, namespace=namespace)
+                    vectors_uploaded += len(vectors)
+                    logger.info("Uploaded batch %d-%d/%d", i, i + len(vectors), len(docs))
+                    break
+                except Exception as e:
+                    e_str = str(e).lower()
+                    is_transient = any(
+                        k in e_str
+                        for k in ["429", "502", "503", "504", "rate limit", "timeout", "connection refused", "temporary", "busy"]
+                    )
+
+                    if not is_transient or attempt >= max_retries:
+                        logger.error("Pinecone upsert failed permanently for batch %d: %s", i, e)
+                        raise e
+
+                    jitter = random.uniform(0.5, 1.5)
+                    sleep_time = backoff * jitter
+                    logger.warning(
+                        "Transient Pinecone failure during batch %d: %s. Retrying in %.2fs (attempt %d/%d)...",
+                        i, e, sleep_time, attempt + 1, max_retries
+                    )
+                    time.sleep(sleep_time)
+                    backoff *= 2.0
 
         logger.info("Embedder done: %d vectors uploaded to %s", vectors_uploaded, index_name)
 

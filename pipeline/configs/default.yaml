@@ -1,22 +1,29 @@
 # ─────────────────────────────────────────────────────────────
-# Default product pipeline configuration
-# Single user-facing launch template. Keep this file as the
-# editable base config and apply per-run changes via snapshots.
+# MBZUAI production indexing pipeline configuration
+# Single terminal launch template for the MBZUAI website.
+# This path builds assertion-first retrieval artifacts, uploads
+# Pinecone dense/sparse namespaces, and promotes a local JSON
+# knowledge graph artifact. Neo4j remains an optional connector
+# config, not the default production graph store.
 # ─────────────────────────────────────────────────────────────
 
-project_name: "default"
+project_name: "mbzuai_indexing"
 work_dir: "./runs"
 
 pipeline:
   audit_on_stage_complete: true
   audit_on_run_complete: true
   fail_on_audit_error: true
+  require_production_preflight: true
 
 # Stage execution order — each entry maps to a registered plugin.
 stages:
   - id: crawl_web
     type: crawler
     plugin: crawl4ai
+  - id: prepare_mbzuai_index
+    type: formatter
+    plugin: mbzuai_index_readiness
   - id: score_raw_content
     type: quality_gate
     plugin: quality_scorer
@@ -53,27 +60,30 @@ stages:
   - id: format_retrieval
     type: formatter
     plugin: retrieval_bundle_v2
-  - id: upload_retrieval
-    type: embedder
-    plugin: gemini_pinecone
   - id: format_graph
     type: formatter
     plugin: knowledge_graph
   - id: promote_graph
     type: formatter
     plugin: semantic_graph_promote
-  - id: upload_graph
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: upload_retrieval
     type: embedder
-    plugin: neo4j_graph_store
+    plugin: gemini_pinecone
 
 # ─── Crawler ────────────────────────────────────────────────
 crawler:
   start_url: "https://mbzuai.ac.ae"
-  max_pages: 1200
+  max_pages: 5000
   max_depth: 4
   fetch_concurrency: 5
   download_concurrency: 10
-  timeout: 30                   # seconds
+  timeout: 45                   # seconds
   stream_results: false
   fail_on_empty_result: true
   frontier_empty_timeout_sec: 180
@@ -83,10 +93,27 @@ crawler:
   max_image_size_mb: 10
   download_retry_attempts: 3
   download_retry_backoff_sec: 2.0
+  raw_source_retry_attempts: 5
+  raw_source_retry_backoff_sec: 2.0
   checkpoint_flush_interval_sec: 5
   sitemap_enabled: true
-  sitemap_seed_limit: 200
-  sitemap_frontier_seed_limit: 10
+  sitemap_seed_limit: 5000
+  sitemap_frontier_seed_limit: 5000
+  sitemap_batch_crawl: true        # bounded batches prevent thousands of sitemap URLs from spawning one giant Crawl4AI level
+  sitemap_crawl_batch_size: 40
+  sitemap_failed_url_retry_attempts: 2
+  sitemap_failed_retry_backoff_sec: 2.0
+  retry_recoverable_skipped_on_resume: true
+  recoverable_skip_max_retries: 2
+  excluded_path_prefixes: []
+  priority_seed_urls:
+    - "https://mbzuai.ac.ae/about/office-of-the-president"
+    - "https://mbzuai.ac.ae/about/leadership"
+    - "https://mbzuai.ac.ae/about/contact"
+    - "https://mbzuai.ac.ae/study/graduate-admission-process"
+    - "https://mbzuai.ac.ae/study/undergraduate-admission-process"
+    - "https://mbzuai.ac.ae/student-resources"
+    - "https://mbzuai.ac.ae/student-resources/campus-facilities"
   respect_robots_txt: true
   include_external: false
   allow_query_urls: false
@@ -95,37 +122,42 @@ crawler:
     - "mbzuai.ac.ae"
   excluded_subdomains:
     - "library.mbzuai.ac.ae"
-  user_agent: null
-  headers: {}
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+  headers:
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    Accept-Language: "en-US,en;q=0.9"
   cookies: []
   proxy: null
   proxy_config: null
   storage_state: null
   viewport: null
-  ignore_https_errors: true
+  ignore_https_errors: false
+  require_https: true
   enable_stealth: false
   java_script_enabled: true
   init_scripts: []
   wait_until: "domcontentloaded"
   wait_for: null
   wait_for_timeout_ms: null
-  delay_before_return_html: 0.1
-  mean_delay: 0.1
-  max_range: 0.3
+  delay_before_return_html: 1.0
+  mean_delay: 0.25
+  max_range: 0.5
   process_iframes: false
   remove_overlay_elements: true
-  simulate_user: false
-  override_navigator: false
-  magic: false
+  simulate_user: true
+  override_navigator: true
+  magic: true
   # Image extraction from web pages
   extract_images: true            # extract content images from HTML
-  download_page_images: true      # cache HTML page images locally for the dashboard
+  download_page_images: false     # keep text indexing lean; media URLs remain in metadata without caching binaries
   max_images_per_page: 20         # max images to save per page
   extract_videos: true            # extract embedded/direct videos from HTML and iframe embeds
   max_videos_per_page: 10
   fetch_video_transcripts: true   # fetch WebVTT/SRT text tracks when available on allowed domains
   max_video_transcript_kb: 128
   parse_source_html_for_media: true  # merge media found in raw source when rendered DOM omits it
+  validate_source_html: true          # compare rendered captures with raw source and keep the page-specific version
+  validate_source_html_mode: "on_quality_warning"  # use "always" for audits; default protects speed on large crawls
 
 # ─── Cleaner ────────────────────────────────────────────────
 cleaner:
@@ -149,16 +181,24 @@ converter:
   do_table_structure: true
   force_backend_text: true
   images_scale: 2.0
-  generate_picture_images: true
+  generate_picture_images: false
   generate_page_images: false
   document_timeout: 180
   docling_prefetch_models: true
   docling_artifacts_path: "~/.cache/docling/models"
-  docling_doc_batch_size: 4
-  docling_doc_batch_concurrency: 2
-  docling_submit_batch_size: 4
-  docling_page_batch_size: 8
-  docling_page_batch_concurrency: 2
+  docling_max_pages: 80            # larger PDFs are converted through Docling page windows
+  docling_max_file_size_mb: 35
+  docling_large_pdf_strategy: "page_windows"
+  docling_large_pdf_window_pages: 40
+  docling_large_pdf_min_window_pages: 1
+  docling_large_pdf_allow_window_text_fallback: true
+  reuse_existing_conversions: true
+  min_free_disk_mb: 1024
+  docling_doc_batch_size: 1
+  docling_doc_batch_concurrency: 1
+  docling_submit_batch_size: 1
+  docling_page_batch_size: 4
+  docling_page_batch_concurrency: 1
   docling_elements_batch_size: 24
   # Granite Vision picture descriptions
   use_vlm: false
@@ -200,17 +240,6 @@ converter:
   validation_min_semantic_media_words: 10
   validation_min_semantic_media_item_words: 4
 
-# ─── Summarizer ─────────────────────────────────────────────
-summarizer:
-  model: "gpt-4.1-nano"
-  temperature: 0.1
-  max_tokens: 32000
-  concurrency: 10
-  retry_attempts: 3
-  retry_delay: 5
-  per_request_delay_sec: 0.0
-  use_existing_summaries: true
-
 # ─── Chunker ────────────────────────────────────────────────
 chunker:
   strategy: "hybrid"
@@ -233,6 +262,17 @@ quality:
   target_languages:
     - en
 
+# ─── Summarizer ──────────────────────────────────────────────
+summarizer:
+  model: "gpt-5.4-mini"
+  temperature: 0.1
+  max_tokens: 32000
+  concurrency: 4
+  retry_attempts: 3
+  retry_delay: 5
+  per_request_delay_sec: 0
+  use_existing_summaries: true
+
 # ─── Formatter ──────────────────────────────────────────────
 formatter:
   include_full_content: true
@@ -252,29 +292,55 @@ formatter:
   sparse_parent_max_chars: 8000
   sparse_media_max_chars: 4000
   sparse_fact_max_chars: 480
+  sparse_summary_max_chars: 3000
+  summary_record_max_chars: 1800
   sparse_parent_max_headings: 12
   sparse_parent_max_snippets: 6
+  legacy_summary_context_max_chars: 10000
+  legacy_text_context_max_chars: 12000
+  previous_canonical_page_metadata_file: ""
+  expected_site_inventory_count: 3800
+  minimum_inventory_coverage_ratio: 0.75
+  fail_on_critical_coverage: true
+  fail_on_inventory_gap: false
+  critical_url_patterns:
+    - "/about/office-of-the-president/?$"
+    - "/about/leadership"
+    - "/about/contact/?$"
+    - "/study/"
+    - "/student-resources"
+  official_source_host_suffixes:
+    - "mbzuai.ac.ae"
+    - "staticcdn.mbzuai.ac.ae"
+  exclude_non_official_sources: true
 
 graph:
+  store_backend: "local_json"
+  require_neo4j_upload: false
+  community_summary_model: "gemini-2.5-flash"
+  community_summary_min_coverage_ratio: 0.90
+  community_summary_min_characters: 40
+  community_summary_max_provider_failures: 5
+  community_summary_reuse_existing: true
   extraction_provider: "gemini"
   extraction_model: "gemini-2.5-flash"
   extraction_temperature: 0.0
-  extraction_source: "facts_only"
+  extraction_source: "facts_first"
   extraction_batch_size: 16
   extraction_parallelism: 3
-  extraction_max_items: 800
-  extraction_max_items_per_document: 3
+  extraction_max_items: 0
+  extraction_max_items_per_document: 0
   extraction_min_score: 5.0
   extraction_priority_host_suffixes:
     - "mbzuai.ac.ae"
   extraction_resume_cache: true
-  extraction_include_chunk_fallback: false
+  extraction_include_chunk_fallback: true
   extraction_min_confidence: 0.55
   extraction_retry_attempts: 5
   extraction_retry_base_delay_sec: 5
   extraction_retry_max_delay_sec: 120
   extraction_split_on_retryable_failure: true
-  extraction_fail_open_after_retries: true
+  extraction_fail_open_after_retries: false
   promote_min_confidence: 0.65
   canonicalize_merge_aliases: true
   neo4j_uri: ""
@@ -287,6 +353,7 @@ graph:
   neo4j_http_timeout_sec: 60
   neo4j_load_batch_size: 1000
   neo4j_clear_namespace_on_zero_progress: true
+  neo4j_verify_after_upload: true
   allowed_entity_types:
     - Person
     - Program
@@ -320,26 +387,23 @@ graph:
     - OTHER
 
 assertions:
-  slice_target_tokens: 2200
-  slice_max_tokens: 3200
-  slice_section_margin_tokens: 320
-  max_slices: 0
   allowed_authority_classes:
     - canonical_page
     - policy_page
     - official_catalog
     - official_brochure
     - faq_page
-  excluded_authority_classes: []
-  allowed_document_types: []
+  slice_target_tokens: 2200
+  slice_max_tokens: 3200
+  slice_section_margin_tokens: 320
   extract_model: "gpt-5-mini"
   extract_reasoning_effort: "minimal"
   extract_temperature: 0.0
   extract_max_completion_tokens: 4000
   extract_concurrency: 4
   extract_retries: 3
-  extract_retry_delay_sec: 3
-  extract_per_request_delay_sec: 0
+  extract_retry_delay_sec: 3.0
+  extract_per_request_delay_sec: 0.0
   extract_use_cache: true
   validate_model: "gpt-5-nano"
   validate_reasoning_effort: "minimal"
@@ -347,15 +411,17 @@ assertions:
   validate_max_completion_tokens: 3000
   validate_concurrency: 4
   validate_retries: 3
-  validate_retry_delay_sec: 2
-  validate_per_request_delay_sec: 0
+  validate_retry_delay_sec: 2.0
+  validate_per_request_delay_sec: 0.0
   validate_use_cache: true
   promote_min_confidence: 0.58
   promote_min_authority_score: 0.40
   promote_allow_ambiguous: false
+  conflict_tie_tolerance: 0.03
 
 retrieval:
   retriever_backend: "routed_hybrid"
+  pinecone_query_timeout_seconds: 10
   routed_graph_enabled: true
   routed_graph_query_types: ["fact"]
   routed_graph_min_confidence: 0.38
@@ -364,17 +430,32 @@ retrieval:
   parallel_graph_enabled: true
   parallel_query_rewriting_enabled: true
   parallel_graph_augment_all_queries: true
-  query_planner_enabled: true
-  query_planner_model: "gpt-5-nano"
+  query_planner_enabled: false
+  query_planner_model: "gemini-2.5-flash"
   query_planner_reasoning_effort: "minimal"
   query_planner_min_confidence: 0.55
-  evidence_adjudicator_enabled: true
-  evidence_adjudicator_model: "gpt-5-nano"
+  hyde_enabled: false
+  hyde_query_modes: ["synthesis"]
+  hyde_model: "gpt-5-nano"
+  hyde_min_confidence: 0.55
+  hyde_max_chars: 600
+  selective_adjudication_enabled: true
+  namespace_evidence_spans: "evidence_spans"
+  evidence_budget_items: 8
+  evidence_budget_chars: 8000
+  evidence_budget_max_per_source: 2
+  aggregation_evidence_budget_items: 12
+  aggregation_evidence_budget_chars: 10000
+  large_page_evidence_budget_items: 12
+  large_page_evidence_budget_chars: 10000
+  evidence_adjudicator_enabled: false
+  evidence_adjudicator_model: "gemini-2.5-flash"
   evidence_adjudicator_reasoning_effort: "minimal"
   evidence_adjudicator_min_confidence: 0.58
   evidence_adjudicator_max_completion_tokens: 800
   evidence_adjudicator_retries: 2
   evidence_adjudicator_retry_delay_sec: 1
+  evidence_adjudicator_timeout_sec: 12
   evidence_adjudicator_per_request_delay_sec: 0
   evidence_adjudicator_answer_limit: 4
   evidence_adjudicator_fact_limit: 4
@@ -386,7 +467,6 @@ retrieval:
   graph_relation_route_min_confidence: 0.38
   graph_relation_graph_first_min_confidence: 0.62
   graph_relation_reorder_min_confidence: 0.86
-  graph_relation_assertion_limit: 4
   graph_relation_fact_limit: 6
   graph_relation_local_candidate_limit: 12
   graph_relation_prefer_local: true
@@ -395,6 +475,10 @@ retrieval:
   graph_relation_parent_seed_bonus: 1.4
   graph_relation_fact_seed_bonus: 2.5
   parallel_lane_workers: 6
+  persistent_lane_executors: true
+  split_lane_executors: true
+  parallel_remote_lane_workers: 6
+  parallel_local_lane_workers: 4
   enable_local_bm25_fallback: false
   local_index_max_postings_per_token: 512
   local_chunk_candidate_pool: 96
@@ -406,13 +490,13 @@ retrieval:
   dense_parent_top_k: 6
   dense_media_top_k: 6
   dense_fact_top_k: 8
-  dense_assertion_top_k: 10
+  dense_summary_top_k: 6
   lexical_top_k: 12
   sparse_chunk_top_k: 14
   sparse_parent_top_k: 8
   sparse_media_top_k: 8
   sparse_fact_top_k: 10
-  sparse_assertion_top_k: 10
+  sparse_summary_top_k: 8
   rrf_k: 60
   fact_neighbor_window: 1
   max_context_chunks: 12
@@ -428,6 +512,8 @@ retrieval:
   rerank_fact_return_top_k: 6
   rerank_query_max_tokens: 32
   rerank_doc_max_tokens: 96
+  rerank_doc_max_chars: 800
+  rerank_request_max_chars: 9000
   rerank_retry_doc_max_tokens: [72, 56, 40]
   rerank_skip_high_confidence_fact: true
   rerank_skip_fact_overlap: 0.72
@@ -436,16 +522,16 @@ retrieval:
   fact_abstain_min_token_overlap: 0.20
   fact_require_fact_support_overlap: 0.35
   abstain_min_support_score: 0.05
+  temporal_exact_year_guard_enabled: true
+  temporal_guard_top_k: 5
   parent_candidate_top_k: 3
   graph_max_fact_results: 4
   graph_max_additional_media_results: 2
   graph_max_context_documents: 4
-  graph_max_assertion_results: 4
   graph_chunk_fact_bonus: 0.25
   graph_parent_fact_bonus: 0.15
   graph_chunk_media_bonus: 0.20
   graph_parent_media_bonus: 0.12
-  graph_assertion_bonus: 0.30
   graph_max_additional_chunk_candidates: 6
   graph_max_additional_parent_candidates: 4
   weight_dense_chunks: 1.0
@@ -461,8 +547,8 @@ retrieval:
   weight_local_media: 1.4
   weight_dense_facts: 1.3
   weight_sparse_facts: 1.5
-  weight_dense_assertions: 2.0
-  weight_sparse_assertions: 2.2
+  weight_dense_summaries: 1.15
+  weight_sparse_summaries: 1.25
   weight_local_facts: 1.9
   weight_local_answers: 2.1
   weight_graph_relation_facts: 2.4
@@ -476,40 +562,53 @@ storage:
 
 # ─── Embedder ───────────────────────────────────────────────
 embedder:
+  # Release-scoped namespaces make candidate uploads immutable and keep the
+  # active retriever untouched until release promotion.
+  namespace_strategy: "release"
+  namespace_release_template: "{base}--{release_id}"
   engine: "gemini"
-  model: "gemini-embedding-2-preview"
-  pinecone_index: "mbzuai-gemini-retrieval-v2"
-  pinecone_sparse_index: "mbzuai-gemini-retrieval-v2-sparse"
-  batch_size: 32
-  media_text_batch_size: 32
-  media_multimodal_batch_size: 4
-  upsert_batch_size: 100
-  use_sparse_embeddings: false
-  namespace: ""
+  model: "gemini-embedding-2"
   output_dimensionality: 1536
+  # Legacy two-index chatbot compatibility fields. The production upload stage
+  # below uses pinecone_index/pinecone_sparse_index and the typed namespaces.
+  pinecone_summary_index: "mbzuai-summary-gemini-index-latest"
+  pinecone_text_index: "mbzuai-text-gemini-index-latest"
+  pinecone_index: "mbzuai-gemini-retrieval-v3"
+  pinecone_sparse_index: "mbzuai-gemini-retrieval-v3-sparse"
   namespace_chunks: "chunks"
   namespace_parents: "parents"
   namespace_media: "media"
   namespace_facts: "facts"
+  namespace_evidence_spans: "evidence_spans"
+  namespace_summaries: "summaries"
   namespace_assertions: "assertions"
-  create_index_if_missing: true
+  namespace_entities: "entities"
+  namespace_communities: "communities"
+  batch_size: 32
+  media_text_batch_size: 32
+  media_multimodal_batch_size: 4
+  upsert_batch_size: 100
   enable_dense_facts: true
+  enable_dense_evidence_spans: true
   enable_dense_assertions: true
   enable_sparse: true
+  enable_sparse_evidence_spans: true
   sparse_model: "pinecone-sparse-english-v0"
   sparse_text_field: "chunk_text"
   sparse_upsert_batch_size: 96
-  sparse_max_text_chars: 12000
-  sparse_max_record_bytes: 24000
-  clear_dense_namespace_on_zero_progress: true
-  clear_sparse_namespace_on_zero_progress: true
-  sparse_metric: "dotproduct"
+  use_sparse_embeddings: true
+  namespace: ""
+  refit_bm25: true
+  bm25_model_path: ""
+  bm25_output_path: "../../MBZUAI_BM25_ENCODER.json"
+  create_index_if_missing: true
   pinecone_cloud: "aws"
   pinecone_region: "us-east-1"
-  metric: "cosine"
-  pinecone_connect_timeout_sec: 10
-  pinecone_read_timeout_sec: 120
-  progress_flush_every_batches: 1
+  metric: "dotproduct"
+  create_index_wait_timeout_sec: 180
   max_retries: 10
   retry_base_delay_sec: 5
   retry_max_delay_sec: 300
+  gemini_request_timeout_ms: 120000
+  verify_index_after_upload: true
+  verify_index_min_count_only: false

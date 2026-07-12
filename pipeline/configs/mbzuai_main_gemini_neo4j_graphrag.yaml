@@ -33,6 +33,9 @@ stages:
   - id: format_graph
     type: formatter
     plugin: knowledge_graph
+  - id: gliner_extract_graph
+    type: formatter
+    plugin: gliner_extract
   - id: extract_semantic_graph
     type: formatter
     plugin: semantic_graph_extract
@@ -42,6 +45,15 @@ stages:
   - id: promote_graph
     type: formatter
     plugin: semantic_graph_promote
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: finalize_retrieval_bundle
+    type: formatter
+    plugin: gemini_retrieval
   - id: upload_retrieval
     type: embedder
     plugin: gemini_pinecone

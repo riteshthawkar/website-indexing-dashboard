@@ -1,30 +1,42 @@
--r dashboard/requirements.txt
 -r pipeline/requirements-docling.txt
 
-aiohttp==3.11.14
+# Canonical mbzuai_production runtime. Optional benchmark, RAGAS, local
+# SentenceTransformer, and GLiNER stacks are intentionally excluded: they are
+# not reached by the production profile and currently force vulnerable or
+# incompatible dependency lines into the deployment image.
+aiohttp==3.14.1
 beautifulsoup4==4.13.3
-crawl4ai==0.8.0
+boto3==1.43.46
+crawl4ai==0.9.1
 datasketch==1.9.0
-datasets==4.8.2
-google-generativeai==0.8.4
+fastapi==0.136.1
+google-genai==1.75.0
 httpx==0.28.1
-ir-datasets==0.5.11
 markitdown==0.1.1
 openai==2.28.0
 openpyxl==3.1.5
-orjson==3.10.16
+orjson==3.11.6
+pinecone==9.0.0
 pinecone-text==0.10.0
+pillow==12.2.0
+pydantic==2.13.4
 PyMuPDF==1.25.4
+python-dotenv==1.2.2
 python-docx==1.2.0
 python-pptx==1.0.2
-requests==2.32.3
-sentence-transformers==5.0.0
+PyYAML==6.0.3
+rank-bm25==0.2.2
+requests==2.33.0
 tiktoken==0.9.0
-torch==2.7.0
-transformers==4.53.0
 trafilatura==2.0.0
+uvicorn[standard]==0.47.0
+websockets==16.0
+networkx==3.6.1
+igraph==1.0.0
+leidenalg==0.11.0
+lxml==6.1.1
+lxml-html-clean==0.4.5
 
-# Fallback / optional helpers used by some pipeline paths.
-langdetect>=1.0.9
-pdfplumber>=0.11.0
-ragas==0.4.3
+# Fallback helpers used by production document paths.
+langdetect==1.0.9
+pdfplumber==0.11.9

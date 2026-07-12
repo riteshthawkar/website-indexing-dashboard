@@ -23,9 +23,79 @@ TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$")
 SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
 
 
+def _clean_text(value: Any) -> str:
+    return " ".join(str(value or "").split()).strip()
+
+
+def _path_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).resolve())
+    except Exception:
+        return text
+
+
+def _document_stem_key(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    stem = Path(text).stem
+    stem = re.sub(r"\.pages_\d+_\d+$", "", stem)
+    return stem.casefold()
+
+
+def _load_download_source_lookup(ctx: StageContext) -> Dict[str, str]:
+    mapping_file = ctx.work_dir / "mappings.json"
+    payload = load_json_safe(mapping_file, {}) if mapping_file.exists() else {}
+    if not isinstance(payload, dict):
+        return {}
+    lookup: Dict[str, str] = {}
+    for source_url, local_path in payload.items():
+        source = _clean_text(source_url)
+        if not source:
+            continue
+        for key in (
+            _path_key(local_path),
+            _document_stem_key(local_path),
+            Path(str(local_path or "")).name.casefold(),
+        ):
+            if key:
+                lookup.setdefault(key, source)
+    return lookup
+
+
+def _resolve_source_url(
+    source_url: Any,
+    *,
+    source_file: Any = "",
+    source_markdown_path: Any = "",
+    document_title: Any = "",
+    download_source_lookup: Dict[str, str] | None = None,
+) -> str:
+    existing = _clean_text(source_url)
+    if existing:
+        return existing
+    lookup = download_source_lookup or {}
+    for key in (
+        _path_key(source_file),
+        _path_key(source_markdown_path),
+        _document_stem_key(source_file),
+        _document_stem_key(source_markdown_path),
+        _document_stem_key(document_title),
+        Path(str(source_file or "")).name.casefold(),
+        Path(str(source_markdown_path or "")).name.casefold(),
+    ):
+        if key and key in lookup:
+            return lookup[key]
+    return ""
+
+
 def collect_markdown_sources(ctx: StageContext) -> List[Dict[str, Any]]:
     markdown_artifacts = ctx.find_artifacts(artifact_type="markdown")
     sources: List[Dict[str, Any]] = []
+    download_source_lookup = _load_download_source_lookup(ctx)
 
     if markdown_artifacts:
         for record in markdown_artifacts:
@@ -33,16 +103,24 @@ def collect_markdown_sources(ctx: StageContext) -> List[Dict[str, Any]]:
                 continue
             metadata = dict(record.metadata or {})
             path = Path(record.local_path).resolve()
+            source_file = str(metadata.get("source_file") or "")
+            source_url = _resolve_source_url(
+                metadata.get("source_url"),
+                source_file=source_file,
+                source_markdown_path=path,
+                document_title=metadata.get("document_title") or path.stem,
+                download_source_lookup=download_source_lookup,
+            )
             sources.append(
                 {
                     "path": path,
                     "artifact_id": record.artifact_id,
                     "metadata": metadata,
-                    "source_url": str(metadata.get("source_url") or ""),
+                    "source_url": source_url,
                     "source_backend": str(metadata.get("backend") or ""),
                     "document_title": metadata.get("document_title") or path.stem,
                     "document_type": str(metadata.get("source_type") or ""),
-                    "source_file": str(metadata.get("source_file") or ""),
+                    "source_file": source_file,
                 }
             )
         return sources
@@ -57,12 +135,18 @@ def collect_markdown_sources(ctx: StageContext) -> List[Dict[str, Any]]:
 
     for path in Path(md_dir).glob("**/*.md"):
         resolved = path.resolve()
+        source_url = _resolve_source_url(
+            md_to_url.get(str(resolved), ""),
+            source_markdown_path=resolved,
+            document_title=resolved.stem,
+            download_source_lookup=download_source_lookup,
+        )
         sources.append(
             {
                 "path": resolved,
                 "artifact_id": None,
                 "metadata": {},
-                "source_url": md_to_url.get(str(resolved), ""),
+                "source_url": source_url,
                 "source_backend": "",
                 "document_title": resolved.stem,
                 "document_type": "",
@@ -296,9 +380,26 @@ def split_text_by_budget(
     current_units: List[str] = []
     current_tokens = 0
 
+    def estimate_units(candidate_units: List[str]) -> int:
+        return estimate_token_count("\n\n".join(candidate_units).strip())
+
     for unit in units:
         unit_tokens = estimate_token_count(unit)
-        if current_units and current_tokens + unit_tokens > max_tokens:
+        if unit_tokens > max_tokens:
+            if current_units:
+                chunks.append("\n\n".join(current_units).strip())
+                current_units = []
+                current_tokens = 0
+            chunks.extend(
+                split_text_by_budget(
+                    unit,
+                    max_tokens=max_tokens,
+                    overlap_tokens=overlap_tokens,
+                )
+            )
+            continue
+        prospective_tokens = estimate_units(current_units + [unit]) if current_units else unit_tokens
+        if current_units and prospective_tokens > max_tokens:
             chunks.append("\n\n".join(current_units).strip())
             if overlap_tokens > 0:
                 overlap: List[str] = []
@@ -310,13 +411,17 @@ def split_text_by_budget(
                     if overlap_count >= overlap_tokens:
                         break
                 current_units = overlap
-                current_tokens = sum(estimate_token_count(item) for item in current_units)
+                current_tokens = estimate_units(current_units) if current_units else 0
+                if current_units and estimate_units(current_units + [unit]) > max_tokens:
+                    while current_units and estimate_units(current_units + [unit]) > max_tokens:
+                        current_units.pop(0)
+                    current_tokens = estimate_units(current_units) if current_units else 0
             else:
                 current_units = []
                 current_tokens = 0
 
         current_units.append(unit)
-        current_tokens += unit_tokens
+        current_tokens = estimate_units(current_units)
 
     if current_units:
         chunks.append("\n\n".join(current_units).strip())
@@ -438,23 +543,27 @@ def hybrid_markdown_chunks(
             return
         section_path = list(current_units[-1].get("section_path") or [])
         element_types = sorted({etype for unit in current_units for etype in unit.get("element_types") or []})
-        chunks.append(
-            {
-                "document_id": document_id,
-                "chunk_index": len(chunks),
-                "text": piece,
-                "token_count": estimate_token_count(piece),
-                "section_path": section_path,
-                "heading": section_path[-1] if section_path else "",
-                "element_types": element_types or ["paragraph"],
-                "document_title": source_info.get("document_title") or Path(source_info["path"]).stem,
-                "document_type": source_info.get("document_type") or "",
-                "source_backend": source_info.get("source_backend") or "",
-                "source_file": source_info.get("source_file") or "",
-                "source_markdown_path": str(source_info["path"]),
-                "source_url": source_info.get("source_url") or "",
-            }
-        )
+        pieces = split_text_by_budget(piece, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
+        for emitted_piece in pieces:
+            chunks.append(
+                {
+                    "document_id": document_id,
+                    "chunk_index": len(chunks),
+                    "text": emitted_piece,
+                    "token_count": estimate_token_count(emitted_piece),
+                    "section_path": section_path,
+                    "heading": section_path[-1] if section_path else "",
+                    "element_types": element_types or ["paragraph"],
+                    "document_title": source_info.get("document_title") or Path(source_info["path"]).stem,
+                    "document_type": source_info.get("document_type") or "",
+                    "source_backend": source_info.get("source_backend") or "",
+                    "source_file": source_info.get("source_file") or "",
+                    "source_markdown_path": str(source_info["path"]),
+                    "source_url": source_info.get("source_url") or "",
+                }
+            )
+            if len(chunks) >= max_chunks_per_document:
+                break
         current_units = []
         current_tokens = 0
 
@@ -555,6 +664,38 @@ def extract_docling_meta(meta: Any) -> Tuple[List[str], List[int], List[str]]:
     return headings, sorted(set(page_numbers)), sorted(set(element_types))
 
 
+def _build_docling_hybrid_chunker(max_tokens: int, *, always_emit_headings: bool):
+    from docling.chunking import HybridChunker
+
+    try:
+        import tiktoken
+        from docling_core.transforms.chunker.tokenizer.base import BaseTokenizer
+        from pydantic import ConfigDict
+
+        class TiktokenBudgetTokenizer(BaseTokenizer):
+            model_config = ConfigDict(arbitrary_types_allowed=True)
+
+            tokenizer: Any
+            max_tokens: int
+
+            def count_tokens(self, text: str) -> int:
+                return len(self.tokenizer.encode(text=text or "", disallowed_special=()))
+
+            def get_max_tokens(self) -> int:
+                return self.max_tokens
+
+            def get_tokenizer(self) -> Any:
+                return self.tokenizer
+
+        tokenizer = TiktokenBudgetTokenizer(
+            tokenizer=tiktoken.get_encoding("cl100k_base"),
+            max_tokens=max_tokens,
+        )
+        return HybridChunker(tokenizer=tokenizer, always_emit_headings=always_emit_headings)
+    except Exception:
+        return HybridChunker(always_emit_headings=always_emit_headings)
+
+
 def docling_chunks_from_json(
     json_path: Path,
     *,
@@ -565,12 +706,50 @@ def docling_chunks_from_json(
     max_chunks_per_document: int,
     always_emit_headings: bool = False,
 ) -> List[Dict[str, Any]]:
+    window_index = load_json_safe(json_path, {})
+    if isinstance(window_index, dict) and window_index.get("schema") == "mbzuai_docling_page_windows.v1":
+        chunks: List[Dict[str, Any]] = []
+        for part in window_index.get("parts") or []:
+            structured_path = str(part.get("structured_document_path") or "").strip()
+            if not structured_path:
+                continue
+            part_path = Path(structured_path)
+            if not part_path.is_absolute():
+                part_path = (json_path.parent / part_path).resolve()
+            if not part_path.is_file():
+                continue
+            remaining = max_chunks_per_document - len(chunks)
+            if remaining <= 0:
+                return chunks
+            part_chunks = docling_chunks_from_json(
+                part_path,
+                strategy=strategy,
+                source_info=source_info,
+                max_tokens=max_tokens,
+                overlap_tokens=overlap_tokens,
+                max_chunks_per_document=remaining,
+                always_emit_headings=always_emit_headings,
+            )
+            page_range = part.get("page_range") or []
+            for chunk in part_chunks:
+                chunk["chunk_index"] = len(chunks)
+                if page_range and not chunk.get("page_numbers"):
+                    try:
+                        start_page, end_page = int(page_range[0]), int(page_range[1])
+                        chunk["page_numbers"] = list(range(start_page, end_page + 1))
+                    except Exception:
+                        pass
+                chunks.append(chunk)
+                if len(chunks) >= max_chunks_per_document:
+                    return chunks
+        return chunks
+
     from docling.chunking import HierarchicalChunker, HybridChunker
     from docling_core.types.doc import DoclingDocument
 
     doc = DoclingDocument.load_from_json(json_path)
     if strategy == "hybrid":
-        chunker = HybridChunker(always_emit_headings=always_emit_headings)
+        chunker = _build_docling_hybrid_chunker(max_tokens, always_emit_headings=always_emit_headings)
     else:
         chunker = HierarchicalChunker(always_emit_headings=always_emit_headings)
 

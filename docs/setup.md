@@ -1,31 +1,29 @@
 # Setup Guide
 
-This is the machine-setup guide for bringing the product up on a new workstation.
+This is the operator setup guide for the terminal-first MBZUAI indexing pipeline.
 
 ## 1. Prerequisites
 
-- Python `3.10`
-- Node.js `20+`
-- npm `10+`
-- network access to OpenAI, Gemini, Pinecone, and Neo4j
+- Python `3.10` to `3.12`
+- network access to OpenAI, Gemini, and Pinecone
 
-## 2. Clone And Configure
+## 2. Configure Secrets
 
 ```bash
-git clone <repo-url>
-cd website-indexing-dashboard
 cp .env.example .env
 ```
 
-Fill in:
+Required for the production config:
 
 - `OPENAI_API_KEY`
-- `GEMINI_API_KEY`
+- `GOOGLE_API_KEY` or `GEMINI_API_KEY`
 - `PINECONE_API_KEY`
-- `NEO4J_URI`
-- `NEO4J_DATABASE`
-- `NEO4J_USERNAME`
-- `NEO4J_PASSWORD`
+
+Optional:
+
+- `NEO4J_URI`, `NEO4J_DATABASE`, `NEO4J_USERNAME`, `NEO4J_PASSWORD`, and `NEO4J_NAMESPACE` only when `graph.store_backend: neo4j` is enabled
+- `FASTTEXT_LID_MODEL` for local language detection
+- `PIPELINE_<SECTION>__<KEY>` overrides for any YAML config value
 
 ## 3. Bootstrap
 
@@ -33,102 +31,124 @@ Fill in:
 bash scripts/bootstrap.sh
 ```
 
-The bootstrap script performs:
+The bootstrap script creates `env/`, installs Python dependencies from `requirements.txt`, and installs Chromium for Crawl4AI/Playwright.
 
-- Python virtualenv creation at `env/`
-- `pip install -r requirements.txt`
-- `python -m playwright install chromium`
-- `npm ci` in [`dashboard-ui/`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui)
-
-If Playwright browser installation fails because the host is missing system packages, run:
+If browser installation fails because system packages are missing:
 
 ```bash
 env/bin/python -m playwright install-deps chromium
 env/bin/python -m playwright install chromium
 ```
 
-## 4. Start The Product
+## 4. Preflight
 
-### Backend
-
-```bash
-bash scripts/dashboard.sh
-```
-
-This starts the FastAPI dashboard backend on `:8050`.
-
-### Frontend
-
-Development mode:
+Run this before a production crawl:
 
 ```bash
-cd dashboard-ui
-npm run dev -- --hostname 0.0.0.0 --port 3000
+bash scripts/pipeline.sh doctor
 ```
 
-Production-like static serve:
+The doctor command checks:
+
+- required assertion-first stage order
+- OpenAI, Gemini, and Pinecone credentials
+- Pinecone index and namespace targets
+- Pinecone post-upload verification
+- local promoted graph artifact verification
+- Neo4j credentials and post-upload verification only when configured as the graph store
+- stage registration and stage-level config validation
+
+## 5. Core Commands
 
 ```bash
-cd dashboard-ui
-npm run build
-npx serve out -l 3000
+bash scripts/pipeline.sh dry-run
+bash scripts/pipeline.sh validate-config
+bash scripts/pipeline.sh run
 ```
 
-The frontend is configured as a static export build in:
-
-- [`dashboard-ui/next.config.ts`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/dashboard-ui/next.config.ts)
-
-## 5. Default Product Config
-
-There is a single user-facing launch config:
-
-- [`pipeline/configs/default.yaml`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/pipeline/configs/default.yaml)
-
-Important operational details:
-
-- the dashboard uses `default` for launch
-- the dashboard stores a run-local config snapshot
-- each run executes its own saved snapshot, not the mutable file on disk
-
-## 6. Core Commands
-
-Validate config:
+Resume a run:
 
 ```bash
-bash scripts/pipeline.sh validate-config --config default
+bash scripts/pipeline.sh run --resume --run-id <run_id>
 ```
 
-Show stage plan:
+Restart from a stage:
 
 ```bash
-bash scripts/pipeline.sh dry-run --config default
+bash scripts/pipeline.sh run --restart-from-stage <stage_id> --run-id <run_id>
 ```
 
-Run the full pipeline:
+Audit run artifacts:
 
 ```bash
-bash scripts/pipeline.sh run --config default
+bash scripts/pipeline.sh audit-run --work-dir runs/<project>/<run_id>
 ```
 
-Run the retriever service:
+Run a retrieval smoke query:
 
 ```bash
-bash scripts/pipeline.sh serve-retriever --config default --work-dir <run_work_dir> --host 0.0.0.0 --port 8663
+bash scripts/pipeline.sh retrieve --work-dir runs/<project>/<run_id> --query "What programs does MBZUAI offer?"
 ```
 
-## 7. Current Default External Stores
+Serve retrieval over HTTP for agents:
 
-Default Pinecone indexes from [`pipeline/configs/default.yaml`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/pipeline/configs/default.yaml):
+```bash
+bash scripts/pipeline.sh serve-retriever --work-dir runs/<project>/<run_id> --host 127.0.0.1 --port 8663
+```
 
-- `mbzuai-gemini-retrieval-v2`
-- `mbzuai-gemini-retrieval-v2-sparse`
+Migrate a trusted existing run to the current v2 retrieval contract without re-scraping:
 
-Neo4j namespace:
+```bash
+bash scripts/pipeline.sh migrate-release \
+  --config mbzuai_main \
+  --source-work-dir runs/<project>/<old_run_id> \
+  --target-work-dir runs/<project>/<old_run_id>-v2-migrated \
+  --dry-run
 
-- generated per run unless overridden with `NEO4J_NAMESPACE` or `graph.neo4j_namespace`
+bash scripts/pipeline.sh migrate-release \
+  --config mbzuai_main \
+  --source-work-dir runs/<project>/<old_run_id> \
+  --target-work-dir runs/<project>/<old_run_id>-v2-migrated \
+  --force
+```
 
-## 8. Docs For Operators
+Resume Pinecone upload for a migrated run:
 
-- dashboard control plane: [`docs/dashboard_control_plane.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/dashboard_control_plane.md)
-- retriever system: [`docs/retriever_system.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/retriever_system.md)
-- structured logs: [`docs/structured_logs.md`](/home/fahadkhan/ritesh/Final-MBZUAI-vectorstore/docs/structured_logs.md)
+```bash
+bash scripts/pipeline.sh migrate-release \
+  --config mbzuai_main \
+  --source-work-dir runs/<project>/<old_run_id> \
+  --target-work-dir runs/<project>/<old_run_id>-v2-migrated \
+  --upload-existing \
+  --embed-batch-size 96 \
+  --media-text-batch-size 96
+```
+
+## 6. Default External Stores
+
+Default Pinecone indexes:
+
+- `mbzuai-gemini-retrieval-v3`
+- `mbzuai-gemini-retrieval-v3-sparse`
+
+Canonical Pinecone namespace bases:
+
+- `mbzuai_main-chunks`
+- `mbzuai_main-parents`
+- `mbzuai_main-media`
+- `mbzuai_main-facts`
+- `mbzuai_main-evidence-spans`
+- `mbzuai_main-summaries`
+- `mbzuai_main-assertions`
+- `mbzuai_main-entities`
+- `mbzuai_main-communities`
+
+Production uploads append `--<release_id>` to every base. The retriever resolves the exact dense and sparse namespace names from the promoted run's `index_upload_manifest.json`; operators must not hard-code or reconstruct them.
+
+Default knowledge graph store:
+
+- promoted local JSON graph artifact under `runs/<project>/<run_id>/stage_outputs/promote_graph/`
+
+Optional Neo4j namespace:
+
+- generated per run unless `graph.store_backend: neo4j` is enabled and overridden with `NEO4J_NAMESPACE` or `graph.neo4j_namespace`

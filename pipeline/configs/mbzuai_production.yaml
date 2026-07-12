@@ -1,0 +1,129 @@
+# Canonical MBZUAI production indexing and retrieval configuration.
+# Deployment, release checks, and the long-lived retriever must all use this
+# profile so capabilities cannot drift between documentation and runtime.
+_inherit: mbzuai_main.yaml
+
+project_name: "mbzuai_main"
+
+pipeline:
+  production_profile: true
+  require_assertion_first: true
+  require_query_planner: true
+
+crawler:
+  # Corpus integrity depends on authenticated HTTPS. Any exceptional local
+  # debugging override must use a non-production profile.
+  ignore_https_errors: false
+  require_https: true
+
+graph:
+  # The final graph is uploaded only when every detected community has a
+  # substantive summary and no provider request failed.
+  community_summary_min_coverage_ratio: 1.0
+  community_summary_min_characters: 40
+  community_summary_max_provider_failures: 0
+  community_summary_reuse_existing: true
+
+assertions:
+  extract_model: "gpt-5-mini-2025-08-07"
+  validate_model: "gpt-5-nano-2025-08-07"
+
+embedder:
+  # Query embeddings may be retried once by the retriever. Keep two provider
+  # attempts plus backoff comfortably inside the 110-second request budget.
+  gemini_request_timeout_ms: 30000
+
+formatter:
+  # The live non-tag sitemap currently contains roughly 3.8k canonical URLs.
+  # Production must cover at least 90% and may tolerate only a very small tail
+  # of non-critical fetch failures.
+  expected_site_inventory_count: 3800
+  minimum_inventory_coverage_ratio: 0.90
+  maximum_hard_failure_count: 25
+  fail_on_critical_coverage: true
+  fail_on_inventory_gap: true
+  fail_on_hard_failure_gap: true
+
+# The production sequence is explicit so inherited development profiles cannot
+# move upload ahead of coverage validation or the final knowledge graph.
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: prepare_mbzuai_index
+    type: formatter
+    plugin: mbzuai_index_readiness
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_assertion_slices
+    type: formatter
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone
+
+retrieval:
+  serving_contract_revision: "mbzuai-routed-hybrid-v1"
+  retriever_backend: "routed_hybrid"
+  routed_graph_required: true
+  query_planner_enabled: true
+  query_planner_model: "gpt-5-nano-2025-08-07"
+  evidence_adjudicator_enabled: true
+  evidence_adjudicator_model: "gpt-5-nano-2025-08-07"
+  evidence_adjudicator_timeout_sec: 12
+  evidence_adjudicator_provider_timeout_sec: 10
+  evidence_adjudicator_max_workers: 2
+
+# These values document the backend behavior exercised by answer-readiness
+# evaluation. Bump answer_pipeline_revision whenever the grounded prompt or
+# orchestration behavior changes, and keep model values aligned with backend
+# production environment settings.
+serving:
+  answer_pipeline_revision: "mbzuai-agentic-grounded-v1"
+  generation_model: "gpt-5.4-2026-03-05"
+  query_rewrite_model: "gpt-5.4-mini-2026-03-17"
+  reranker_model: "gpt-5.4-mini-2026-03-17"
+  grounded_finalizer_model: "gpt-5.4-mini-2026-03-17"

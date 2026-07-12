@@ -19,6 +19,9 @@ from .knowledge_graph import load_graph_bundle, validate_graph_bundle
 from .state import PipelineState, load_state, now_iso
 
 
+_PRUNABLE_CRAWLER_OUTPUT_DIR_KEYS = {"html_dir", "images_dir"}
+
+
 @dataclass
 class AuditIssue:
     severity: str
@@ -81,6 +84,23 @@ def _iter_output_paths(outputs: Dict[str, Any]) -> Iterable[tuple[str, str]]:
             yield key, value
 
 
+def _has_completed_downstream_stage(state: PipelineState, stage_index: int) -> bool:
+    return any(stage.status == "completed" for stage in state.stages[stage_index + 1 :])
+
+
+def _is_pruned_crawler_intermediate(
+    state: PipelineState,
+    stage_index: int,
+    stage_type: str,
+    output_key: str,
+) -> bool:
+    return (
+        stage_type == "crawler"
+        and output_key in _PRUNABLE_CRAWLER_OUTPUT_DIR_KEYS
+        and _has_completed_downstream_stage(state, stage_index)
+    )
+
+
 def _quality_report_selected_markdown_path(record: ArtifactRecord) -> str:
     metadata = dict(record.metadata or {})
     resolved = _resolve_path_str(metadata.get("selected_markdown_path"))
@@ -103,6 +123,17 @@ def _audit_stage_output_paths(
         for key, value in _iter_output_paths(stage.outputs):
             path = Path(value)
             if key.endswith("_dir") and not path.is_dir():
+                if _is_pruned_crawler_intermediate(state, index, stage.stage_type, key):
+                    report.warnings.append(
+                        AuditIssue(
+                            severity="warning",
+                            code="pruned_intermediate_dir",
+                            message=f"Pruned crawler intermediate directory is missing: {key}",
+                            path=str(path),
+                            stage_id=stage_id,
+                        )
+                    )
+                    continue
                 report.errors.append(
                     AuditIssue(
                         severity="error",
@@ -307,6 +338,65 @@ def _audit_knowledge_graphs(report: RunAuditReport, catalog: ArtifactCatalog) ->
             )
 
 
+def _audit_index_coverage_gate(report: RunAuditReport, work_dir: Path) -> None:
+    """Fail a run audit when its own site-coverage gate did not pass.
+
+    Older release checks validated downstream retrieval quality without
+    carrying the crawler's coverage decision into the final run audit.  That
+    allowed a partially indexed site to be promoted when benchmark queries
+    happened to target the pages that were present.  When a run contains the
+    MBZUAI coverage artifact, it is authoritative and must pass.
+    """
+
+    gate_path = (
+        work_dir
+        / "stage_outputs"
+        / "prepare_mbzuai_index"
+        / "index_coverage_gate.json"
+    )
+    if not gate_path.exists():
+        return
+
+    gate = load_json_safe(gate_path)
+    if not isinstance(gate, dict):
+        report.errors.append(
+            AuditIssue(
+                severity="error",
+                code="invalid_index_coverage_gate",
+                message="Index coverage gate is unreadable or is not a JSON object",
+                path=str(gate_path),
+                stage_id="prepare_mbzuai_index",
+            )
+        )
+        return
+
+    if gate.get("ok") is True:
+        return
+
+    report.errors.append(
+        AuditIssue(
+            severity="error",
+            code="index_coverage_gate_failed",
+            message="Website index coverage gate did not pass",
+            path=str(gate_path),
+            stage_id="prepare_mbzuai_index",
+            metadata={
+                key: gate.get(key)
+                for key in (
+                    "missing_critical_count",
+                    "hard_failure_count",
+                    "expected_site_inventory_count",
+                    "effective_expected_inventory_count",
+                    "minimum_inventory_coverage_ratio",
+                    "inventory_coverage_ratio",
+                    "inventory_gap",
+                )
+                if key in gate
+            },
+        )
+    )
+
+
 def audit_run(
     work_dir: str | Path,
     *,
@@ -343,6 +433,7 @@ def audit_run(
     _audit_mapping_files(report, state)
     _audit_chunk_indexes(report, artifact_catalog)
     _audit_knowledge_graphs(report, artifact_catalog)
+    _audit_index_coverage_gate(report, work_dir)
     _audit_retrieval_index_manifest(report, work_dir)
 
     return report
@@ -350,8 +441,7 @@ def audit_run(
 
 def _audit_retrieval_index_manifest(report: RunAuditReport, work_dir: Path) -> None:
     manifest_path = work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json"
-    bundle_path = work_dir / "stage_outputs" / "format_retrieval" / "retrieval_bundle.json"
-    if not manifest_path.exists() or not bundle_path.exists():
+    if not manifest_path.exists():
         return
 
     manifest = load_json_safe(manifest_path, {}) or {}
@@ -362,6 +452,36 @@ def _audit_retrieval_index_manifest(report: RunAuditReport, work_dir: Path) -> N
                 code="invalid_index_upload_manifest",
                 message="Index upload manifest is unreadable or invalid",
                 path=str(manifest_path),
+            )
+        )
+        return
+
+    bundle_candidates: List[Path] = []
+    manifest_bundle_file = str(manifest.get("retrieval_bundle_file") or "").strip()
+    if manifest_bundle_file:
+        manifest_bundle_path = Path(manifest_bundle_file)
+        if not manifest_bundle_path.is_absolute():
+            manifest_bundle_path = work_dir / manifest_bundle_path
+        bundle_candidates.append(manifest_bundle_path)
+    bundle_candidates.extend(
+        [
+            work_dir / "stage_outputs" / "finalize_retrieval_bundle" / "retrieval_bundle.json",
+            work_dir / "stage_outputs" / "format_retrieval" / "retrieval_bundle.json",
+            work_dir / "stage_outputs" / "build_retrieval_bundle" / "retrieval_bundle.json",
+        ]
+    )
+    bundle_path = next((candidate for candidate in bundle_candidates if candidate.exists()), None)
+    if bundle_path is None:
+        report.errors.append(
+            AuditIssue(
+                severity="error",
+                code="index_manifest_bundle_missing",
+                message="Index upload manifest records a bundle fingerprint but no retrieval bundle file is available for verification",
+                path=str(manifest_path),
+                metadata={
+                    "retrieval_bundle_file": manifest_bundle_file,
+                    "checked_paths": [str(candidate) for candidate in bundle_candidates],
+                },
             )
         )
         return

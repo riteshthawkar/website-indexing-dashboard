@@ -39,9 +39,9 @@ def _load_prediction_rows(path: str | Path) -> List[Dict[str, Any]]:
 
 
 def _make_google_clients():
-    api_key = os.environ.get("GEMINI_API_KEY")
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        raise ValueError("GEMINI_API_KEY is required for RAGAS evaluation")
+        raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required for RAGAS evaluation")
     genai = import_genai()
     client = genai.Client(api_key=api_key)
     return client
@@ -123,7 +123,7 @@ def run_ragas_evaluation(
     predictions_path: str | Path,
     metric_names: Iterable[str] | None = None,
     llm_model: str = "gemini-2.5-flash",
-    embedding_model: str = "gemini-embedding-2-preview",
+    embedding_model: str = "gemini-embedding-2",
 ) -> Dict[str, Any]:
     Dataset, evaluate, llm_factory, embedding_factory, metric_registry, RunConfig = _import_ragas_components()
     rows = _load_prediction_rows(predictions_path)

@@ -20,7 +20,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from .artifacts import load_artifact_catalog, save_artifact_catalog
 from .base import PipelineStage, StageContext, StageResult, StageStatus
-from .io import atomic_write_json, ensure_dir
+from .config import (
+    indexing_build_identity,
+    production_indexing_contract_fingerprint,
+    sanitized_config_snapshot,
+)
+from .io import atomic_write_json, ensure_dir, load_json_safe
 from .registry import auto_discover, get_stage
 from .run_audit import audit_run, reconcile_state_artifact_ids, save_run_audit
 from .state import (
@@ -42,8 +47,16 @@ class RunLockError(RuntimeError):
     """Raised when another pipeline process already owns the run work directory."""
 
 
+class RunConfigMismatchError(RuntimeError):
+    """Raised when a resumed run does not match its immutable config snapshot."""
+
+
 class RunAuditError(RuntimeError):
     """Raised when a run fails integrity validation after stage execution."""
+
+
+class ActiveReleaseMutationError(RuntimeError):
+    """Raised when a run would rewrite the active release's vector namespaces."""
 
 
 class PipelineOrchestrator:
@@ -55,7 +68,7 @@ class PipelineOrchestrator:
         run_id: Optional override for the run ID (auto-generated if omitted).
         on_stage_start: Callback fired before each stage.
         on_stage_complete: Callback fired after each stage.
-        on_log: Callback for log messages (for dashboard integration).
+        on_log: Callback for log messages (for terminal or service integrations).
     """
 
     def __init__(
@@ -127,16 +140,56 @@ class PipelineOrchestrator:
             finally:
                 handle.close()
         finally:
-            if self._run_lock_path and self._run_lock_path.exists():
-                try:
-                    self._run_lock_path.unlink()
-                except OSError:
-                    pass
+            # A flock belongs to an inode. Removing the file after unlocking
+            # lets a waiter retain a lock on the old inode while a third process
+            # creates and locks a new one. Keep one stable lock inode forever.
             self._run_lock_handle = None
             self._run_lock_path = None
 
     def _stage_output_dir(self, stage_id: str) -> Path:
         return self.work_dir / "stage_outputs" / stage_id
+
+    def _active_release_pointer_path(self) -> Path:
+        pipeline_cfg = self.config.get("pipeline") if isinstance(self.config.get("pipeline"), dict) else {}
+        configured = str(
+            pipeline_cfg.get("active_release_file")
+            or os.environ.get("ACTIVE_RELEASE_FILE")
+            or ""
+        ).strip()
+        if configured:
+            return Path(configured).expanduser().resolve()
+        return (self.work_dir.parent / "active_release.json").resolve()
+
+    def _is_active_release_run(self, run_id: str) -> bool:
+        pointer = load_json_safe(self._active_release_pointer_path(), {}) or {}
+        return isinstance(pointer, dict) and str(pointer.get("run_id") or "").strip() == str(run_id).strip()
+
+    def _upload_stage_index(self) -> Optional[int]:
+        for index, (_stage_type, plugin_name, stage_id, _stage_def, _instance) in enumerate(self._stages):
+            if str(plugin_name) == "gemini_pinecone" or str(stage_id) == "upload_retrieval":
+                return index
+        return None
+
+    def _raise_if_active_upload_would_run(
+        self,
+        *,
+        state: Optional[PipelineState],
+        restart_index: Optional[int] = None,
+    ) -> None:
+        upload_index = self._upload_stage_index()
+        run_id = state.run_id if state is not None else self.run_id
+        if upload_index is None or not self._is_active_release_run(run_id):
+            return
+        upload_would_run = state is None
+        if restart_index is not None:
+            upload_would_run = restart_index <= upload_index
+        elif state is not None:
+            upload_would_run = upload_index >= len(state.stages) or state.stages[upload_index].status != "completed"
+        if upload_would_run:
+            raise ActiveReleaseMutationError(
+                f"Run {run_id!r} is the active release and cannot re-execute upload stage "
+                f"{self._stages[upload_index][2]!r}; create a new candidate run ID instead"
+            )
 
     def _archive_stage_output_dir(self, stage_id: str) -> Optional[Path]:
         source = self._stage_output_dir(stage_id)
@@ -156,7 +209,7 @@ class PipelineOrchestrator:
     def _resolve_stage_index(self, selector: str) -> int:
         text = str(selector).strip()
         if not text:
-            raise ValueError("restart_from must not be empty")
+            raise ValueError("Stage selector must not be empty")
 
         if text.isdigit():
             index = int(text)
@@ -176,6 +229,12 @@ class PipelineOrchestrator:
                 return index
 
         raise ValueError(f"Unknown stage selector: {selector}")
+
+    def resolve_stage_index(self, selector: str) -> int:
+        """Resolve a public stage selector without starting or mutating a run."""
+        if not self._stages:
+            self._build_stages()
+        return self._resolve_stage_index(selector)
 
     def _align_state_to_stages(self, state: PipelineState) -> None:
         configured_count = len(self._stages)
@@ -257,9 +316,80 @@ class PipelineOrchestrator:
             {
                 "run_id": self.run_id,
                 "project_name": self.project_name,
-                "config": self.config,
+                "production_indexing_contract_fingerprint": production_indexing_contract_fingerprint(
+                    self.config
+                ),
+                "indexing_build": indexing_build_identity(),
+                "config": sanitized_config_snapshot(self.config),
             },
         )
+
+    def _validate_resume_config_snapshot(self) -> None:
+        """Prove completed artifacts were built with the current index contract.
+
+        This check must run before state alignment, stage skipping, or rewriting
+        ``resolved_config.json``. Otherwise a changed production config could
+        relabel old completed outputs as if they had been rebuilt.
+        """
+
+        snapshot_path = self.work_dir / "resolved_config.json"
+        snapshot = load_json_safe(snapshot_path, None)
+        production = bool(self._pipeline_config().get("production_profile", False))
+        if not isinstance(snapshot, dict):
+            if production:
+                raise RunConfigMismatchError(
+                    f"Cannot resume production run without a valid immutable config snapshot: {snapshot_path}"
+                )
+            return
+
+        snapshot_config = snapshot.get("config")
+        if not isinstance(snapshot_config, dict):
+            raise RunConfigMismatchError(
+                f"Cannot resume run because its config snapshot is invalid: {snapshot_path}"
+            )
+        snapshot_run_id = str(snapshot.get("run_id") or "").strip()
+        if snapshot_run_id and snapshot_run_id != self.run_id:
+            raise RunConfigMismatchError(
+                "Cannot resume run because resolved_config.json belongs to a different run ID "
+                f"({snapshot_run_id!r} != {self.run_id!r})"
+            )
+
+        actual_fingerprint = production_indexing_contract_fingerprint(snapshot_config)
+        recorded_fingerprint = str(
+            snapshot.get("production_indexing_contract_fingerprint") or ""
+        ).strip()
+        if production and not recorded_fingerprint:
+            raise RunConfigMismatchError(
+                "Cannot resume production run because its recorded indexing fingerprint is missing"
+            )
+        if recorded_fingerprint and recorded_fingerprint != actual_fingerprint:
+            raise RunConfigMismatchError(
+                "Cannot resume run because resolved_config.json no longer matches its recorded indexing fingerprint"
+            )
+
+        requested_fingerprint = production_indexing_contract_fingerprint(self.config)
+        if requested_fingerprint != actual_fingerprint:
+            raise RunConfigMismatchError(
+                "Cannot resume run with a different immutable indexing configuration "
+                f"(saved={actual_fingerprint}, requested={requested_fingerprint}); create a new run ID"
+            )
+
+    def _validate_fresh_production_run_directory(self) -> None:
+        if not bool(self._pipeline_config().get("production_profile", False)):
+            return
+        sentinels = (
+            self.work_dir / "resolved_config.json",
+            self.work_dir / "pipeline_state.json",
+            self.work_dir / "artifact_catalog.json",
+            self.work_dir / "stage_outputs",
+        )
+        existing = [path for path in sentinels if path.exists()]
+        if existing:
+            raise RunConfigMismatchError(
+                "Production run directory is already initialized; use --resume with the matching config "
+                "or create a new run ID. Existing paths: "
+                + ", ".join(str(path) for path in existing)
+            )
 
     def _run_integrity_audit(
         self,
@@ -335,6 +465,7 @@ class PipelineOrchestrator:
         return [
             {
                 "index": i,
+                "id": stage_id,
                 "type": stage_type,
                 "plugin": plugin_name,
                 "description": instance.description or "",
@@ -342,21 +473,55 @@ class PipelineOrchestrator:
             for i, (stage_type, plugin_name, stage_id, stage_def, instance) in enumerate(self._stages)
         ]
 
-    async def run(self, resume: bool = False, restart_from: Optional[str] = None) -> PipelineState:
-        """Execute the full pipeline.
+    async def run(
+        self,
+        resume: bool = False,
+        restart_from: Optional[str] = None,
+        stop_after_stage: Optional[str] = None,
+    ) -> PipelineState:
+        """Execute the pipeline, optionally pausing after a selected stage.
 
         Args:
             resume: If True, load existing state and skip completed stages.
+            restart_from: Reset the selected stage and every downstream stage before running.
+            stop_after_stage: Execute through this stage (inclusive), then persist a resumable
+                ``paused`` state without running the full-run completion audit.
 
         Returns:
             Final PipelineState with all stage results.
         """
         self._build_stages()
+        # Resolve execution boundaries before creating a work directory, taking
+        # a lock, loading artifacts, or doing any stage/provider work.
+        restart_from_index = (
+            self._resolve_stage_index(restart_from)
+            if restart_from is not None
+            else None
+        )
+        stop_after_index = (
+            self._resolve_stage_index(stop_after_stage)
+            if stop_after_stage is not None
+            else None
+        )
+        if (
+            restart_from_index is not None
+            and stop_after_index is not None
+            and restart_from_index > stop_after_index
+        ):
+            raise ValueError(
+                "--stop-after-stage must select the same stage as, or a stage after, "
+                "--restart-from-stage"
+            )
         ensure_dir(self.work_dir)
-        self._write_config_snapshot()
         self._acquire_run_lock()
 
         try:
+            if not resume and not restart_from:
+                self._validate_fresh_production_run_directory()
+                self._raise_if_active_upload_would_run(state=None)
+            else:
+                self._validate_resume_config_snapshot()
+
             # Load or create state
             state = None
             artifact_catalog = load_artifact_catalog(self.work_dir)
@@ -384,6 +549,10 @@ class PipelineOrchestrator:
 
                     inconsistent_index = self._first_inconsistent_stage_index(state)
                     if inconsistent_index is not None:
+                        self._raise_if_active_upload_would_run(
+                            state=state,
+                            restart_index=inconsistent_index,
+                        )
                         self._log(
                             "warning",
                             "State has completed stages after unfinished stage %d; resetting downstream",
@@ -392,15 +561,26 @@ class PipelineOrchestrator:
                         self._reset_from_stage(state, artifact_catalog, inconsistent_index)
 
                     if restart_from:
-                        restart_index = self._resolve_stage_index(restart_from)
-                        self._log("info", "Restarting run %s from stage %d", state.run_id, restart_index)
-                        self._reset_from_stage(state, artifact_catalog, restart_index)
+                        self._raise_if_active_upload_would_run(
+                            state=state,
+                            restart_index=restart_from_index,
+                        )
+                        self._log(
+                            "info",
+                            "Restarting run %s from stage %d",
+                            state.run_id,
+                            restart_from_index,
+                        )
+                        self._reset_from_stage(state, artifact_catalog, restart_from_index)
+                    else:
+                        self._raise_if_active_upload_would_run(state=state)
 
             if restart_from and not state:
                 raise ValueError(
                     f"Cannot restart from stage {restart_from!r}: no existing state found in {self.work_dir}"
                 )
 
+            self._write_config_snapshot()
             if not state:
                 state = PipelineState(
                     run_id=self.run_id,
@@ -426,8 +606,15 @@ class PipelineOrchestrator:
                     completed_stage_id = ss.stage_id or f"{ss.stage_type}_{ss.name}_{index}"
                     previous_outputs.setdefault("stage_outputs", {})[completed_stage_id] = ss.outputs
 
-            # Execute stages
-            for i in range(state.current_stage_index, len(self._stages)):
+            # Execute stages, bounded inclusively when an intentional checkpoint
+            # was requested. If the target was already completed, the empty range
+            # below simply re-persists the paused checkpoint without rerunning it.
+            execution_end = (
+                stop_after_index + 1
+                if stop_after_index is not None
+                else len(self._stages)
+            )
+            for i in range(state.current_stage_index, execution_end):
                 stage_type, plugin_name, stage_id, stage_def, instance = self._stages[i]
                 stage_state = state.stages[i]
                 stage_key = f"{stage_type}/{plugin_name}"
@@ -529,6 +716,29 @@ class PipelineOrchestrator:
                     previous_outputs.setdefault("stage_outputs", {})[stage_id] = result.outputs
 
                 self._log("info", "Stage %s completed: %s", stage_key, result.metrics)
+
+            if stop_after_index is not None:
+                _stage_type, _plugin_name, stop_stage_id, _stage_def, _instance = self._stages[
+                    stop_after_index
+                ]
+                stop_stage_state = state.stages[stop_after_index]
+                if not stop_stage_state.is_terminal:
+                    raise RuntimeError(
+                        f"Cannot pause after unfinished stage {stop_stage_id!r} "
+                        f"(status={stop_stage_state.status!r})"
+                    )
+                state.status = "paused"
+                state.finished_at = None
+                state.current_stage_index = min(stop_after_index + 1, len(self._stages))
+                save_state(state, self.work_dir)
+                self._log(
+                    "info",
+                    "Pipeline run %s intentionally paused after stage %s; resume from stage %d",
+                    self.run_id,
+                    stop_stage_id,
+                    state.current_stage_index,
+                )
+                return state
 
             # All stages completed
             state.status = "completed"

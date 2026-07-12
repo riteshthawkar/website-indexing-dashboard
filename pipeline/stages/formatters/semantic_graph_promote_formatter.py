@@ -7,20 +7,24 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict, List, Set
 
+from pipeline.core.artifact_contracts import ArtifactContract, resolve_artifact_path
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.knowledge_graph import (
     build_graph_bundle,
-    build_graph_index,
     load_graph_bundle,
     make_graph_edge,
     make_graph_node,
-    save_graph_bundle,
+    save_graph_bundle_with_index,
 )
 from pipeline.core.registry import register_stage
 from pipeline.core.semantic_graph import semantic_assertion_text
 
 logger = logging.getLogger(__name__)
+
+
+def _active_validity_status(value: Any) -> bool:
+    return str(value or "active").strip().lower() in {"active", "valid"}
 
 
 @register_stage
@@ -29,9 +33,36 @@ class SemanticGraphPromoteFormatter(FormatterStage):
     description = "Promotes deterministic and semantic graph artifacts into a final graph bundle."
 
     async def execute(self, ctx: StageContext) -> StageResult:
-        base_graph_file = ctx.previous_outputs.get("knowledge_graph_file")
-        entities_file = ctx.previous_outputs.get("semantic_entities_file")
-        assertions_file = ctx.previous_outputs.get("semantic_assertions_file")
+        base_graph = resolve_artifact_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="knowledge_graph_bundle",
+                role="knowledge_graph",
+                legacy_output_key="knowledge_graph_file",
+                label="knowledge graph bundle",
+            ),
+        )
+        semantic_entities = resolve_artifact_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="semantic_entities",
+                role="semantic_graph_canonical",
+                legacy_output_key="semantic_entities_file",
+                label="canonical semantic entities",
+            ),
+        )
+        semantic_assertions = resolve_artifact_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="semantic_assertions",
+                role="semantic_graph_canonical",
+                legacy_output_key="semantic_assertions_file",
+                label="canonical semantic assertions",
+            ),
+        )
+        base_graph_file = base_graph.path if base_graph else ""
+        entities_file = semantic_entities.path if semantic_entities else ""
+        assertions_file = semantic_assertions.path if semantic_assertions else ""
         if not base_graph_file or not entities_file or not assertions_file:
             return StageResult.failure("Base graph and canonical semantic graph files are required for promotion")
 
@@ -63,6 +94,16 @@ class SemanticGraphPromoteFormatter(FormatterStage):
             if isinstance(edge, dict) and edge.get("source_id") and edge.get("target_id") and edge.get("edge_type")
         ]
         node_ids: Set[str] = {node.id for node in nodes}
+        span_ids_by_chunk: Dict[str, List[str]] = {}
+        for edge in (base_graph.get("edges") or []):
+            if not isinstance(edge, dict):
+                continue
+            if str(edge.get("edge_type") or "") != "CHUNK_HAS_EVIDENCE_SPAN":
+                continue
+            source_id = str(edge.get("source_id") or "")
+            target_id = str(edge.get("target_id") or "")
+            if source_id and target_id:
+                span_ids_by_chunk.setdefault(source_id, []).append(target_id)
 
         for entity in canonical_entities:
             if not isinstance(entity, dict):
@@ -70,6 +111,11 @@ class SemanticGraphPromoteFormatter(FormatterStage):
             entity_id = str(entity.get("id") or "")
             if not entity_id or entity_id in node_ids:
                 continue
+            source_span_ids = list(entity.get("source_span_ids") or [])
+            if not source_span_ids:
+                for chunk_id in entity.get("source_chunk_ids") or []:
+                    source_span_ids.extend(span_ids_by_chunk.get(str(chunk_id), []))
+            source_span_ids = list(dict.fromkeys(str(value) for value in source_span_ids if str(value)))
             nodes.append(
                 make_graph_node(
                     node_id=entity_id,
@@ -82,6 +128,7 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                         "description": entity.get("description"),
                         "confidence": entity.get("confidence"),
                         "source_chunk_ids": entity.get("source_chunk_ids") or [],
+                        "source_span_ids": source_span_ids,
                         "source_fact_ids": entity.get("source_fact_ids") or [],
                         "source_parent_ids": entity.get("source_parent_ids") or [],
                         "source_urls": entity.get("source_urls") or [],
@@ -110,15 +157,32 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                             qualifier=f"{chunk_id}:{entity_id}",
                         )
                     )
+            for span_id in source_span_ids:
+                if span_id in node_ids:
+                    edges.append(
+                        make_graph_edge(
+                            edge_type="ENTITY_MENTIONED_IN_SPAN",
+                            source_id=entity_id,
+                            target_id=str(span_id),
+                            qualifier=f"{entity_id}:{span_id}",
+                        )
+                    )
 
         for assertion in canonical_assertions:
             if not isinstance(assertion, dict):
+                continue
+            if not _active_validity_status(assertion.get("validity_status")):
                 continue
             assertion_id = str(assertion.get("id") or "")
             subject_id = str(assertion.get("subject_entity_id") or "")
             object_id = str(assertion.get("object_entity_id") or "")
             if not assertion_id or not subject_id or not object_id:
                 continue
+            source_span_ids = list(assertion.get("source_span_ids") or [])
+            if not source_span_ids:
+                for chunk_id in assertion.get("source_chunk_ids") or []:
+                    source_span_ids.extend(span_ids_by_chunk.get(str(chunk_id), []))
+            source_span_ids = list(dict.fromkeys(str(value) for value in source_span_ids if str(value)))
             nodes.append(
                 make_graph_node(
                     node_id=assertion_id,
@@ -131,6 +195,15 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                         "subject_name": assertion.get("subject_name"),
                         "object_name": assertion.get("object_name"),
                         "confidence": assertion.get("confidence"),
+                        "authority_class": assertion.get("authority_class"),
+                        "authority_score": assertion.get("authority_score"),
+                        "freshness_score": assertion.get("freshness_score"),
+                        "source_last_seen": assertion.get("source_last_seen"),
+                        "canonical_subject": assertion.get("canonical_subject"),
+                        "canonical_predicate": assertion.get("canonical_predicate"),
+                        "canonical_object": assertion.get("canonical_object"),
+                        "validity_status": assertion.get("validity_status") or "active",
+                        "superseded_by": assertion.get("superseded_by"),
                         "evidence": assertion.get("evidence"),
                         "text": semantic_assertion_text(
                             assertion.get("subject_name"),
@@ -141,6 +214,7 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                         "source_id": assertion.get("source_id"),
                         "source_kind": assertion.get("source_kind"),
                         "source_chunk_ids": assertion.get("source_chunk_ids") or [],
+                        "source_span_ids": source_span_ids,
                         "source_fact_ids": assertion.get("source_fact_ids") or [],
                         "source_parent_ids": assertion.get("source_parent_ids") or [],
                         "source_url": assertion.get("source_url"),
@@ -148,6 +222,7 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                     },
                 )
             )
+            node_ids.add(assertion_id)
             edges.extend(
                 [
                     make_graph_edge(
@@ -184,6 +259,16 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                             qualifier=f"{chunk_id}:{assertion_id}",
                         )
                     )
+            for span_id in source_span_ids:
+                if span_id in node_ids:
+                    edges.append(
+                        make_graph_edge(
+                            edge_type="ASSERTION_SUPPORTED_BY_SPAN",
+                            source_id=assertion_id,
+                            target_id=str(span_id),
+                            qualifier=f"{assertion_id}:{span_id}",
+                        )
+                    )
 
         promoted_bundle = build_graph_bundle(
             nodes=nodes,
@@ -191,12 +276,9 @@ class SemanticGraphPromoteFormatter(FormatterStage):
             schema_version=2,
             graph_type="promoted_semantic_graph",
         )
-        promoted_index = build_graph_index(promoted_bundle)
-
         graph_file = ctx.stage_work_dir / "promoted_knowledge_graph.json"
         graph_index_file = ctx.stage_work_dir / "promoted_knowledge_graph_index.json"
-        save_graph_bundle(promoted_bundle, graph_file)
-        save_graph_bundle(promoted_index, graph_index_file)
+        save_graph_bundle_with_index(promoted_bundle, graph_file, graph_index_file)
 
         artifacts = [
             ctx.make_artifact(

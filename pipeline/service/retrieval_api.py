@@ -1,15 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hmac
+import json
 import logging
 import os
 import time
 import uuid
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Dict
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from pipeline.retrieval import AdaptiveHybridRetriever
@@ -17,11 +23,197 @@ from pipeline.retrieval import AdaptiveHybridRetriever
 
 logger = logging.getLogger(__name__)
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+_SERVICE_TOKEN_PLACEHOLDER_MARKERS = (
+    "change-me",
+    "change_me",
+    "changeme",
+    "replace-with",
+    "replace_me",
+    "placeholder",
+    "example-token",
+    "retrieval-service-token",
+)
+_PROVIDER_CREDENTIAL_PLACEHOLDER_MARKERS = (
+    "change-me",
+    "change_me",
+    "changeme",
+    "replace-me",
+    "replace_me",
+    "placeholder",
+    "example-key",
+    "example_key",
+    "your-key",
+    "your_key",
+)
 
 
 class RetrieveRequest(BaseModel):
-    query: str = Field(..., min_length=1, description="Natural-language query text.")
-    request_id: str | None = Field(default=None, description="Optional caller-supplied request identifier.")
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=4096,
+        description="Natural-language query text.",
+    )
+    request_id: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+        description="Optional caller-supplied request identifier.",
+    )
+
+
+def _env_bool(name: str, *, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off", ""}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
+
+
+def _service_token_error(token: str) -> str | None:
+    value = str(token or "")
+    lowered = value.casefold()
+    if len(value) < 32:
+        return "must contain at least 32 characters"
+    if value != value.strip() or any(character.isspace() for character in value):
+        return "must not contain whitespace"
+    if any(marker in lowered for marker in _SERVICE_TOKEN_PLACEHOLDER_MARKERS):
+        return "must not use a documented placeholder"
+    if len(set(value)) < 10:
+        return "must contain at least 10 distinct characters"
+    if any(
+        len(value) % width == 0 and value == value[:width] * (len(value) // width)
+        for width in range(1, (len(value) // 2) + 1)
+    ):
+        return "must not be a repeated pattern"
+    return None
+
+
+def _provider_credential_error(value: str | None) -> str | None:
+    candidate = str(value or "")
+    normalized = candidate.casefold()
+    if not candidate.strip():
+        return "is required"
+    if candidate != candidate.strip() or any(character.isspace() for character in candidate):
+        return "must not contain whitespace"
+    if any(marker in normalized for marker in _PROVIDER_CREDENTIAL_PLACEHOLDER_MARKERS):
+        return "must not use a documented placeholder"
+    if len(candidate) < 16:
+        return "must contain at least 16 characters"
+    return None
+
+
+def _field(value: Any, name: str, default: Any = None) -> Any:
+    if isinstance(value, dict):
+        return value.get(name, default)
+    return getattr(value, name, default)
+
+
+def _namespace_counts(stats: Any) -> Dict[str, int]:
+    namespaces = _field(stats, "namespaces", {}) or {}
+    if not hasattr(namespaces, "items"):
+        return {}
+    output: Dict[str, int] = {}
+    for namespace, summary in namespaces.items():
+        try:
+            output[str(namespace)] = int(_field(summary, "vector_count", 0) or 0)
+        except (TypeError, ValueError):
+            output[str(namespace)] = 0
+    return output
+
+
+def _response_items(response: Any, *, nested: bool = False) -> list[Any]:
+    source = _field(response, "result", None) if nested else response
+    if source is None:
+        source = response
+    key = "hits" if nested else "matches"
+    return list(_field(source, key, []) or [])
+
+
+def _run_startup_probe(
+    retriever: Any,
+    *,
+    work_dir: Path,
+    query: str,
+    operation_timeout_seconds: float,
+) -> Dict[str, Any]:
+    """Prove provider credentials and both remote release indexes are usable."""
+
+    manifest_path = work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError("startup probe could not read the vector upload manifest") from exc
+    if not isinstance(manifest, dict):
+        raise RuntimeError("startup probe vector upload manifest is invalid")
+
+    vector = getattr(retriever, "vector", retriever)
+    dense_handle = vector._pinecone_index()
+    sparse_handle = vector._pinecone_sparse_index()
+    dense_counts = _namespace_counts(
+        dense_handle.describe_index_stats(timeout=operation_timeout_seconds)
+    )
+    sparse_counts = _namespace_counts(
+        sparse_handle.describe_index_stats(timeout=operation_timeout_seconds)
+    )
+    namespaces = manifest.get("namespaces") if isinstance(manifest.get("namespaces"), dict) else {}
+    uploaded = manifest.get("uploaded") if isinstance(manifest.get("uploaded"), dict) else {}
+    if not namespaces:
+        raise RuntimeError("startup probe vector namespaces are missing")
+    for lane, namespace_value in namespaces.items():
+        namespace = str(namespace_value or "").strip()
+        expected_dense = int(uploaded.get(str(lane)) or 0)
+        expected_sparse = int(uploaded.get(f"sparse_{lane}") or 0)
+        if not namespace or expected_dense <= 0 or dense_counts.get(namespace) != expected_dense:
+            raise RuntimeError(f"startup probe dense namespace count mismatch for {lane}")
+        if expected_sparse <= 0 or sparse_counts.get(namespace) != expected_sparse:
+            raise RuntimeError(f"startup probe sparse namespace count mismatch for {lane}")
+
+    query_vector = list(vector.embed_query(query))
+    expected_dimension = int(getattr(vector, "output_dimensionality", 0) or 0)
+    if not query_vector or (expected_dimension and len(query_vector) != expected_dimension):
+        raise RuntimeError("startup probe embedding dimension mismatch")
+    chunk_namespace = str(namespaces.get("chunks") or "").strip()
+    dense_response = dense_handle.query(
+        vector=query_vector,
+        top_k=1,
+        namespace=chunk_namespace,
+        include_metadata=False,
+        include_values=False,
+        timeout=operation_timeout_seconds,
+    )
+    if not _response_items(dense_response):
+        raise RuntimeError("startup probe dense query returned no matches")
+    sparse_response = sparse_handle.search(
+        namespace=chunk_namespace,
+        top_k=1,
+        inputs={"text": query},
+        fields=[],
+        timeout=operation_timeout_seconds,
+    )
+    if not _response_items(sparse_response, nested=True):
+        raise RuntimeError("startup probe sparse query returned no hits")
+
+    result = retriever.retrieve(query, query_vector=query_vector)
+    if not isinstance(result, dict) or result.get("query_embedding_status") not in {None, "ok"}:
+        raise RuntimeError("startup probe full retrieval reported an embedding failure")
+    evidence = [
+        *(result.get("answer_documents") or []),
+        *(result.get("fact_documents") or []),
+        *(result.get("retrieval_documents") or []),
+    ]
+    if result.get("abstained") is True or not evidence:
+        raise RuntimeError("startup probe full retrieval returned no usable evidence")
+    return {
+        "dense_namespace_count": len(dense_counts),
+        "sparse_namespace_count": len(sparse_counts),
+        "evidence_count": len(evidence),
+    }
 
 
 def _load_env_files() -> None:
@@ -41,18 +233,81 @@ def _load_env_files() -> None:
 
 def _health_payload(app: FastAPI) -> Dict[str, Any]:
     started_at = float(getattr(app.state, "started_at_monotonic", time.monotonic()))
+    timed_out_inflight = int(getattr(app.state, "timed_out_inflight", 0))
+    detached_inflight = int(getattr(app.state, "detached_inflight", 0))
+    max_concurrency = int(getattr(app.state, "max_concurrency", 0))
+    ready = bool(getattr(app.state, "ready", False)) and (
+        max_concurrency <= 0 or detached_inflight < max_concurrency
+    )
     return {
         "ok": True,
         "service": "retriever",
-        "ready": bool(getattr(app.state, "ready", False)),
+        "ready": ready,
         "config_name": getattr(app.state, "config_name", None),
-        "work_dir": str(getattr(app.state, "work_dir", "")),
+        "release_id": getattr(app.state, "release_id", None),
+        "run_id": getattr(app.state, "release_run_id", None),
+        "commit_sha": getattr(app.state, "release_commit_sha", None),
+        "retrieval_bundle_sha256": getattr(app.state, "retrieval_bundle_sha256", None),
+        "knowledge_graph_sha256": getattr(app.state, "knowledge_graph_sha256", None),
+        "knowledge_graph_index_sha256": getattr(app.state, "knowledge_graph_index_sha256", None),
+        "lexical_corpus_sha256": getattr(app.state, "lexical_corpus_sha256", None),
+        "promoted_assertions_sha256": getattr(app.state, "promoted_assertions_sha256", None),
+        "answer_runtime_commit_sha": getattr(app.state, "answer_runtime_commit_sha", None),
+        "indexing_build_commit_sha": getattr(app.state, "indexing_build_commit_sha", None),
+        "startup_probe_required": bool(getattr(app.state, "startup_probe_required", False)),
+        "startup_probe_passed": bool(getattr(app.state, "startup_probe_passed", False)),
         "request_count": int(getattr(app.state, "request_count", 0)),
         "error_count": int(getattr(app.state, "error_count", 0)),
-        "max_concurrency": int(getattr(app.state, "max_concurrency", 0)),
+        "max_concurrency": max_concurrency,
         "request_timeout_seconds": float(getattr(app.state, "request_timeout_seconds", 0.0)),
+        "queue_timeout_seconds": float(getattr(app.state, "queue_timeout_seconds", 0.0)),
+        "timed_out_inflight": timed_out_inflight,
+        "detached_inflight": detached_inflight,
+        "cancelled_request_count": int(getattr(app.state, "cancelled_request_count", 0)),
+        "queue_rejection_count": int(getattr(app.state, "queue_rejection_count", 0)),
+        "result_cache_size": len(getattr(app.state, "result_cache", {}) or {}),
+        "result_cache_max_size": int(getattr(app.state, "result_cache_max_size", 0)),
         "uptime_seconds": round(max(0.0, time.monotonic() - started_at), 3),
     }
+
+
+def _normalize_cache_query(query: str) -> str:
+    return " ".join(str(query or "").strip().split()).casefold()
+
+
+async def _get_cached_result(app: FastAPI, query: str) -> Dict[str, Any] | None:
+    cache = getattr(app.state, "result_cache", None)
+    if not cache:
+        return None
+    cache_key = _normalize_cache_query(query)
+    if not cache_key:
+        return None
+    async with app.state.result_cache_lock:
+        cached = cache.get(cache_key)
+        if not cached:
+            return None
+        cached_at, payload = cached
+        ttl_seconds = float(getattr(app.state, "result_cache_ttl_seconds", 0.0) or 0.0)
+        if ttl_seconds > 0 and time.monotonic() - float(cached_at) > ttl_seconds:
+            cache.pop(cache_key, None)
+            return None
+        cache.move_to_end(cache_key)
+        return copy.deepcopy(payload)
+
+
+async def _cache_result(app: FastAPI, query: str, payload: Dict[str, Any]) -> None:
+    cache = getattr(app.state, "result_cache", None)
+    max_size = int(getattr(app.state, "result_cache_max_size", 0) or 0)
+    if cache is None or max_size <= 0:
+        return
+    cache_key = _normalize_cache_query(query)
+    if not cache_key:
+        return
+    async with app.state.result_cache_lock:
+        cache[cache_key] = (time.monotonic(), copy.deepcopy(payload))
+        cache.move_to_end(cache_key)
+        while len(cache) > max_size:
+            cache.popitem(last=False)
 
 
 def create_retrieval_service_app(
@@ -61,7 +316,11 @@ def create_retrieval_service_app(
     work_dir: str | Path,
     max_concurrency: int = 4,
     request_timeout_seconds: float = 90.0,
+    queue_timeout_seconds: float = 1.0,
 ) -> FastAPI:
+    # Load the optional local environment before reading service-local auth,
+    # cache, probe, and shutdown settings. Injected production variables win.
+    _load_env_files()
     config_name = str(config_name or "").strip()
     resolved_work_dir = Path(work_dir).resolve()
     if not config_name:
@@ -70,19 +329,111 @@ def create_retrieval_service_app(
         raise FileNotFoundError(f"Retrieval work directory does not exist: {resolved_work_dir}")
     bounded_concurrency = max(1, int(max_concurrency))
     bounded_timeout = max(1.0, float(request_timeout_seconds))
+    bounded_queue_timeout = max(0.05, float(queue_timeout_seconds))
+    production_config = Path(config_name).stem == "mbzuai_production"
+    service_token = str(os.getenv("RETRIEVAL_SERVICE_TOKEN") or "")
+    token_error = _service_token_error(service_token) if service_token else "is required"
+    if production_config and token_error:
+        raise ValueError(f"RETRIEVAL_SERVICE_TOKEN {token_error} in production")
+    if service_token and token_error:
+        raise ValueError(f"RETRIEVAL_SERVICE_TOKEN {token_error}")
+    if production_config:
+        provider_credentials = (
+            ("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY")),
+            ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
+            (
+                "GOOGLE_API_KEY or GEMINI_API_KEY",
+                os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
+            ),
+        )
+        provider_errors = [
+            f"{name} {error}"
+            for name, value in provider_credentials
+            if (error := _provider_credential_error(value))
+        ]
+        if provider_errors:
+            raise ValueError(
+                "Production retriever has invalid provider credentials: "
+                + "; ".join(provider_errors)
+            )
+    startup_probe_required = production_config or _env_bool(
+        "RETRIEVER_STARTUP_PROBE_REQUIRED",
+        default=False,
+    )
+    startup_probe_query = str(
+        os.getenv("RETRIEVER_STARTUP_PROBE_QUERY") or "Where is MBZUAI located?"
+    ).strip()
+    if startup_probe_required and not startup_probe_query:
+        raise ValueError("RETRIEVER_STARTUP_PROBE_QUERY must not be empty")
+    startup_probe_timeout = max(
+        1.0,
+        float(os.getenv("RETRIEVER_STARTUP_PROBE_TIMEOUT_SECONDS", str(bounded_timeout))),
+    )
+    startup_probe_operation_timeout = max(
+        1.0,
+        min(
+            startup_probe_timeout,
+            float(
+                os.getenv(
+                    "RETRIEVER_STARTUP_PROBE_OPERATION_TIMEOUT_SECONDS",
+                    str(min(15.0, startup_probe_timeout)),
+                )
+            ),
+        ),
+    )
+    shutdown_drain_timeout = max(
+        0.0,
+        float(os.getenv("RETRIEVER_SHUTDOWN_DRAIN_TIMEOUT_SECONDS", "30")),
+    )
+    result_cache_size = max(
+        0,
+        int(os.getenv("RETRIEVAL_SERVICE_RESULT_CACHE_SIZE", "256") or "0"),
+    )
+    result_cache_ttl_seconds = max(
+        0.0,
+        float(os.getenv("RETRIEVAL_SERVICE_RESULT_CACHE_TTL_SECONDS", "300") or "0"),
+    )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        _load_env_files()
         app.state.started_at_monotonic = time.monotonic()
         app.state.ready = False
         app.state.request_count = 0
         app.state.error_count = 0
+        app.state.timed_out_inflight = 0
+        app.state.detached_inflight = 0
+        app.state.cancelled_request_count = 0
+        app.state.queue_rejection_count = 0
         app.state.config_name = config_name
+        # These values are populated only after the deployment wrapper has
+        # validated the active release. They are intentionally non-secret and
+        # let readiness checks prove which immutable code/artifact pair is live.
+        app.state.release_id = os.getenv("RETRIEVAL_RELEASE_ID") or None
+        app.state.release_run_id = os.getenv("RETRIEVAL_RELEASE_RUN_ID") or None
+        app.state.release_commit_sha = os.getenv("RELEASE_COMMIT_SHA") or None
+        app.state.retrieval_bundle_sha256 = os.getenv("RETRIEVAL_BUNDLE_SHA256") or None
+        app.state.knowledge_graph_sha256 = os.getenv("RETRIEVAL_KNOWLEDGE_GRAPH_SHA256") or None
+        app.state.knowledge_graph_index_sha256 = os.getenv("RETRIEVAL_KNOWLEDGE_GRAPH_INDEX_SHA256") or None
+        app.state.lexical_corpus_sha256 = os.getenv("RETRIEVAL_LEXICAL_CORPUS_SHA256") or None
+        app.state.promoted_assertions_sha256 = os.getenv("RETRIEVAL_PROMOTED_ASSERTIONS_SHA256") or None
+        app.state.answer_runtime_commit_sha = os.getenv("RETRIEVAL_ANSWER_RUNTIME_COMMIT_SHA") or None
+        app.state.indexing_build_commit_sha = os.getenv("RETRIEVAL_INDEXING_BUILD_COMMIT_SHA") or None
+        app.state.startup_probe_required = startup_probe_required
+        app.state.startup_probe_passed = False
         app.state.work_dir = resolved_work_dir
         app.state.max_concurrency = bounded_concurrency
         app.state.request_timeout_seconds = bounded_timeout
+        app.state.queue_timeout_seconds = bounded_queue_timeout
         app.state.semaphore = asyncio.Semaphore(bounded_concurrency)
+        app.state.executor = ThreadPoolExecutor(
+            max_workers=bounded_concurrency,
+            thread_name_prefix="mbzuai-retriever",
+        )
+        app.state.result_cache = OrderedDict()
+        app.state.result_cache_lock = asyncio.Lock()
+        app.state.result_cache_max_size = result_cache_size
+        app.state.result_cache_ttl_seconds = result_cache_ttl_seconds
+        app.state.inflight_futures = set()
         logger.info(
             "Loading retrieval service: config=%s work_dir=%s max_concurrency=%s timeout=%ss",
             config_name,
@@ -90,13 +441,67 @@ def create_retrieval_service_app(
             bounded_concurrency,
             bounded_timeout,
         )
-        app.state.retriever = AdaptiveHybridRetriever.from_config(
-            config_name=config_name,
-            work_dir=resolved_work_dir,
-        )
-        app.state.ready = True
-        logger.info("Retrieval service ready: config=%s work_dir=%s", config_name, resolved_work_dir)
-        yield
+        app.state.retriever = None
+        try:
+            app.state.retriever = AdaptiveHybridRetriever.from_config(
+                config_name=config_name,
+                work_dir=resolved_work_dir,
+            )
+            if getattr(app.state.retriever, "supports_shared_parallel_retrieval", True) is False:
+                if app.state.max_concurrency > 1:
+                    logger.warning(
+                        "Retriever does not support shared parallel calls; capping service concurrency from %s to 1",
+                        app.state.max_concurrency,
+                    )
+                app.state.max_concurrency = 1
+                app.state.semaphore = asyncio.Semaphore(1)
+            if startup_probe_required:
+                loop = asyncio.get_running_loop()
+                probe_future = loop.run_in_executor(
+                    app.state.executor,
+                    lambda: _run_startup_probe(
+                        app.state.retriever,
+                        work_dir=resolved_work_dir,
+                        query=startup_probe_query,
+                        operation_timeout_seconds=startup_probe_operation_timeout,
+                    ),
+                )
+                app.state.inflight_futures.add(probe_future)
+                probe_future.add_done_callback(app.state.inflight_futures.discard)
+                await asyncio.wait_for(
+                    asyncio.shield(probe_future),
+                    timeout=startup_probe_timeout,
+                )
+                app.state.startup_probe_passed = True
+            app.state.ready = True
+            logger.info("Retrieval service ready: config=%s work_dir=%s", config_name, resolved_work_dir)
+            yield
+        finally:
+            app.state.ready = False
+            pending = [
+                future
+                for future in list(getattr(app.state, "inflight_futures", set()))
+                if not future.done()
+            ]
+            if pending and shutdown_drain_timeout > 0:
+                _done, pending_set = await asyncio.wait(
+                    pending,
+                    timeout=shutdown_drain_timeout,
+                )
+                pending = list(pending_set)
+            if pending:
+                # Do not close shared clients while worker threads still use
+                # them. The process supervisor owns forced termination after
+                # its grace period; provider deadlines bound normal drains.
+                logger.error(
+                    "Retriever shutdown drain timed out with %d provider task(s) still active",
+                    len(pending),
+                )
+            else:
+                close_retriever = getattr(app.state.retriever, "close", None) if app.state.retriever else None
+                if callable(close_retriever):
+                    close_retriever()
+            app.state.executor.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(
         title="MBZUAI Retrieval Service",
@@ -104,18 +509,58 @@ def create_retrieval_service_app(
         lifespan=lifespan,
     )
 
+    def _public_health_payload() -> Dict[str, Any]:
+        payload = _health_payload(app)
+        return {
+            "ok": True,
+            "service": "retriever",
+            "ready": payload["ready"],
+            "uptime_seconds": payload["uptime_seconds"],
+        }
+
+    def _authorize(request: Request) -> None:
+        if not service_token:
+            return
+        provided_token = request.headers.get("X-Retrieval-Service-Token", "")
+        if not hmac.compare_digest(provided_token, service_token):
+            raise HTTPException(status_code=401, detail="unauthorized")
+
+    async def _health_response() -> Dict[str, Any]:
+        return _public_health_payload()
+
+    async def _ready_response() -> Dict[str, Any]:
+        payload = _public_health_payload()
+        if not payload["ready"]:
+            raise HTTPException(status_code=503, detail="retriever_not_ready")
+        return payload
+
     @app.get("/healthz")
     async def healthz() -> Dict[str, Any]:
-        return _health_payload(app)
+        return await _health_response()
+
+    @app.get("/health")
+    async def health() -> Dict[str, Any]:
+        return await _health_response()
 
     @app.get("/readyz")
     async def readyz() -> Dict[str, Any]:
-        if not bool(getattr(app.state, "ready", False)):
-            raise HTTPException(status_code=503, detail="retriever_not_ready")
-        return _health_payload(app)
+        return await _ready_response()
+
+    @app.get("/ready")
+    async def ready() -> Dict[str, Any]:
+        return await _ready_response()
+
+    @app.get("/attestationz")
+    async def attestationz(request: Request) -> Any:
+        _authorize(request)
+        payload = _health_payload(app)
+        if not payload["ready"]:
+            return JSONResponse(status_code=503, content=payload)
+        return payload
 
     @app.post("/retrieve")
     async def retrieve_endpoint(payload: RetrieveRequest, request: Request) -> Dict[str, Any]:
+        _authorize(request)
         if not bool(getattr(app.state, "ready", False)):
             raise HTTPException(status_code=503, detail="retriever_not_ready")
         query = payload.query.strip()
@@ -126,30 +571,79 @@ def create_retrieval_service_app(
         started_at = time.perf_counter()
         retriever = app.state.retriever
         semaphore = app.state.semaphore
+        executor = app.state.executor
         app.state.request_count += 1
+        cached_result = await _get_cached_result(app, query)
+        if cached_result is not None:
+            output = dict(cached_result or {})
+            output["service_request_id"] = request_id
+            output["service_latency_ms"] = round((time.perf_counter() - started_at) * 1000.0, 3)
+            output["service_backend"] = "retrieval_service"
+            output["service_config_name"] = app.state.config_name
+            output["service_cache_hit"] = True
+            return output
         try:
-            async with semaphore:
-                result = await asyncio.wait_for(
-                    asyncio.to_thread(retriever.retrieve, query),
-                    timeout=app.state.request_timeout_seconds,
-                )
+            await asyncio.wait_for(semaphore.acquire(), timeout=app.state.queue_timeout_seconds)
         except asyncio.TimeoutError as exc:
             app.state.error_count += 1
+            app.state.queue_rejection_count += 1
+            raise HTTPException(status_code=503, detail="retrieval_busy") from exc
+
+        release_capacity_on_exit = True
+
+        def _retain_capacity_until_done(future, *, timed_out: bool) -> None:
+            app.state.detached_inflight += 1
+            if timed_out:
+                app.state.timed_out_inflight += 1
+
+            def _release_detached_capacity(_future) -> None:
+                app.state.detached_inflight = max(0, int(app.state.detached_inflight) - 1)
+                if timed_out:
+                    app.state.timed_out_inflight = max(0, int(app.state.timed_out_inflight) - 1)
+                semaphore.release()
+
+            future.add_done_callback(_release_detached_capacity)
+
+        try:
+            loop = asyncio.get_running_loop()
+            retrieval_future = loop.run_in_executor(executor, retriever.retrieve, query)
+            app.state.inflight_futures.add(retrieval_future)
+            retrieval_future.add_done_callback(app.state.inflight_futures.discard)
+            result = await asyncio.wait_for(
+                asyncio.shield(retrieval_future),
+                timeout=app.state.request_timeout_seconds,
+            )
+        except asyncio.TimeoutError as exc:
+            app.state.error_count += 1
+            release_capacity_on_exit = False
+            _retain_capacity_until_done(retrieval_future, timed_out=True)
             raise HTTPException(status_code=504, detail="retrieval_timeout") from exc
+        except asyncio.CancelledError:
+            # Client disconnects cancel the ASGI task, but Python cannot stop the
+            # synchronous retriever thread. Keep its capacity reserved until the
+            # worker genuinely exits so abandoned work cannot overrun the pool.
+            app.state.cancelled_request_count += 1
+            release_capacity_on_exit = False
+            _retain_capacity_until_done(retrieval_future, timed_out=False)
+            raise
         except HTTPException:
             app.state.error_count += 1
             raise
         except Exception as exc:  # pragma: no cover - exercised in live validation
             app.state.error_count += 1
             logger.exception("Retrieval request failed: request_id=%s path=%s", request_id, request.url.path)
-            raise HTTPException(status_code=500, detail=f"retrieval_failed: {exc}") from exc
+            raise HTTPException(status_code=500, detail="retrieval_failed") from exc
+        finally:
+            if release_capacity_on_exit:
+                semaphore.release()
 
         output = dict(result or {})
+        await _cache_result(app, query, output)
         output["service_request_id"] = request_id
         output["service_latency_ms"] = round((time.perf_counter() - started_at) * 1000.0, 3)
         output["service_backend"] = "retrieval_service"
         output["service_config_name"] = app.state.config_name
-        output["service_work_dir"] = str(app.state.work_dir)
+        output["service_cache_hit"] = False
         return output
 
     return app

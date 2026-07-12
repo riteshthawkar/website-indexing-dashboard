@@ -40,20 +40,62 @@ class SemanticGraphCanonicalizeFormatter(FormatterStage):
 
         graph_cfg = dict(ctx.graph_config or {})
         promote_min_confidence = float(graph_cfg.get("promote_min_confidence") or 0.65)
+        canonicalize_similarity_threshold = float(graph_cfg.get("canonicalize_similarity_threshold") or 0.85)
+
+        try:
+            from sentence_transformers import SentenceTransformer
+            import numpy as np
+            has_st = True
+            logger.info("SentenceTransformer available, initializing vector similarity deduplication...")
+            embed_model = SentenceTransformer("all-MiniLM-L6-v2")
+        except ImportError:
+            has_st = False
+            logger.warning("SentenceTransformer not found, falling back to string matching deduplication.")
+            embed_model = None
 
         canonical_entities: Dict[str, Dict[str, Any]] = {}
         entity_id_by_key: Dict[str, str] = {}
+        type_embeddings: Dict[str, Dict[str, Any]] = {}
 
         def _upsert_entity(*, entity_type: str, name: str, aliases: List[str], description: str, confidence: float, source_candidate: Dict[str, Any]) -> str:
-            merge_key = entity_merge_key(entity_type, name)
+            clean_type = clean_text(entity_type) or "Other"
+            merge_key = entity_merge_key(clean_type, name)
             canonical_id = entity_id_by_key.get(merge_key)
+
+            if not canonical_id and has_st and embed_model is not None:
+                emb_text = f"{name} {description}".strip()
+                emb = embed_model.encode(emb_text)
+
+                type_dict = type_embeddings.get(clean_type, {})
+                if type_dict:
+                    ids = list(type_dict.keys())
+                    embs = np.array(list(type_dict.values()))
+                    norms_embs = np.linalg.norm(embs, axis=1)
+                    norm_emb = np.linalg.norm(emb)
+                    # avoid division by zero
+                    denom = norms_embs * norm_emb
+                    denom[denom == 0] = 1e-9
+                    sims = np.dot(embs, emb) / denom
+                    best_idx = int(np.argmax(sims))
+                    if sims[best_idx] >= canonicalize_similarity_threshold:
+                        canonical_id = ids[best_idx]
+                        entity_id_by_key[merge_key] = canonical_id
+
             if not canonical_id:
                 canonical_id = stable_semantic_id("entity", merge_key)
                 entity_id_by_key[merge_key] = canonical_id
+
+                if has_st and embed_model is not None:
+                    if clean_type not in type_embeddings:
+                        type_embeddings[clean_type] = {}
+                    emb_text = f"{name} {description}".strip()
+                    if canonical_id not in type_embeddings[clean_type]:
+                        type_embeddings[clean_type][canonical_id] = embed_model.encode(emb_text)
+
                 canonical_entities[canonical_id] = {
                     "id": canonical_id,
                     "node_type": "entity",
-                    "entity_type": clean_text(entity_type) or "Other",
+                    "entity_type": clean_type,
                     "canonical_name": normalize_entity_label(name),
                     "aliases": [],
                     "description": "",
@@ -64,6 +106,7 @@ class SemanticGraphCanonicalizeFormatter(FormatterStage):
                     "source_urls": [],
                     "document_titles": [],
                 }
+
             entity = canonical_entities[canonical_id]
             entity["aliases"] = unique_strings([entity["canonical_name"], *entity.get("aliases", []), *aliases, name])
             if description and (not entity.get("description") or len(description) > len(str(entity.get("description") or ""))):

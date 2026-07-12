@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Sequence, Tuple
 
+from pipeline.core.graph_artifacts import resolve_canonical_graph_artifacts
 from pipeline.core.io import load_json_safe
 from pipeline.core.knowledge_graph import load_graph_bundle, validate_graph_bundle
 from pipeline.core.media import build_retrieval_documents
@@ -26,6 +27,7 @@ from pipeline.stages.embedders.neo4j_graph_store import _env_or_config, _neo4j_e
 
 _GENERIC_RELATION_TYPES = {"RELATED_TO", "ABOUT", "MENTIONS", "OTHER"}
 _GRAPH_FIRST_RELATION_FAMILIES = {"location", "naming", "affiliation"}
+_ACTIVE_ASSERTION_STATUSES = {"active", "valid"}
 _OFFERING_ROUTER_TOKENS = {
     "parking",
     "accommodation",
@@ -255,24 +257,28 @@ class GraphRAGRetriever:
             self.neo4j_uri and self.neo4j_username and self.neo4j_password and self.neo4j_namespace
         )
 
-        promoted_dir = self.work_dir / "stage_outputs" / "promote_graph"
-        promoted_graph_file = promoted_dir / "promoted_knowledge_graph.json"
-        promoted_graph_index_file = promoted_dir / "promoted_knowledge_graph_index.json"
         self.local_graph_available = False
         self._graph_file: Path | None = None
         self._graph_index_file: Path | None = None
+        self.local_graph_kind = ""
+        self.local_graph_sha256 = ""
+        self.local_graph_index_sha256 = ""
         self._local_graph_loaded = False
-        if promoted_graph_file.is_file() and promoted_graph_index_file.is_file():
-            graph_file = promoted_graph_file
-            graph_index_file = promoted_graph_index_file
-        else:
-            graph_dir = self.work_dir / "stage_outputs" / "format_graph"
-            graph_file = graph_dir / "knowledge_graph.json"
-            graph_index_file = graph_dir / "knowledge_graph_index.json"
-        if graph_file.is_file() and graph_index_file.is_file():
+        graph_artifacts = resolve_canonical_graph_artifacts(
+            self.work_dir,
+            required=False,
+            require_index=True,
+            validate_binding=bool(
+                (config.get("pipeline") or {}).get("production_profile", False)
+            ),
+        )
+        if graph_artifacts is not None:
             self.local_graph_available = True
-            self._graph_file = graph_file
-            self._graph_index_file = graph_index_file
+            self._graph_file = graph_artifacts.graph_file
+            self._graph_index_file = graph_artifacts.index_file
+            self.local_graph_kind = graph_artifacts.kind
+            self.local_graph_sha256 = graph_artifacts.graph_sha256
+            self.local_graph_index_sha256 = graph_artifacts.index_sha256
         if not self.local_graph_available and not self.neo4j_enabled:
             raise ValueError(
                 "GraphRAG requested but neither local graph artifacts nor Neo4j graph settings are available. "
@@ -284,6 +290,7 @@ class GraphRAGRetriever:
         self.edge_map: Dict[str, Dict[str, Any]] = {}
         self.entity_map: Dict[str, Dict[str, Any]] = {}
         self.assertion_map: Dict[str, Dict[str, Any]] = {}
+        self.community_map: Dict[str, Dict[str, Any]] = {}
         self.outgoing_edge_ids: Dict[str, List[str]] = {}
         should_eager_load_local = self.local_graph_available and (
             not self.neo4j_enabled or self.graph_query_backend == "local"
@@ -330,6 +337,11 @@ class GraphRAGRetriever:
     def _set_neo4j_last_error(self, value: str | None) -> None:
         self._thread_state.neo4j_last_error = value
 
+    def _is_active_assertion_node(self, node: Dict[str, Any]) -> bool:
+        props = dict(node.get("properties") or {})
+        status = _clean_text(props.get("validity_status") or "active").lower()
+        return status in _ACTIVE_ASSERTION_STATUSES
+
     def _ensure_local_graph_loaded(self) -> None:
         if self._local_graph_loaded or not self.local_graph_available:
             return
@@ -360,7 +372,16 @@ class GraphRAGRetriever:
         self.assertion_map = {
             str(node.get("id") or ""): node
             for node in (self.graph_bundle.get("nodes") or [])
-            if isinstance(node, dict) and str(node.get("node_type") or "") == "relation_assertion"
+            if (
+                isinstance(node, dict)
+                and str(node.get("node_type") or "") == "relation_assertion"
+                and self._is_active_assertion_node(node)
+            )
+        }
+        self.community_map = {
+            str(node.get("id") or ""): node
+            for node in (self.graph_bundle.get("nodes") or [])
+            if isinstance(node, dict) and str(node.get("node_type") or "") == "community"
         }
         outgoing = self.graph_index.get("outgoing_edge_ids") or {}
         self.outgoing_edge_ids = {
@@ -478,6 +499,8 @@ class GraphRAGRetriever:
         )
 
     def _score_relation_assertion_candidate(self, query: str, plan: RelationQueryPlan, node: Dict[str, Any]) -> float:
+        if not self._is_active_assertion_node(node):
+            return -1.0
         props = dict(node.get("properties") or {})
         relation_type = str(props.get("relation_type") or node.get("label") or "").upper()
         if relation_type in plan.primary_relation_types:
@@ -607,6 +630,13 @@ class GraphRAGRetriever:
         seen_targets = set()
         seen_edges = set()
         for source_id in source_ids:
+            source_node = self.node_map.get(str(source_id))
+            if (
+                isinstance(source_node, dict)
+                and str(source_node.get("node_type") or "") == "relation_assertion"
+                and not self._is_active_assertion_node(source_node)
+            ):
+                continue
             for edge_id in self.outgoing_edge_ids.get(str(source_id), []):
                 edge = self.edge_map.get(str(edge_id))
                 if not edge:
@@ -615,6 +645,13 @@ class GraphRAGRetriever:
                     continue
                 target_id = str(edge.get("target_id") or "")
                 if not target_id:
+                    continue
+                target_node = self.node_map.get(target_id)
+                if (
+                    isinstance(target_node, dict)
+                    and str(target_node.get("node_type") or "") == "relation_assertion"
+                    and not self._is_active_assertion_node(target_node)
+                ):
                     continue
                 if edge_id not in seen_edges:
                     used_edges.append(str(edge_id))
@@ -685,6 +722,7 @@ class GraphRAGRetriever:
                 "       target.source_chunk_ids AS source_chunk_ids, "
                 "       target.source_fact_ids AS source_fact_ids, "
                 "       target.source_parent_ids AS source_parent_ids, "
+                "       target.validity_status AS validity_status, "
                 "       collect(DISTINCT r.id) AS edge_ids "
                 "LIMIT $limit"
             ),
@@ -704,6 +742,10 @@ class GraphRAGRetriever:
             target_id = str(row.get("target_id") or "")
             if not target_id:
                 continue
+            node_type = str(row.get("node_type") or "")
+            validity_status = _clean_text(row.get("validity_status") or "active").lower()
+            if node_type == "relation_assertion" and validity_status not in _ACTIVE_ASSERTION_STATUSES:
+                continue
             if target_id not in seen_targets:
                 seen_targets.add(target_id)
                 targets.append(target_id)
@@ -715,7 +757,7 @@ class GraphRAGRetriever:
                 used_edges.append(edge_id)
             self._neo4j_node_cache()[target_id] = {
                 "id": target_id,
-                "node_type": str(row.get("node_type") or ""),
+                "node_type": node_type,
                 "label": str(row.get("label") or ""),
                 "properties": {
                     "text": row.get("text"),
@@ -734,6 +776,7 @@ class GraphRAGRetriever:
                     "source_chunk_ids": row.get("source_chunk_ids") or [],
                     "source_fact_ids": row.get("source_fact_ids") or [],
                     "source_parent_ids": row.get("source_parent_ids") or [],
+                    "validity_status": row.get("validity_status"),
                 },
             }
         return targets, used_edges
@@ -835,6 +878,10 @@ class GraphRAGRetriever:
             "text": text,
             "source_url": str(props.get("source_url") or ""),
             "document_title": str(props.get("document_title") or ""),
+            "source_span_ids": [str(value) for value in (props.get("source_span_ids") or []) if str(value)],
+            "linked_span_ids": [str(value) for value in (props.get("source_span_ids") or []) if str(value)],
+            "linked_chunk_ids": [str(value) for value in (props.get("source_chunk_ids") or []) if str(value)],
+            "linked_parent_ids": [str(value) for value in (props.get("source_parent_ids") or []) if str(value)],
             "document_summary": "",
             "media": [],
         }
@@ -844,6 +891,96 @@ class GraphRAGRetriever:
         if not node:
             node = self._neo4j_node_cache().get(str(assertion_id))
         return dict(node.get("properties") or {}) if isinstance(node, dict) else {}
+
+    def _score_community_summary(self, query: str, community_id: str) -> float:
+        node = self.community_map.get(str(community_id))
+        if not node:
+            node = self._neo4j_node_cache().get(str(community_id))
+        if not node:
+            return -1.0
+        if not self._is_active_assertion_node(node):
+            return -1.0
+        props = dict(node.get("properties") or {})
+        text = str(props.get("summary") or "").strip()
+        if not text:
+            return -1.0
+        return self.base._score_text_match(query, text)
+
+    def _local_community_candidates(self, query: str, top_k: int = 2) -> List[Tuple[str, float]]:
+        if not self.local_graph_available:
+            return []
+        self._ensure_local_graph_loaded()
+        scored: List[Tuple[str, float]] = []
+        for cid in self.community_map:
+            score = self._score_community_summary(query, cid)
+            if score > 0.0:
+                scored.append((cid, score))
+        scored.sort(key=lambda item: item[1], reverse=True)
+        return scored[:top_k]
+
+    def _neo4j_community_candidates(self, query: str, top_k: int = 2) -> List[Tuple[str, float]]:
+        self._set_neo4j_last_error(None)
+        try:
+            rows = self._neo4j_query_rows(
+                statement=(
+                    "MATCH (n:KGNode {namespace: $namespace, node_type: 'community'}) "
+                    "RETURN n.id AS id, n.summary AS summary, n.title AS title LIMIT 100"
+                ),
+                parameters={"namespace": self.neo4j_namespace},
+            )
+            for row in rows:
+                cid = str(row.get("id") or "")
+                if cid:
+                    self._neo4j_node_cache()[cid] = {
+                        "id": cid,
+                        "node_type": "community",
+                        "properties": {
+                            "summary": row.get("summary"),
+                            "title": row.get("title")
+                        }
+                    }
+            scored: List[Tuple[str, float]] = []
+            for row in rows:
+                cid = str(row.get("id") or "")
+                if cid:
+                    score = self._score_community_summary(query, cid)
+                    if score > 0.0:
+                        scored.append((cid, score))
+            scored.sort(key=lambda item: item[1], reverse=True)
+            return scored[:top_k]
+        except Exception as exc:
+            self._set_neo4j_last_error(str(exc))
+            return []
+
+    def _get_top_communities(self, query: str, prefer_local: bool = False, top_k: int = 2) -> List[str]:
+        prefer_neo4j = (not prefer_local) and self.graph_query_backend in {"auto", "neo4j"}
+        if prefer_neo4j and self.neo4j_enabled:
+            candidates = self._neo4j_community_candidates(query, top_k=top_k)
+            if candidates or self.graph_query_backend == "neo4j":
+                return [cid for cid, score in candidates]
+        if self.local_graph_available:
+            return [cid for cid, score in self._local_community_candidates(query, top_k=top_k)]
+        return []
+
+    def _build_community_document(self, community_id: str) -> Dict[str, Any] | None:
+        node = self.community_map.get(str(community_id))
+        if not node:
+            node = self._neo4j_node_cache().get(str(community_id))
+        if not node:
+            return None
+        props = dict(node.get("properties") or {})
+        text = str(props.get("summary") or "").strip()
+        title = str(props.get("title") or "Community Summary").strip()
+        if not text:
+            return None
+        return {
+            "id": str(node.get("id") or ""),
+            "text": text,
+            "source_url": "",
+            "document_title": title,
+            "document_summary": "",
+            "media": [],
+        }
 
     def _build_chunk_document(self, chunk_id: str, selected_media: Sequence[Dict[str, Any]]) -> Dict[str, Any] | None:
         chunk = self.base.chunk_map.get(str(chunk_id))
@@ -953,6 +1090,46 @@ class GraphRAGRetriever:
             score += self.graph_assertion_bonus * 0.5
         return score
 
+    def _bfs_multi_hop_traversal(
+        self,
+        start_ids: Sequence[str],
+        max_hops: int = 2,
+        prefer_local: bool = False,
+    ) -> List[str]:
+        """
+        Performs BFS multi-hop traversal from seed IDs to connect entities across multiple steps.
+        """
+        queue = [(sid, 0) for sid in start_ids if sid]
+        visited = set(sid for sid in start_ids if sid)
+        expanded_ids = list(visited)
+
+        # Broad edge types to connect entities to chunks, facts, assertions
+        traversal_edge_types = [
+            "CHUNK_HAS_FACT", "PAGE_HAS_FACT", "SECTION_HAS_FACT",
+            "CHUNK_HAS_EVIDENCE_SPAN", "ASSERTION_SUPPORTED_BY_SPAN",
+            "FACT_SUPPORTS_ASSERTION", "CHUNK_SUPPORTS_ASSERTION",
+            "ENTITY_IN_ASSERTION", "RELATED_TO", "MENTIONS", "ABOUT",
+            "ENTITY_MENTIONED_IN_SPAN", "ENTITY_HAS_COMMUNITY", "PART_OF", "LOCATED_IN", "AFFILIATED_WITH"
+        ]
+
+        while queue:
+            current_id, depth = queue.pop(0)
+            if depth >= max_hops:
+                continue
+
+            targets, _, _ = self._targets_for_edge_types(
+                [current_id],
+                traversal_edge_types,
+                prefer_local=prefer_local
+            )
+            for target in targets:
+                if target not in visited:
+                    visited.add(target)
+                    expanded_ids.append(target)
+                    queue.append((target, depth + 1))
+
+        return expanded_ids
+
     def augment_result(
         self,
         query: str,
@@ -996,8 +1173,16 @@ class GraphRAGRetriever:
         seed_chunk_scores = dict(relation_candidates.chunk_scores or {})
         seed_parent_scores = dict(relation_candidates.parent_scores or {})
 
+        # Entity-aware Multi-Hop BFS Traversal
+        bfs_expanded_ids = self._bfs_multi_hop_traversal(
+            start_ids=[*selected_chunk_ids, *selected_parent_ids, *seed_fact_ids, *seed_assertion_ids],
+            max_hops=2,
+            prefer_local=prefer_local_lookup
+        )
+        expanded_source_ids = list(dict.fromkeys([*selected_chunk_ids, *selected_parent_ids, *bfs_expanded_ids]))
+
         candidate_fact_ids, fact_edge_ids, fact_backend = self._targets_for_edge_types(
-            [*selected_chunk_ids, *selected_parent_ids],
+            expanded_source_ids,
             ["CHUNK_HAS_FACT", "PAGE_HAS_FACT", "SECTION_HAS_FACT"],
             node_types=["fact"],
             prefer_local=prefer_local_lookup,
@@ -1019,7 +1204,7 @@ class GraphRAGRetriever:
         fact_score_map = {fact_id: score for fact_id, score in scored_fact_ids if score > 0.0}
 
         candidate_media_ids, media_edge_ids, media_backend = self._targets_for_edge_types(
-            [*selected_chunk_ids, *selected_parent_ids],
+            expanded_source_ids,
             ["CHUNK_HAS_MEDIA", "PAGE_HAS_MEDIA", "SECTION_HAS_MEDIA"],
             node_types=["media"],
             prefer_local=prefer_local_lookup,
@@ -1040,10 +1225,10 @@ class GraphRAGRetriever:
         ][: self.graph_max_additional_media_results]
         media_score_map = {media_id: score for media_id, score in scored_media_ids if score > 0.0}
 
-        assertion_source_ids = [*selected_chunk_ids, *graph_fact_ids]
+        assertion_source_ids = list(dict.fromkeys([*expanded_source_ids, *graph_fact_ids]))
         candidate_assertion_ids, assertion_edge_ids, assertion_backend = self._targets_for_edge_types(
             assertion_source_ids,
-            ["FACT_SUPPORTS_ASSERTION", "CHUNK_SUPPORTS_ASSERTION"],
+            ["FACT_SUPPORTS_ASSERTION", "CHUNK_SUPPORTS_ASSERTION", "ENTITY_IN_ASSERTION"],
             node_types=["relation_assertion"],
             prefer_local=prefer_local_lookup,
         )
@@ -1106,6 +1291,13 @@ class GraphRAGRetriever:
             props = self._assertion_props(assertion_id)
             assertion_score = assertion_score_map.get(str(assertion_id), 0.0)
             assertion_bonus = (self.graph_assertion_bonus * 2.0) + (assertion_score * self.graph_assertion_bonus)
+            for span_id in props.get("source_span_ids") or []:
+                span = getattr(self.base, "evidence_span_map", {}).get(str(span_id)) or {}
+                for chunk_id in [*list(span.get("linked_chunk_ids") or []), span.get("chunk_id")]:
+                    chunk_id = str(chunk_id or "")
+                    if not chunk_id:
+                        continue
+                    chunk_graph_scores[chunk_id] = chunk_graph_scores.get(chunk_id, 0.0) + assertion_bonus
             for chunk_id in props.get("source_chunk_ids") or []:
                 chunk_id = str(chunk_id)
                 if not chunk_id:
@@ -1206,6 +1398,16 @@ class GraphRAGRetriever:
             if doc and doc["text"]:
                 augmented_docs.append(doc)
                 existing_doc_ids.add(assertion_id)
+
+        graph_community_ids = self._get_top_communities(query, prefer_local=prefer_local_lookup, top_k=2)
+        for cid in graph_community_ids:
+            if cid in existing_doc_ids:
+                continue
+            doc = self._build_community_document(cid)
+            if doc and doc["text"]:
+                augmented_docs.append(doc)
+                existing_doc_ids.add(cid)
+
         if self.graph_max_context_documents > 0:
             augmented_docs = augmented_docs[: max(len(existing_docs), self.graph_max_context_documents + len(existing_docs))]
 
@@ -1252,7 +1454,7 @@ class GraphRAGRetriever:
             and str(doc.get("id") or "") not in leading_answer_doc_ids
         ]
 
-        graph_used = bool(graph_fact_ids or graph_media_ids or graph_assertion_ids)
+        graph_used = bool(graph_fact_ids or graph_media_ids or graph_assertion_ids or graph_community_ids)
         result["graph_used"] = graph_used
         result["graph_store_backend"] = (
             "neo4j"
@@ -1264,6 +1466,7 @@ class GraphRAGRetriever:
         result["graph_store_error"] = self._neo4j_last_error()
         result["graph_fact_ids"] = graph_fact_ids
         result["graph_assertion_ids"] = graph_assertion_ids
+        result["graph_community_ids"] = graph_community_ids
         result["graph_edge_ids"] = list(dict.fromkeys([*fact_edge_ids, *media_edge_ids, *assertion_edge_ids]))
         result["graph_media_ids"] = graph_media_ids
         result["graph_relation_family"] = relation_candidates.family if relation_query else ""
