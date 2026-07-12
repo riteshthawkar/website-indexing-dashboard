@@ -15,6 +15,9 @@ crawler:
   # debugging override must use a non-production profile.
   ignore_https_errors: false
   require_https: true
+  # Fail before the expensive browser crawl when TLS or sitemap changes collapse
+  # the expected frontier. The final index-readiness gate remains stricter.
+  minimum_sitemap_seed_count: 2300
 
 graph:
   # The final graph is uploaded only when every detected community has a
@@ -34,10 +37,11 @@ embedder:
   gemini_request_timeout_ms: 30000
 
 formatter:
-  # The live non-tag sitemap currently contains roughly 3.8k canonical URLs.
-  # Production must cover at least 90% and may tolerate only a very small tail
-  # of non-critical fetch failures.
-  expected_site_inventory_count: 3800
+  # The verified live sitemap inventory on 2026-07-12 contains 2,636 allowed
+  # URLs, consistent with the previous release's 2,595 seeded URLs. Keep a
+  # rounded 2.6k baseline so normal small content churn does not make the
+  # production gate impossible while still requiring at least 90% coverage.
+  expected_site_inventory_count: 2600
   minimum_inventory_coverage_ratio: 0.90
   maximum_hard_failure_count: 25
   fail_on_critical_coverage: true

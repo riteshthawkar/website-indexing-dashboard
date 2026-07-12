@@ -16,6 +16,7 @@ import inspect
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import re
 import socket
@@ -1082,6 +1083,125 @@ def _has_resumable_crawl_state(crawl_state: Optional[Dict[str, Any]]) -> bool:
     return bool(pending or visited or pages_crawled > 0)
 
 
+def _checkpoint_freshness(payload: Dict[str, Any], path: Path) -> float:
+    """Return a comparable checkpoint timestamp, preferring persisted metadata."""
+    try:
+        updated_at = float(payload.get("updated_at"))
+    except (TypeError, ValueError):
+        updated_at = 0.0
+    if math.isfinite(updated_at) and updated_at > 0:
+        return updated_at
+    try:
+        return float(path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+def _coerce_frontier_state(payload: Any) -> Dict[str, Any]:
+    """Normalize a public or runtime frontier payload without mutating it."""
+    if not isinstance(payload, dict):
+        return {}
+    state = dict(payload)
+    pending = state.get("pending")
+    if not pending and state.get("to_visit"):
+        state["pending"] = [
+            {"url": url, "parent_url": None}
+            for url in state.get("to_visit", [])
+        ]
+    return state
+
+
+def _merge_crawl_frontier_states(
+    candidates: Sequence[Tuple[Dict[str, Any], float, int]],
+    max_pages: int,
+) -> Dict[str, Any]:
+    """Merge valid frontier snapshots with the freshest source authoritative.
+
+    A URL's visited/pending classification and parent are taken from the first
+    (freshest) snapshot containing it.  Missing URLs from an older valid
+    snapshot are retained so a lagging runtime checkpoint cannot discard work.
+    """
+    ordered = sorted(candidates, key=lambda item: (item[1], item[2]), reverse=True)
+    assignments: Dict[str, Tuple[str, Optional[str]]] = {}
+    depths: Dict[str, Any] = {}
+    pages_crawled = 0
+    primary_selected = False
+    base_state: Dict[str, Any] = {}
+
+    for raw_state, _freshness, _priority in ordered:
+        state = _coerce_frontier_state(raw_state)
+        if not state:
+            continue
+
+        normalized_depths: Dict[str, Any] = {}
+        if isinstance(state.get("depths"), dict):
+            for value, depth in state["depths"].items():
+                normalized = _normalize_http_url(value)
+                if normalized:
+                    normalized_depths.setdefault(normalized, depth)
+
+        normalized_visited = [
+            normalized
+            for value in (state.get("visited") or [])
+            if (normalized := _normalize_http_url(value))
+        ]
+        normalized_pending: List[Tuple[str, Optional[str]]] = []
+        for item in state.get("pending") or []:
+            if isinstance(item, dict):
+                normalized = _normalize_http_url(item.get("url"))
+                parent_url = _normalize_http_url(item.get("parent_url"))
+            else:
+                normalized = _normalize_http_url(item)
+                parent_url = None
+            if normalized:
+                normalized_pending.append((normalized, parent_url))
+
+        try:
+            state_pages_crawled = max(0, int(state.get("pages_crawled") or 0))
+        except (TypeError, ValueError):
+            state_pages_crawled = 0
+        if not (normalized_visited or normalized_pending or normalized_depths or state_pages_crawled):
+            continue
+
+        if not primary_selected:
+            base_state = {
+                key: value
+                for key, value in state.items()
+                if key not in {"visited", "pending", "to_visit", "depths", "pages_crawled", "updated_at"}
+            }
+            pages_crawled = state_pages_crawled
+            primary_selected = True
+
+        for url, depth in normalized_depths.items():
+            depths.setdefault(url, depth)
+        for url in normalized_visited:
+            assignments.setdefault(url, ("visited", None))
+        for url, parent_url in normalized_pending:
+            assignments.setdefault(url, ("pending", parent_url))
+
+    if not primary_selected:
+        return {}
+
+    # Crawl4AI's batch state can omit the start URL from visited/pending while
+    # retaining it in depths.  Keep such scheduled URLs recoverable as pending.
+    for url in depths:
+        assignments.setdefault(url, ("pending", None))
+
+    base_state.update(
+        {
+            "visited": [url for url, (status, _parent) in assignments.items() if status == "visited"],
+            "pending": [
+                {"url": url, "parent_url": parent}
+                for url, (status, parent) in assignments.items()
+                if status == "pending"
+            ],
+            "depths": depths,
+            "pages_crawled": pages_crawled,
+        }
+    )
+    return _trim_crawl_state_to_budget(base_state, max_pages)
+
+
 def _select_best_srcset(srcset: str) -> str:
     best_url = ""
     best_score = -1.0
@@ -2055,6 +2175,26 @@ class Crawl4AICrawler(CrawlerStage):
             except (TypeError, ValueError):
                 errors.append("crawler.max_depth must be an integer")
 
+        minimum_sitemap_seed_count = crawler.get("minimum_sitemap_seed_count")
+        if minimum_sitemap_seed_count is not None:
+            try:
+                minimum_sitemap_seed_count = int(minimum_sitemap_seed_count)
+                if minimum_sitemap_seed_count < 0:
+                    errors.append("crawler.minimum_sitemap_seed_count must be >= 0")
+                if minimum_sitemap_seed_count > 0 and not bool(crawler.get("sitemap_enabled", True)):
+                    errors.append(
+                        "crawler.sitemap_enabled must be true when "
+                        "crawler.minimum_sitemap_seed_count is positive"
+                    )
+                sitemap_seed_limit = int(crawler.get("sitemap_seed_limit", 500))
+                if minimum_sitemap_seed_count > sitemap_seed_limit:
+                    errors.append(
+                        "crawler.minimum_sitemap_seed_count must not exceed "
+                        "crawler.sitemap_seed_limit"
+                    )
+            except (TypeError, ValueError):
+                errors.append("crawler.minimum_sitemap_seed_count must be an integer")
+
         if AsyncWebCrawler is None or BrowserConfig is None or CrawlerRunConfig is None:
             errors.append("crawl4ai is not installed. Run: pip install crawl4ai")
 
@@ -2221,6 +2361,16 @@ class Crawl4AICrawler(CrawlerStage):
         self._load_runtime_state(ctx.checkpoint)
         if self.retry_recoverable_skipped_on_resume:
             self._requeue_recoverable_skipped_urls()
+        recovered_unprocessed = self._requeue_unprocessed_visited_urls()
+        if recovered_unprocessed:
+            logger.warning(
+                "Recovered %d visited URL(s) without durable processing evidence from crawler checkpoint.",
+                len(recovered_unprocessed),
+            )
+        if self.crawl_state:
+            # Persist the reconciled frontier before starting network work so a
+            # second interruption cannot restore the unsafe pre-recovery state.
+            self._flush_runtime_state(force=True)
 
         try:
             await self._open_http_session()
@@ -2232,6 +2382,17 @@ class Crawl4AICrawler(CrawlerStage):
                 if self.config.get("sitemap_enabled", True):
                     sitemap_urls = await self._discover_sitemap_urls()
                     self.stats["sitemap_urls_seeded"] = len(sitemap_urls)
+                minimum_sitemap_seed_count = max(
+                    0,
+                    int(self.config.get("minimum_sitemap_seed_count") or 0),
+                )
+                if len(sitemap_urls) < minimum_sitemap_seed_count:
+                    raise RuntimeError(
+                        "Sitemap discovery coverage gate failed before browser crawling: "
+                        f"discovered={len(sitemap_urls)} "
+                        f"required={minimum_sitemap_seed_count}. "
+                        "Check verified TLS trust, sitemap availability, and the configured inventory baseline."
+                    )
                 self.crawl_state = _build_initial_crawl_state(
                     self.start_url,
                     sitemap_urls,
@@ -2355,13 +2516,32 @@ class Crawl4AICrawler(CrawlerStage):
         if isinstance(checkpoint, dict):
             runtime_path = checkpoint.get("runtime_state_file")
 
-        state = None
+        runtime_paths: List[Tuple[Path, int]] = []
         if runtime_path:
-            state = load_json_safe(runtime_path)
-        if not state:
-            state = load_json_safe(self.runtime_state_file, {})
+            runtime_paths.append((Path(runtime_path), 2))
+        try:
+            local_runtime_resolved = self.runtime_state_file.resolve()
+        except OSError:
+            local_runtime_resolved = self.runtime_state_file
+        if not any(
+            path.resolve() == local_runtime_resolved
+            for path, _priority in runtime_paths
+        ):
+            runtime_paths.append((self.runtime_state_file, 1))
 
-        state = state or {}
+        runtime_sources: List[Tuple[Dict[str, Any], Path, float, int]] = []
+        for path, priority in runtime_paths:
+            payload = load_json_safe(path, {}) or {}
+            if not isinstance(payload, dict):
+                continue
+            runtime_sources.append(
+                (payload, path, _checkpoint_freshness(payload, path), priority)
+            )
+
+        state: Dict[str, Any] = {}
+        if runtime_sources:
+            state = max(runtime_sources, key=lambda item: (item[2], item[3]))[0]
+
         self.url_mapping = load_json_safe(self.mapping_file, {}) or {}
         self.url_mapping.update(state.get("url_mapping") or {})
 
@@ -2420,14 +2600,28 @@ class Crawl4AICrawler(CrawlerStage):
         loaded_stats = state.get("stats") or {}
         self.stats = _merge_counter_dict(self.stats, loaded_stats)
 
-        crawl_state = state.get("crawl_state") or load_json_safe(self.crawl_state_file, {}) or {}
-        pending = crawl_state.get("pending")
-        if not pending and crawl_state.get("to_visit"):
-            crawl_state["pending"] = [
-                {"url": url, "parent_url": None}
-                for url in crawl_state.get("to_visit", [])
-            ]
-        normalized_crawl_state = _trim_crawl_state_to_budget(crawl_state, self.max_pages)
+        frontier_candidates: List[Tuple[Dict[str, Any], float, int]] = []
+        for runtime_payload, _path, freshness, priority in runtime_sources:
+            runtime_frontier = _coerce_frontier_state(runtime_payload.get("crawl_state"))
+            if runtime_frontier:
+                frontier_candidates.append((runtime_frontier, freshness, priority))
+
+        public_crawl_state = load_json_safe(self.crawl_state_file, {}) or {}
+        if isinstance(public_crawl_state, dict):
+            public_frontier = _coerce_frontier_state(public_crawl_state)
+            if public_frontier:
+                frontier_candidates.append(
+                    (
+                        public_frontier,
+                        _checkpoint_freshness(public_crawl_state, self.crawl_state_file),
+                        3,
+                    )
+                )
+
+        normalized_crawl_state = _merge_crawl_frontier_states(
+            frontier_candidates,
+            self.max_pages,
+        )
         self.crawl_state = (
             normalized_crawl_state
             if _has_resumable_crawl_state(normalized_crawl_state)
@@ -2443,6 +2637,116 @@ class Crawl4AICrawler(CrawlerStage):
             "sources": sitemap_state.get("sources", []),
             "urls": sitemap_state.get("urls", []),
         }
+
+    def _requeue_unprocessed_visited_urls(self) -> List[str]:
+        """Recover Crawl4AI list-mode results not yet durably consumed.
+
+        Crawl4AI advances its BFS checkpoint before returning a non-streaming
+        result list.  If result consumption is interrupted, those URLs appear
+        visited even though no mapping or skipped marker exists.  Move only
+        such URLs back to pending and derive pages_crawled from durable mapped
+        frontier entries so max_pages remains effective after resume.
+        """
+        if not self.crawl_state:
+            return []
+
+        mapping_keys_by_url: Dict[str, List[str]] = {}
+        durable_mapped_urls: set[str] = set()
+        for mapping_url, mapping_value in self.url_mapping.items():
+            normalized = _normalize_http_url(mapping_url)
+            if not normalized:
+                continue
+            mapping_keys_by_url.setdefault(normalized, []).append(mapping_url)
+            stored_value = str(mapping_value or "")
+            if stored_value.startswith("SKIPPED_"):
+                durable_mapped_urls.add(normalized)
+                continue
+            try:
+                output_is_durable = bool(stored_value) and Path(stored_value).is_file()
+            except (OSError, ValueError):
+                output_is_durable = False
+            if output_is_durable:
+                durable_mapped_urls.add(normalized)
+        depths = dict(self.crawl_state.get("depths") or {})
+        visited = [
+            normalized
+            for value in (self.crawl_state.get("visited") or [])
+            if (normalized := _normalize_http_url(value))
+        ]
+        pending = self._filter_pending_items(self.crawl_state.get("pending") or [])
+
+        durable_visited: List[str] = []
+        durable_seen: set[str] = set()
+        unresolved: List[Tuple[Dict[str, Optional[str]], int]] = []
+        unresolved_seen: set[str] = set()
+        recovered: List[str] = []
+        order = 0
+
+        def mark_durable(url: str) -> None:
+            if url not in durable_seen:
+                durable_seen.add(url)
+                durable_visited.append(url)
+
+        def add_unresolved(url: str, parent_url: Optional[str]) -> None:
+            nonlocal order
+            if url in unresolved_seen or url in durable_seen:
+                return
+            unresolved_seen.add(url)
+            unresolved.append(({"url": url, "parent_url": parent_url}, order))
+            order += 1
+
+        def remove_stale_mapping(url: str) -> None:
+            if url in durable_mapped_urls:
+                return
+            for mapping_key in mapping_keys_by_url.get(url, []):
+                self.url_mapping.pop(mapping_key, None)
+
+        for url in visited:
+            if url in durable_mapped_urls:
+                mark_durable(url)
+                continue
+            if self._allow_frontier_url(url):
+                remove_stale_mapping(url)
+                add_unresolved(url, None)
+                recovered.append(url)
+                continue
+            remove_stale_mapping(url)
+            self._mark_url_excluded_from_frontier(url, reason="resume_policy")
+            durable_mapped_urls.add(url)
+            mark_durable(url)
+
+        for item in pending:
+            url = str(item.get("url") or "")
+            if not url:
+                continue
+            if url in durable_mapped_urls:
+                mark_durable(url)
+            else:
+                remove_stale_mapping(url)
+                add_unresolved(url, item.get("parent_url"))
+
+        def depth_rank(entry: Tuple[Dict[str, Optional[str]], int]) -> Tuple[float, int]:
+            item, stable_order = entry
+            raw_depth = depths.get(item["url"])
+            try:
+                depth = float(raw_depth)
+            except (TypeError, ValueError):
+                depth = math.inf
+            if not math.isfinite(depth) or depth < 0:
+                depth = math.inf
+            return (depth, stable_order)
+
+        unresolved.sort(key=depth_rank)
+        self.crawl_state.update(
+            {
+                "visited": durable_visited,
+                "pending": [item for item, _order in unresolved],
+                "depths": depths,
+                "pages_crawled": min(len(durable_visited), self.max_pages),
+            }
+        )
+        self.crawl_state = _trim_crawl_state_to_budget(self.crawl_state, self.max_pages)
+        return recovered
 
     def _mark_url_excluded_from_frontier(self, page_url: str, reason: str = "path_prefix") -> None:
         normalized = _normalize_http_url(page_url)
