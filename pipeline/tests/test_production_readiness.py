@@ -1161,6 +1161,19 @@ class TestCrawlerHelpers:
         assert _is_recoverable_crawl_skip_reason(
             "SKIPPED_HTTP_403:content_quality:blocked_or_error_page,url_token_mismatch,thin_html"
         )
+        assert _is_recoverable_crawl_skip_reason(
+            "SKIPPED_HTTP_403:Blocked by anti-bot protection while loading the page"
+        )
+        assert not _is_recoverable_crawl_skip_reason("SKIPPED_HTTP_403")
+        assert not _is_recoverable_crawl_skip_reason("SKIPPED_HTTP_403:Forbidden")
+
+    @pytest.mark.parametrize("status", [301, 302, 307, 308])
+    def test_redirect_skips_are_recoverable(self, status):
+        from pipeline.stages.crawlers.crawl4ai_crawler import _is_recoverable_crawl_skip_reason
+
+        assert _is_recoverable_crawl_skip_reason(f"SKIPPED_HTTP_{status}")
+        assert not _is_recoverable_crawl_skip_reason("SKIPPED_HTTP_404")
+        assert not _is_recoverable_crawl_skip_reason(f"SKIPPED_HTTP_{status}0")
 
     def test_transient_network_navigation_errors_are_recoverable(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _is_recoverable_crawl_skip_reason
@@ -1224,6 +1237,319 @@ class TestCrawlerHelpers:
         assert requeued == []
         assert crawler.url_mapping["https://mbzuai.ac.ae/news/a"].startswith("SKIPPED_ERROR")
         assert crawler.stats["recoverable_skips_exhausted"] == 1
+
+        # Reconciliation runs before every bounded batch. Exhaustion metrics
+        # must remain URL counts rather than growing once per later batch.
+        assert crawler._requeue_recoverable_skipped_urls() == []
+        assert crawler.stats["recoverable_skips_exhausted"] == 1
+
+    def test_requeue_anti_bot_403_without_requeueing_generic_403(self, monkeypatch):
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        anti_bot_url = "https://mbzuai.ac.ae/news/anti-bot"
+        pdf_url = "https://mbzuai.ac.ae/uploads/protected.pdf"
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [],
+            "visited": [anti_bot_url, pdf_url],
+            "pages_crawled": 0,
+            "depths": {},
+        }
+        crawler.url_mapping = {
+            anti_bot_url: "SKIPPED_HTTP_403:Blocked by anti-bot protection while loading the page",
+            pdf_url: "SKIPPED_HTTP_403",
+        }
+        crawler.stats = {
+            "pages_failed": 2,
+            "skipped_urls": 2,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+        }
+        crawler.recoverable_skip_retries = {}
+        crawler.recoverable_skip_exhausted_urls = set()
+        crawler.recoverable_skip_max_retries = 2
+        crawler.excluded_path_prefixes = set()
+        crawler.start_url = "https://mbzuai.ac.ae"
+        crawler.allowed_domains = {"mbzuai.ac.ae"}
+        crawler.excluded_subdomains = set()
+        monkeypatch.setattr(
+            crawler_module,
+            "_host_resolves_to_private_or_reserved",
+            lambda _host: False,
+        )
+
+        requeued = crawler._requeue_recoverable_skipped_urls()
+
+        assert requeued == [anti_bot_url]
+        assert crawler.crawl_state["pending"] == [
+            {"url": anti_bot_url, "parent_url": None}
+        ]
+        assert crawler.crawl_state["visited"] == [pdf_url]
+        assert crawler.recoverable_skip_retries == {anti_bot_url: 1}
+        assert anti_bot_url not in crawler.url_mapping
+        assert crawler.url_mapping[pdf_url] == "SKIPPED_HTTP_403"
+        assert crawler.stats["pages_failed"] == 1
+        assert crawler.stats["skipped_urls"] == 1
+
+    def test_seed_frontier_fetches_requeue_before_slicing_pending(self, monkeypatch):
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        retry_url = "https://mbzuai.ac.ae/news/retry"
+        pending_urls = [
+            "https://mbzuai.ac.ae/news/next-a",
+            "https://mbzuai.ac.ae/news/next-b",
+        ]
+        fetched_batches = []
+
+        class FakeCrawler:
+            async def arun_many(self, *, urls, config):
+                fetched_batches.append(list(urls))
+                return [
+                    SimpleNamespace(
+                        url=url,
+                        success=True,
+                        status_code=200,
+                        html="<html><body>ok</body></html>",
+                    )
+                    for url in urls
+                ]
+
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [
+                {"url": url, "parent_url": "https://mbzuai.ac.ae"}
+                for url in pending_urls
+            ],
+            "visited": [retry_url],
+            "pages_crawled": 0,
+            "depths": {},
+        }
+        crawler.url_mapping = {retry_url: "SKIPPED_HTTP_301"}
+        crawler.stats = {
+            "pages_scraped": 0,
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+            "sitemap_batches_completed": 0,
+        }
+        crawler.recoverable_skip_retries = {}
+        crawler.recoverable_skip_exhausted_urls = set()
+        crawler.recoverable_skip_max_retries = 2
+        crawler.sitemap_crawl_batch_size = 2
+        crawler.fetch_concurrency = 2
+        crawler.max_pages = 3
+        crawler.start_url = "https://mbzuai.ac.ae"
+        crawler.allowed_domains = {"mbzuai.ac.ae"}
+        crawler.excluded_subdomains = set()
+        crawler.excluded_path_prefixes = set()
+        crawler.allow_query_urls = False
+        crawler.allowed_query_param_names = set()
+        crawler.require_https = True
+        monkeypatch.setattr(
+            crawler_module,
+            "_host_resolves_to_private_or_reserved",
+            lambda _host: False,
+        )
+
+        run_config = SimpleNamespace(clone=lambda **_kwargs: SimpleNamespace())
+        with patch.object(crawler, "_process_result", return_value=True), patch.object(
+            crawler, "_flush_runtime_state"
+        ):
+            run_async(
+                crawler._crawl_seed_frontier(
+                    {"crawler": FakeCrawler()},
+                    run_config,
+                    SimpleNamespace(),
+                )
+            )
+
+        assert fetched_batches == [[retry_url, pending_urls[0]], [pending_urls[1]]]
+        assert crawler.recoverable_skip_retries == {retry_url: 1}
+        assert retry_url not in crawler.url_mapping
+
+    def test_seed_frontier_stops_after_redirect_retry_cap(self, monkeypatch):
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        retry_url = "https://mbzuai.ac.ae/news/always-redirects"
+        fetched_batches = []
+
+        class FakeCrawler:
+            async def arun_many(self, *, urls, config):
+                fetched_batches.append(list(urls))
+                return [
+                    SimpleNamespace(
+                        url=url,
+                        success=False,
+                        status_code=301,
+                        html="",
+                        error_message="redirect response without a rendered page",
+                    )
+                    for url in urls
+                ]
+
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [],
+            "visited": [retry_url],
+            "pages_crawled": 0,
+            "depths": {},
+        }
+        crawler.url_mapping = {retry_url: "SKIPPED_HTTP_301"}
+        crawler.stats = {
+            "pages_scraped": 0,
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+            "sitemap_batches_completed": 0,
+        }
+        crawler.recoverable_skip_retries = {}
+        crawler.recoverable_skip_exhausted_urls = set()
+        crawler.recoverable_skip_max_retries = 2
+        crawler.sitemap_crawl_batch_size = 1
+        crawler.fetch_concurrency = 1
+        crawler.max_pages = 10
+        crawler.start_url = "https://mbzuai.ac.ae"
+        crawler.allowed_domains = {"mbzuai.ac.ae"}
+        crawler.excluded_subdomains = set()
+        crawler.excluded_path_prefixes = set()
+        crawler.allow_query_urls = False
+        crawler.allowed_query_param_names = set()
+        crawler.require_https = True
+        monkeypatch.setattr(
+            crawler_module,
+            "_host_resolves_to_private_or_reserved",
+            lambda _host: False,
+        )
+
+        run_config = SimpleNamespace(clone=lambda **_kwargs: SimpleNamespace())
+        with patch.object(crawler, "_process_result", return_value=False), patch.object(
+            crawler, "_recover_url_with_http_retry", return_value=False
+        ), patch.object(crawler, "_flush_runtime_state"):
+            run_async(
+                crawler._crawl_seed_frontier(
+                    {"crawler": FakeCrawler()},
+                    run_config,
+                    SimpleNamespace(),
+                )
+            )
+
+        assert fetched_batches == [[retry_url], [retry_url]]
+        assert crawler.recoverable_skip_retries == {retry_url: 2}
+        assert crawler.url_mapping[retry_url].startswith("SKIPPED_HTTP_301")
+        assert crawler.stats["recoverable_skips_exhausted"] == 1
+
+    def test_seed_frontier_reconciles_retry_at_exact_page_budget(self, monkeypatch):
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        retry_url = "https://mbzuai.ac.ae/news/retry-at-budget"
+        fetched_batches = []
+
+        class FakeCrawler:
+            async def arun_many(self, *, urls, config):
+                fetched_batches.append(list(urls))
+                return [
+                    SimpleNamespace(
+                        url=url,
+                        success=True,
+                        status_code=200,
+                        html="<html><body>recovered</body></html>",
+                    )
+                    for url in urls
+                ]
+
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [],
+            "visited": [retry_url],
+            "pages_crawled": 1,
+            "depths": {},
+        }
+        crawler.url_mapping = {retry_url: "SKIPPED_HTTP_301"}
+        crawler.stats = {
+            "pages_scraped": 0,
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+            "sitemap_batches_completed": 0,
+        }
+        crawler.recoverable_skip_retries = {}
+        crawler.recoverable_skip_exhausted_urls = set()
+        crawler.recoverable_skip_max_retries = 2
+        crawler.sitemap_crawl_batch_size = 1
+        crawler.fetch_concurrency = 1
+        crawler.max_pages = 1
+        crawler.start_url = "https://mbzuai.ac.ae"
+        crawler.allowed_domains = {"mbzuai.ac.ae"}
+        crawler.excluded_subdomains = set()
+        crawler.excluded_path_prefixes = set()
+        crawler.allow_query_urls = False
+        crawler.allowed_query_param_names = set()
+        crawler.require_https = True
+        monkeypatch.setattr(
+            crawler_module,
+            "_host_resolves_to_private_or_reserved",
+            lambda _host: False,
+        )
+
+        run_config = SimpleNamespace(clone=lambda **_kwargs: SimpleNamespace())
+        with patch.object(crawler, "_process_result", return_value=True), patch.object(
+            crawler, "_flush_runtime_state"
+        ):
+            run_async(
+                crawler._crawl_seed_frontier(
+                    {"crawler": FakeCrawler()},
+                    run_config,
+                    SimpleNamespace(),
+                )
+            )
+
+        assert fetched_batches == [[retry_url]]
+        assert crawler.recoverable_skip_retries == {retry_url: 1}
+        assert crawler.crawl_state["pages_crawled"] == 1
+        assert crawler.crawl_state["pending"] == []
+
+    def test_successful_http_retry_clears_existing_skip_counters_once(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        page_url = "https://mbzuai.ac.ae/news/raw-source-recovers"
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.url_mapping = {
+            page_url: "SKIPPED_LOW_QUALITY:content_quality:blocked_or_error_page"
+        }
+        crawler.stats = {
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "http_fallback_retries": 0,
+            "http_fallback_pages": 0,
+        }
+        crawler.sitemap_failed_url_retry_attempts = 1
+        crawler.sitemap_failed_retry_backoff = 0
+
+        async def fetch_raw_source(_url):
+            return "<html><body>recovered content</body></html>", 200
+
+        async def process_result(result, *, mark_failure):
+            assert mark_failure is True
+            crawler.url_mapping[page_url] = "/tmp/recovered.html"
+            return True
+
+        with patch.object(
+            crawler,
+            "_fetch_raw_source_page",
+            side_effect=fetch_raw_source,
+        ), patch.object(crawler, "_process_result", side_effect=process_result):
+            assert run_async(crawler._recover_url_with_http_retry(page_url)) is True
+            assert run_async(crawler._recover_url_with_http_retry(page_url)) is True
+
+        assert crawler.stats["pages_failed"] == 0
+        assert crawler.stats["skipped_urls"] == 0
 
     def test_requeue_recoverable_skipped_urls_excludes_configured_path_prefix(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler

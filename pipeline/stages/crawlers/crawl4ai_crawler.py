@@ -297,6 +297,13 @@ def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
     text = str(value or "").lower()
     if not text.startswith("skipped"):
         return False
+    if re.match(r"^skipped_http_(?:301|302|307|308)(?::|$)", text):
+        return True
+    if re.match(
+        r"^skipped_http_403:blocked by anti-bot protection(?:[\s:.,;!()\[\]-]|$)",
+        text,
+    ):
+        return True
     recoverable_tokens = (
         "browser has been closed",
         "target page, context or browser has been closed",
@@ -2349,6 +2356,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.page_links: Dict[str, List[Dict[str, Any]]] = {}
         self.downloaded_images: Dict[str, str] = {}
         self.recoverable_skip_retries: Dict[str, int] = {}
+        self.recoverable_skip_exhausted_urls: set[str] = set()
         self.crawl_state: Dict[str, Any] = {}
         self.discovered_sitemaps: Dict[str, Any] = {"sources": [], "urls": []}
         self._last_flush_at = 0.0
@@ -2571,6 +2579,11 @@ class Crawl4AICrawler(CrawlerStage):
             for url, count in (state.get("recoverable_skip_retries") or {}).items()
             if str(url)
         }
+        self.recoverable_skip_exhausted_urls = {
+            normalized
+            for value in (state.get("recoverable_skip_exhausted_urls") or [])
+            if (normalized := _normalize_http_url(value))
+        }
 
         graph_payload = load_json_safe(self.page_link_graph_file, {}) or {}
         graph_links: Dict[str, List[Dict[str, Any]]] = {}
@@ -2789,6 +2802,11 @@ class Crawl4AICrawler(CrawlerStage):
         if not self.crawl_state or not self.url_mapping:
             return []
 
+        exhausted_urls = getattr(self, "recoverable_skip_exhausted_urls", set())
+        if not isinstance(exhausted_urls, set):
+            exhausted_urls = set(exhausted_urls or [])
+        self.recoverable_skip_exhausted_urls = exhausted_urls
+
         pending = self._filter_pending_items(self.crawl_state.get("pending") or [])
         pending_urls = {
             _normalize_http_url(item.get("url"))
@@ -2801,25 +2819,39 @@ class Crawl4AICrawler(CrawlerStage):
             if isinstance(url, str) and url
         ]
         requeued: List[str] = []
+        requeued_set: set[str] = set()
+        recoverable_mapping_urls: set[str] = set()
         exhausted = 0
         for url, reason in list(self.url_mapping.items()):
             normalized = _normalize_http_url(url)
             if not normalized or not _is_recoverable_crawl_skip_reason(reason):
+                continue
+            recoverable_mapping_urls.add(normalized)
+            if normalized in requeued_set:
+                self.url_mapping.pop(url, None)
                 continue
             if not self._allow_frontier_url(normalized):
                 self._mark_url_excluded_from_frontier(normalized)
                 continue
             attempts = int(self.recoverable_skip_retries.get(normalized) or 0)
             if attempts >= self.recoverable_skip_max_retries:
-                exhausted += 1
+                if normalized not in exhausted_urls:
+                    exhausted_urls.add(normalized)
+                    exhausted += 1
                 continue
             self.recoverable_skip_retries[normalized] = attempts + 1
+            exhausted_urls.discard(normalized)
             self.url_mapping.pop(url, None)
             self.url_mapping.pop(normalized, None)
             if normalized not in pending_urls:
-                pending.insert(0, {"url": normalized, "parent_url": None})
+                # Keep the mapping's stable insertion order while prioritizing
+                # all retries ahead of work that has not yet been attempted.
+                pending.insert(len(requeued), {"url": normalized, "parent_url": None})
                 pending_urls.add(normalized)
             requeued.append(normalized)
+            requeued_set.add(normalized)
+
+        exhausted_urls.intersection_update(recoverable_mapping_urls)
 
         if exhausted:
             self.stats["recoverable_skips_exhausted"] += exhausted
@@ -2833,9 +2865,20 @@ class Crawl4AICrawler(CrawlerStage):
             self.crawl_state["pending"] = pending
             return []
 
-        requeued_set = set(requeued)
-        self.crawl_state["visited"] = [url for url in visited if url not in requeued_set]
+        remaining_visited = [url for url in visited if url not in requeued_set]
+        self.crawl_state["visited"] = remaining_visited
         self.crawl_state["pending"] = pending
+        try:
+            recorded_pages_crawled = max(
+                0,
+                int(self.crawl_state.get("pages_crawled") or 0),
+            )
+        except (TypeError, ValueError):
+            recorded_pages_crawled = 0
+        self.crawl_state["pages_crawled"] = min(
+            recorded_pages_crawled,
+            len(remaining_visited),
+        )
         self.stats["pages_failed"] = max(0, int(self.stats.get("pages_failed", 0)) - len(requeued))
         self.stats["skipped_urls"] = max(0, int(self.stats.get("skipped_urls", 0)) - len(requeued))
         logger.info(
@@ -3164,34 +3207,42 @@ class Crawl4AICrawler(CrawlerStage):
             self.fetch_concurrency,
         )
 
-        while pending and pages_crawled < self.max_pages:
-            batch = pending[: self.sitemap_crawl_batch_size]
-            urls = [str(item["url"]) for item in batch if item.get("url")]
-            if not urls:
-                pending = pending[len(batch):]
-                continue
-
+        while True:
+            # Reconcile recoverable failures before freezing the next batch.
+            # Selecting first would allow a newly prepended retry to be removed
+            # by the post-batch slice even though that retry was never fetched.
             self._set_crawl_state(
                 visited=visited,
                 pending=pending,
                 depths=depths,
                 pages_crawled=pages_crawled,
             )
-            requeued = self._requeue_recoverable_skipped_urls()
-            if requeued:
-                pending = [
-                    item
-                    for item in (self.crawl_state.get("pending") or [])
-                    if isinstance(item, dict) and item.get("url")
-                ]
-                visited = [
-                    str(url)
-                    for url in (self.crawl_state.get("visited") or [])
-                    if isinstance(url, str) and url
-                ]
-                visited_set = set(visited)
-                pages_crawled = int(self.crawl_state.get("pages_crawled") or pages_crawled)
+            self._requeue_recoverable_skipped_urls()
+            pending = [
+                {"url": item.get("url"), "parent_url": item.get("parent_url")}
+                for item in (self.crawl_state.get("pending") or [])
+                if isinstance(item, dict) and item.get("url")
+            ]
+            visited = [
+                str(url)
+                for url in (self.crawl_state.get("visited") or [])
+                if isinstance(url, str) and url
+            ]
+            visited_set = set(visited)
+            pages_crawled = int(self.crawl_state.get("pages_crawled") or 0)
             self._flush_runtime_state(force=True)
+
+            if not pending:
+                break
+            if pages_crawled >= self.max_pages:
+                break
+
+            remaining_budget = self.max_pages - pages_crawled
+            batch = pending[: min(self.sitemap_crawl_batch_size, remaining_budget)]
+            urls = [str(item["url"]) for item in batch if item.get("url")]
+            if not urls:
+                pending = pending[len(batch):]
+                continue
 
             batch_results = await self._collect_crawl_results(
                 await crawler_holder["crawler"].arun_many(urls=urls, config=batch_config)
@@ -3542,6 +3593,7 @@ class Crawl4AICrawler(CrawlerStage):
             if fallback_html:
                 self.stats["http_fallback_retries"] += 1
                 self.stats["http_fallback_pages"] += 1
+                previous_mapping = str(self.url_mapping.get(normalized) or "")
                 result = SimpleNamespace(
                     url=normalized,
                     html=fallback_html,
@@ -3550,7 +3602,25 @@ class Crawl4AICrawler(CrawlerStage):
                     links={"internal": [], "external": []},
                     markdown=None,
                 )
-                return await self._process_result(result, mark_failure=True)
+                processed = await self._process_result(result, mark_failure=True)
+                current_mapping = str(self.url_mapping.get(normalized) or "")
+                if (
+                    processed
+                    and previous_mapping.startswith("SKIPPED")
+                    and not current_mapping.startswith("SKIPPED")
+                ):
+                    # A rendered low-quality result can mark the URL skipped
+                    # before this immediate raw-source recovery succeeds.
+                    # Clear that one obsolete failure exactly once.
+                    self.stats["pages_failed"] = max(
+                        0,
+                        int(self.stats.get("pages_failed", 0)) - 1,
+                    )
+                    self.stats["skipped_urls"] = max(
+                        0,
+                        int(self.stats.get("skipped_urls", 0)) - 1,
+                    )
+                return processed
             if attempt < attempts and self.sitemap_failed_retry_backoff:
                 await asyncio.sleep(self.sitemap_failed_retry_backoff)
         return False
@@ -3964,6 +4034,9 @@ class Crawl4AICrawler(CrawlerStage):
             "page_links": self.page_links,
             "downloaded_images": self.downloaded_images,
             "recoverable_skip_retries": self.recoverable_skip_retries,
+            "recoverable_skip_exhausted_urls": sorted(
+                self.recoverable_skip_exhausted_urls
+            ),
             "stats": self.stats,
             "updated_at": time.time(),
         }
