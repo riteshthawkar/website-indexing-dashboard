@@ -16,6 +16,13 @@ crawler:
   excluded_path_prefixes:
     - "/tag/"
     - "/ar/tag/"
+    # Yoast still advertises 33 legacy publication endpoints, but their
+    # canonical trailing-slash responses are HTTP 200 with an empty body. The
+    # previous release accidentally indexed 102-byte empty browser shells for
+    # this family, so exclude it from the production frontier rather than
+    # treating known non-content as a crawl failure.
+    - "/publication"
+    - "/ar/publication"
   allowed_domains:
     - "mbzuai.ac.ae"
   excluded_subdomains:

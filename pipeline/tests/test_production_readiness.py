@@ -555,6 +555,12 @@ class TestConfig:
         plugins = [stage["plugin"] for stage in config["stages"]]
         assert config["pipeline"]["production_profile"] is True
         assert config["embedder"]["namespace_strategy"] == "release"
+        excluded_prefixes = set(config["crawler"]["excluded_path_prefixes"])
+        assert "/tag/" in excluded_prefixes
+        assert "/ar/tag/" in excluded_prefixes
+        assert "/publication" in excluded_prefixes
+        assert "/ar/publication" in excluded_prefixes
+        assert config["formatter"]["expected_site_inventory_count"] == 2600
         assert config["retrieval"]["retriever_backend"] == "routed_hybrid"
         assert config["retrieval"]["query_planner_enabled"] is True
         assert config["retrieval"]["evidence_adjudicator_max_workers"] == 2
@@ -1582,6 +1588,19 @@ class TestCrawlerHelpers:
         )
         assert crawler.stats["skipped_urls"] == 1
         assert crawler.stats["excluded_frontier_urls"] == 1
+
+    def test_publication_exclusion_is_scoped_to_the_known_empty_route_family(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import PathPrefixFilter
+
+        path_filter = PathPrefixFilter({"/publication", "/ar/publication"})
+
+        assert path_filter.apply("https://mbzuai.ac.ae/publication") is False
+        assert path_filter.apply("https://mbzuai.ac.ae/publication/legacy-author") is False
+        assert path_filter.apply("https://mbzuai.ac.ae/ar/publication") is False
+        assert path_filter.apply("https://mbzuai.ac.ae/ar/publication/legacy-author") is False
+        assert path_filter.apply(
+            "https://mbzuai.ac.ae/news/publication-announcement"
+        ) is True
 
     def test_trim_crawl_state_to_budget_caps_pending_urls(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _trim_crawl_state_to_budget
