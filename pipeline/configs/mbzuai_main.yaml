@@ -28,6 +28,10 @@ crawler:
     # intentionally indexed student-resources hub remains available.
     - "/moodle-service-interruption"
     - "/ar/moodle-service-interruption"
+    # These two Arabic faculty aliases redirect to each other indefinitely.
+    # Keep the healthy English faculty profile eligible for indexing.
+    - "/ar/study/faculty/qirong-ho-ar"
+    - "/ar/study/faculty/qirong-ho"
   # Yoast still advertises non-content sitemap members. Every fresh run probes
   # each configured, source-bound cohort member and excludes only exact URLs
   # proven to return an empty HTTP 200 body. Mixed cohorts are safe: members

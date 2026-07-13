@@ -308,7 +308,7 @@ formatter:
     - "/about/leadership"
     - "/about/contact/?$"
     - "/study/"
-    - "/student-resources"
+    - "/student-resources/?$"
   official_source_host_suffixes:
     - "mbzuai.ac.ae"
     - "staticcdn.mbzuai.ac.ae"

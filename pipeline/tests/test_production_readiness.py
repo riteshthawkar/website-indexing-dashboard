@@ -611,6 +611,28 @@ class TestConfig:
         assert "assertion_promote" in plugins
         assert "retrieval_bundle_v2" in plugins
 
+    def test_production_config_excludes_only_arabic_qirong_redirect_loop(self):
+        from pipeline.core.config import load_config
+        from pipeline.stages.crawlers.crawl4ai_crawler import _url_matches_path_prefix
+
+        config = load_config("mbzuai_production")
+        excluded_prefixes = set(config["crawler"]["excluded_path_prefixes"])
+
+        assert "/ar/study/faculty/qirong-ho-ar" in excluded_prefixes
+        assert "/ar/study/faculty/qirong-ho" in excluded_prefixes
+        assert _url_matches_path_prefix(
+            "https://mbzuai.ac.ae/ar/study/faculty/qirong-ho-ar",
+            excluded_prefixes,
+        )
+        assert _url_matches_path_prefix(
+            "https://mbzuai.ac.ae/ar/study/faculty/qirong-ho/",
+            excluded_prefixes,
+        )
+        assert not _url_matches_path_prefix(
+            "https://mbzuai.ac.ae/study/faculty/qirong-ho/",
+            excluded_prefixes,
+        )
+
     def test_default_config_passes_production_preflight_wiring(self):
         from pipeline.core.config import load_config
         from pipeline.core.preflight import assess_production_readiness

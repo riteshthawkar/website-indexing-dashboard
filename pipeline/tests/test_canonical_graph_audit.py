@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record
 from pipeline.core.base import StageContext, StageStatus
+from pipeline.core.config import load_config
 from pipeline.core.io import atomic_write_json
 from pipeline.core.knowledge_graph import validate_graph_bundle
 from pipeline.core.run_audit import audit_run
@@ -196,3 +199,44 @@ def test_student_resources_critical_pattern_is_route_exact():
     assert pattern == r"/student-resources/?$"
     assert near_match["missing_critical_count"] == 1
     assert exact_match["missing_critical_count"] == 0
+
+
+@pytest.mark.parametrize("config_name", ["default", "mbzuai_production"])
+def test_resolved_student_resources_critical_pattern_is_route_exact(config_name):
+    config = load_config(config_name)
+    patterns = config["formatter"]["critical_url_patterns"]
+    student_resources_patterns = [
+        str(pattern) for pattern in patterns if "student-resources" in str(pattern)
+    ]
+    failure_manifest = {
+        "hard_failure_count": 0,
+        "expected_site_inventory_count": 0,
+        "inventory_coverage_ratio": None,
+        "cohort_evidence_errors": [],
+        "failed_urls": [],
+    }
+
+    assert student_resources_patterns == [r"/student-resources/?$"]
+
+    near_match = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/student-resources-archive": {"indexable": True}
+        },
+        failure_manifest=failure_manifest,
+        formatter_config={"critical_url_patterns": student_resources_patterns},
+    )
+    assert near_match["missing_critical_count"] == 1
+    assert [item["pattern"] for item in near_match["missing_critical_patterns"]] == [
+        r"/student-resources/?$"
+    ]
+
+    for exact_url in (
+        "https://mbzuai.ac.ae/student-resources",
+        "https://mbzuai.ac.ae/student-resources/",
+    ):
+        exact_match = _coverage_gate(
+            canonical_metadata={exact_url: {"indexable": True}},
+            failure_manifest=failure_manifest,
+            formatter_config={"critical_url_patterns": student_resources_patterns},
+        )
+        assert exact_match["missing_critical_count"] == 0
