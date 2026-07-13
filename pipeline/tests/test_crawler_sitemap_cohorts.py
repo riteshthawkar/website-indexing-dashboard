@@ -4,6 +4,7 @@ from pathlib import Path
 
 import pytest
 
+from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
 from pipeline.stages.crawlers.crawl4ai_crawler import (
     Crawl4AICrawler,
     _normalize_known_empty_cohort_policies,
@@ -95,6 +96,34 @@ def test_probe_bounds_are_validated_before_execution(monkeypatch):
         "crawler.cohort_probe_min_interval_sec must be a non-negative number"
         in errors
     )
+
+
+def test_concurrent_cohort_probes_keep_one_global_start_interval(tmp_path, monkeypatch):
+    crawler = _crawler(tmp_path)
+    crawler.cohort_probe_min_interval = 1.5
+    crawler._cohort_probe_rate_lock = asyncio.Lock()
+    crawler._cohort_probe_last_started_at = 0.0
+    clock = {"now": 10.0}
+    sleeps = []
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+        clock["now"] += seconds
+        await real_sleep(0)
+
+    monkeypatch.setattr(crawler_module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(crawler_module.asyncio, "sleep", fake_sleep)
+
+    async def run_probes():
+        await asyncio.gather(
+            *(crawler._pace_cohort_probe_request() for _ in range(4))
+        )
+
+    asyncio.run(run_probes())
+
+    assert sleeps == [1.5, 1.5, 1.5]
+    assert crawler._cohort_probe_last_started_at == 14.5
 
 
 def test_exact_source_verified_empty_is_excluded_but_other_source_is_not(tmp_path, monkeypatch):

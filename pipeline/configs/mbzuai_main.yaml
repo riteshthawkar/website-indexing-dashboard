@@ -13,9 +13,9 @@ crawler:
   sitemap_crawl_batch_size: 30
   validate_source_html_mode: "always"
   recoverable_skip_max_retries: 2
-  # Probe known-empty cohorts conservatively to avoid turning short-lived
-  # origin throttling into a false empty classification.
-  cohort_probe_concurrency: 1
+  # Request starts are globally paced below; a small in-flight pool hides
+  # origin latency without increasing the per-hop request rate.
+  cohort_probe_concurrency: 4
   cohort_probe_attempts: 3
   cohort_probe_backoff_sec: 2.0
   cohort_probe_min_interval_sec: 1.5
@@ -24,8 +24,9 @@ crawler:
     - "/tag/"
     - "/ar/tag/"
   # Yoast still advertises non-content sitemap members. Every fresh run probes
-  # every member and excludes only exact URLs proven to return an empty HTTP
-  # 200 body. Any URL that becomes non-empty is automatically crawled again.
+  # each configured, source-bound cohort member and excludes only exact URLs
+  # proven to return an empty HTTP 200 body. Mixed cohorts are safe: members
+  # with content remain eligible and are crawled automatically.
   known_empty_sitemap_cohorts:
     - id: "legacy-publications-v1"
       source_url: "https://mbzuai.ac.ae/publication-sitemap.xml"
@@ -52,6 +53,46 @@ crawler:
     - id: "empty-llm-vacancy-hub-v1"
       source_url: "https://mbzuai.ac.ae/llmvacancy-sitemap.xml"
       exact_urls: ["https://mbzuai.ac.ae/llmvacancy"]
+      expected_member_count: 1
+      max_members: 1
+    - id: "empty-course-type-archives-v1"
+      source_url: "https://mbzuai.ac.ae/course_type-sitemap.xml"
+      allowed_path_prefixes: ["/course_type"]
+      expected_member_count: 2
+      max_members: 2
+    - id: "empty-department-archives-v1"
+      source_url: "https://mbzuai.ac.ae/department-sitemap.xml"
+      allowed_path_prefixes: ["/department", "/ar/department"]
+      expected_member_count: 26
+      max_members: 40
+    - id: "empty-job-category-archives-v1"
+      source_url: "https://mbzuai.ac.ae/job_category-sitemap.xml"
+      allowed_path_prefixes: ["/job_category"]
+      expected_member_count: 1
+      max_members: 1
+    - id: "empty-theme-archives-v1"
+      source_url: "https://mbzuai.ac.ae/theme-sitemap.xml"
+      allowed_path_prefixes: ["/Theme", "/ar/Theme"]
+      expected_member_count: 13
+      max_members: 20
+    - id: "empty-talk-category-archives-v1"
+      source_url: "https://mbzuai.ac.ae/talk_category-sitemap.xml"
+      allowed_path_prefixes: ["/talk_category", "/ar/talk_category"]
+      expected_member_count: 60
+      max_members: 75
+    - id: "empty-speaker-archives-v1"
+      source_url: "https://mbzuai.ac.ae/speaker-sitemap.xml"
+      allowed_path_prefixes: ["/speaker", "/ar/speaker"]
+      expected_member_count: 263
+      max_members: 300
+    - id: "empty-podcast-category-archives-v1"
+      source_url: "https://mbzuai.ac.ae/podcast_category-sitemap.xml"
+      allowed_path_prefixes: ["/podcast_category"]
+      expected_member_count: 1
+      max_members: 1
+    - id: "empty-research-center-category-archives-v1"
+      source_url: "https://mbzuai.ac.ae/research_center_cat-sitemap.xml"
+      allowed_path_prefixes: ["/research-center"]
       expected_member_count: 1
       max_members: 1
   allowed_domains:

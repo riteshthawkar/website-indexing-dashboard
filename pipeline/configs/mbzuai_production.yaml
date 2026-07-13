@@ -16,8 +16,9 @@ crawler:
   ignore_https_errors: false
   require_https: true
   # Fail before the expensive browser crawl when TLS or sitemap changes collapse
-  # the expected frontier. The final index-readiness gate remains stricter.
-  minimum_sitemap_seed_count: 2300
+  # the eligible frontier. The raw ~2.6k inventory and evidence-backed empty
+  # members are checked separately by the stricter index-readiness gate.
+  minimum_sitemap_seed_count: 2100
 
 graph:
   # The final graph is uploaded only when every detected community has a
@@ -37,10 +38,9 @@ embedder:
   gemini_request_timeout_ms: 30000
 
 formatter:
-  # The verified live sitemap inventory on 2026-07-13 contains 2,636 URLs.
-  # Ninety-two sitemap members currently return an empty HTTP 200 body. They
-  # are excluded only after fresh run-scoped verification, leaving 2,544
-  # eligible URLs while retaining the rounded 2.6k raw inventory baseline.
+  # The verified live sitemap inventory on 2026-07-13 contains 2,636 raw URLs.
+  # Defective CMS members are excluded only after fresh, run-scoped HTTP proof;
+  # the raw inventory baseline remains independent of the eligible crawl count.
   expected_site_inventory_count: 2600
   minimum_inventory_coverage_ratio: 0.90
   maximum_hard_failure_count: 25

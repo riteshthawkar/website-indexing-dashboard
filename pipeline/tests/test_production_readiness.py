@@ -569,8 +569,17 @@ class TestConfig:
             "empty-news-hub-v1": 1,
             "empty-training-hubs-v1": 2,
             "empty-llm-vacancy-hub-v1": 1,
+            "empty-course-type-archives-v1": 2,
+            "empty-department-archives-v1": 26,
+            "empty-job-category-archives-v1": 1,
+            "empty-theme-archives-v1": 13,
+            "empty-talk-category-archives-v1": 60,
+            "empty-speaker-archives-v1": 263,
+            "empty-podcast-category-archives-v1": 1,
+            "empty-research-center-category-archives-v1": 1,
         }
-        assert config["crawler"]["cohort_probe_concurrency"] == 1
+        assert config["crawler"]["minimum_sitemap_seed_count"] == 2100
+        assert config["crawler"]["cohort_probe_concurrency"] == 4
         assert config["crawler"]["cohort_probe_attempts"] == 3
         assert config["crawler"]["cohort_probe_backoff_sec"] == 2.0
         assert config["crawler"]["cohort_probe_min_interval_sec"] == 1.5
