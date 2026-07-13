@@ -21,6 +21,10 @@ from pipeline.core.mbzuai_indexing import (
     compare_page_hashes,
 )
 from pipeline.core.registry import register_stage
+from pipeline.core.sitemap_cohorts import (
+    parse_verified_empty_reason,
+    validate_evidence,
+)
 from pipeline.core.state import now_iso
 
 logger = logging.getLogger(__name__)
@@ -62,7 +66,11 @@ def _load_crawler_runtime_state(ctx: StageContext) -> Dict[str, Any]:
     return {}
 
 
-def _failure_manifest(runtime_state: Dict[str, Any], formatter_config: Dict[str, Any]) -> Dict[str, Any]:
+def _failure_manifest(
+    runtime_state: Dict[str, Any],
+    formatter_config: Dict[str, Any],
+    crawler_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     url_mapping = runtime_state.get("url_mapping") if isinstance(runtime_state.get("url_mapping"), dict) else {}
     crawl_state = runtime_state.get("crawl_state") if isinstance(runtime_state.get("crawl_state"), dict) else {}
     stats = runtime_state.get("stats") if isinstance(runtime_state.get("stats"), dict) else {}
@@ -71,6 +79,12 @@ def _failure_manifest(runtime_state: Dict[str, Any], formatter_config: Dict[str,
     route_counts: Dict[str, int] = {}
     intentional_excluded_count = 0
     hard_failure_count = 0
+    verified_empty_urls, cohort_evidence_errors = validate_evidence(
+        runtime_state.get("sitemap_cohort_verification"),
+        expected_policies=(crawler_config or {}).get("known_empty_sitemap_cohorts"),
+        sitemap_snapshot=runtime_state.get("discovered_sitemaps"),
+    )
+    matched_verified_empty_urls: set[str] = set()
 
     for url, value in sorted(url_mapping.items()):
         reason = str(value or "")
@@ -79,11 +93,27 @@ def _failure_manifest(runtime_state: Dict[str, Any], formatter_config: Dict[str,
         route = "/" + "/".join([part for part in str(url).split("//", 1)[-1].split("/", 1)[-1].split("/")[:2] if part])
         reason_counts[reason] = reason_counts.get(reason, 0) + 1
         route_counts[route] = route_counts.get(route, 0) + 1
-        if reason.startswith("SKIPPED_EXCLUDED"):
+        verified_empty_policy = parse_verified_empty_reason(reason)
+        if verified_empty_policy:
+            if verified_empty_urls.get(str(url)) == verified_empty_policy:
+                intentional_excluded_count += 1
+                matched_verified_empty_urls.add(str(url))
+            else:
+                hard_failure_count += 1
+        elif reason.startswith("SKIPPED_EXCLUDED"):
             intentional_excluded_count += 1
         else:
             hard_failure_count += 1
         failures.append({"url": url, "reason": reason, "route_group": route})
+
+    missing_verified_mappings = sorted(
+        set(verified_empty_urls) - matched_verified_empty_urls
+    )
+    if missing_verified_mappings:
+        cohort_evidence_errors.append(
+            "verified-empty evidence is missing matching URL mappings: "
+            + ", ".join(missing_verified_mappings[:10])
+        )
 
     visited = crawl_state.get("visited") if isinstance(crawl_state.get("visited"), list) else []
     pending = crawl_state.get("pending") if isinstance(crawl_state.get("pending"), list) else []
@@ -99,6 +129,8 @@ def _failure_manifest(runtime_state: Dict[str, Any], formatter_config: Dict[str,
         "failure_count": len(failures),
         "hard_failure_count": hard_failure_count,
         "intentional_excluded_count": intentional_excluded_count,
+        "verified_empty_count": len(verified_empty_urls),
+        "cohort_evidence_errors": cohort_evidence_errors,
         "reason_counts": reason_counts,
         "route_counts": route_counts,
         "failed_urls": failures,
@@ -166,6 +198,7 @@ def _coverage_gate(
         and coverage_ratio is not None
         and float(coverage_ratio) < minimum_ratio
     )
+    cohort_evidence_errors = list(failure_manifest.get("cohort_evidence_errors") or [])
     return {
         "schema_version": 1,
         "critical_url_patterns": [str(pattern) for pattern in patterns],
@@ -178,10 +211,18 @@ def _coverage_gate(
         "maximum_hard_failure_count": maximum_hard_failures,
         "hard_failure_gap": hard_failure_gap,
         "intentional_excluded_count": failure_manifest.get("intentional_excluded_count", 0),
+        "verified_empty_count": failure_manifest.get("verified_empty_count", 0),
+        "cohort_evidence_errors": cohort_evidence_errors,
+        "cohort_evidence_error_count": len(cohort_evidence_errors),
         "raw_inventory_coverage_ratio": failure_manifest.get("raw_inventory_coverage_ratio"),
         "inventory_coverage_ratio": coverage_ratio,
         "inventory_gap": inventory_gap,
-        "ok": not missing_critical and not inventory_gap and not hard_failure_gap,
+        "ok": (
+            not missing_critical
+            and not inventory_gap
+            and not hard_failure_gap
+            and not cohort_evidence_errors
+        ),
     }
 
 
@@ -229,7 +270,11 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
         manifest_file = ctx.stage_work_dir / "index_readiness_manifest.json"
 
         runtime_state = _load_crawler_runtime_state(ctx)
-        crawl_failure_manifest = _failure_manifest(runtime_state, ctx.formatter_config)
+        crawl_failure_manifest = _failure_manifest(
+            runtime_state,
+            ctx.formatter_config,
+            ctx.crawler_config,
+        )
         coverage_gate = _coverage_gate(
             canonical_metadata=canonical_metadata,
             failure_manifest=crawl_failure_manifest,
@@ -261,6 +306,8 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
                 "failure_count": crawl_failure_manifest["failure_count"],
                 "hard_failure_count": crawl_failure_manifest["hard_failure_count"],
                 "intentional_excluded_count": crawl_failure_manifest["intentional_excluded_count"],
+                "verified_empty_count": crawl_failure_manifest["verified_empty_count"],
+                "cohort_evidence_errors": crawl_failure_manifest["cohort_evidence_errors"],
                 "reason_counts": crawl_failure_manifest["reason_counts"],
                 "expected_site_inventory_count": crawl_failure_manifest["expected_site_inventory_count"],
                 "effective_expected_inventory_count": crawl_failure_manifest["effective_expected_inventory_count"],
@@ -271,6 +318,7 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
                 "ok": coverage_gate["ok"],
                 "missing_critical_count": coverage_gate["missing_critical_count"],
                 "inventory_gap": coverage_gate["inventory_gap"],
+                "cohort_evidence_error_count": coverage_gate["cohort_evidence_error_count"],
             },
             "change_detection": {
                 "previous_metadata_file": str(previous_metadata_path or ""),
@@ -296,12 +344,14 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
             (fail_on_critical and coverage_gate["missing_critical_count"])
             or (fail_on_inventory_gap and coverage_gate["inventory_gap"])
             or (fail_on_hard_failures and coverage_gate["hard_failure_gap"])
+            or coverage_gate["cohort_evidence_error_count"]
         ):
             return StageResult.failure(
                 "MBZUAI index coverage gate failed: "
                 f"missing_critical={coverage_gate['missing_critical_count']} "
                 f"inventory_gap={coverage_gate['inventory_gap']} "
-                f"hard_failure_gap={coverage_gate['hard_failure_gap']}"
+                f"hard_failure_gap={coverage_gate['hard_failure_gap']} "
+                f"cohort_evidence_errors={coverage_gate['cohort_evidence_error_count']}"
             )
 
         logger.info(

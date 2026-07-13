@@ -136,3 +136,101 @@ def test_raw_source_fetch_blocks_unsafe_redirect(monkeypatch):
 
     assert html == ""
     assert status == 200
+
+
+def test_raw_source_fetch_never_requests_external_redirect_target(monkeypatch):
+    crawler = _crawler()
+    crawler.raw_source_retry_attempts = 1
+    crawler.raw_source_retry_backoff = 0
+
+    class RedirectResponse:
+        status = 302
+        url = "https://mbzuai.ac.ae/admissions"
+        headers = {"Location": "https://untrusted.example/source"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class RedirectSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if len(self.calls) > 1:
+                raise AssertionError("external redirect target must never be requested")
+            return RedirectResponse()
+
+    session = RedirectSession()
+    crawler._session = session
+    monkeypatch.setattr(
+        crawler,
+        "_url_allowed_for_fetch",
+        lambda url: url.startswith("https://mbzuai.ac.ae/"),
+    )
+
+    html, status = asyncio.run(
+        crawler._fetch_raw_source_page("https://mbzuai.ac.ae/admissions")
+    )
+
+    assert html == ""
+    assert status == 302
+    assert [call[0] for call in session.calls] == [
+        "https://mbzuai.ac.ae/admissions"
+    ]
+    assert session.calls[0][1]["allow_redirects"] is False
+
+
+def test_safe_redirects_stop_before_request_beyond_hop_limit(monkeypatch):
+    crawler = _crawler()
+    monkeypatch.setattr(crawler_module, "SAFE_REDIRECT_MAX_HOPS", 1)
+    monkeypatch.setattr(crawler, "_url_allowed_for_fetch", lambda _url: True)
+
+    class RedirectResponse:
+        status = 302
+        headers = {"Location": "/next"}
+
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class RedirectSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if len(self.calls) > 2:
+                raise AssertionError("redirect target beyond the limit must not be requested")
+            return RedirectResponse(url)
+
+    session = RedirectSession()
+
+    async def fetch():
+        async with crawler._get_with_safe_redirects(
+            session=session,
+            url="https://mbzuai.ac.ae/start",
+            enforce_allowed_domain=True,
+        ):
+            raise AssertionError("a redirect-only chain must not yield a response")
+
+    try:
+        asyncio.run(fetch())
+    except crawler_module._SafeRedirectLimitError:
+        pass
+    else:
+        raise AssertionError("redirect chain must fail closed at the hop limit")
+
+    assert [call[0] for call in session.calls] == [
+        "https://mbzuai.ac.ae/start",
+        "https://mbzuai.ac.ae/next",
+    ]
+    assert all(call[1]["allow_redirects"] is False for call in session.calls)

@@ -13,16 +13,47 @@ crawler:
   sitemap_crawl_batch_size: 30
   validate_source_html_mode: "always"
   recoverable_skip_max_retries: 2
+  # Probe known-empty cohorts conservatively to avoid turning short-lived
+  # origin throttling into a false empty classification.
+  cohort_probe_concurrency: 1
+  cohort_probe_attempts: 3
+  cohort_probe_backoff_sec: 2.0
+  cohort_probe_min_interval_sec: 1.5
+  cohort_probe_max_bytes: 4096
   excluded_path_prefixes:
     - "/tag/"
     - "/ar/tag/"
-    # Yoast still advertises 33 legacy publication endpoints, but their
-    # canonical trailing-slash responses are HTTP 200 with an empty body. The
-    # previous release accidentally indexed 102-byte empty browser shells for
-    # this family, so exclude it from the production frontier rather than
-    # treating known non-content as a crawl failure.
-    - "/publication"
-    - "/ar/publication"
+  # Yoast still advertises non-content sitemap members. Every fresh run probes
+  # every member and excludes only exact URLs proven to return an empty HTTP
+  # 200 body. Any URL that becomes non-empty is automatically crawled again.
+  known_empty_sitemap_cohorts:
+    - id: "legacy-publications-v1"
+      source_url: "https://mbzuai.ac.ae/publication-sitemap.xml"
+      allowed_path_prefixes: ["/publication", "/ar/publication"]
+      expected_member_count: 33
+      max_members: 50
+    - id: "empty-category-archives-v1"
+      source_url: "https://mbzuai.ac.ae/category-sitemap.xml"
+      allowed_path_prefixes: ["/category", "/ar/category"]
+      expected_member_count: 55
+      max_members: 75
+    - id: "empty-news-hub-v1"
+      source_url: "https://mbzuai.ac.ae/news-sitemap.xml"
+      exact_urls: ["https://mbzuai.ac.ae/ar/news"]
+      expected_member_count: 1
+      max_members: 1
+    - id: "empty-training-hubs-v1"
+      source_url: "https://mbzuai.ac.ae/training_program-sitemap.xml"
+      exact_urls:
+        - "https://mbzuai.ac.ae/training-programs"
+        - "https://mbzuai.ac.ae/ar/training-programs"
+      expected_member_count: 2
+      max_members: 2
+    - id: "empty-llm-vacancy-hub-v1"
+      source_url: "https://mbzuai.ac.ae/llmvacancy-sitemap.xml"
+      exact_urls: ["https://mbzuai.ac.ae/llmvacancy"]
+      expected_member_count: 1
+      max_members: 1
   allowed_domains:
     - "mbzuai.ac.ae"
   excluded_subdomains:

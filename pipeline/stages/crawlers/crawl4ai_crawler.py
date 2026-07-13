@@ -35,6 +35,12 @@ from pipeline.core.base import CrawlerStage, StageContext, StageResult
 from pipeline.core.media import dedupe_media_items
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe, safe_filename
 from pipeline.core.registry import register_stage
+from pipeline.core.sitemap_cohorts import (
+    finalize_evidence,
+    member_urls_sha256,
+    validate_evidence,
+    verified_empty_reason,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,6 +182,8 @@ VIDEO_EMBED_HOSTS = {
     "player.youku.com": "youku",
 }
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+SAFE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
+SAFE_REDIRECT_MAX_HOPS = 10
 CRAWL_SKIP_EXTENSIONS = DOWNLOADABLE_EXTENSIONS | EXCLUDED_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | TEXT_TRACK_EXTENSIONS
 GENERIC_MBZUAI_PAGE_TITLES = {
     "mbzuai mohamed bin zayed university of artificial intelligence",
@@ -284,6 +292,28 @@ PAGE_LINK_GRAPH_FILENAME = "page_link_graph.json"
 URL_TO_MD_FILENAME = "url_to_md_mapping.json"
 RUNTIME_STATE_FILENAME = "crawler_checkpoint.json"
 SITEMAP_STATE_FILENAME = "sitemap_discovery.json"
+SITEMAP_COHORT_VERIFICATION_FILENAME = "sitemap_cohort_verification.json"
+
+
+class _RedirectEgressPolicyError(RuntimeError):
+    """Raised before a redirect target outside the fetch policy is requested."""
+
+    def __init__(self, source_url: str, target_url: str, *, status: Optional[int]):
+        super().__init__(
+            f"redirect outside allowed egress policy: {source_url} -> {target_url}"
+        )
+        self.source_url = source_url
+        self.target_url = target_url
+        self.status = status
+
+
+class _SafeRedirectLimitError(RuntimeError):
+    """Raised when a manually followed redirect chain exceeds its fixed bound."""
+
+    def __init__(self, url: str, *, status: Optional[int]):
+        super().__init__(f"redirect limit exceeded while fetching {url}")
+        self.url = url
+        self.status = status
 
 
 def _compact_failure_reason(value: Any, *, max_chars: int = 220) -> str:
@@ -420,6 +450,33 @@ def _normalize_http_url(url: str | None, base_url: str | None = None) -> Optiona
         return urlunparse((scheme, netloc, path, "", query, ""))
 
     return None
+
+
+def _normalize_http_fetch_url(
+    url: str | None,
+    base_url: str | None = None,
+) -> Optional[str]:
+    """Normalize a request URL while preserving a meaningful trailing slash.
+
+    Storage identities intentionally collapse trailing slashes. HTTP redirect
+    handling cannot do that: many origins redirect ``/path`` to ``/path/`` and
+    would otherwise form an artificial loop in the manual redirect guard.
+    """
+    if not url:
+        return None
+    candidate = urljoin(base_url, str(url).strip()) if base_url else str(url).strip()
+    canonical = _normalize_http_url(candidate)
+    if not canonical:
+        return None
+    try:
+        requested_path = urlparse(candidate).path
+        parsed = urlparse(canonical)
+    except (TypeError, ValueError):
+        return None
+    path = parsed.path
+    if requested_path.endswith("/"):
+        path = f"{path}/" if path else "/"
+    return urlunparse((parsed.scheme, parsed.netloc, path, "", parsed.query, ""))
 
 
 def _url_extension(url: str) -> str:
@@ -559,6 +616,82 @@ def _url_matches_path_prefix(url: str, prefixes: Iterable[str]) -> bool:
         if path == clean_prefix or path.startswith(f"{clean_prefix}/"):
             return True
     return False
+
+
+def _normalize_known_empty_cohort_policies(
+    value: Any,
+    *,
+    start_url: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    if value in (None, []):
+        return [], []
+    if not isinstance(value, list):
+        return [], ["crawler.known_empty_sitemap_cohorts must be a list"]
+
+    policies: List[Dict[str, Any]] = []
+    errors: List[str] = []
+    seen_ids: set[str] = set()
+    for index, raw_policy in enumerate(value):
+        label = f"crawler.known_empty_sitemap_cohorts[{index}]"
+        if not isinstance(raw_policy, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        policy_id = str(raw_policy.get("id") or "").strip()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", policy_id):
+            errors.append(f"{label}.id must be a lowercase stable identifier")
+        elif policy_id in seen_ids:
+            errors.append(f"{label}.id is duplicated: {policy_id}")
+        seen_ids.add(policy_id)
+
+        source_url = _normalize_http_url(raw_policy.get("source_url"), start_url)
+        if not source_url:
+            errors.append(f"{label}.source_url must be a valid absolute HTTP(S) URL")
+
+        prefixes = sorted(
+            {
+                normalized
+                for item in (raw_policy.get("allowed_path_prefixes") or [])
+                if (normalized := _normalize_path_prefix(item))
+            }
+        )
+        exact_urls = sorted(
+            {
+                normalized
+                for item in (raw_policy.get("exact_urls") or [])
+                if (normalized := _normalize_http_url(item, start_url))
+            }
+        )
+        if not prefixes and not exact_urls:
+            errors.append(f"{label} requires allowed_path_prefixes or exact_urls")
+
+        try:
+            expected_member_count = int(raw_policy.get("expected_member_count"))
+            if expected_member_count <= 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            expected_member_count = 0
+            errors.append(f"{label}.expected_member_count must be a positive integer")
+        try:
+            max_members = int(raw_policy.get("max_members"))
+            if max_members <= 0 or max_members < expected_member_count:
+                raise ValueError
+        except (TypeError, ValueError):
+            max_members = 0
+            errors.append(
+                f"{label}.max_members must be a positive integer >= expected_member_count"
+            )
+
+        policies.append(
+            {
+                "id": policy_id,
+                "source_url": source_url or "",
+                "allowed_path_prefixes": prefixes,
+                "exact_urls": exact_urls,
+                "expected_member_count": expected_member_count,
+                "max_members": max_members,
+            }
+        )
+    return policies, errors
 
 
 def _html_quality_report(html: str, page_url: str, markdown: str = "") -> Dict[str, Any]:
@@ -1938,7 +2071,19 @@ def _is_valid_downloaded_document_payload(payload_head: bytes, *, extension: str
         return False
 
     if ext == ".pdf":
-        return payload_head.lstrip().startswith(b"%PDF-")
+        # Some origin/CDN combinations legitimately use a generic binary MIME
+        # type, but an explicitly non-PDF response must not be persisted merely
+        # because its first bytes resemble a PDF.  This also rejects HTML/WAF
+        # responses before they can enter document conversion.
+        allowed_pdf_mimes = {
+            "",
+            "application/pdf",
+            "application/acrobat",
+            "application/x-pdf",
+            "application/octet-stream",
+            "binary/octet-stream",
+        }
+        return mime in allowed_pdf_mimes and payload_head.lstrip().startswith(b"%PDF-")
     if ext in {".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp"}:
         return payload_head.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"))
     return True
@@ -2202,6 +2347,34 @@ class Crawl4AICrawler(CrawlerStage):
             except (TypeError, ValueError):
                 errors.append("crawler.minimum_sitemap_seed_count must be an integer")
 
+        _cohort_policies, cohort_errors = _normalize_known_empty_cohort_policies(
+            crawler.get("known_empty_sitemap_cohorts"),
+            start_url=str(start_url or ""),
+        )
+        errors.extend(cohort_errors)
+        for field, default in (
+            ("cohort_probe_concurrency", 1),
+            ("cohort_probe_max_bytes", 4096),
+            ("cohort_probe_attempts", 2),
+        ):
+            try:
+                if int(crawler.get(field, default)) <= 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"crawler.{field} must be a positive integer")
+        try:
+            if float(crawler.get("cohort_probe_backoff_sec", 0.5)) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append("crawler.cohort_probe_backoff_sec must be a non-negative number")
+        try:
+            if float(crawler.get("cohort_probe_min_interval_sec", 0.0)) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append(
+                "crawler.cohort_probe_min_interval_sec must be a non-negative number"
+            )
+
         if AsyncWebCrawler is None or BrowserConfig is None or CrawlerRunConfig is None:
             errors.append("crawl4ai is not installed. Run: pip install crawl4ai")
 
@@ -2296,6 +2469,31 @@ class Crawl4AICrawler(CrawlerStage):
             for value in (self.config.get("excluded_path_prefixes") or [])
             if _normalize_path_prefix(value)
         }
+        self.known_empty_sitemap_cohorts, cohort_errors = (
+            _normalize_known_empty_cohort_policies(
+                self.config.get("known_empty_sitemap_cohorts"),
+                start_url=self.start_url,
+            )
+        )
+        if cohort_errors:
+            raise ValueError("; ".join(cohort_errors))
+        self.cohort_probe_concurrency = max(
+            1, int(self.config.get("cohort_probe_concurrency", self.fetch_concurrency))
+        )
+        self.cohort_probe_max_bytes = max(
+            1, int(self.config.get("cohort_probe_max_bytes", 4096))
+        )
+        self.cohort_probe_attempts = max(
+            1, int(self.config.get("cohort_probe_attempts", 2))
+        )
+        self.cohort_probe_backoff = max(
+            0.0, float(self.config.get("cohort_probe_backoff_sec", 0.5))
+        )
+        self.cohort_probe_min_interval = max(
+            0.0, float(self.config.get("cohort_probe_min_interval_sec", 0.0))
+        )
+        self._cohort_probe_rate_lock = asyncio.Lock()
+        self._cohort_probe_last_started_at = 0.0
         self.frontier_empty_timeout = max(30, int(self.config.get("frontier_empty_timeout_sec", 180) or 180))
         self.crawl_stall_timeout = max(self.frontier_empty_timeout, int(self.config.get("crawl_stall_timeout_sec", 900) or 900))
         self.priority_seed_urls = []
@@ -2324,6 +2522,9 @@ class Crawl4AICrawler(CrawlerStage):
         self.crawl_state_file = ctx.work_dir / CRAWL_STATE_FILENAME
         self.runtime_state_file = ctx.work_dir / RUNTIME_STATE_FILENAME
         self.sitemap_state_file = ctx.work_dir / SITEMAP_STATE_FILENAME
+        self.sitemap_cohort_verification_file = (
+            ctx.work_dir / SITEMAP_COHORT_VERIFICATION_FILENAME
+        )
 
         self.stats = {
             "pages_scraped": 0,
@@ -2342,6 +2543,8 @@ class Crawl4AICrawler(CrawlerStage):
             "video_transcripts_fetched": 0,
             "bytes_downloaded": 0,
             "sitemap_urls_seeded": 0,
+            "sitemap_urls_discovered": 0,
+            "verified_empty_urls": 0,
             "sitemap_batches_completed": 0,
             "skipped_urls": 0,
             "excluded_frontier_urls": 0,
@@ -2359,6 +2562,8 @@ class Crawl4AICrawler(CrawlerStage):
         self.recoverable_skip_exhausted_urls: set[str] = set()
         self.crawl_state: Dict[str, Any] = {}
         self.discovered_sitemaps: Dict[str, Any] = {"sources": [], "urls": []}
+        self.sitemap_cohort_verification: Optional[Dict[str, Any]] = None
+        self.verified_empty_urls: Dict[str, str] = {}
         self._last_flush_at = 0.0
         self._session: Optional[aiohttp.ClientSession] = None
         self._download_semaphore = asyncio.Semaphore(self.download_concurrency)
@@ -2408,7 +2613,7 @@ class Crawl4AICrawler(CrawlerStage):
                     frontier_seed_limit=self.config.get("sitemap_frontier_seed_limit"),
                     priority_urls=self.priority_seed_urls,
                 )
-                self._write_crawl_state_file()
+                self._flush_runtime_state(force=True)
 
             browser_config = self._build_browser_config()
             run_config = self._build_run_config()
@@ -2464,6 +2669,9 @@ class Crawl4AICrawler(CrawlerStage):
                     "page_link_graph_file": str(self.page_link_graph_file),
                     "runtime_state_file": str(self.runtime_state_file),
                     "crawler_runtime_state_file": str(self.runtime_state_file),
+                    "sitemap_cohort_verification_file": str(
+                        self.sitemap_cohort_verification_file
+                    ),
                     "images_dir": str(self.images_dir),
                     "md_mapping_file": str(self.url_to_md_mapping_file),
                 },
@@ -2484,6 +2692,23 @@ class Crawl4AICrawler(CrawlerStage):
                             "nodes": len(self.page_metadata),
                             "edges": sum(len(links) for links in self.page_links.values()),
                         },
+                    ),
+                    *(
+                        [
+                            ctx.make_artifact(
+                                self.sitemap_cohort_verification_file,
+                                artifact_type="sitemap_cohort_verification",
+                                role="verified_empty_sitemap_evidence",
+                                metadata={
+                                    "verified_empty_urls": len(self.verified_empty_urls),
+                                    "policy_count": len(
+                                        self.sitemap_cohort_verification.get("policies", [])
+                                    ),
+                                },
+                            )
+                        ]
+                        if self.sitemap_cohort_verification
+                        else []
                     ),
                 ],
             )
@@ -2645,11 +2870,40 @@ class Crawl4AICrawler(CrawlerStage):
                 self.crawl_state.get("pending") or []
             )
 
-        sitemap_state = load_json_safe(self.sitemap_state_file, {}) or {}
-        self.discovered_sitemaps = {
-            "sources": sitemap_state.get("sources", []),
-            "urls": sitemap_state.get("urls", []),
-        }
+        sitemap_state = state.get("discovered_sitemaps")
+        if not isinstance(sitemap_state, dict):
+            sitemap_state = load_json_safe(self.sitemap_state_file, {}) or {}
+        self.discovered_sitemaps = (
+            dict(sitemap_state)
+            if isinstance(sitemap_state, dict)
+            else {"sources": [], "urls": []}
+        )
+        cohort_evidence = state.get("sitemap_cohort_verification")
+        if not isinstance(cohort_evidence, dict) and self.crawl_state:
+            # Separate projections are a legacy recovery path only. A fresh
+            # discovery that was interrupted before the atomic runtime
+            # checkpoint must be rerun instead of trusting a half-written pair.
+            cohort_evidence = load_json_safe(
+                self.sitemap_cohort_verification_file,
+                {},
+            ) or None
+        if cohort_evidence:
+            verified_empty_urls, evidence_errors = validate_evidence(
+                cohort_evidence,
+                expected_policies=self.known_empty_sitemap_cohorts,
+                sitemap_snapshot=self.discovered_sitemaps,
+            )
+            if evidence_errors:
+                raise ValueError(
+                    "Persisted sitemap cohort verification is invalid: "
+                    + "; ".join(evidence_errors)
+                )
+            self.sitemap_cohort_verification = cohort_evidence
+            self.verified_empty_urls = verified_empty_urls
+        elif self.crawl_state and self.known_empty_sitemap_cohorts:
+            raise ValueError(
+                "Resumable crawl state is missing configured sitemap cohort evidence"
+            )
 
     def _requeue_unprocessed_visited_urls(self) -> List[str]:
         """Recover Crawl4AI list-mode results not yet durably consumed.
@@ -2919,6 +3173,304 @@ class Crawl4AICrawler(CrawlerStage):
             cookie_jar=cookie_jar,
         )
 
+    @contextlib.asynccontextmanager
+    async def _get_with_safe_redirects(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        url: str,
+        enforce_allowed_domain: bool,
+        before_request: Optional[Any] = None,
+    ):
+        """Stream one GET response while approving every redirect before fetch.
+
+        ``aiohttp`` follows redirects internally by default, which makes a
+        final-URL policy check too late: the redirect target has already been
+        contacted.  Keeping each response context open only until its next
+        target is validated preserves streaming for the terminal response and
+        closes intermediate responses before the next bounded hop.
+        """
+
+        current_url = _normalize_http_fetch_url(url)
+        if not current_url:
+            raise _RedirectEgressPolicyError(url, "", status=None)
+
+        redirects_followed = 0
+        while True:
+            if enforce_allowed_domain and not self._url_allowed_for_fetch(current_url):
+                raise _RedirectEgressPolicyError(
+                    current_url,
+                    current_url,
+                    status=None,
+                )
+
+            if before_request is not None:
+                await before_request()
+            async with session.get(
+                current_url,
+                allow_redirects=False,
+                proxy=self.proxy,
+            ) as response:
+                location = (
+                    response.headers.get("Location")
+                    if response.status in SAFE_REDIRECT_STATUSES
+                    else None
+                )
+                if location:
+                    if redirects_followed >= SAFE_REDIRECT_MAX_HOPS:
+                        raise _SafeRedirectLimitError(
+                            current_url,
+                            status=response.status,
+                        )
+                    response_url = (
+                        _normalize_http_fetch_url(str(response.url)) or current_url
+                    )
+                    target_url = _normalize_http_fetch_url(
+                        location,
+                        base_url=response_url,
+                    )
+                    if not target_url or (
+                        enforce_allowed_domain
+                        and not self._url_allowed_for_fetch(target_url)
+                    ):
+                        raise _RedirectEgressPolicyError(
+                            current_url,
+                            target_url or str(location),
+                            status=response.status,
+                        )
+                    current_url = target_url
+                    redirects_followed += 1
+                    continue
+
+                yield response
+                return
+
+    async def _pace_cohort_probe_request(self) -> None:
+        """Rate-limit every cohort HTTP hop, including canonical redirects."""
+        min_interval = float(
+            getattr(self, "cohort_probe_min_interval", 0.0) or 0.0
+        )
+        if min_interval <= 0:
+            return
+        rate_lock = getattr(self, "_cohort_probe_rate_lock", None)
+        if rate_lock is None:
+            rate_lock = asyncio.Lock()
+            self._cohort_probe_rate_lock = rate_lock
+        async with rate_lock:
+            elapsed = time.monotonic() - float(
+                getattr(self, "_cohort_probe_last_started_at", 0.0) or 0.0
+            )
+            if elapsed < min_interval:
+                await asyncio.sleep(min_interval - elapsed)
+            self._cohort_probe_last_started_at = time.monotonic()
+
+    async def _probe_known_empty_url(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        semaphore: asyncio.Semaphore,
+        url: str,
+        policy_id: str,
+        source_url: str,
+    ) -> Dict[str, Any]:
+        record: Dict[str, Any] = {
+            "url": url,
+            "policy_id": policy_id,
+            "source_url": source_url,
+            "final_url": "",
+            "final_status": None,
+            "body_bytes": 0,
+            "reached_eof": False,
+            "classification": "unverified",
+            "attempts": 0,
+            "error_type": "",
+        }
+        for attempt in range(1, self.cohort_probe_attempts + 1):
+            record["attempts"] = attempt
+            if not self._url_allowed_for_fetch(url):
+                record["classification"] = "egress_rejected"
+                record["error_type"] = "egress_policy"
+                break
+            try:
+                async with semaphore:
+                    async with self._get_with_safe_redirects(
+                        session=session,
+                        url=url,
+                        enforce_allowed_domain=True,
+                        before_request=self._pace_cohort_probe_request,
+                    ) as response:
+                        final_url = _normalize_http_url(str(response.url))
+                        record["final_url"] = final_url or ""
+                        record["final_status"] = response.status
+                        if not final_url or not self._url_allowed_for_fetch(final_url):
+                            record["classification"] = "egress_rejected"
+                            record["error_type"] = "redirect_egress_policy"
+                            break
+                        body = await response.content.read(self.cohort_probe_max_bytes + 1)
+                        record["body_bytes"] = len(body)
+                        record["reached_eof"] = response.content.at_eof()
+                        if (
+                            response.status == 200
+                            and not body
+                            and record["reached_eof"] is True
+                        ):
+                            record["classification"] = "verified_empty"
+                            break
+                        if response.status == 200 and body:
+                            record["classification"] = "content"
+                            break
+                        record["classification"] = "http_error"
+                        record["error_type"] = f"http_{response.status}"
+                        if response.status not in ({403, 429} | RETRYABLE_STATUSES):
+                            break
+            except _RedirectEgressPolicyError as exc:
+                record["final_url"] = exc.target_url
+                record["final_status"] = exc.status
+                record["classification"] = "egress_rejected"
+                record["error_type"] = "redirect_egress_policy"
+                break
+            except _SafeRedirectLimitError as exc:
+                record["final_status"] = exc.status
+                record["classification"] = "request_error"
+                record["error_type"] = "redirect_limit"
+                break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                record["classification"] = "request_error"
+                record["error_type"] = type(exc).__name__
+            if attempt < self.cohort_probe_attempts and self.cohort_probe_backoff:
+                await asyncio.sleep(self.cohort_probe_backoff * attempt)
+        return record
+
+    async def _verify_known_empty_sitemap_cohorts(
+        self,
+        urls: Sequence[str],
+        url_sources: Dict[str, List[str]],
+        source_fetches: Optional[Dict[str, Dict[str, Any]]] = None,
+    ) -> List[str]:
+        if not getattr(self, "known_empty_sitemap_cohorts", None):
+            self.sitemap_cohort_verification = None
+            self.verified_empty_urls = {}
+            return list(urls)
+
+        headers: Dict[str, str] = {}
+        config_headers = self.config.get("headers")
+        if isinstance(config_headers, dict):
+            headers.update(
+                {
+                    str(key): str(value)
+                    for key, value in config_headers.items()
+                    if str(key).strip().lower() not in {"cookie", "set-cookie"}
+                }
+            )
+        user_agent = self.config.get("user_agent")
+        if user_agent and "User-Agent" not in headers:
+            headers["User-Agent"] = str(user_agent)
+
+        connector = aiohttp.TCPConnector(
+            limit=self.cohort_probe_concurrency,
+            ssl=False if self.ignore_https_errors else True,
+        )
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        semaphore = asyncio.Semaphore(self.cohort_probe_concurrency)
+        policy_evidence: List[Dict[str, Any]] = []
+        async with aiohttp.ClientSession(
+            headers=headers or None,
+            timeout=timeout,
+            connector=connector,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
+            for policy in self.known_empty_sitemap_cohorts:
+                source_url = policy["source_url"]
+                source_record = (source_fetches or {}).get(source_url)
+                source_payload_sha256 = (
+                    str(source_record.get("payload_sha256") or "")
+                    if isinstance(source_record, dict)
+                    else ""
+                )
+                if (
+                    not isinstance(source_record, dict)
+                    or source_record.get("status") != 200
+                    or not re.fullmatch(r"[0-9a-f]{64}", source_payload_sha256)
+                ):
+                    raise RuntimeError(
+                        f"Known-empty sitemap cohort {policy['id']!r} has no "
+                        "successful, digest-bound sitemap source fetch"
+                    )
+                exact_urls = set(policy["exact_urls"])
+                prefixes = set(policy["allowed_path_prefixes"])
+                members = sorted(
+                    {
+                        url
+                        for url in urls
+                        if source_url in set(url_sources.get(url) or [])
+                        and (
+                            url in exact_urls
+                            or (prefixes and _url_matches_path_prefix(url, prefixes))
+                        )
+                    }
+                )
+                if len(members) > policy["max_members"]:
+                    raise RuntimeError(
+                        f"Known-empty sitemap cohort {policy['id']!r} exceeded max_members: "
+                        f"observed={len(members)} max={policy['max_members']}"
+                    )
+                if len(members) != policy["expected_member_count"]:
+                    raise RuntimeError(
+                        f"Known-empty sitemap cohort {policy['id']!r} member count changed: "
+                        f"observed={len(members)} expected={policy['expected_member_count']}"
+                    )
+                records = await asyncio.gather(
+                    *(
+                        self._probe_known_empty_url(
+                            session=session,
+                            semaphore=semaphore,
+                            url=url,
+                            policy_id=policy["id"],
+                            source_url=source_url,
+                        )
+                        for url in members
+                    )
+                )
+                policy_evidence.append(
+                    {
+                        **policy,
+                        "source_payload_sha256": source_payload_sha256,
+                        "member_count": len(members),
+                        "member_urls_sha256": member_urls_sha256(members),
+                        "records": records,
+                    }
+                )
+
+        evidence = finalize_evidence(
+            {
+                "generated_at_epoch": time.time(),
+                "policies": policy_evidence,
+            }
+        )
+        verified, evidence_errors = validate_evidence(evidence)
+        if evidence_errors:
+            raise RuntimeError(
+                "Sitemap cohort verification evidence is invalid: "
+                + "; ".join(evidence_errors)
+            )
+        self.sitemap_cohort_verification = evidence
+        self.verified_empty_urls = verified
+        atomic_write_json(self.sitemap_cohort_verification_file, evidence)
+
+        for url, policy_id in sorted(verified.items()):
+            reason = verified_empty_reason(policy_id)
+            if self.url_mapping.get(url) != reason:
+                if not str(self.url_mapping.get(url) or "").startswith("SKIPPED"):
+                    self.stats["skipped_urls"] += 1
+                self.url_mapping[url] = reason
+        self.stats["verified_empty_urls"] = len(verified)
+        logger.info(
+            "Verified and excluded %d empty sitemap cohort URL(s); %d URL(s) remain eligible.",
+            len(verified),
+            len(urls) - len(verified),
+        )
+        return [url for url in urls if url not in verified]
+
     async def _discover_sitemap_urls(self) -> List[str]:
         if not self._session:
             return []
@@ -2928,7 +3480,11 @@ class Crawl4AICrawler(CrawlerStage):
         if self.respect_robots_txt:
             robots_url = urljoin(self.start_url, "/robots.txt")
             try:
-                async with self._session.get(robots_url, proxy=self.proxy) as response:
+                async with self._get_with_safe_redirects(
+                    session=self._session,
+                    url=robots_url,
+                    enforce_allowed_domain=True,
+                ) as response:
                     if response.status == 200:
                         robots_text = await response.text()
                         for line in robots_text.splitlines():
@@ -2948,6 +3504,8 @@ class Crawl4AICrawler(CrawlerStage):
         )
 
         seen_sitemaps = set()
+        source_fetches: Dict[str, Dict[str, Any]] = {}
+        url_sources: Dict[str, List[str]] = {}
         collected_urls: list[str] = []
         sitemap_limit = max(0, int(self.config.get("sitemap_seed_limit", 500)))
 
@@ -2961,12 +3519,31 @@ class Crawl4AICrawler(CrawlerStage):
             seen_sitemaps.add(normalized)
 
             try:
-                async with self._session.get(normalized, proxy=self.proxy) as response:
+                async with self._get_with_safe_redirects(
+                    session=self._session,
+                    url=normalized,
+                    enforce_allowed_domain=True,
+                ) as response:
+                    source_record = {
+                        "url": normalized,
+                        "status": response.status,
+                        "content_type": response.headers.get("Content-Type", ""),
+                        "payload_sha256": "",
+                        "child_sitemap_count": 0,
+                        "page_url_count": 0,
+                    }
+                    source_fetches[normalized] = source_record
                     if response.status != 200:
                         return
                     payload = await response.read()
                     content_type = response.headers.get("Content-Type", "")
+                    source_record["payload_sha256"] = hashlib.sha256(payload).hexdigest()
             except Exception as exc:
+                source_fetches[normalized] = {
+                    "url": normalized,
+                    "status": None,
+                    "error_type": type(exc).__name__,
+                }
                 logger.debug("Failed to fetch sitemap %s: %s", normalized, exc)
                 return
 
@@ -2975,6 +3552,8 @@ class Crawl4AICrawler(CrawlerStage):
                 source_url=normalized,
                 content_type=content_type,
             )
+            source_fetches[normalized]["child_sitemap_count"] = len(child_sitemaps)
+            source_fetches[normalized]["page_url_count"] = len(page_urls)
             for page_url in page_urls:
                 normalized_page = _normalize_http_url(page_url)
                 if not normalized_page:
@@ -2982,6 +3561,7 @@ class Crawl4AICrawler(CrawlerStage):
                 host = (urlparse(normalized_page).hostname or "").lower()
                 if not any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains):
                     continue
+                url_sources.setdefault(normalized_page, []).append(normalized)
                 if not self._allow_frontier_url(normalized_page):
                     continue
                 collected_urls.append(normalized_page)
@@ -3001,10 +3581,24 @@ class Crawl4AICrawler(CrawlerStage):
             if sitemap_limit and len(collected_urls) >= sitemap_limit:
                 break
 
-        deduped = list(dict.fromkeys(collected_urls))
+        raw_urls = list(dict.fromkeys(collected_urls))
+        if isinstance(getattr(self, "stats", None), dict):
+            self.stats["sitemap_urls_discovered"] = len(raw_urls)
+        deduped = await self._verify_known_empty_sitemap_cohorts(
+            raw_urls,
+            {url: sorted(set(sources)) for url, sources in url_sources.items()},
+            source_fetches,
+        )
         self.discovered_sitemaps = {
             "sources": sorted(seen_sitemaps),
             "urls": deduped,
+            "raw_urls": raw_urls,
+            "url_sources": {
+                url: sorted(set(sources)) for url, sources in sorted(url_sources.items())
+            },
+            "source_fetches": {
+                url: source_fetches[url] for url in sorted(source_fetches)
+            },
         }
         atomic_write_json(self.sitemap_state_file, self.discovered_sitemaps)
         return deduped
@@ -3792,7 +4386,11 @@ class Crawl4AICrawler(CrawlerStage):
         for attempt in range(1, self.raw_source_retry_attempts + 1):
             for candidate in candidates:
                 try:
-                    async with self._session.get(candidate, allow_redirects=True, proxy=self.proxy) as response:
+                    async with self._get_with_safe_redirects(
+                        session=self._session,
+                        url=candidate,
+                        enforce_allowed_domain=True,
+                    ) as response:
                         last_status = response.status
                         final_url = _normalize_http_url(str(response.url))
                         if not final_url or not self._url_allowed_for_fetch(final_url):
@@ -3813,6 +4411,21 @@ class Crawl4AICrawler(CrawlerStage):
                             )
                             continue
                         return await response.text(), response.status
+                except _RedirectEgressPolicyError as exc:
+                    last_status = exc.status
+                    logger.warning(
+                        "Blocked raw page source redirect outside allowed egress policy: %s -> %s",
+                        exc.source_url,
+                        exc.target_url,
+                    )
+                    return "", last_status
+                except _SafeRedirectLimitError as exc:
+                    last_status = exc.status
+                    logger.warning(
+                        "Blocked raw page source after exceeding redirect limit: %s",
+                        candidate,
+                    )
+                    return "", last_status
                 except Exception as exc:
                     logger.debug(
                         "Failed to fetch raw page source for %s candidate=%s attempt=%d/%d: %s",
@@ -3881,6 +4494,192 @@ class Crawl4AICrawler(CrawlerStage):
             self.url_mapping[url] = str(path)
             self.stats["documents_downloaded"] += 1
 
+    @contextlib.asynccontextmanager
+    async def _fresh_cookie_isolated_download_session(self):
+        """Yield a short-lived session without long-lived affinity cookies.
+
+        This is deliberately a normal request using the configured user agent,
+        proxy, timeout, and TLS policy.  It is not an access-control bypass; it
+        only prevents a transient cookie/connection affinity block in the main
+        crawl session from making an otherwise public same-site PDF unavailable.
+        """
+
+        headers: Dict[str, str] = {}
+        config_headers = self.config.get("headers")
+        if isinstance(config_headers, dict):
+            headers.update(
+                {
+                    str(key): str(value)
+                    for key, value in config_headers.items()
+                    if str(key).strip().lower() not in {"cookie", "set-cookie"}
+                }
+            )
+        user_agent = self.config.get("user_agent")
+        if user_agent and "User-Agent" not in headers:
+            headers["User-Agent"] = str(user_agent)
+
+        connector = aiohttp.TCPConnector(
+            limit=1,
+            ssl=False if self.ignore_https_errors else True,
+        )
+        timeout = aiohttp.ClientTimeout(total=self.timeout)
+        async with aiohttp.ClientSession(
+            headers=headers or None,
+            timeout=timeout,
+            connector=connector,
+            cookie_jar=aiohttp.DummyCookieJar(),
+        ) as session:
+            yield session
+
+    async def _download_binary_once(
+        self,
+        *,
+        session: aiohttp.ClientSession,
+        normalized: str,
+        destination_dir: Path,
+        max_bytes: int,
+        expected_prefix: Optional[str],
+        validate_document: bool,
+        enforce_allowed_domain: bool,
+    ) -> Tuple[Optional[Path], Optional[str], bool]:
+        """Perform one bounded binary request without mutating skip counters.
+
+        Returns ``(path, failure_reason, retryable)``.  Deferring failure-state
+        mutation until all bounded attempts finish prevents one URL from being
+        counted multiple times during recovery.
+        """
+
+        tmp_path: Optional[Path] = None
+        try:
+            async with self._download_semaphore:
+                async with self._get_with_safe_redirects(
+                    session=session,
+                    url=normalized,
+                    enforce_allowed_domain=enforce_allowed_domain,
+                ) as response:
+                    if enforce_allowed_domain:
+                        final_url = _normalize_http_url(str(response.url))
+                        if not final_url or not self._url_allowed_for_fetch(final_url):
+                            return None, "SKIPPED_EGRESS_POLICY", False
+
+                    status = response.status
+                    if status >= 400:
+                        return None, f"SKIPPED_HTTP_{status}", status in RETRYABLE_STATUSES
+
+                    content_type = response.headers.get("Content-Type", "")
+                    if expected_prefix and content_type and not content_type.lower().startswith(expected_prefix):
+                        return None, None, False
+
+                    target_path = _build_stable_output_path(
+                        destination_dir,
+                        normalized,
+                        content_type=content_type,
+                    )
+                    tmp_path = target_path.with_suffix(target_path.suffix + ".part")
+                    bytes_written = 0
+                    payload_head = bytearray()
+
+                    with open(tmp_path, "wb") as handle:
+                        async for chunk in response.content.iter_chunked(64 * 1024):
+                            if not chunk:
+                                continue
+                            bytes_written += len(chunk)
+                            if bytes_written > max_bytes:
+                                raise ValueError("download exceeds configured size limit")
+                            if len(payload_head) < 1024:
+                                payload_head.extend(chunk[: 1024 - len(payload_head)])
+                            handle.write(chunk)
+
+                    if validate_document and not _is_valid_downloaded_document_payload(
+                        bytes(payload_head),
+                        extension=target_path.suffix.lower(),
+                        content_type=content_type,
+                    ):
+                        tmp_path.unlink(missing_ok=True)
+                        return None, "SKIPPED_INVALID_DOCUMENT", False
+
+                    tmp_path.replace(target_path)
+                    self.stats["bytes_downloaded"] += bytes_written
+                    return target_path, None, False
+        except _RedirectEgressPolicyError:
+            return None, "SKIPPED_EGRESS_POLICY", False
+        except _SafeRedirectLimitError:
+            return None, "SKIPPED_REDIRECT_LIMIT", False
+        except BaseException:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            raise
+
+    def _record_download_failure(
+        self,
+        normalized: str,
+        failure_reason: Optional[str],
+        status_on_failure: Optional[str],
+    ) -> None:
+        if not status_on_failure:
+            return
+        self.url_mapping[normalized] = failure_reason or status_on_failure
+        self.stats["skipped_urls"] += 1
+
+    async def _recover_same_site_pdf_after_403(
+        self,
+        *,
+        normalized: str,
+        destination_dir: Path,
+        max_bytes: int,
+        expected_prefix: Optional[str],
+        validate_document: bool,
+        enforce_allowed_domain: bool,
+        status_on_failure: Optional[str],
+    ) -> Optional[Path]:
+        """Retry a blocked same-site PDF with bounded cookie-isolated sessions."""
+
+        last_reason: Optional[str] = "SKIPPED_HTTP_403"
+        for attempt in range(1, self.retry_attempts + 1):
+            if self.retry_backoff:
+                await asyncio.sleep(self.retry_backoff * attempt)
+            try:
+                # Re-check before every fresh request.  This retains the normal
+                # DNS/private-address egress guard even if resolution changed.
+                if not self._url_allowed_for_fetch(normalized):
+                    last_reason = "SKIPPED_EGRESS_POLICY"
+                    break
+                async with self._fresh_cookie_isolated_download_session() as session:
+                    path, failure_reason, retryable = await self._download_binary_once(
+                        session=session,
+                        normalized=normalized,
+                        destination_dir=destination_dir,
+                        max_bytes=max_bytes,
+                        expected_prefix=expected_prefix,
+                        validate_document=validate_document,
+                        enforce_allowed_domain=enforce_allowed_domain,
+                    )
+                if path:
+                    return path
+                last_reason = failure_reason or status_on_failure
+                # A missing resource and invalid payload are terminal.  A
+                # persistent 403 is retried only within the configured bound.
+                if failure_reason == "SKIPPED_HTTP_404":
+                    break
+                if failure_reason == "SKIPPED_HTTP_403" or retryable:
+                    continue
+                break
+            except ValueError:
+                last_reason = "SKIPPED_TOO_LARGE"
+                break
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.debug(
+                    "Cookie-isolated PDF recovery attempt %d/%d failed for %s: %s",
+                    attempt,
+                    self.retry_attempts,
+                    normalized,
+                    exc,
+                )
+                last_reason = status_on_failure
+
+        self._record_download_failure(normalized, last_reason, status_on_failure)
+        return None
+
     async def _download_binary(
         self,
         url: str,
@@ -3903,90 +4702,47 @@ class Crawl4AICrawler(CrawlerStage):
                 self.stats["skipped_urls"] += 1
             return None
 
+        is_same_site_pdf = (
+            validate_document
+            and enforce_allowed_domain
+            and _url_extension(normalized) == ".pdf"
+        )
+
         for attempt in range(1, self.retry_attempts + 1):
-            tmp_path = None
             try:
-                async with self._download_semaphore:
-                    async with self._session.get(
-                        normalized,
-                        allow_redirects=True,
-                        proxy=self.proxy,
-                    ) as response:
-                        if enforce_allowed_domain:
-                            final_url = _normalize_http_url(str(response.url))
-                            if not final_url or not self._url_allowed_for_fetch(final_url):
-                                if status_on_failure:
-                                    self.url_mapping[normalized] = "SKIPPED_EGRESS_POLICY"
-                                    self.stats["skipped_urls"] += 1
-                                return None
-                        status = response.status
-                        if status in RETRYABLE_STATUSES and attempt < self.retry_attempts:
-                            raise aiohttp.ClientResponseError(
-                                response.request_info,
-                                response.history,
-                                status=status,
-                                message=f"retryable status {status}",
-                            )
-                        if status >= 400:
-                            if status_on_failure:
-                                self.url_mapping[normalized] = f"SKIPPED_HTTP_{status}"
-                                self.stats["skipped_urls"] += 1
-                            return None
-
-                        content_type = response.headers.get("Content-Type", "")
-                        if expected_prefix and content_type and not content_type.lower().startswith(expected_prefix):
-                            return None
-
-                        target_path = _build_stable_output_path(
-                            destination_dir,
-                            normalized,
-                            content_type=content_type,
-                        )
-                        tmp_path = target_path.with_suffix(target_path.suffix + ".part")
-                        bytes_written = 0
-                        payload_head = bytearray()
-
-                        with open(tmp_path, "wb") as handle:
-                            async for chunk in response.content.iter_chunked(64 * 1024):
-                                if not chunk:
-                                    continue
-                                bytes_written += len(chunk)
-                                if bytes_written > max_bytes:
-                                    raise ValueError("download exceeds configured size limit")
-                                if len(payload_head) < 1024:
-                                    payload_head.extend(chunk[: 1024 - len(payload_head)])
-                                handle.write(chunk)
-
-                        if validate_document and not _is_valid_downloaded_document_payload(
-                            bytes(payload_head),
-                            extension=target_path.suffix.lower(),
-                            content_type=content_type,
-                        ):
-                            if tmp_path.exists():
-                                tmp_path.unlink(missing_ok=True)
-                            if status_on_failure:
-                                self.url_mapping[normalized] = "SKIPPED_INVALID_DOCUMENT"
-                                self.stats["skipped_urls"] += 1
-                            return None
-
-                        tmp_path.replace(target_path)
-                        self.stats["bytes_downloaded"] += bytes_written
-                        return target_path
+                path, failure_reason, retryable = await self._download_binary_once(
+                    session=self._session,
+                    normalized=normalized,
+                    destination_dir=destination_dir,
+                    max_bytes=max_bytes,
+                    expected_prefix=expected_prefix,
+                    validate_document=validate_document,
+                    enforce_allowed_domain=enforce_allowed_domain,
+                )
+                if path:
+                    return path
+                if failure_reason == "SKIPPED_HTTP_403" and is_same_site_pdf:
+                    return await self._recover_same_site_pdf_after_403(
+                        normalized=normalized,
+                        destination_dir=destination_dir,
+                        max_bytes=max_bytes,
+                        expected_prefix=expected_prefix,
+                        validate_document=validate_document,
+                        enforce_allowed_domain=enforce_allowed_domain,
+                        status_on_failure=status_on_failure,
+                    )
+                if retryable and attempt < self.retry_attempts:
+                    await asyncio.sleep(self.retry_backoff * attempt)
+                    continue
+                self._record_download_failure(normalized, failure_reason, status_on_failure)
+                return None
             except ValueError:
-                if tmp_path and tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
-                if status_on_failure:
-                    self.url_mapping[normalized] = "SKIPPED_TOO_LARGE"
-                    self.stats["skipped_urls"] += 1
+                self._record_download_failure(normalized, "SKIPPED_TOO_LARGE", status_on_failure)
                 return None
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                if tmp_path and tmp_path.exists():
-                    tmp_path.unlink(missing_ok=True)
                 if attempt >= self.retry_attempts:
                     logger.debug("Download failed for %s: %s", normalized, exc)
-                    if status_on_failure:
-                        self.url_mapping[normalized] = status_on_failure
-                        self.stats["skipped_urls"] += 1
+                    self._record_download_failure(normalized, None, status_on_failure)
                     return None
                 await asyncio.sleep(self.retry_backoff * attempt)
 
@@ -4037,6 +4793,8 @@ class Crawl4AICrawler(CrawlerStage):
             "recoverable_skip_exhausted_urls": sorted(
                 self.recoverable_skip_exhausted_urls
             ),
+            "sitemap_cohort_verification": self.sitemap_cohort_verification,
+            "discovered_sitemaps": self.discovered_sitemaps,
             "stats": self.stats,
             "updated_at": time.time(),
         }
@@ -4046,6 +4804,11 @@ class Crawl4AICrawler(CrawlerStage):
         if not force and (now - self._last_flush_at) < self.checkpoint_flush_interval:
             return
 
+        # The runtime checkpoint is the atomic resume source because it carries
+        # the frontier, mappings, cohort proof, and sitemap provenance together.
+        # Persist it before the individual human-readable projections so an
+        # interruption can never expose a newer frontier with older mappings.
+        atomic_write_json(self.runtime_state_file, self._serialize_runtime_state())
         self._write_crawl_state_file()
         atomic_write_json(self.mapping_file, self.url_mapping)
         atomic_write_json(self.url_to_md_mapping_file, self.url_to_md_mapping)
@@ -4060,9 +4823,13 @@ class Crawl4AICrawler(CrawlerStage):
                 page_links=self.page_links,
             ),
         )
-        atomic_write_json(self.runtime_state_file, self._serialize_runtime_state())
-        if self.discovered_sitemaps["sources"] or self.discovered_sitemaps["urls"]:
+        if self.discovered_sitemaps.get("sources") or self.discovered_sitemaps.get("urls"):
             atomic_write_json(self.sitemap_state_file, self.discovered_sitemaps)
+        if self.sitemap_cohort_verification:
+            atomic_write_json(
+                self.sitemap_cohort_verification_file,
+                self.sitemap_cohort_verification,
+            )
         self._last_flush_at = now
 
     def _build_metrics(self) -> Dict[str, int]:
