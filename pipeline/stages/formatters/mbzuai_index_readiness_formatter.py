@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import logging
 import re
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
+from pipeline.core.knowledge_graph import validate_graph_bundle
 from pipeline.core.mbzuai_indexing import (
     build_url_identity_map,
     canonicalize_link_graph,
@@ -45,7 +47,7 @@ DEFAULT_CRITICAL_URL_PATTERNS = [
     r"/about/leadership",
     r"/about/contact/?$",
     r"/study/",
-    r"/student-resources",
+    r"/student-resources/?$",
 ]
 
 
@@ -248,6 +250,20 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
         raw_link_graph = load_json_safe(page_link_graph_file, {}) if page_link_graph_file else {}
         raw_link_graph = raw_link_graph if isinstance(raw_link_graph, dict) else {}
         canonical_graph = canonicalize_link_graph(raw_link_graph, canonical_metadata)
+        canonical_graph_issues = validate_graph_bundle(canonical_graph, require_stats=True)
+        if canonical_graph_issues:
+            issue_counts = Counter(
+                str(issue.get("code") or "invalid_canonical_page_link_graph")
+                for issue in canonical_graph_issues
+            )
+            issue_summary = ", ".join(
+                f"{code}={count}"
+                for code, count in sorted(issue_counts.items())
+            )
+            return StageResult.failure(
+                "Canonical page link graph validation failed: "
+                f"issues={len(canonical_graph_issues)} ({issue_summary})"
+            )
         url_identity_map = build_url_identity_map(canonical_metadata)
 
         previous_metadata: Dict[str, Any] = {}

@@ -8,6 +8,7 @@ rules.
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -359,35 +360,96 @@ def canonicalize_link_graph(
     page_metadata: Mapping[str, Mapping[str, Any]],
 ) -> Dict[str, Any]:
     graph = graph or {}
-    nodes = []
-    edges = []
-    node_ids: set[str] = set()
+    nodes_by_id: Dict[str, Dict[str, Any]] = {}
+    edges_by_id: Dict[str, Dict[str, Any]] = {}
 
     def node_id_for(url: str) -> str:
-        return f"page:{sha1_text(locale_family_url(url) or normalize_url(url), 24)}"
+        # A locale family is a useful grouping key, but it is not page
+        # identity. English and Arabic variants can have different content,
+        # titles, and link topology, so they must remain separate graph nodes.
+        return f"page:{sha1_text(normalize_url(url), 24)}"
 
-    for source_url, metadata in sorted(page_metadata.items()):
-        node_id = node_id_for(source_url)
-        node_ids.add(node_id)
-        nodes.append(
+    def stable_value_key(value: Any) -> str:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+
+    def normalized_list(value: Any) -> List[Any]:
+        values = value if isinstance(value, (list, tuple, set)) else [value]
+        by_key: Dict[str, Any] = {}
+        for item in values:
+            if item in (None, "", [], {}):
+                continue
+            by_key[stable_value_key(item)] = item
+        return [by_key[key] for key in sorted(by_key)]
+
+    def merge_edge_properties(
+        current: Mapping[str, Any] | None,
+        incoming: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        """Merge duplicate normalized-link evidence without order dependence."""
+
+        current = current or {}
+        incoming = incoming or {}
+        merged: Dict[str, Any] = {}
+        list_evidence_keys = {"anchor_texts", "rels", "sources"}
+        link_types = sorted(
             {
-                "id": node_id,
-                "url": source_url,
-                "canonical_url": metadata.get("canonical_url") or source_url,
-                "canonical_family_url": metadata.get("canonical_family_url") or locale_family_url(source_url),
-                "node_type": "page",
-                "label": metadata.get("title") or source_url,
-                "properties": {
-                    "title": metadata.get("title") or "",
-                    "description": metadata.get("description") or "",
-                    "language": metadata.get("language") or "",
-                    "normalized_path": metadata.get("normalized_path") or "",
-                    "content_hash": metadata.get("content_hash") or "",
-                    "status_code": metadata.get("status_code"),
-                    "depth": metadata.get("depth"),
-                },
+                clean_text(value)
+                for value in (
+                    current.get("link_type"),
+                    incoming.get("link_type"),
+                    *normalized_list(current.get("link_type_variants")),
+                    *normalized_list(incoming.get("link_type_variants")),
+                )
+                if clean_text(value)
             }
         )
+        if link_types:
+            merged["link_type"] = link_types[0]
+            if len(link_types) > 1:
+                merged["link_type_variants"] = link_types
+
+        for key in sorted(set(current) | set(incoming)):
+            if key in {"link_type", "link_type_variants"}:
+                continue
+            left = current.get(key)
+            right = incoming.get(key)
+            if key in list_evidence_keys:
+                values = normalized_list(left) + normalized_list(right)
+                merged[key] = normalized_list(values)
+                continue
+            if isinstance(left, (list, tuple, set)) or isinstance(right, (list, tuple, set)):
+                merged[key] = normalized_list(normalized_list(left) + normalized_list(right))
+                continue
+            candidates = [value for value in (left, right) if value not in (None, "", [], {})]
+            if candidates:
+                # Unknown scalar properties are not part of the link contract.
+                # Select them by serialized value so duplicate input order can
+                # never change the canonical graph.
+                merged[key] = min(candidates, key=stable_value_key)
+        return merged
+
+    for raw_source_url, metadata in sorted(page_metadata.items()):
+        source_url = normalize_url(metadata.get("url") or raw_source_url)
+        if not source_url:
+            continue
+        node_id = node_id_for(source_url)
+        nodes_by_id[node_id] = {
+            "id": node_id,
+            "url": source_url,
+            "canonical_url": normalize_url(metadata.get("canonical_url")) or source_url,
+            "canonical_family_url": metadata.get("canonical_family_url") or locale_family_url(source_url),
+            "node_type": "page",
+            "label": metadata.get("title") or source_url,
+            "properties": {
+                "title": metadata.get("title") or "",
+                "description": metadata.get("description") or "",
+                "language": metadata.get("language") or "",
+                "normalized_path": metadata.get("normalized_path") or "",
+                "content_hash": metadata.get("content_hash") or "",
+                "status_code": metadata.get("status_code"),
+                "depth": metadata.get("depth"),
+            },
+        }
 
     for raw_edge in graph.get("edges") or []:
         if not isinstance(raw_edge, Mapping):
@@ -398,44 +460,43 @@ def canonicalize_link_graph(
             continue
         source_id = node_id_for(source_url)
         target_id = node_id_for(target_url)
-        if source_id not in node_ids:
-            node_ids.add(source_id)
-            nodes.append(
-                {
-                    "id": source_id,
-                    "url": source_url,
-                    "canonical_family_url": locale_family_url(source_url),
-                    "node_type": "discovered_url",
-                    "label": source_url,
-                    "properties": {},
-                }
-            )
-        if target_id not in node_ids:
-            node_ids.add(target_id)
-            nodes.append(
-                {
-                    "id": target_id,
-                    "url": target_url,
-                    "canonical_family_url": locale_family_url(target_url),
-                    "node_type": "discovered_url",
-                    "label": target_url,
-                    "properties": {},
-                }
-            )
-        edge_id = f"edge:{sha1_text(f'{source_id}|{target_id}', 24)}"
-        edges.append(
-            {
-                "id": edge_id,
-                "edge_type": "LINKS_TO",
-                "source_id": source_id,
-                "target_id": target_id,
-                "source_url": source_url,
-                "target_url": target_url,
-                "source_family_url": locale_family_url(source_url),
-                "target_family_url": locale_family_url(target_url),
-                "properties": dict(raw_edge.get("properties") or {}),
+        if source_id not in nodes_by_id:
+            nodes_by_id[source_id] = {
+                "id": source_id,
+                "url": source_url,
+                "canonical_family_url": locale_family_url(source_url),
+                "node_type": "discovered_url",
+                "label": source_url,
+                "properties": {},
             }
-        )
+        if target_id not in nodes_by_id:
+            nodes_by_id[target_id] = {
+                "id": target_id,
+                "url": target_url,
+                "canonical_family_url": locale_family_url(target_url),
+                "node_type": "discovered_url",
+                "label": target_url,
+                "properties": {},
+            }
+        edge_id = f"edge:{sha1_text(f'{source_id}|{target_id}', 24)}"
+        existing_edge = edges_by_id.get(edge_id)
+        edges_by_id[edge_id] = {
+            "id": edge_id,
+            "edge_type": "LINKS_TO",
+            "source_id": source_id,
+            "target_id": target_id,
+            "source_url": source_url,
+            "target_url": target_url,
+            "source_family_url": locale_family_url(source_url),
+            "target_family_url": locale_family_url(target_url),
+            "properties": merge_edge_properties(
+                (existing_edge or {}).get("properties"),
+                raw_edge.get("properties") if isinstance(raw_edge.get("properties"), Mapping) else {},
+            ),
+        }
+
+    nodes = sorted(nodes_by_id.values(), key=lambda item: item["id"])
+    edges = sorted(edges_by_id.values(), key=lambda item: item["id"])
 
     link_type_counts: Dict[str, int] = {}
     for edge in edges:
@@ -443,13 +504,14 @@ def canonicalize_link_graph(
         link_type_counts[link_type] = link_type_counts.get(link_type, 0) + 1
 
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "graph_type": "mbzuai_canonical_page_link_graph",
-        "nodes": sorted(nodes, key=lambda item: item["id"]),
-        "edges": sorted({edge["id"]: edge for edge in edges}.values(), key=lambda item: item["id"]),
+        "node_identity": "normalized_url_v1",
+        "nodes": nodes,
+        "edges": edges,
         "stats": {
-            "node_count": len(node_ids),
-            "edge_count": len({edge["id"] for edge in edges}),
+            "node_count": len(nodes),
+            "edge_count": len(edges),
             "link_type_counts": link_type_counts,
         },
     }

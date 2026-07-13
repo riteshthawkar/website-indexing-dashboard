@@ -7,10 +7,11 @@ provenance only. It does not attempt open-ended entity/relation extraction.
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import asdict, dataclass, field
 from hashlib import sha1
 from pathlib import Path
-import re
 from typing import Any, Dict, Iterable, List
 
 from .io import atomic_write_json, load_json_safe, sha256_file
@@ -296,7 +297,11 @@ def load_graph_bundle(path: str | Path) -> Dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def validate_graph_bundle(graph_bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
+def validate_graph_bundle(
+    graph_bundle: Dict[str, Any],
+    *,
+    require_stats: bool = False,
+) -> List[Dict[str, Any]]:
     issues: List[Dict[str, Any]] = []
     nodes = graph_bundle.get("nodes")
     edges = graph_bundle.get("edges")
@@ -350,6 +355,107 @@ def validate_graph_bundle(graph_bundle: Dict[str, Any]) -> List[Dict[str, Any]]:
             issues.append({"code": "graph_edge_missing_source_node", "message": "Graph edge references a missing source node", "edge_id": edge_id, "node_id": source_id})
         if target_id not in node_ids:
             issues.append({"code": "graph_edge_missing_target_node", "message": "Graph edge references a missing target node", "edge_id": edge_id, "node_id": target_id})
+
+    stats = graph_bundle.get("stats")
+    if stats is None:
+        if require_stats:
+            issues.append({"code": "graph_stats_missing", "message": "Graph bundle is missing required stats"})
+        return issues
+    if not isinstance(stats, dict):
+        issues.append({"code": "invalid_graph_stats", "message": "Graph bundle stats payload is not an object"})
+        return issues
+
+    if "node_count" not in stats:
+        if require_stats:
+            issues.append(
+                {
+                    "code": "graph_stats_missing_node_count",
+                    "message": "Graph bundle stats is missing node_count",
+                }
+            )
+    elif type(stats.get("node_count")) is not int or stats.get("node_count") != len(nodes):
+        issues.append(
+            {
+                "code": "graph_node_count_mismatch",
+                "message": "Graph stats node_count does not match the stored node rows",
+                "expected": len(nodes),
+                "actual": stats.get("node_count"),
+            }
+        )
+
+    if "edge_count" not in stats:
+        if require_stats:
+            issues.append(
+                {
+                    "code": "graph_stats_missing_edge_count",
+                    "message": "Graph bundle stats is missing edge_count",
+                }
+            )
+    elif type(stats.get("edge_count")) is not int or stats.get("edge_count") != len(edges):
+        issues.append(
+            {
+                "code": "graph_edge_count_mismatch",
+                "message": "Graph stats edge_count does not match the stored edge rows",
+                "expected": len(edges),
+                "actual": stats.get("edge_count"),
+            }
+        )
+
+    if "link_type_counts" not in stats:
+        if require_stats:
+            issues.append(
+                {
+                    "code": "graph_stats_missing_link_type_counts",
+                    "message": "Graph bundle stats is missing required link_type_counts",
+                }
+            )
+    else:
+        recorded_link_type_counts = stats.get("link_type_counts")
+        if not isinstance(recorded_link_type_counts, dict):
+            issues.append(
+                {
+                    "code": "invalid_graph_link_type_counts",
+                    "message": "Graph stats link_type_counts payload is not an object",
+                }
+            )
+        else:
+            recorded_counts_are_valid = all(
+                isinstance(key, str)
+                and type(value) is int
+                and value >= 0
+                for key, value in recorded_link_type_counts.items()
+            )
+            actual_link_type_counts: Counter[str] = Counter()
+            for edge in edges:
+                if not isinstance(edge, dict):
+                    continue
+                properties = edge.get("properties")
+                properties = properties if isinstance(properties, dict) else {}
+                link_type = str(properties.get("link_type") or "unknown").strip() or "unknown"
+                actual_link_type_counts[link_type] += 1
+            actual_counts = dict(sorted(actual_link_type_counts.items()))
+            recorded_counts = {
+                str(key): value
+                for key, value in sorted(
+                    recorded_link_type_counts.items(),
+                    key=lambda item: str(item[0]),
+                )
+            }
+            if not recorded_counts_are_valid or recorded_counts != actual_counts:
+                issues.append(
+                    {
+                        "code": "graph_link_type_counts_mismatch",
+                        "message": "Graph stats link_type_counts does not exactly match the stored edges",
+                        "expected": actual_counts,
+                        "actual": recorded_counts,
+                        "expected_total": sum(actual_counts.values()),
+                        "actual_total": sum(
+                            value
+                            for value in recorded_counts.values()
+                            if isinstance(value, int) and not isinstance(value, bool)
+                        ),
+                    }
+                )
 
     return issues
 

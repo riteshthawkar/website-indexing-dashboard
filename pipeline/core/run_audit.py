@@ -316,26 +316,31 @@ def _audit_chunk_indexes(report: RunAuditReport, catalog: ArtifactCatalog) -> No
 
 
 def _audit_knowledge_graphs(report: RunAuditReport, catalog: ArtifactCatalog) -> None:
-    for record in catalog.filter(artifact_type="knowledge_graph_bundle"):
-        if not record.local_path or not Path(record.local_path).is_file():
-            continue
-        bundle = load_graph_bundle(record.local_path)
-        for issue in validate_graph_bundle(bundle):
-            report.errors.append(
-                AuditIssue(
-                    severity="error",
-                    code=str(issue.get("code") or "invalid_knowledge_graph"),
-                    message=str(issue.get("message") or "Knowledge graph bundle is invalid"),
-                    path=str(record.local_path),
-                    artifact_id=record.artifact_id,
-                    stage_id=record.producer_stage,
-                    metadata={
-                        key: value
-                        for key, value in issue.items()
-                        if key not in {"code", "message"}
-                    },
+    graph_artifact_types = (
+        ("knowledge_graph_bundle", False),
+        ("canonical_page_link_graph", True),
+    )
+    for artifact_type, require_stats in graph_artifact_types:
+        for record in catalog.filter(artifact_type=artifact_type):
+            if not record.local_path or not Path(record.local_path).is_file():
+                continue
+            bundle = load_graph_bundle(record.local_path)
+            for issue in validate_graph_bundle(bundle, require_stats=require_stats):
+                report.errors.append(
+                    AuditIssue(
+                        severity="error",
+                        code=str(issue.get("code") or "invalid_graph_artifact"),
+                        message=str(issue.get("message") or "Graph artifact is invalid"),
+                        path=str(record.local_path),
+                        artifact_id=record.artifact_id,
+                        stage_id=record.producer_stage,
+                        metadata={
+                            key: value
+                            for key, value in issue.items()
+                            if key not in {"code", "message"}
+                        },
+                    )
                 )
-            )
 
 
 def _audit_index_coverage_gate(report: RunAuditReport, work_dir: Path) -> None:

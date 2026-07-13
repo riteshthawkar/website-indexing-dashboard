@@ -23,6 +23,11 @@ crawler:
   excluded_path_prefixes:
     - "/tag/"
     - "/ar/tag/"
+    # This transient, noindex outage notice is stale and must never become
+    # retrievable chatbot evidence. Keep the exclusion route-specific so the
+    # intentionally indexed student-resources hub remains available.
+    - "/moodle-service-interruption"
+    - "/ar/moodle-service-interruption"
   # Yoast still advertises non-content sitemap members. Every fresh run probes
   # each configured, source-bound cohort member and excludes only exact URLs
   # proven to return an empty HTTP 200 body. Mixed cohorts are safe: members

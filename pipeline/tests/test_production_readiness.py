@@ -550,6 +550,7 @@ class TestConfig:
 
     def test_canonical_production_config_keeps_required_capabilities(self):
         from pipeline.core.config import load_config
+        from pipeline.stages.crawlers.crawl4ai_crawler import _url_matches_path_prefix
 
         config = load_config("mbzuai_production")
         plugins = [stage["plugin"] for stage in config["stages"]]
@@ -558,7 +559,21 @@ class TestConfig:
         excluded_prefixes = set(config["crawler"]["excluded_path_prefixes"])
         assert "/tag/" in excluded_prefixes
         assert "/ar/tag/" in excluded_prefixes
+        assert "/moodle-service-interruption" in excluded_prefixes
+        assert "/ar/moodle-service-interruption" in excluded_prefixes
         assert "/publication" not in excluded_prefixes
+        assert _url_matches_path_prefix(
+            "https://mbzuai.ac.ae/moodle-service-interruption",
+            excluded_prefixes,
+        )
+        assert _url_matches_path_prefix(
+            "https://mbzuai.ac.ae/ar/moodle-service-interruption/details",
+            excluded_prefixes,
+        )
+        assert not _url_matches_path_prefix(
+            "https://mbzuai.ac.ae/moodle",
+            excluded_prefixes,
+        )
         cohort_counts = {
             item["id"]: item["expected_member_count"]
             for item in config["crawler"]["known_empty_sitemap_cohorts"]
