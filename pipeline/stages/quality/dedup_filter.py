@@ -1,20 +1,70 @@
 """
 Near-duplicate content filter using MinHash LSH.
 
-Computes MinHash signatures of document content and uses Locality-Sensitive
-Hashing to detect near-duplicates above a configurable similarity threshold.
+Uses MinHash Locality-Sensitive Hashing only to generate candidates, then
+requires exact source/content and identity proof before deleting an artifact.
 """
 
+import hashlib
 import logging
+import re
 import shutil
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from pipeline.core.base import QualityGate, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
+
+
+_DOCUMENT_SOURCE_TYPES = {
+    "csv",
+    "doc",
+    "docx",
+    "epub",
+    "odt",
+    "pdf",
+    "ppt",
+    "pptx",
+    "rtf",
+    "txt",
+    "xls",
+    "xlsx",
+}
+_WEB_SOURCE_TYPES = {"html", "web", "webpage"}
+_STALE_ROUTE_TOKENS = {
+    "archive",
+    "archived",
+    "backup",
+    "copy",
+    "deprecated",
+    "duplicate",
+    "legacy",
+    "old",
+    "prev",
+    "previous",
+    "stale",
+}
+_TABLE_SEPARATOR_RE = re.compile(
+    r"^\s*\|?\s*:?-{3,}:?\s*(?:\|\s*:?-{3,}:?\s*)+\|?\s*$"
+)
+
+
+@dataclass
+class _DedupEntry:
+    path: Path
+    metadata: Dict[str, Any]
+    raw_content_hash: str
+    normalized_content_hash: str
+    shingles: FrozenSet[int]
+    minhash: Any
+    identity: Dict[str, Any]
+    rank: Dict[str, Any]
+    rank_key: Tuple[Any, ...]
 
 
 def _resolved_path_str(value: Any) -> str:
@@ -62,6 +112,278 @@ def _remove_artifact_local_path(local_path: str) -> None:
         parent = parent.parent
 
 
+def _normalize_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return raw
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
+
+
+def _is_markdown_table_separator(line: str) -> bool:
+    """Return true only for Markdown table alignment/separator rows."""
+    return bool(_TABLE_SEPARATOR_RE.fullmatch(line))
+
+
+def _normalized_content(text: str) -> str:
+    return " ".join(str(text or "").casefold().split())
+
+
+def _shingle_fingerprint(value: str) -> int:
+    # A stable 128-bit digest keeps exact-Jaccard sets bounded without relying
+    # on Python's randomized hash().  Collision risk is negligible and unlike
+    # MinHash this is not a similarity estimate.
+    return int.from_bytes(hashlib.blake2b(value.encode("utf-8"), digest_size=16).digest(), "big")
+
+
+def _exact_jaccard(left: FrozenSet[int], right: FrozenSet[int]) -> float:
+    if not left and not right:
+        return 1.0
+    intersection_size = len(left & right)
+    union_size = len(left) + len(right) - intersection_size
+    if not union_size:
+        return 0.0
+    return intersection_size / union_size
+
+
+def _metadata_records(payload: Any) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [dict(item) for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    records = payload.get("records")
+    if isinstance(records, list):
+        return [dict(item) for item in records if isinstance(item, dict)]
+    return [
+        dict(value, source_url=value.get("source_url") or key)
+        for key, value in payload.items()
+        if isinstance(value, dict)
+    ]
+
+
+def _load_url_identity(ctx: StageContext) -> Dict[str, Dict[str, Any]]:
+    index: Dict[str, Dict[str, Any]] = {}
+    paths = [
+        ctx.previous_outputs.get("canonical_page_metadata_file"),
+        ctx.previous_outputs.get("page_metadata_file"),
+        ctx.previous_outputs.get("url_identity_map_file"),
+    ]
+    for path_str in paths:
+        if not path_str:
+            continue
+        payload = load_json_safe(path_str, {}) or {}
+        for record in _metadata_records(payload):
+            aliases = {
+                _normalize_url(record.get("source_url")),
+                _normalize_url(record.get("url")),
+                _normalize_url(record.get("normalized_url")),
+            }
+            aliases.discard("")
+            for alias in aliases:
+                current = index.setdefault(alias, {})
+                current.update({key: value for key, value in record.items() if value not in (None, "")})
+    return index
+
+
+def _load_source_urls_by_path(ctx: StageContext) -> Dict[str, str]:
+    """Recover original document URLs from the crawler URL-to-file mapping."""
+    path_str = ctx.previous_outputs.get("mapping_file")
+    payload = load_json_safe(path_str, {}) if path_str else {}
+    if not isinstance(payload, dict):
+        return {}
+    recovered: Dict[str, str] = {}
+    for url, local_path in sorted(payload.items(), key=lambda item: str(item[0])):
+        if not isinstance(url, str) or not isinstance(local_path, str) or local_path.startswith("SKIPPED_"):
+            continue
+        resolved = _resolved_path_str(local_path)
+        if resolved:
+            recovered.setdefault(resolved, url)
+    return recovered
+
+
+def _source_kind(metadata: Dict[str, Any]) -> str:
+    source_type = str(metadata.get("source_type") or "").strip().lower().lstrip(".")
+    source_url = str(metadata.get("source_url") or "").strip()
+    source_file = str(metadata.get("source_file") or "").strip()
+    if source_type in _WEB_SOURCE_TYPES:
+        return "web"
+    if source_type in _DOCUMENT_SOURCE_TYPES or Path(source_file).suffix.lower().lstrip(".") in _DOCUMENT_SOURCE_TYPES:
+        return "document"
+    if source_url.startswith(("http://", "https://")):
+        suffix = Path(urlsplit(source_url).path).suffix.lower().lstrip(".")
+        return "document" if suffix in _DOCUMENT_SOURCE_TYPES else "web"
+    return "generic"
+
+
+def _enrich_pdf_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    source_file = Path(str(metadata.get("source_file") or ""))
+    if source_file.suffix.lower() != ".pdf" or not source_file.is_file():
+        return metadata
+    try:
+        import fitz
+
+        with fitz.open(source_file) as document:
+            pdf_metadata = dict(document.metadata or {})
+    except Exception:
+        return metadata
+    enriched = dict(metadata)
+    for source_key, target_key in (
+        ("modDate", "pdf_mod_date"),
+        ("creationDate", "pdf_creation_date"),
+        ("title", "pdf_title"),
+    ):
+        if pdf_metadata.get(source_key):
+            enriched[target_key] = pdf_metadata[source_key]
+    return enriched
+
+
+def _source_document_hash(entry: _DedupEntry, cache: Dict[str, str]) -> str:
+    source_file = _resolved_path_str(entry.metadata.get("source_file"))
+    if not source_file or not Path(source_file).is_file():
+        return ""
+    if source_file in cache:
+        return cache[source_file]
+    digest = hashlib.sha256()
+    try:
+        with Path(source_file).open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        value = digest.hexdigest()
+    except Exception:
+        value = ""
+    cache[source_file] = value
+    return value
+
+
+def _same_exact_source_document(
+    left: _DedupEntry,
+    right: _DedupEntry,
+    cache: Dict[str, str],
+) -> bool:
+    left_hash = _source_document_hash(left, cache)
+    return bool(left_hash and left_hash == _source_document_hash(right, cache))
+
+
+def _entry_identity(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    source_url = _normalize_url(metadata.get("source_url"))
+    canonical_url = _normalize_url(metadata.get("canonical_url"))
+    canonical_family = _normalize_url(metadata.get("canonical_family_url"))
+    language = str(metadata.get("language") or "").strip().lower().replace("_", "-")
+    if source_url:
+        path_parts = [part for part in urlsplit(source_url).path.split("/") if part]
+        if path_parts and path_parts[0].lower() == "ar":
+            # URL locale is authoritative when upstream identity metadata is
+            # stale or inherited from an English canonical family.
+            language = "ar"
+    return {
+        "kind": _source_kind(metadata),
+        "source_url": source_url,
+        "canonical_url": canonical_url,
+        "canonical_family_url": canonical_family,
+        "language": language,
+        "canonical_identity_available": bool(canonical_family and language),
+    }
+
+
+def _freshness_value(metadata: Dict[str, Any]) -> int:
+    candidates: List[str] = []
+    for key in (
+        "last_modified",
+        "modified_at",
+        "publication_date",
+        "published_at",
+        "pdf_mod_date",
+        "pdf_creation_date",
+        "source_url",
+        "source_file",
+    ):
+        value = metadata.get(key)
+        if value:
+            candidates.append(Path(str(value)).name if key == "source_file" else str(value))
+    meta_tags = metadata.get("meta_tags")
+    if isinstance(meta_tags, dict):
+        for key in ("article:modified_time", "article:published_time"):
+            value = meta_tags.get(key)
+            if value:
+                candidates.extend(str(item) for item in (value if isinstance(value, list) else [value]))
+
+    best = 0
+    for candidate in candidates:
+        pdf_date = re.search(r"D:(20\d{2})(\d{2})(\d{2})", candidate)
+        if pdf_date:
+            best = max(best, int("".join(pdf_date.groups())))
+        for year, month, day in re.findall(
+            r"(?<!\d)(20\d{2})(?:[-_/]?(0[1-9]|1[0-2]))?(?:[-_/]?([0-2]\d|3[01]))?(?!\d)",
+            candidate,
+        ):
+            best = max(best, int(year) * 10000 + int(month or 0) * 100 + int(day or 0))
+    return best
+
+
+def _is_stale(metadata: Dict[str, Any], identity: Dict[str, Any]) -> bool:
+    if metadata.get("is_stale") is True or metadata.get("stale") is True:
+        return True
+    source = " ".join(
+        str(value or "")
+        for value in (identity.get("source_url"), metadata.get("source_file"))
+    ).casefold()
+    tokens = set(re.findall(r"[a-z]+", source))
+    return bool(tokens & _STALE_ROUTE_TOKENS)
+
+
+def _rank_entry(path: Path, metadata: Dict[str, Any], identity: Dict[str, Any], content_length: int) -> Tuple[Dict[str, Any], Tuple[Any, ...]]:
+    source_url = str(identity.get("source_url") or "")
+    canonical_url = str(identity.get("canonical_url") or "")
+    canonical = bool(source_url and canonical_url and source_url == canonical_url)
+    stale = _is_stale(metadata, identity)
+    freshness = _freshness_value(metadata)
+    try:
+        quality_score = float(metadata.get("quality_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        quality_score = 0.0
+    lexical = source_url or str(metadata.get("source_file") or "") or str(path.resolve())
+    rank = {
+        "canonical": canonical,
+        "stale": stale,
+        "freshness": freshness,
+        "quality_score": quality_score,
+        "content_length": content_length,
+        "lexical": lexical,
+    }
+    return rank, (
+        0 if canonical else 1,
+        1 if stale else 0,
+        -freshness,
+        -quality_score,
+        -content_length,
+        lexical.casefold(),
+        str(path.resolve()),
+    )
+
+
+def _identity_allows_web_duplicate(left: _DedupEntry, right: _DedupEntry) -> bool:
+    left_kind = left.identity["kind"]
+    right_kind = right.identity["kind"]
+    if "document" in {left_kind, right_kind}:
+        return False
+    if left_kind == right_kind == "web":
+        if not (left.identity["canonical_identity_available"] and right.identity["canonical_identity_available"]):
+            return False
+        return (
+            left.identity["canonical_family_url"] == right.identity["canonical_family_url"]
+            and left.identity["language"] == right.identity["language"]
+        )
+    return False
+
+
 def _strip_boilerplate(text: str) -> str:
     """Strip navigation links, headers, footers, and boilerplate text before LSH signature generation."""
     if not text:
@@ -94,11 +416,13 @@ def _strip_boilerplate(text: str) -> str:
         stripped = line.strip()
         if not stripped:
             continue
-        # Skip markdown link lists (e.g. "* [Home](/home)" or "- [Contact](/contact)")
-        if (stripped.startswith("*") or stripped.startswith("-") or stripped.startswith("1.")) and "[" in stripped and "](" in stripped:
-            continue
-        # Skip purely navigation lines (e.g. "Home | About | Contact Us | Privacy Policy")
-        if "|" in stripped and len(stripped.split("|")) > 3:
+        # Preserve Markdown link-list rows. Resource, policy, contact, and
+        # support links are substantive facts; upstream HTML cleaning already
+        # removes actual nav/header/footer elements before conversion.
+        # Markdown tables carry high-value schedules, requirements, and other
+        # row-level facts.  Drop only the syntactic separator/alignment row;
+        # never classify an arbitrary pipe-delimited data row as navigation.
+        if _is_markdown_table_separator(stripped):
             continue
         # Skip social shares
         if any(social in stripped.lower() for social in ["facebook", "twitter", "linkedin", "share this", "follow us"]):
@@ -159,27 +483,36 @@ class DedupFilter(QualityGate):
         num_perm = config.get("dedup_num_perm", 128)
         ngram_size = config.get("dedup_ngram_size", 5)
 
+        threshold = float(threshold)
+        num_perm = int(num_perm)
+        ngram_size = int(ngram_size)
+
         artifact_ids_by_path: Dict[str, List[str]] = {}
+        artifact_metadata_by_path: Dict[str, Dict[str, Any]] = {}
         markdown_artifacts = ctx.find_artifacts(artifact_type="markdown")
         cleaned_artifacts = ctx.find_artifacts(artifact_type="cleaned_html")
         if markdown_artifacts:
             files = []
-            for record in markdown_artifacts:
+            for record in sorted(markdown_artifacts, key=lambda item: item.artifact_id):
                 if not record.local_path:
                     continue
                 path = Path(record.local_path)
                 if path.is_file():
                     files.append(path)
-                    artifact_ids_by_path.setdefault(str(path.resolve()), []).append(record.artifact_id)
+                    resolved = str(path.resolve())
+                    artifact_ids_by_path.setdefault(resolved, []).append(record.artifact_id)
+                    artifact_metadata_by_path.setdefault(resolved, {}).update(dict(record.metadata or {}))
         elif cleaned_artifacts:
             files = []
-            for record in cleaned_artifacts:
+            for record in sorted(cleaned_artifacts, key=lambda item: item.artifact_id):
                 if not record.local_path:
                     continue
                 path = Path(record.local_path)
                 if path.is_file():
                     files.append(path)
-                    artifact_ids_by_path.setdefault(str(path.resolve()), []).append(record.artifact_id)
+                    resolved = str(path.resolve())
+                    artifact_ids_by_path.setdefault(resolved, []).append(record.artifact_id)
+                    artifact_metadata_by_path.setdefault(resolved, {}).update(dict(record.metadata or {}))
         else:
             input_dir = ctx.previous_outputs.get("md_dir") or ctx.previous_outputs.get("cleaned_dir")
             if not input_dir:
@@ -187,21 +520,21 @@ class DedupFilter(QualityGate):
 
             input_dir = Path(input_dir)
             files = list(input_dir.rglob("*.md")) + list(input_dir.rglob("*.html"))
+        files = sorted({Path(path).resolve() for path in files}, key=lambda path: str(path))
         if not files:
             return StageResult.skipped("No files to deduplicate")
 
         logger.info("Dedup filter: %d files, threshold=%.2f", len(files), threshold)
 
-        lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
-        minhashes: Dict[str, MinHash] = {}
-        duplicates: List[str] = []
-        removed_artifact_ids: List[str] = []
-
+        identity_by_url = _load_url_identity(ctx)
+        source_urls_by_path = _load_source_urls_by_path(ctx)
+        entries: List[_DedupEntry] = []
         for fp in files:
             try:
-                text = fp.read_text(encoding="utf-8", errors="replace")
+                raw_content = fp.read_bytes()
             except Exception:
                 continue
+            text = raw_content.decode("utf-8", errors="replace")
 
             cleaned_text = _strip_boilerplate(text)
             ngrams = _word_ngrams(cleaned_text, ngram_size)
@@ -212,33 +545,161 @@ class DedupFilter(QualityGate):
             for ng in ngrams:
                 m.update(ng.encode("utf-8"))
 
-            key = str(fp)
+            resolved = str(fp.resolve())
+            metadata = dict(artifact_metadata_by_path.get(resolved) or {})
+            source_file = _resolved_path_str(metadata.get("source_file"))
+            if source_file and not metadata.get("source_url"):
+                metadata["source_url"] = source_urls_by_path.get(source_file, "")
+            metadata = _enrich_pdf_metadata(metadata)
+            source_url = _normalize_url(metadata.get("source_url"))
+            if source_url and source_url in identity_by_url:
+                enriched = dict(identity_by_url[source_url])
+                enriched.update(metadata)
+                metadata = enriched
 
-            # Check for near-duplicates
-            existing = lsh.query(m)
-            if existing:
-                duplicates.append(key)
-                fp.unlink(missing_ok=True)
-                removed_artifact_ids.extend(artifact_ids_by_path.get(str(fp.resolve()), []))
-                logger.debug("Duplicate: %s (similar to %s)", fp.name, existing[0])
-            else:
-                try:
-                    lsh.insert(key, m)
-                    minhashes[key] = m
-                except ValueError:
-                    # Key already exists
-                    pass
+            normalized = _normalized_content(text)
+            identity = _entry_identity(metadata)
+            rank, rank_key = _rank_entry(fp, metadata, identity, len(normalized))
+            entries.append(
+                _DedupEntry(
+                    path=fp,
+                    metadata=metadata,
+                    raw_content_hash=hashlib.sha256(raw_content).hexdigest(),
+                    normalized_content_hash=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                    shingles=frozenset(_shingle_fingerprint(ng) for ng in ngrams),
+                    minhash=m,
+                    identity=identity,
+                    rank=rank,
+                    rank_key=rank_key,
+                )
+            )
 
+        lsh = MinHashLSH(threshold=threshold, num_perm=num_perm)
+        entries_by_key = {str(entry.path): entry for entry in entries}
+        for key in sorted(entries_by_key):
+            lsh.insert(key, entries_by_key[key].minhash)
+
+        candidate_keys: Dict[str, List[str]] = {}
+        candidate_pairs = set()
+        for key in sorted(entries_by_key):
+            queried = sorted({str(item) for item in lsh.query(entries_by_key[key].minhash) if str(item) != key})
+            candidate_keys[key] = queried
+            candidate_pairs.update(tuple(sorted((key, other))) for other in queried if other in entries_by_key)
+
+        kept_entries: Dict[str, _DedupEntry] = {}
+        decisions: List[Dict[str, Any]] = []
+        exact_pairs_verified = 0
+        source_document_hashes: Dict[str, str] = {}
+        for entry in sorted(entries, key=lambda item: item.rank_key):
+            key = str(entry.path)
+            candidates = [
+                kept_entries[candidate]
+                for candidate in candidate_keys.get(key, [])
+                if candidate in kept_entries
+            ]
+            candidates.sort(key=lambda item: item.rank_key)
+            winner: Optional[_DedupEntry] = None
+            winner_similarity = 0.0
+            winner_reason = ""
+            for candidate in candidates:
+                similarity = _exact_jaccard(entry.shingles, candidate.shingles)
+                exact_pairs_verified += 1
+                if similarity < threshold:
+                    continue
+
+                exact_content = entry.raw_content_hash == candidate.raw_content_hash
+                kinds = {entry.identity["kind"], candidate.identity["kind"]}
+                exact_source_document = False
+                if "document" in kinds:
+                    if kinds == {"document"}:
+                        exact_source_document = _same_exact_source_document(
+                            entry,
+                            candidate,
+                            source_document_hashes,
+                        )
+                    # Distinct source documents must be byte-identical. Text
+                    # extraction and converted Markdown can omit links,
+                    # images, vector graphics, or interactive content.
+                    allowed = kinds == {"document"} and exact_source_document
+                elif kinds == {"generic"}:
+                    # Missing source identity must fail closed for fuzzy matches.
+                    # Only byte-identical Markdown is safe to collapse in
+                    # legacy/unit-test contexts where no artifact metadata exists.
+                    allowed = exact_content
+                else:
+                    # Similarity only identifies candidates. Web deletion
+                    # additionally requires byte-identical Markdown
+                    # and matching canonical family/language identity.
+                    allowed = exact_content and _identity_allows_web_duplicate(entry, candidate)
+                if not allowed:
+                    continue
+
+                winner = candidate
+                winner_similarity = similarity
+                winner_reason = (
+                    "exact_source_document_bytes"
+                    if exact_source_document
+                    else "exact_markdown_bytes"
+                    if exact_content
+                    else "near_duplicate_same_canonical_family_language"
+                    if entry.identity["kind"] == "web"
+                    else "near_duplicate_exact_jaccard"
+                )
+                break
+
+            if winner is None:
+                kept_entries[key] = entry
+                continue
+
+            decisions.append(
+                {
+                    "winner": str(winner.path),
+                    "loser": key,
+                    "winner_source_url": winner.identity.get("source_url", ""),
+                    "loser_source_url": entry.identity.get("source_url", ""),
+                    "reason": winner_reason,
+                    "exact_similarity": round(winner_similarity, 12),
+                    "identity": {
+                        "winner": winner.identity,
+                        "loser": entry.identity,
+                    },
+                    "rank": {
+                        "winner": winner.rank,
+                        "loser": entry.rank,
+                    },
+                    "proof": {
+                        "winner_raw_markdown_sha256": winner.raw_content_hash,
+                        "loser_raw_markdown_sha256": entry.raw_content_hash,
+                        "winner_normalized_markdown_sha256": winner.normalized_content_hash,
+                        "loser_normalized_markdown_sha256": entry.normalized_content_hash,
+                        "source_document_sha256": (
+                            _source_document_hash(winner, source_document_hashes)
+                            if exact_source_document
+                            else ""
+                        ),
+                    },
+                }
+            )
+
+        decisions.sort(key=lambda item: (item["winner"], item["loser"]))
+        duplicates = sorted(item["loser"] for item in decisions)
+        loser_paths = {_resolved_path_str(path) for path in duplicates}
         kept = len(files) - len(duplicates)
-        live_markdown_paths = {
-            str(fp.resolve())
-            for fp in files
-            if fp.is_file()
+        manifest_path = ctx.stage_work_dir / "dedup_manifest.json"
+        for decision in decisions:
+            decision["planned_removed_artifact_ids"] = sorted(
+                artifact_ids_by_path.get(_resolved_path_str(decision["loser"]), [])
+            )
+        planned_markdown_artifact_ids = {
+            artifact_id
+            for decision in decisions
+            for artifact_id in decision["planned_removed_artifact_ids"]
         }
-        dependent_removed = 0
+        dependent_plan_records: List[Tuple[Any, str]] = []
+        dependent_plan: List[Dict[str, Any]] = []
         if ctx.artifact_catalog:
             for record in list(ctx.artifact_catalog.records):
-                if record.artifact_id in removed_artifact_ids:
+                if record.artifact_id in planned_markdown_artifact_ids:
                     continue
                 if record.artifact_type not in {
                     "document_quality_report",
@@ -246,15 +707,77 @@ class DedupFilter(QualityGate):
                     "extracted_image",
                 }:
                     continue
-
                 referenced_markdown = _artifact_markdown_reference(record)
-                if not referenced_markdown or referenced_markdown in live_markdown_paths:
+                if referenced_markdown not in loser_paths:
                     continue
+                dependent_plan_records.append((record, referenced_markdown))
+                dependent_plan.append(
+                    {
+                        "artifact_id": record.artifact_id,
+                        "artifact_type": record.artifact_type,
+                        "local_path": str(record.local_path or ""),
+                        "referenced_markdown": referenced_markdown,
+                    }
+                )
+        dependent_plan.sort(key=lambda item: (item["artifact_id"], item["local_path"]))
+        manifest_payload = {
+            "schema_version": 1,
+            "application_status": "planned",
+            "threshold": threshold,
+            "num_perm": num_perm,
+            "ngram_size": ngram_size,
+            "input_count": len(files),
+            "signature_count": len(entries),
+            "lsh_candidate_pair_count": len(candidate_pairs),
+            "exact_pairs_verified": exact_pairs_verified,
+            "kept_count": kept,
+            "removed_count": len(duplicates),
+            "planned_removed_markdown_paths": duplicates,
+            "planned_dependent_artifacts": dependent_plan,
+            "removed_artifact_ids": [],
+            "dependent_artifacts_removed": [],
+            "decisions": decisions,
+        }
+        # Persist the complete decision plan before the first destructive
+        # operation. If removal is interrupted, the run retains auditable
+        # evidence and can fail closed instead of losing unexplained files.
+        atomic_write_json(manifest_path, manifest_payload)
 
-                if record.local_path:
-                    _remove_artifact_local_path(record.local_path)
-                removed_artifact_ids.append(record.artifact_id)
-                dependent_removed += 1
+        removed_artifact_ids: List[str] = []
+        for duplicate in duplicates:
+            duplicate_path = Path(duplicate)
+            duplicate_path.unlink(missing_ok=True)
+            removed_artifact_ids.extend(artifact_ids_by_path.get(str(duplicate_path.resolve()), []))
+            logger.debug("Duplicate: %s", duplicate)
+
+        dependent_removed = 0
+        dependent_removals: List[Dict[str, Any]] = []
+        for record, referenced_markdown in dependent_plan_records:
+            if record.local_path:
+                _remove_artifact_local_path(record.local_path)
+            removed_artifact_ids.append(record.artifact_id)
+            dependent_removed += 1
+            dependent_removals.append(
+                {
+                    "artifact_id": record.artifact_id,
+                    "artifact_type": record.artifact_type,
+                    "local_path": str(record.local_path or ""),
+                    "referenced_markdown": referenced_markdown,
+                }
+            )
+
+        removed_artifact_ids = sorted(set(removed_artifact_ids))
+        manifest_payload.update(
+            {
+                "application_status": "applied",
+                "removed_artifact_ids": removed_artifact_ids,
+                "dependent_artifacts_removed": sorted(
+                    dependent_removals,
+                    key=lambda item: (item["artifact_id"], item["local_path"]),
+                ),
+            }
+        )
+        atomic_write_json(manifest_path, manifest_payload)
 
         final_mapping: Dict[str, str] = {}
         for record in markdown_artifacts:
@@ -281,9 +804,23 @@ class DedupFilter(QualityGate):
             "passed_count": kept,
             "filtered_count": len(duplicates),
             "filtered_items": duplicates,
+            "dedup_manifest_file": str(manifest_path),
         }
-        artifacts = []
+        artifacts = [
+            ctx.make_artifact(
+                manifest_path,
+                artifact_type="dedup_manifest",
+                role="dedup_decisions",
+                metadata={
+                    "input_count": len(files),
+                    "kept_count": kept,
+                    "removed_count": len(duplicates),
+                    "threshold": threshold,
+                },
+            )
+        ]
         if final_mapping:
+            final_mapping = dict(sorted(final_mapping.items()))
             final_mapping_path = ctx.stage_work_dir / "url_to_md_mapping.json"
             atomic_write_json(final_mapping_path, final_mapping)
             outputs["md_mapping_file"] = str(final_mapping_path)
@@ -313,7 +850,7 @@ class DedupFilter(QualityGate):
                     continue
                 pruned = {
                     str(url): items
-                    for url, items in payload.items()
+                    for url, items in sorted(payload.items(), key=lambda item: str(item[0]))
                     if str(url) in valid_urls
                 }
                 atomic_write_json(Path(path_str), pruned)
@@ -327,6 +864,8 @@ class DedupFilter(QualityGate):
                 "kept": kept,
                 "duplicates_removed": len(duplicates),
                 "dependent_artifacts_removed": dependent_removed,
+                "lsh_candidate_pairs": len(candidate_pairs),
+                "exact_pairs_verified": exact_pairs_verified,
             },
             removed_artifact_ids=removed_artifact_ids,
             artifacts=artifacts,

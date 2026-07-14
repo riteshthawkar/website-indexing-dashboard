@@ -430,7 +430,7 @@ class TestIO:
 
     def test_atomic_write_creates_parent_dirs(self, tmp_dir):
         """Atomic write should create intermediate directories."""
-        from pipeline.core.io import atomic_write_json
+        from pipeline.core.io import atomic_write_json, load_json_safe
         path = tmp_dir / "a" / "b" / "c" / "test.json"
         atomic_write_json(path, [1, 2, 3])
         assert json.loads(path.read_text()) == [1, 2, 3]
@@ -2959,6 +2959,94 @@ except ImportError:
 
 
 class TestDedupFilter:
+    @staticmethod
+    def _run_catalog_case(tmp_dir, specs, *, identity_records=None, force_lsh_collision=False):
+        from datasketch import MinHashLSH
+        from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record
+        from pipeline.core.base import StageContext
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.quality.dedup_filter import DedupFilter
+
+        md_dir = tmp_dir / "markdown"
+        md_dir.mkdir(parents=True)
+        catalog = ArtifactCatalog()
+        mapping = {}
+        paths = {}
+        for index, spec in enumerate(specs):
+            path = md_dir / spec["name"]
+            path.write_text(spec["content"], encoding="utf-8")
+            paths[spec["name"]] = path
+            metadata = dict(spec.get("metadata") or {})
+            mapping_url = spec.get("mapping_url")
+            if mapping_url:
+                source_file = tmp_dir / "downloads" / spec.get("source_name", f"source-{index}.pdf")
+                source_file.parent.mkdir(parents=True, exist_ok=True)
+                if "source_bytes" in spec:
+                    source_file.write_bytes(spec["source_bytes"])
+                elif "source_pdf_text" in spec:
+                    import fitz
+
+                    document = fitz.open()
+                    page = document.new_page()
+                    page.insert_textbox(
+                        fitz.Rect(36, 36, 560, 806),
+                        spec["source_pdf_text"],
+                        fontsize=10,
+                    )
+                    if spec.get("source_pdf_fill") is not None:
+                        page.draw_rect(
+                            fitz.Rect(420, 680, 540, 780),
+                            color=spec["source_pdf_fill"],
+                            fill=spec["source_pdf_fill"],
+                        )
+                    pdf_metadata = dict(spec.get("pdf_metadata") or {})
+                    if pdf_metadata:
+                        document.set_metadata(pdf_metadata)
+                    document.save(source_file)
+                    document.close()
+                metadata["source_file"] = str(source_file)
+                mapping[mapping_url] = str(source_file)
+            catalog.add(
+                build_artifact_record(
+                    artifact_type="markdown",
+                    role="content",
+                    producer_stage=spec.get("producer_stage", "convert_html"),
+                    uri=path.resolve().as_uri(),
+                    local_path=path,
+                    metadata=metadata,
+                    artifact_id=f"md-{index}",
+                )
+            )
+
+        previous_outputs = {"md_dir": str(md_dir)}
+        if identity_records is not None:
+            identity_file = tmp_dir / "canonical_url_identity_map.json"
+            atomic_write_json(identity_file, {"schema_version": 1, "records": identity_records})
+            previous_outputs["url_identity_map_file"] = str(identity_file)
+        if mapping:
+            mapping_file = tmp_dir / "mappings.json"
+            atomic_write_json(mapping_file, mapping)
+            previous_outputs["mapping_file"] = str(mapping_file)
+
+        ctx = StageContext(
+            run_id="test",
+            project_name="test",
+            config={"quality": {"dedup_threshold": 0.85, "dedup_num_perm": 128, "dedup_ngram_size": 5}},
+            work_dir=tmp_dir,
+            previous_outputs=previous_outputs,
+            stage_definition={"type": "quality_gate", "plugin": "dedup_filter"},
+            stage_id="deduplicate_markdown",
+            artifact_catalog=catalog,
+        )
+        if force_lsh_collision:
+            all_keys = [str(path.resolve()) for path in paths.values()]
+            with patch.object(MinHashLSH, "query", return_value=all_keys):
+                result = run_async(DedupFilter().execute(ctx))
+        else:
+            result = run_async(DedupFilter().execute(ctx))
+        manifest = load_json_safe(result.outputs["dedup_manifest_file"])
+        return result, manifest, paths
+
     def test_word_ngrams_normal(self):
         from pipeline.stages.quality.dedup_filter import _word_ngrams
         ngrams = _word_ngrams("the quick brown fox jumps over the lazy dog", 3)
@@ -2979,44 +3067,435 @@ class TestDedupFilter:
         from pipeline.stages.quality.dedup_filter import _word_ngrams
         assert _word_ngrams("   \n\t  ", 5) == []
 
+    def test_strip_boilerplate_preserves_markdown_table_schedule_facts(self):
+        from pipeline.stages.quality.dedup_filter import _strip_boilerplate
+
+        schedule = """| Day | Start | End | Activity |
+| --- | :---: | :---: | ---: |
+| Monday | 08:30 | 10:00 | Women only |
+| Tuesday | 14:00 | 16:30 | Open swim |"""
+        cleaned = _strip_boilerplate(schedule)
+        assert "| Monday | 08:30 | 10:00 | Women only |" in cleaned
+        assert "| Tuesday | 14:00 | 16:30 | Open swim |" in cleaned
+        assert "| --- | :---: | :---: | ---: |" not in cleaned
+
     @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
-    def test_execute_removes_near_duplicates(self, tmp_dir):
-        """Create near-duplicate files and verify dedup removes them."""
-        from pipeline.stages.quality.dedup_filter import DedupFilter
-        from pipeline.core.base import StageContext
+    def test_lsh_collision_below_exact_threshold_is_preserved(self, tmp_dir):
+        first = " ".join([f"shared{i}" for i in range(10)] + [f"alpha{i}" for i in range(30)])
+        second = " ".join([f"shared{i}" for i in range(10)] + [f"beta{i}" for i in range(30)])
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "first.md", "content": first},
+                {"name": "second.md", "content": second},
+            ],
+            force_lsh_collision=True,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert all(path.exists() for path in paths.values())
+        assert manifest["exact_pairs_verified"] >= 1
 
-        md_dir = tmp_dir / "markdown"
-        md_dir.mkdir()
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_winner_is_deterministic_across_artifact_order(self, tmp_dir):
+        content = "Deterministic duplicate content for MBZUAI. " * 30
+        for order in (("z.md", "a.md"), ("a.md", "z.md")):
+            case_dir = tmp_dir / f"case-{order[0][0]}"
+            result, manifest, paths = self._run_catalog_case(
+                case_dir,
+                [{"name": name, "content": content} for name in order],
+            )
+            assert result.outputs["filtered_count"] == 1
+            assert paths["a.md"].exists()
+            assert not paths["z.md"].exists()
+            assert Path(manifest["decisions"][0]["winner"]).name == "a.md"
 
-        # Original document
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_current_canonical_route_beats_stale_route(self, tmp_dir):
+        content = "MBZUAI leadership and institutional governance information. " * 35
+        current = "https://mbzuai.ac.ae/about/leadership"
+        stale = "https://mbzuai.ac.ae/leadership-prev"
+        identities = [
+            {
+                "source_url": current,
+                "canonical_url": current,
+                "canonical_family_url": current,
+                "language": "en",
+            },
+            {
+                "source_url": stale,
+                "canonical_url": stale,
+                "canonical_family_url": current,
+                "language": "en",
+            },
+        ]
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "stale.md", "content": content, "metadata": {"source_url": stale, "source_type": "webpage"}},
+                {"name": "current.md", "content": content, "metadata": {"source_url": current, "source_type": "webpage"}},
+            ],
+            identity_records=identities,
+        )
+        assert result.outputs["filtered_count"] == 1
+        assert paths["current.md"].exists()
+        assert not paths["stale.md"].exists()
+        assert manifest["decisions"][0]["winner_source_url"] == current
+        assert manifest["decisions"][0]["reason"] == "exact_markdown_bytes"
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_arabic_url_locale_overrides_incorrect_english_identity(self, tmp_dir):
+        content = "MBZUAI privacy policy and data protection information. " * 35
+        english = "https://mbzuai.ac.ae/privacy-policy"
+        arabic = "https://mbzuai.ac.ae/ar/privacy-policy-2"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "en.md", "content": content, "metadata": {"source_url": english, "source_type": "webpage"}},
+                {"name": "ar.md", "content": content, "metadata": {"source_url": arabic, "source_type": "webpage"}},
+            ],
+            identity_records=[
+                {"source_url": english, "canonical_url": english, "canonical_family_url": english, "language": "en"},
+                {
+                    "source_url": arabic,
+                    "canonical_url": english,
+                    "canonical_family_url": english,
+                    "language": "en",
+                },
+            ],
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_distinct_faculty_streams_and_document_revisions_are_preserved(self, tmp_dir):
+        shared_web = "Faculty profile research interests publications teaching biography " * 25
+        shared_doc = "Pool access schedule Monday Tuesday Wednesday opening hours " * 30
+        faculty_a = "https://mbzuai.ac.ae/research/faculty/alice"
+        faculty_b = "https://mbzuai.ac.ae/research/faculty/bob"
+        stream_en = "https://mbzuai.ac.ae/study/ai-stream"
+        stream_ar = "https://mbzuai.ac.ae/ar/study/ai-stream"
+        venue_a = "https://mbzuai.ac.ae/campus/auditorium"
+        venue_b = "https://mbzuai.ac.ae/campus/knowledge-centre"
+        identities = [
+            {"source_url": faculty_a, "canonical_url": faculty_a, "canonical_family_url": faculty_a, "language": "en"},
+            {"source_url": faculty_b, "canonical_url": faculty_b, "canonical_family_url": faculty_b, "language": "en"},
+            {"source_url": stream_en, "canonical_url": stream_en, "canonical_family_url": stream_en, "language": "en"},
+            {"source_url": stream_ar, "canonical_url": stream_ar, "canonical_family_url": stream_en, "language": "ar"},
+            {"source_url": venue_a, "canonical_url": venue_a, "canonical_family_url": venue_a, "language": "en"},
+            {"source_url": venue_b, "canonical_url": venue_b, "canonical_family_url": venue_b, "language": "en"},
+        ]
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "alice.md", "content": shared_web + "alice", "metadata": {"source_url": faculty_a, "source_type": "webpage"}},
+                {"name": "bob.md", "content": shared_web + "bob", "metadata": {"source_url": faculty_b, "source_type": "webpage"}},
+                {"name": "stream-en.md", "content": shared_web + "english", "metadata": {"source_url": stream_en, "source_type": "webpage"}},
+                {"name": "stream-ar.md", "content": shared_web + "arabic", "metadata": {"source_url": stream_ar, "source_type": "webpage"}},
+                {"name": "auditorium.md", "content": shared_web + "auditorium", "metadata": {"source_url": venue_a, "source_type": "webpage"}},
+                {"name": "knowledge-centre.md", "content": shared_web + "knowledge centre", "metadata": {"source_url": venue_b, "source_type": "webpage"}},
+                {
+                    "name": "pool-2022.md",
+                    "content": shared_doc + "08:00 10:00",
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/2022/MBZUAI-Pool-Schedule.pdf",
+                    "source_name": "MBZUAI-Pool-Schedule-2022.pdf",
+                    "source_pdf_text": shared_doc + "08:00 10:00",
+                },
+                {
+                    "name": "pool-2024.md",
+                    "content": shared_doc + "09:00 11:00",
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/2024/MBZUAI-Pool-Schedule.pdf",
+                    "source_name": "MBZUAI-Pool-Schedule-2024.pdf",
+                    "source_pdf_text": shared_doc + "09:00 11:00",
+                },
+            ],
+            identity_records=identities,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_text_equal_catalogues_with_different_source_bytes_are_preserved(self, tmp_dir):
+        body = " ".join(
+            f"programme{i} policy{i} course{i} credits{i}"
+            for i in range(80)
+        )
+        source_text = "MBZUAI University Catalogue 2023-2024\n" + body
+        first_markdown = "# Catalogue 2023-2024\n" + body
+        second_markdown = "# MBZUAI University Catalogue 2023-2024\n" + body
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "dated.md",
+                    "content": first_markdown,
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/2023/08/University-Catalogue-2023-24.pdf",
+                    "source_name": "University-Catalogue-2023-24.pdf",
+                    "source_pdf_text": source_text,
+                    "pdf_metadata": {"modDate": "D:20230830162537+04'00'"},
+                },
+                {
+                    "name": "canonical.md",
+                    "content": second_markdown,
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/PDF/University_Catalogue.pdf",
+                    "source_name": "University_Catalogue.pdf",
+                    "source_pdf_text": source_text,
+                    "pdf_metadata": {"modDate": "D:20230912065330Z"},
+                },
+            ],
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert paths["canonical.md"].exists()
+        assert paths["dated.md"].exists()
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_text_equal_pdfs_with_different_graphics_are_preserved(self, tmp_dir):
+        content = "Identical extracted text with a semantic graphic. " * 40
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "red.md",
+                    "content": content,
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/red.pdf",
+                    "source_name": "red.pdf",
+                    "source_pdf_text": content,
+                    "source_pdf_fill": (1.0, 0.0, 0.0),
+                },
+                {
+                    "name": "blue.md",
+                    "content": content,
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/blue.pdf",
+                    "source_name": "blue.pdf",
+                    "source_pdf_text": content,
+                    "source_pdf_fill": (0.0, 0.0, 1.0),
+                },
+            ],
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_exact_revised_catalogue_content_prefers_fresher_pdf_url(self, tmp_dir):
+        content = "Identical normalized catalogue publication content. " * 40
+        source_bytes = b"byte-identical source publication"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "catalogue-2023.md",
+                    "content": content,
+                    "metadata": {
+                        "source_type": "pdf",
+                        "source_url": "https://static.example/2023/08/University-Catalogue.pdf",
+                        "quality_score": 1.0,
+                    },
+                    "mapping_url": "https://static.example/2023/08/University-Catalogue.pdf",
+                    "source_name": "University-Catalogue-2023.pdf",
+                    "source_bytes": source_bytes,
+                },
+                {
+                    "name": "catalogue-2025.md",
+                    "content": content,
+                    "metadata": {
+                        "source_type": "pdf",
+                        "source_url": "https://static.example/2025/05/University-Catalogue.pdf",
+                        "quality_score": 0.9,
+                    },
+                    "mapping_url": "https://static.example/2025/05/University-Catalogue.pdf",
+                    "source_name": "University-Catalogue-2025.pdf",
+                    "source_bytes": source_bytes,
+                },
+            ],
+        )
+        assert result.outputs["filtered_count"] == 1
+        assert paths["catalogue-2025.md"].exists()
+        assert not paths["catalogue-2023.md"].exists()
+        assert manifest["decisions"][0]["winner_source_url"].startswith("https://static.example/2025/")
+        assert manifest["decisions"][0]["reason"] == "exact_source_document_bytes"
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_execute_preserves_nonexact_near_duplicate_web_aliases(self, tmp_dir):
+        """Canonical identity and similarity do not authorize non-exact deletion."""
         original = "MBZUAI is the world's first graduate-level research-based AI university. " * 20
-        (md_dir / "original.md").write_text(original)
-
-        # Near-duplicate (slightly modified — same core content)
         duplicate = "MBZUAI is the world's first graduate-level research-based AI university. " * 20
         duplicate += " Some tiny addition."
-        (md_dir / "duplicate.md").write_text(duplicate)
-
-        # Totally different document — should survive
         different = "The weather in Abu Dhabi is typically hot and sunny throughout the year. " * 20
-        (md_dir / "different.md").write_text(different)
-
-        ctx = StageContext(
-            run_id="test", project_name="test",
-            config={"quality": {"dedup_threshold": 0.85, "dedup_num_perm": 128, "dedup_ngram_size": 5}},
-            work_dir=tmp_dir,
-            previous_outputs={"md_dir": str(md_dir)},
+        canonical = "https://mbzuai.ac.ae/about"
+        alias = "https://mbzuai.ac.ae/about-us"
+        weather = "https://mbzuai.ac.ae/weather"
+        result, _manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "original.md", "content": original, "metadata": {"source_url": canonical, "source_type": "webpage"}},
+                {"name": "duplicate.md", "content": duplicate, "metadata": {"source_url": alias, "source_type": "webpage"}},
+                {"name": "different.md", "content": different, "metadata": {"source_url": weather, "source_type": "webpage"}},
+            ],
+            identity_records=[
+                {"source_url": canonical, "canonical_url": canonical, "canonical_family_url": canonical, "language": "en"},
+                {"source_url": alias, "canonical_url": canonical, "canonical_family_url": canonical, "language": "en"},
+                {"source_url": weather, "canonical_url": weather, "canonical_family_url": weather, "language": "en"},
+            ],
         )
+        assert result.outputs["filtered_count"] == 0
+        assert result.outputs["passed_count"] == 3
+        assert paths["different.md"].exists()
+        assert paths["original.md"].exists()
+        assert paths["duplicate.md"].exists()
 
-        dedup = DedupFilter()
-        result = run_async(dedup.execute(ctx))
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_generic_near_duplicates_without_identity_fail_closed(self, tmp_dir):
+        shared = "Faculty biography research publications teaching awards and service. " * 30
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "faculty-a.md", "content": shared + "Alice leads vision research."},
+                {"name": "faculty-b.md", "content": shared + "Bob leads language research."},
+            ],
+            force_lsh_collision=True,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
 
-        assert result.outputs["filtered_count"] == 1  # one duplicate removed
-        assert result.outputs["passed_count"] == 2  # original + different survived
-        assert (md_dir / "different.md").exists()
-        # One of original/duplicate survives, the other is removed
-        surviving = [(md_dir / "original.md").exists(), (md_dir / "duplicate.md").exists()]
-        assert sum(surviving) == 1
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_distinct_resource_links_are_not_treated_as_exact_content(self, tmp_dir):
+        shared = "Student resources, wellbeing, and campus support information. " * 30
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "scholarships.md",
+                    "content": shared + "\n- [Scholarship support](/students/scholarships)",
+                },
+                {
+                    "name": "emergency.md",
+                    "content": shared + "\n- [Emergency support](/students/emergency-support)",
+                },
+            ],
+            force_lsh_collision=True,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_same_family_case_sensitive_resource_links_fail_closed(self, tmp_dir):
+        shared = "MBZUAI policy information for students and university staff. " * 30
+        current = "https://mbzuai.ac.ae/policies/current"
+        legacy = "https://mbzuai.ac.ae/policies/legacy"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "current.md",
+                    "content": shared + "\n[Download policy](/documents/Policy.PDF)",
+                    "metadata": {"source_url": current, "source_type": "webpage"},
+                },
+                {
+                    "name": "legacy.md",
+                    "content": shared + "\n[Download policy](/documents/policy.pdf)",
+                    "metadata": {"source_url": legacy, "source_type": "webpage"},
+                },
+            ],
+            identity_records=[
+                {
+                    "source_url": current,
+                    "canonical_url": current,
+                    "canonical_family_url": current,
+                    "language": "en",
+                },
+                {
+                    "source_url": legacy,
+                    "canonical_url": legacy,
+                    "canonical_family_url": current,
+                    "language": "en",
+                },
+            ],
+            force_lsh_collision=True,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_web_page_is_not_removed_in_favor_of_document(self, tmp_dir):
+        content = "President address on MBZUAI strategy, students, and research. " * 35
+        web_url = "https://mbzuai.ac.ae/about/president-address"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "president-address.md",
+                    "content": content,
+                    "metadata": {"source_url": web_url, "source_type": "webpage"},
+                },
+                {
+                    "name": "president-address-document.md",
+                    "content": content,
+                    "metadata": {"source_type": "pdf"},
+                    "mapping_url": "https://static.example/president-address.pdf",
+                    "source_name": "president-address.pdf",
+                    "source_bytes": b"president address document",
+                },
+            ],
+            identity_records=[
+                {
+                    "source_url": web_url,
+                    "canonical_url": web_url,
+                    "canonical_family_url": web_url,
+                    "language": "en",
+                }
+            ],
+            force_lsh_collision=True,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_similarity_chain_does_not_authorize_nonexact_deletion(self, tmp_dir):
+        common = [f"common{i}" for i in range(200)]
+        content_a = " ".join(common + [f"a{i}" for i in range(20)])
+        content_b = " ".join(common + [f"a{i}" for i in range(10)] + [f"c{i}" for i in range(10, 20)])
+        content_c = " ".join(common + [f"c{i}" for i in range(20)])
+        family = "https://mbzuai.ac.ae/example-family"
+        urls = [f"https://mbzuai.ac.ae/example-{suffix}" for suffix in "abc"]
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": f"{suffix}.md",
+                    "content": content,
+                    "metadata": {"source_url": url, "source_type": "webpage"},
+                }
+                for suffix, content, url in zip("abc", (content_a, content_b, content_c), urls)
+            ],
+            identity_records=[
+                {
+                    "source_url": url,
+                    "canonical_url": url,
+                    "canonical_family_url": family,
+                    "language": "en",
+                }
+                for url in urls
+            ],
+            force_lsh_collision=True,
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert paths["a.md"].exists()
+        assert paths["b.md"].exists()
+        assert paths["c.md"].exists()
+        assert manifest["decisions"] == []
 
     @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
     def test_execute_keeps_all_unique_files(self, tmp_dir):
@@ -3122,7 +3601,7 @@ class TestDedupFilter:
     def test_execute_prunes_dependent_document_artifacts_for_removed_markdown(self, tmp_dir):
         from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record
         from pipeline.core.base import StageContext
-        from pipeline.core.io import atomic_write_json
+        from pipeline.core.io import atomic_write_json, load_json_safe
         from pipeline.stages.quality.dedup_filter import DedupFilter
 
         md_dir = tmp_dir / "markdown"
@@ -3131,13 +3610,16 @@ class TestDedupFilter:
         dup_md = md_dir / "duplicate.md"
         kept_md.write_text("MBZUAI duplicate content " * 30, encoding="utf-8")
         dup_md.write_text("MBZUAI duplicate content " * 30, encoding="utf-8")
+        source_document = tmp_dir / "downloads" / "same-source.pdf"
+        source_document.parent.mkdir(parents=True)
+        source_document.write_bytes(b"byte-identical source document")
 
         report = tmp_dir / "quality_reports" / "duplicate.validation.json"
         report.parent.mkdir(parents=True)
         atomic_write_json(
             report,
             {
-                "source_file": "/tmp/duplicate.pdf",
+                "source_file": str(source_document),
                 "selected_backend": "docling",
                 "selected_markdown_path": str(dup_md.resolve()),
                 "quarantined": False,
@@ -3162,7 +3644,7 @@ class TestDedupFilter:
                     producer_stage="convert_documents",
                     uri=kept_md.resolve().as_uri(),
                     local_path=kept_md,
-                    metadata={"source_file": "/tmp/kept.pdf", "source_type": "pdf"},
+                    metadata={"source_file": str(source_document), "source_type": "pdf", "quality_score": 1.0},
                     artifact_id="md-kept",
                 ),
                 build_artifact_record(
@@ -3171,7 +3653,7 @@ class TestDedupFilter:
                     producer_stage="convert_documents",
                     uri=dup_md.resolve().as_uri(),
                     local_path=dup_md,
-                    metadata={"source_file": "/tmp/duplicate.pdf", "source_type": "pdf"},
+                    metadata={"source_file": str(source_document), "source_type": "pdf", "quality_score": 0.9},
                     artifact_id="md-dup",
                 ),
                 build_artifact_record(
@@ -3180,7 +3662,7 @@ class TestDedupFilter:
                     producer_stage="convert_documents",
                     uri=report.resolve().as_uri(),
                     local_path=report,
-                    metadata={"source_file": "/tmp/duplicate.pdf"},
+                    metadata={"source_file": str(source_document)},
                     artifact_id="report-dup",
                 ),
                 build_artifact_record(
@@ -3224,6 +3706,118 @@ class TestDedupFilter:
         assert not image.exists()
         assert {"md-dup", "report-dup", "structured-dup", "image-dup"}.issubset(set(result.removed_artifact_ids))
         assert result.metrics["dependent_artifacts_removed"] == 3
+        manifest = load_json_safe(result.outputs["dedup_manifest_file"])
+        assert manifest["application_status"] == "applied"
+        assert manifest["planned_removed_markdown_paths"] == [str(dup_md.resolve())]
+        assert {item["artifact_id"] for item in manifest["planned_dependent_artifacts"]} == {
+            "report-dup",
+            "structured-dup",
+            "image-dup",
+        }
+        assert manifest["dependent_artifacts_removed"] == manifest["planned_dependent_artifacts"]
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_dedup_does_not_prune_unrelated_orphan_artifacts(self, tmp_dir):
+        from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record
+        from pipeline.core.base import StageContext
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.quality.dedup_filter import DedupFilter
+
+        md_dir = tmp_dir / "markdown"
+        md_dir.mkdir()
+        unique_md = md_dir / "unique.md"
+        unique_md.write_text("Unique MBZUAI research content. " * 30, encoding="utf-8")
+        missing_md = md_dir / "already-missing.md"
+        orphan = tmp_dir / "structured_documents" / "orphan.docling.json"
+        orphan.parent.mkdir(parents=True)
+        orphan.write_text('{"orphan": true}', encoding="utf-8")
+
+        catalog = ArtifactCatalog()
+        catalog.extend(
+            [
+                build_artifact_record(
+                    artifact_type="markdown",
+                    role="content",
+                    producer_stage="convert_html",
+                    uri=unique_md.resolve().as_uri(),
+                    local_path=unique_md,
+                    metadata={},
+                    artifact_id="md-unique",
+                ),
+                build_artifact_record(
+                    artifact_type="structured_document",
+                    role="docling_document",
+                    producer_stage="convert_documents",
+                    uri=orphan.resolve().as_uri(),
+                    local_path=orphan,
+                    metadata={"source_markdown_path": str(missing_md.resolve())},
+                    artifact_id="structured-orphan",
+                ),
+            ]
+        )
+        ctx = StageContext(
+            run_id="test",
+            project_name="test",
+            config={"quality": {"dedup_threshold": 0.85, "dedup_num_perm": 128, "dedup_ngram_size": 5}},
+            work_dir=tmp_dir,
+            previous_outputs={"md_dir": str(md_dir)},
+            stage_definition={"type": "quality_gate", "plugin": "dedup_filter"},
+            stage_id="deduplicate_markdown",
+            artifact_catalog=catalog,
+        )
+
+        result = run_async(DedupFilter().execute(ctx))
+        manifest = load_json_safe(result.outputs["dedup_manifest_file"])
+        assert result.outputs["filtered_count"] == 0
+        assert result.metrics["dependent_artifacts_removed"] == 0
+        assert result.removed_artifact_ids == []
+        assert orphan.exists()
+        assert manifest["planned_dependent_artifacts"] == []
+        assert manifest["dependent_artifacts_removed"] == []
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_dedup_manifest_is_written_before_markdown_unlink(self, tmp_dir):
+        from pipeline.core.base import StageContext
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.quality.dedup_filter import DedupFilter
+
+        md_dir = tmp_dir / "markdown"
+        md_dir.mkdir()
+        winner = md_dir / "a.md"
+        loser = md_dir / "z.md"
+        content = "Atomic deduplication decision evidence. " * 40
+        winner.write_text(content, encoding="utf-8")
+        loser.write_text(content, encoding="utf-8")
+        ctx = StageContext(
+            run_id="test",
+            project_name="test",
+            config={"quality": {"dedup_threshold": 0.85, "dedup_num_perm": 128, "dedup_ngram_size": 5}},
+            work_dir=tmp_dir,
+            previous_outputs={"md_dir": str(md_dir)},
+            stage_definition={"type": "quality_gate", "plugin": "dedup_filter"},
+            stage_id="deduplicate_markdown",
+        )
+        manifest_path = ctx.stage_work_dir / "dedup_manifest.json"
+        original_unlink = Path.unlink
+        observed = []
+
+        def guarded_unlink(path, *args, **kwargs):
+            if path.resolve() == loser.resolve():
+                payload = load_json_safe(manifest_path)
+                observed.append(payload)
+                assert payload["application_status"] == "planned"
+                assert payload["planned_removed_markdown_paths"] == [str(loser.resolve())]
+                raise RuntimeError("simulated interruption before unlink")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch.object(Path, "unlink", guarded_unlink):
+            with pytest.raises(RuntimeError, match="simulated interruption"):
+                run_async(DedupFilter().execute(ctx))
+
+        assert len(observed) == 1
+        assert winner.exists()
+        assert loser.exists()
+        assert load_json_safe(manifest_path)["application_status"] == "planned"
 
 
 # ─────────────────────────────────────────────────────────────
