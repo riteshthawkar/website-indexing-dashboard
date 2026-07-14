@@ -303,6 +303,13 @@ formatter:
   minimum_inventory_coverage_ratio: 0.75
   fail_on_critical_coverage: true
   fail_on_inventory_gap: false
+  require_critical_url_markdown_evidence: true
+  critical_url_min_markdown_words: 40
+  critical_url_min_markdown_characters: 240
+  critical_url_min_substantive_words: 20
+  critical_url_navigation_min_links: 8
+  critical_url_max_link_word_ratio: 0.60
+  critical_url_markdown_read_max_bytes: 2000000
   critical_url_patterns:
     - "/about/office-of-the-president/?$"
     - "/about/leadership"

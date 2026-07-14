@@ -201,6 +201,259 @@ def test_student_resources_critical_pattern_is_route_exact():
     assert exact_match["missing_critical_count"] == 0
 
 
+def test_canonical_metadata_honors_robots_noindex_directives():
+    from pipeline.core.mbzuai_indexing import canonicalize_page_metadata
+
+    canonical = canonicalize_page_metadata(
+        {
+            "https://mbzuai.ac.ae/student-resources": {
+                "url": "https://mbzuai.ac.ae/student-resources",
+                "robots": "follow",
+                "meta_tags": {"robots": ["index, follow", "NOINDEX, follow"]},
+            }
+        }
+    )
+
+    record = canonical["https://mbzuai.ac.ae/student-resources"]
+    assert record["indexable"] is False
+    assert record["index_exclusion_reason"] == "robots_noindex"
+    assert record["robots_noindex"] is True
+    assert "noindex" in record["robots_directives"]
+
+
+def test_canonical_metadata_honors_top_level_x_robots_tag():
+    from pipeline.core.mbzuai_indexing import canonicalize_page_metadata
+
+    canonical = canonicalize_page_metadata(
+        {
+            "https://mbzuai.ac.ae/private-preview": {
+                "url": "https://mbzuai.ac.ae/private-preview",
+                "x-robots-tag": "noindex, nofollow",
+            }
+        }
+    )
+
+    record = canonical["https://mbzuai.ac.ae/private-preview"]
+    assert record["indexable"] is False
+    assert record["index_exclusion_reason"] == "robots_noindex"
+
+
+def test_coverage_gate_distinguishes_missing_from_unhealthy_critical_route(tmp_path):
+    pattern = r"/student-resources/?$"
+    failure_manifest = {
+        "hard_failure_count": 0,
+        "expected_site_inventory_count": 0,
+        "inventory_coverage_ratio": None,
+        "cohort_evidence_errors": [],
+        "failed_urls": [],
+    }
+
+    missing = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/student-resources/campus-facilities": {
+                "indexable": True,
+            }
+        },
+        failure_manifest=failure_manifest,
+        formatter_config={"critical_url_patterns": [pattern]},
+    )
+    unhealthy = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/student-resources": {
+                "indexable": True,
+                "markdown_path": str(tmp_path / "missing.md"),
+            }
+        },
+        failure_manifest=failure_manifest,
+        formatter_config={"critical_url_patterns": [pattern]},
+    )
+
+    assert missing["missing_critical_count"] == 1
+    assert missing["unhealthy_critical_count"] == 0
+    assert unhealthy["missing_critical_count"] == 0
+    assert unhealthy["unhealthy_critical_count"] == 1
+    evidence = unhealthy["unhealthy_critical_patterns"][0]["unhealthy_matches"][0]
+    assert evidence["artifact_status"] == "missing"
+    assert evidence["reasons"] == ["missing_markdown_artifact"]
+
+
+def test_coverage_gate_rejects_noindex_critical_route_with_substantive_markdown(tmp_path):
+    markdown_path = tmp_path / "student-resources.md"
+    markdown_path.write_text(
+        " ".join(["Official student resources and campus support information."] * 30),
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/student-resources": {
+                "indexable": False,
+                "index_exclusion_reason": "robots_noindex",
+                "robots": "noindex, follow",
+                "markdown_path": str(markdown_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={"critical_url_patterns": [r"/student-resources/?$"]},
+    )
+
+    assert gate["missing_critical_count"] == 0
+    assert gate["unhealthy_critical_count"] == 1
+    evidence = gate["unhealthy_critical_patterns"][0]["unhealthy_matches"][0]
+    assert evidence["reasons"] == ["robots_noindex"]
+    assert gate["ok"] is False
+
+
+def test_coverage_gate_rejects_failed_http_status_with_substantive_markdown(tmp_path):
+    markdown_path = tmp_path / "contact.md"
+    markdown_path.write_text(
+        " ".join(["Official university contact and visitor information."] * 30),
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/about/contact": {
+                "status_code": "404",
+                "indexable": True,
+                "markdown_path": str(markdown_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={"critical_url_patterns": [r"/about/contact/?$"]},
+    )
+
+    evidence = gate["unhealthy_critical_patterns"][0]["unhealthy_matches"][0]
+    assert evidence["status_code"] == 404
+    assert evidence["reasons"] == ["http_status_404"]
+    assert gate["ok"] is False
+
+
+def test_coverage_gate_rejects_thin_navigation_heavy_markdown(tmp_path):
+    markdown_path = tmp_path / "student-resources.md"
+    links = " ".join(
+        f"[Student service number {index}](https://mbzuai.ac.ae/service-{index})"
+        for index in range(12)
+    )
+    markdown_path.write_text(
+        f"# Student Resources\n\n{links}\n\nHome Student Resources cookies policy.",
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/student-resources": {
+                "indexable": True,
+                "markdown_path": str(markdown_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={
+            "critical_url_patterns": [r"/student-resources/?$"],
+            "critical_url_min_markdown_words": 80,
+            "critical_url_min_markdown_characters": 400,
+            "critical_url_min_substantive_words": 40,
+            "critical_url_navigation_min_links": 8,
+            "critical_url_max_link_word_ratio": 0.55,
+        },
+    )
+
+    evidence = gate["unhealthy_critical_patterns"][0]["unhealthy_matches"][0]
+    assert evidence["reasons"] == ["thin_markdown", "navigation_heavy_markdown"]
+    assert evidence["metrics"]["link_count"] == 12
+    assert evidence["metrics"]["link_word_ratio"] > 0.55
+
+
+def test_coverage_gate_accepts_substantive_indexable_critical_markdown(tmp_path):
+    markdown_path = tmp_path / "student-resources.md"
+    markdown_path.write_text(
+        " ".join(["Official student resources and campus support information."] * 30),
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://mbzuai.ac.ae/student-resources": {
+                "indexable": True,
+                "markdown_path": str(markdown_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={"critical_url_patterns": [r"/student-resources/?$"]},
+    )
+
+    assert gate["missing_critical_count"] == 0
+    assert gate["unhealthy_critical_count"] == 0
+    assert gate["ok"] is True
+
+
+def test_stage2_fails_closed_for_present_but_noindex_critical_route(tmp_path):
+    markdown_path = tmp_path / "student-resources.md"
+    markdown_path.write_text(
+        " ".join(["Official student resources and campus support information."] * 30),
+        encoding="utf-8",
+    )
+    page_metadata_file = tmp_path / "page_metadata.json"
+    atomic_write_json(
+        page_metadata_file,
+        {
+            "https://mbzuai.ac.ae/student-resources": {
+                "url": "https://mbzuai.ac.ae/student-resources",
+                "robots": "noindex, follow",
+                "markdown_path": str(markdown_path),
+            }
+        },
+    )
+    ctx = StageContext(
+        run_id="stage2-critical-health-fail-closed",
+        project_name="mbzuai_main",
+        config={
+            "formatter": {
+                "critical_url_patterns": [r"/student-resources/?$"],
+                "fail_on_critical_coverage": True,
+            }
+        },
+        work_dir=tmp_path,
+        previous_outputs={"page_metadata_file": str(page_metadata_file)},
+        stage_definition={"type": "formatter", "plugin": "mbzuai_index_readiness"},
+        stage_id="prepare_mbzuai_index",
+    )
+
+    result = asyncio.run(readiness_module.MBZUAIIndexReadinessFormatter().execute(ctx))
+
+    assert result.status is StageStatus.FAILED
+    assert "missing_critical=0" in str(result.error_message)
+    assert "unhealthy_critical=1" in str(result.error_message)
+    gate = readiness_module.load_json_safe(
+        tmp_path
+        / "stage_outputs"
+        / "prepare_mbzuai_index"
+        / "index_coverage_gate.json"
+    )
+    assert gate["missing_critical_count"] == 0
+    assert gate["unhealthy_critical_count"] == 1
+
+
 @pytest.mark.parametrize("config_name", ["default", "mbzuai_production"])
 def test_resolved_student_resources_critical_pattern_is_route_exact(config_name):
     config = load_config(config_name)
@@ -217,6 +470,10 @@ def test_resolved_student_resources_critical_pattern_is_route_exact(config_name)
     }
 
     assert student_resources_patterns == [r"/student-resources/?$"]
+    assert config["formatter"]["require_critical_url_markdown_evidence"] is True
+    assert config["formatter"]["critical_url_min_markdown_words"] >= 40
+    assert config["formatter"]["critical_url_min_substantive_words"] >= 20
+    assert config["formatter"]["critical_url_max_link_word_ratio"] <= 0.60
 
     near_match = _coverage_gate(
         canonical_metadata={
@@ -240,3 +497,28 @@ def test_resolved_student_resources_critical_pattern_is_route_exact(config_name)
             formatter_config={"critical_url_patterns": student_resources_patterns},
         )
         assert exact_match["missing_critical_count"] == 0
+
+
+def test_critical_markdown_threshold_config_is_validated_fail_closed():
+    formatter = readiness_module.MBZUAIIndexReadinessFormatter()
+
+    valid = asyncio.run(formatter.validate_config(load_config("mbzuai_production")))
+    invalid = asyncio.run(
+        formatter.validate_config(
+            {
+                "formatter": {
+                    "critical_url_min_markdown_words": -1,
+                    "critical_url_navigation_min_links": 0,
+                    "critical_url_max_link_word_ratio": 1.1,
+                }
+            }
+        )
+    )
+
+    assert valid == []
+    assert "formatter.critical_url_min_markdown_words must be >= 0" in invalid
+    assert "formatter.critical_url_navigation_min_links must be >= 1" in invalid
+    assert (
+        "formatter.critical_url_max_link_word_ratio must be between 0 and 1"
+        in invalid
+    )

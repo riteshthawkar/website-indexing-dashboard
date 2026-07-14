@@ -2444,13 +2444,83 @@ class TestQualityScorer:
 
     def test_detects_login_wall_case_insensitive(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
-        text = "PLEASE LOG IN to access this content. " * 5
+        text = "PLEASE LOG IN to access this protected content."
         assert _check_quality(text, 10, True) == "login_wall"
 
     def test_detects_403_forbidden(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
-        text = "403 Forbidden - You don't have permission. " * 5
+        text = "403 Forbidden - You don't have permission."
         assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_public_instructions_can_say_please_log_in(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Commencement information</h1>
+        <p>{intro}</p><p>An account with the university gown supplier has been
+        created on your behalf. Please log in and place your order, following
+        the attached instructions.</p></main></body></html>""".format(
+            intro="Public graduation guidance for students and families. " * 20
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_public_article_can_discuss_authentication_required(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Authentication design research</h1>
+        <p>{article}</p><p>The phrase authentication required is one response
+        studied by the researchers.</p></main></body></html>""".format(
+            article="Public research article content with evidence and analysis. " * 20
+        )
+        assert _check_quality(text, 100, True) is None
+
+    @pytest.mark.parametrize(
+        "wall_text",
+        [
+            "Please log in with your institutional credentials to continue.",
+            "Please log in to your account.",
+            "Login required to view this page.",
+        ],
+    )
+    def test_detects_bounded_login_wall_responses(self, wall_text):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        assert _check_quality(wall_text, 10, True) == "login_wall"
+
+    def test_detects_login_wall_heading_with_account_continuation(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "<html><body><main><h1>Please log in to your account</h1></main></body></html>"
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_public_first_paragraph_login_instruction_is_not_a_wall(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main>
+        <p>Please log in to access this protected resource.</p>
+        <p>{content}</p></main></body></html>""".format(
+            content="Public instructions for university users and visitors. " * 30
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_public_first_paragraph_authentication_article_is_not_a_wall(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main>
+        <p>Authentication required: design patterns for public APIs.</p>
+        <p>{content}</p></main></body></html>""".format(
+            content="Public research analysis with examples and evidence. " * 30
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_public_parking_rule_is_not_an_access_wall(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Campus parking</h1>
+        <p>You are not authorized to park on campus without a permit.</p>
+        <p>{content}</p></main></body></html>""".format(
+            content="Public parking rules and visitor guidance. " * 20
+        )
+        assert _check_quality(text, 100, True) is None
 
     def test_detects_short_access_denied_page(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
@@ -2512,6 +2582,106 @@ class TestQualityScorer:
         </body></html>""".format(navigation="Navigation content. " * 200)
         assert _check_quality(text, 100, True) == "login_wall"
 
+    def test_detects_nested_access_denied_shell(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><div><div>
+        Access denied. Contact your administrator.
+        </div></div></main></body></html>"""
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_h3_access_denied_heading(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "<html><body><main><h3>Access denied</h3></main></body></html>"
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_markdown_portal_heading_with_login_response(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "# Account portal\n\nPlease sign in to continue."
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_primary_login_form_with_bare_heading(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><nav>{navigation}</nav><main>
+        <h1>Sign in</h1><form action="/login"><input type="password"></form>
+        </main></body></html>""".format(navigation="Navigation. " * 200)
+        assert _check_quality(text, 100, True) == "login_wall"
+
+    def test_detects_short_primary_login_form_without_marker(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Member access</h1>
+        <form><label>Username<input></label><label>Password
+        <input type="password"></label><button>Continue</button></form>
+        </main></body></html>"""
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    @pytest.mark.parametrize("response", ["Access denied.", "Authentication required."])
+    def test_detects_branded_short_access_shell(self, response):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = f"""<html><body><main><h1>University SSO</h1>
+        <div><p>{response}</p></div></main></body></html>"""
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_nested_login_response_near_form(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>University SSO</h1><section>
+        <div><p>Please sign in to continue.</p></div>
+        <div><form action="/login"><input type="password"></form></div>
+        </section></main></body></html>"""
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_waf_reference_response(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "403 Forbidden. Reference ID 12345. Contact your administrator."
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_branded_markdown_login_response(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "# University SSO\n\nPlease sign in to continue."
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_global_navigation_login_widget_does_not_poison_public_page(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><nav><p>Please log in to your account.</p>
+        <form action="/login"><input type="password"></form></nav>
+        <main><h1>Public university information</h1><p>{content}</p></main>
+        </body></html>""".format(content="Substantive public content. " * 50)
+        assert _check_quality(text, 100, True) is None
+
+    def test_custom_login_widget_does_not_poison_public_page(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><div class="account-widget">
+        <h2>Sign in</h2><form action="/login"><input type="password"></form>
+        </div><article><h1>Public information</h1><p>{content}</p></article>
+        </main></body></html>""".format(content="Substantive public content. " * 50)
+        assert _check_quality(text, 100, True) is None
+
+    @pytest.mark.parametrize(
+        "subheading",
+        ["Sign in", "Access denied", "403 Forbidden", "404 Error"],
+    )
+    def test_long_public_subheading_is_not_a_wall_or_error(self, subheading):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>HTTP response handbook</h1>
+        <p>{content}</p><h2>{subheading}</h2>
+        <p>This section documents the response for developers.</p>
+        </main></body></html>""".format(
+            content="Substantive public documentation and examples. " * 50,
+            subheading=subheading,
+        )
+        assert _check_quality(text, 100, True) is None
+
     def test_large_public_article_can_discuss_unauthorized_access(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
 
@@ -2564,14 +2734,64 @@ class TestQualityScorer:
 
     def test_detects_error_page_500(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
-        text = "500 Internal Server Error occurred. " * 5
+        text = "# 500 Internal Server Error\n\nPlease try again later."
         assert _check_quality(text, 10, True) == "error_page"
+
+    def test_detects_plain_500_error_response(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        assert _check_quality("500 Internal Server Error occurred.", 10, True) == "error_page"
+
+    @pytest.mark.parametrize(
+        "error_html",
+        [
+            "<main><h1>Error 404</h1><p>The page does not exist.</p></main>",
+            "<main><h1>Oops!</h1><p>Page not found.</p><p>The URL may be incorrect.</p></main>",
+            "<main><h1>503 Service Unavailable</h1><p>Please try again later.</p></main>",
+        ],
+    )
+    def test_detects_branded_structural_error_pages(self, error_html):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        assert _check_quality(error_html, 10, True) == "error_page"
+
+    @pytest.mark.parametrize(
+        "error_text",
+        [
+            "Page not found. The URL may be incorrect. Visit the homepage or contact support.",
+            "500 Internal Server Error nginx",
+            "# MBZUAI\n\n## Page not found\n\nThe URL may be incorrect.",
+        ],
+    )
+    def test_detects_extended_plain_error_shells(self, error_text):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        assert _check_quality(error_text, 10, True) == "error_page"
 
     def test_error_pages_detected_even_when_login_detection_disabled(self):
         """Error patterns are always checked regardless of detect_login flag."""
         from pipeline.stages.quality.quality_scorer import _check_quality
-        text = "Page not found - the URL may be incorrect. " * 5
+        text = "# Page not found\n\nThe URL may be incorrect."
         assert _check_quality(text, 10, False) == "error_page"
+
+    def test_public_article_can_discuss_error_responses(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Reliable web services</h1>
+        <p>An HTTP 404 error and service unavailable response have different causes.</p>
+        <p>{content}</p></main></body></html>""".format(
+            content="Public engineering article with analysis and examples. " * 30
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_plain_error_incident_sentence_is_not_an_error_page(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = (
+            "A 500 Internal Server Error occurred during the incident. "
+            "This engineering report explains the cause and remediation."
+        )
+        assert _check_quality(text, 50, True) is None
 
     def test_login_skipped_when_disabled(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
@@ -2598,9 +2818,13 @@ class TestQualityScorer:
         # Too short — should be deleted
         (md_dir / "short.md").write_text("tiny")
         # Login wall — should be deleted
-        (md_dir / "login.md").write_text("Please sign in to continue viewing. " * 5)
+        (md_dir / "login.md").write_text(
+            "# Sign in\n\nPlease sign in to continue viewing this protected resource."
+        )
         # 404 — should be deleted
-        (md_dir / "error.md").write_text("Page not found - this page does not exist. " * 5)
+        (md_dir / "error.md").write_text(
+            "# Page not found\n\nThis page does not exist. Please check the URL."
+        )
 
         ctx = StageContext(
             run_id="test", project_name="test",
@@ -14315,10 +14539,16 @@ class TestMBZLegacyVectorStoreFormatterQualityMetadata:
 
 
 class TestMBZUAIIndexReadiness:
-    def test_inventory_coverage_excludes_intentional_url_exclusions(self):
+    def test_inventory_coverage_excludes_intentional_url_exclusions(self, tmp_dir):
         from pipeline.stages.formatters.mbzuai_index_readiness_formatter import (
             _coverage_gate,
             _failure_manifest,
+        )
+
+        markdown_path = tmp_dir / "study.md"
+        markdown_path.write_text(
+            " ".join(["Official admissions requirements and program details."] * 20),
+            encoding="utf-8",
         )
 
         runtime_state = {
@@ -14350,6 +14580,7 @@ class TestMBZUAIIndexReadiness:
             canonical_metadata={
                 "https://mbzuai.ac.ae/study/graduate-admission-process": {
                     "indexable": True,
+                    "markdown_path": str(markdown_path),
                 }
             },
             failure_manifest=failure_manifest,

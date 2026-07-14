@@ -11,7 +11,7 @@ import logging
 import re
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Mapping, Optional
 
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
@@ -21,6 +21,7 @@ from pipeline.core.mbzuai_indexing import (
     canonicalize_link_graph,
     canonicalize_page_metadata,
     compare_page_hashes,
+    has_robots_noindex,
 )
 from pipeline.core.registry import register_stage
 from pipeline.core.sitemap_cohorts import (
@@ -49,6 +50,197 @@ DEFAULT_CRITICAL_URL_PATTERNS = [
     r"/study/",
     r"/student-resources/?$",
 ]
+DEFAULT_CRITICAL_URL_MIN_MARKDOWN_WORDS = 40
+DEFAULT_CRITICAL_URL_MIN_MARKDOWN_CHARACTERS = 240
+DEFAULT_CRITICAL_URL_MIN_SUBSTANTIVE_WORDS = 20
+DEFAULT_CRITICAL_URL_NAVIGATION_MIN_LINKS = 8
+DEFAULT_CRITICAL_URL_MAX_LINK_WORD_RATIO = 0.60
+DEFAULT_CRITICAL_URL_MARKDOWN_READ_MAX_BYTES = 2_000_000
+
+_MARKDOWN_IMAGE_RE = re.compile(r"!\[[^\]]*\]\([^)]+\)")
+_MARKDOWN_LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\([^)]+\)")
+_MARKDOWN_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_MARKDOWN_WORD_RE = re.compile(r"[^\W_]+(?:['’/-][^\W_]+)*", re.UNICODE)
+
+
+def _critical_markdown_metrics(markdown: str) -> Dict[str, Any]:
+    link_texts = _MARKDOWN_LINK_RE.findall(markdown or "")
+    without_images = _MARKDOWN_IMAGE_RE.sub(" ", markdown or "")
+    plain = _MARKDOWN_LINK_RE.sub(r"\1", without_images)
+    plain = _MARKDOWN_HTML_COMMENT_RE.sub(" ", plain)
+    plain = re.sub(r"<[^>]+>", " ", plain)
+    plain = re.sub(r"[#*_`>|~]+", " ", plain)
+    plain = " ".join(plain.split()).strip()
+    words = _MARKDOWN_WORD_RE.findall(plain)
+    link_words = _MARKDOWN_WORD_RE.findall(" ".join(link_texts))
+    word_count = len(words)
+    link_word_count = len(link_words)
+    return {
+        "character_count": len(plain),
+        "word_count": word_count,
+        "link_count": len(link_texts),
+        "link_word_count": link_word_count,
+        "substantive_word_count": max(0, word_count - link_word_count),
+        "link_word_ratio": round(link_word_count / max(1, word_count), 6),
+    }
+
+
+def _critical_url_health(
+    url: str,
+    metadata: Mapping[str, Any],
+    formatter_config: Mapping[str, Any],
+    *,
+    evidence_base_dir: Path | None = None,
+) -> Dict[str, Any]:
+    reasons: List[str] = []
+    status_code: int | None = None
+    try:
+        status_code = int(metadata.get("status_code"))
+    except (TypeError, ValueError):
+        pass
+    if status_code is not None and status_code >= 400:
+        reasons.append(f"http_status_{status_code}")
+
+    robots_noindex = bool(metadata.get("robots_noindex")) or has_robots_noindex(metadata)
+    indexable = bool(metadata.get("indexable", True))
+    exclusion_reason = str(metadata.get("index_exclusion_reason") or "")
+    if robots_noindex:
+        reasons.append("robots_noindex")
+    elif not indexable:
+        reasons.append("non_indexable")
+
+    semantic_evidence_required = bool(
+        formatter_config.get("require_critical_url_markdown_evidence", True)
+    )
+    assessment: Dict[str, Any] = {
+        "url": url,
+        "healthy": False,
+        "status_code": status_code,
+        "indexable": indexable,
+        "index_exclusion_reason": exclusion_reason,
+        "robots_noindex": robots_noindex,
+        "semantic_evidence_required": semantic_evidence_required,
+        "markdown_path": str(metadata.get("markdown_path") or ""),
+        "reasons": reasons,
+        "metrics": {},
+    }
+    if not semantic_evidence_required:
+        assessment["healthy"] = not reasons
+        return assessment
+
+    path_text = str(metadata.get("markdown_path") or "").strip()
+    if not path_text:
+        reasons.append("missing_markdown_artifact")
+        assessment["artifact_status"] = "not_declared"
+        return assessment
+
+    markdown_path = Path(path_text).expanduser()
+    if not markdown_path.is_absolute() and evidence_base_dir is not None:
+        markdown_path = evidence_base_dir / markdown_path
+    markdown_path = markdown_path.resolve()
+    assessment["markdown_path"] = str(markdown_path)
+    if not markdown_path.is_file():
+        reasons.append("missing_markdown_artifact")
+        assessment["artifact_status"] = "missing"
+        return assessment
+
+    max_read_bytes = max(
+        1,
+        int(
+            formatter_config.get(
+                "critical_url_markdown_read_max_bytes",
+                DEFAULT_CRITICAL_URL_MARKDOWN_READ_MAX_BYTES,
+            )
+        ),
+    )
+    try:
+        artifact_bytes = markdown_path.stat().st_size
+        with markdown_path.open("rb") as handle:
+            raw_markdown = handle.read(max_read_bytes + 1)
+    except OSError:
+        reasons.append("unreadable_markdown_artifact")
+        assessment["artifact_status"] = "unreadable"
+        return assessment
+
+    truncated = len(raw_markdown) > max_read_bytes
+    markdown = raw_markdown[:max_read_bytes].decode("utf-8", errors="replace")
+    assessment["artifact_status"] = "readable"
+    metrics = _critical_markdown_metrics(markdown)
+    metrics.update(
+        {
+            "artifact_bytes": artifact_bytes,
+            "analyzed_bytes": min(len(raw_markdown), max_read_bytes),
+            "analysis_truncated": truncated,
+        }
+    )
+    assessment["metrics"] = metrics
+    if not markdown.strip():
+        reasons.append("empty_markdown")
+        return assessment
+
+    min_words = max(
+        0,
+        int(
+            formatter_config.get(
+                "critical_url_min_markdown_words",
+                DEFAULT_CRITICAL_URL_MIN_MARKDOWN_WORDS,
+            )
+        ),
+    )
+    min_characters = max(
+        0,
+        int(
+            formatter_config.get(
+                "critical_url_min_markdown_characters",
+                DEFAULT_CRITICAL_URL_MIN_MARKDOWN_CHARACTERS,
+            )
+        ),
+    )
+    min_substantive_words = max(
+        0,
+        int(
+            formatter_config.get(
+                "critical_url_min_substantive_words",
+                DEFAULT_CRITICAL_URL_MIN_SUBSTANTIVE_WORDS,
+            )
+        ),
+    )
+    navigation_min_links = max(
+        1,
+        int(
+            formatter_config.get(
+                "critical_url_navigation_min_links",
+                DEFAULT_CRITICAL_URL_NAVIGATION_MIN_LINKS,
+            )
+        ),
+    )
+    max_link_word_ratio = float(
+        formatter_config.get(
+            "critical_url_max_link_word_ratio",
+            DEFAULT_CRITICAL_URL_MAX_LINK_WORD_RATIO,
+        )
+    )
+    assessment["thresholds"] = {
+        "minimum_word_count": min_words,
+        "minimum_character_count": min_characters,
+        "minimum_substantive_word_count": min_substantive_words,
+        "navigation_minimum_link_count": navigation_min_links,
+        "maximum_link_word_ratio": max_link_word_ratio,
+    }
+    if (
+        metrics["word_count"] < min_words
+        or metrics["character_count"] < min_characters
+        or metrics["substantive_word_count"] < min_substantive_words
+    ):
+        reasons.append("thin_markdown")
+    if (
+        metrics["link_count"] >= navigation_min_links
+        and metrics["link_word_ratio"] > max_link_word_ratio
+    ):
+        reasons.append("navigation_heavy_markdown")
+
+    assessment["healthy"] = not reasons
+    return assessment
 
 
 def _load_crawler_runtime_state(ctx: StageContext) -> Dict[str, Any]:
@@ -154,6 +346,7 @@ def _coverage_gate(
     canonical_metadata: Dict[str, Dict[str, Any]],
     failure_manifest: Dict[str, Any],
     formatter_config: Dict[str, Any],
+    evidence_base_dir: Path | None = None,
 ) -> Dict[str, Any]:
     patterns = formatter_config.get("critical_url_patterns") or DEFAULT_CRITICAL_URL_PATTERNS
     compiled_patterns = [
@@ -161,10 +354,15 @@ def _coverage_gate(
         for pattern in patterns
         if str(pattern or "").strip()
     ]
-    indexed_urls = [url for url, meta in canonical_metadata.items() if bool(meta.get("indexable", True))]
     missing_critical = []
+    unhealthy_critical = []
     for pattern, regex in compiled_patterns:
-        if not any(regex.search(url) for url in indexed_urls):
+        matched_records = [
+            (url, metadata)
+            for url, metadata in canonical_metadata.items()
+            if regex.search(url)
+        ]
+        if not matched_records:
             failed_matches = [
                 item for item in failure_manifest.get("failed_urls", [])
                 if regex.search(str(item.get("url") or ""))
@@ -174,6 +372,28 @@ def _coverage_gate(
                     "pattern": str(pattern),
                     "failed_matches": failed_matches[:10],
                     "failed_match_count": len(failed_matches),
+                }
+            )
+            continue
+
+        match_assessments = [
+            _critical_url_health(
+                url,
+                metadata,
+                formatter_config,
+                evidence_base_dir=evidence_base_dir,
+            )
+            for url, metadata in matched_records
+        ]
+        healthy_matches = [item for item in match_assessments if item["healthy"]]
+        if not healthy_matches:
+            unhealthy_critical.append(
+                {
+                    "pattern": str(pattern),
+                    "matched_count": len(match_assessments),
+                    "healthy_match_count": 0,
+                    "unhealthy_match_count": len(match_assessments),
+                    "unhealthy_matches": match_assessments[:10],
                 }
             )
 
@@ -202,10 +422,15 @@ def _coverage_gate(
     )
     cohort_evidence_errors = list(failure_manifest.get("cohort_evidence_errors") or [])
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "critical_url_patterns": [str(pattern) for pattern in patterns],
+        "require_critical_url_markdown_evidence": bool(
+            formatter_config.get("require_critical_url_markdown_evidence", True)
+        ),
         "missing_critical_patterns": missing_critical,
         "missing_critical_count": len(missing_critical),
+        "unhealthy_critical_patterns": unhealthy_critical,
+        "unhealthy_critical_count": len(unhealthy_critical),
         "expected_site_inventory_count": expected_inventory,
         "effective_expected_inventory_count": failure_manifest.get("effective_expected_inventory_count", expected_inventory),
         "minimum_inventory_coverage_ratio": minimum_ratio,
@@ -221,6 +446,7 @@ def _coverage_gate(
         "inventory_gap": inventory_gap,
         "ok": (
             not missing_critical
+            and not unhealthy_critical
             and not inventory_gap
             and not hard_failure_gap
             and not cohort_evidence_errors
@@ -232,6 +458,37 @@ def _coverage_gate(
 class MBZUAIIndexReadinessFormatter(FormatterStage):
     name = "mbzuai_index_readiness"
     description = "Canonicalizes MBZUAI page metadata and writes index manifests before vector formatting."
+
+    async def validate_config(self, config: Dict[str, Any]) -> List[str]:
+        formatter_config = config.get("formatter") if isinstance(config.get("formatter"), dict) else {}
+        errors: List[str] = []
+        integer_minimums = {
+            "critical_url_min_markdown_words": 0,
+            "critical_url_min_markdown_characters": 0,
+            "critical_url_min_substantive_words": 0,
+            "critical_url_navigation_min_links": 1,
+            "critical_url_markdown_read_max_bytes": 1,
+        }
+        for key, minimum in integer_minimums.items():
+            if key not in formatter_config:
+                continue
+            try:
+                value = int(formatter_config[key])
+            except (TypeError, ValueError):
+                errors.append(f"formatter.{key} must be an integer")
+                continue
+            if value < minimum:
+                errors.append(f"formatter.{key} must be >= {minimum}")
+
+        if "critical_url_max_link_word_ratio" in formatter_config:
+            try:
+                ratio = float(formatter_config["critical_url_max_link_word_ratio"])
+            except (TypeError, ValueError):
+                errors.append("formatter.critical_url_max_link_word_ratio must be numeric")
+            else:
+                if not 0.0 <= ratio <= 1.0:
+                    errors.append("formatter.critical_url_max_link_word_ratio must be between 0 and 1")
+        return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
         page_metadata_file = ctx.previous_outputs.get("page_metadata_file")
@@ -295,6 +552,7 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
             canonical_metadata=canonical_metadata,
             failure_manifest=crawl_failure_manifest,
             formatter_config=ctx.formatter_config,
+            evidence_base_dir=ctx.work_dir,
         )
 
         manifest = {
@@ -333,6 +591,7 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
             "coverage_gate": {
                 "ok": coverage_gate["ok"],
                 "missing_critical_count": coverage_gate["missing_critical_count"],
+                "unhealthy_critical_count": coverage_gate["unhealthy_critical_count"],
                 "inventory_gap": coverage_gate["inventory_gap"],
                 "cohort_evidence_error_count": coverage_gate["cohort_evidence_error_count"],
             },
@@ -357,7 +616,13 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
         fail_on_inventory_gap = bool(ctx.formatter_config.get("fail_on_inventory_gap", False))
         fail_on_hard_failures = bool(ctx.formatter_config.get("fail_on_hard_failure_gap", False))
         if (
-            (fail_on_critical and coverage_gate["missing_critical_count"])
+            (
+                fail_on_critical
+                and (
+                    coverage_gate["missing_critical_count"]
+                    or coverage_gate["unhealthy_critical_count"]
+                )
+            )
             or (fail_on_inventory_gap and coverage_gate["inventory_gap"])
             or (fail_on_hard_failures and coverage_gate["hard_failure_gap"])
             or coverage_gate["cohort_evidence_error_count"]
@@ -365,6 +630,7 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
             return StageResult.failure(
                 "MBZUAI index coverage gate failed: "
                 f"missing_critical={coverage_gate['missing_critical_count']} "
+                f"unhealthy_critical={coverage_gate['unhealthy_critical_count']} "
                 f"inventory_gap={coverage_gate['inventory_gap']} "
                 f"hard_failure_gap={coverage_gate['hard_failure_gap']} "
                 f"cohort_evidence_errors={coverage_gate['cohort_evidence_error_count']}"
@@ -399,6 +665,7 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
                 "page_link_graph_edges": canonical_graph["stats"]["edge_count"],
                 "crawl_failures": crawl_failure_manifest["failure_count"],
                 "coverage_missing_critical": coverage_gate["missing_critical_count"],
+                "coverage_unhealthy_critical": coverage_gate["unhealthy_critical_count"],
                 "coverage_inventory_gap": int(bool(coverage_gate["inventory_gap"])),
                 "new_pages": change_manifest["new_page_count"],
                 "changed_pages": change_manifest["changed_page_count"],

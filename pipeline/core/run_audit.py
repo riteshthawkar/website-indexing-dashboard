@@ -389,6 +389,7 @@ def _audit_index_coverage_gate(report: RunAuditReport, work_dir: Path) -> None:
                 key: gate.get(key)
                 for key in (
                     "missing_critical_count",
+                    "unhealthy_critical_count",
                     "hard_failure_count",
                     "expected_site_inventory_count",
                     "effective_expected_inventory_count",

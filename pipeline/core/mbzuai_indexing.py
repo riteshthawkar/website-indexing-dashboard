@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
@@ -33,10 +34,57 @@ TRACKING_QUERY_KEYS = {
     "mc_cid",
     "mc_eid",
 }
+ROBOTS_META_KEYS = {
+    "robots",
+    "googlebot",
+    "googlebot-news",
+    "bingbot",
+    "x-robots-tag",
+}
 
 
 def clean_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
+
+
+def _text_values(value: Any) -> List[str]:
+    if isinstance(value, (list, tuple, set)):
+        output: List[str] = []
+        for item in value:
+            output.extend(_text_values(item))
+        return output
+    text = clean_text(value)
+    return [text] if text else []
+
+
+def robots_directives(metadata: Mapping[str, Any] | None) -> List[str]:
+    """Return normalized robots directives declared by page metadata."""
+    metadata = metadata or {}
+    values: List[str] = []
+    for key, value in metadata.items():
+        if clean_text(key).casefold() in ROBOTS_META_KEYS:
+            values.extend(_text_values(value))
+    meta_tags = metadata.get("meta_tags")
+    if isinstance(meta_tags, Mapping):
+        for key, value in meta_tags.items():
+            if clean_text(key).casefold() in ROBOTS_META_KEYS:
+                values.extend(_text_values(value))
+
+    directives: set[str] = set()
+    for value in values:
+        directives.update(
+            token
+            for token in re.split(r"[\s,;]+", value.casefold())
+            if token
+        )
+    return sorted(directives)
+
+
+def has_robots_noindex(metadata: Mapping[str, Any] | None) -> bool:
+    """Return whether page metadata declares the standard noindex behavior."""
+    directives = set(robots_directives(metadata))
+    # The standard ``none`` directive is equivalent to ``noindex, nofollow``.
+    return bool({"noindex", "none"} & directives)
 
 
 def sha1_text(value: str, length: int | None = 40) -> str:
@@ -241,8 +289,21 @@ def canonicalize_page_metadata(page_metadata: Mapping[str, Any] | None) -> Dict[
 
         enriched = dict(raw_metadata)
         page_type = classify_page_type(source_url, {**raw_metadata, "canonical_url": canonical_url})
-        indexable = page_type != "redirect_alias"
-        exclusion_reason = "homepage_redirect_alias" if not indexable else ""
+        declared_robots_directives = robots_directives(raw_metadata)
+        robots_noindex = has_robots_noindex(raw_metadata)
+        source_marked_non_indexable = raw_metadata.get("indexable") is False
+        if page_type == "redirect_alias":
+            indexable = False
+            exclusion_reason = "homepage_redirect_alias"
+        elif robots_noindex:
+            indexable = False
+            exclusion_reason = "robots_noindex"
+        elif source_marked_non_indexable:
+            indexable = False
+            exclusion_reason = clean_text(raw_metadata.get("index_exclusion_reason")) or "source_marked_non_indexable"
+        else:
+            indexable = True
+            exclusion_reason = ""
         enriched.update(
             {
                 "url": source_url,
@@ -257,6 +318,8 @@ def canonicalize_page_metadata(page_metadata: Mapping[str, Any] | None) -> Dict[
                 "page_type": page_type,
                 "indexable": indexable,
                 "index_exclusion_reason": exclusion_reason,
+                "robots_directives": declared_robots_directives,
+                "robots_noindex": robots_noindex,
                 "url_identity_version": 1,
             }
         )

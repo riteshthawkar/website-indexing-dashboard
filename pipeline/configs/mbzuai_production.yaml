@@ -47,6 +47,15 @@ formatter:
   fail_on_critical_coverage: true
   fail_on_inventory_gap: true
   fail_on_hard_failure_gap: true
+  # A critical route counts only when its own crawler-produced Markdown is
+  # indexable and substantive. Child routes cannot satisfy an exact pattern.
+  require_critical_url_markdown_evidence: true
+  critical_url_min_markdown_words: 80
+  critical_url_min_markdown_characters: 400
+  critical_url_min_substantive_words: 40
+  critical_url_navigation_min_links: 8
+  critical_url_max_link_word_ratio: 0.55
+  critical_url_markdown_read_max_bytes: 2000000
 
 # The production sequence is explicit so inherited development profiles cannot
 # move upload ahead of coverage validation or the final knowledge graph.

@@ -18,8 +18,8 @@ from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
 
-# Strong patterns indicating a login wall or access-denied response. These are
-# specific enough to reject whenever they appear in visible page text.
+# Login phrases can also appear in legitimate public instructions or articles.
+# Evaluate them only in a structural wall context, never as page-wide tokens.
 LOGIN_PATTERNS = [
     r"(?i)sign\s*in\s+to\s+continue",
     r"(?i)log\s*in\s+required",
@@ -27,6 +27,47 @@ LOGIN_PATTERNS = [
     r"(?i)authentication\s+required",
     r"(?i)403\s+forbidden",
 ]
+
+_AUTH_OBJECT = (
+    r"(?:this|the|your)?\s*(?:protected|private|restricted|institutional)?\s*"
+    r"(?:account|application|content|page|portal|resource|site)"
+)
+_AUTH_CONTINUATION = (
+    rf"(?:"
+    rf"to\s+continue(?:\s+(?:to\s+)?(?:access|accessing|use|using|view|viewing)"
+    rf"(?:\s+{_AUTH_OBJECT})?)?"
+    rf"|to\s+(?:access|view|open|use)(?:\s+{_AUTH_OBJECT})?"
+    r"|to\s+your\s+account"
+    r"|(?:with|using)\s+(?:your\s+)?(?:institutional\s+)?(?:account|credentials)"
+    r"(?:\s+to\s+continue)?"
+    r")"
+)
+_LOGIN_WALL_MARKER = (
+    rf"(?:"
+    rf"(?:please\s+)?(?:log|sign)\s*in(?:\s+{_AUTH_CONTINUATION})?"
+    rf"|login\s+required(?:\s+to\s+(?:continue|access|view|open|use)(?:\s+{_AUTH_OBJECT})?)?"
+    r"|authentication\s+required(?:\s+to\s+(?:continue|access|view|open|use))?"
+    r"|(?:http\s*)?403\s*[:\-]?\s*forbidden"
+    r")"
+)
+
+LOGIN_WALL_HEADING = re.compile(
+    rf"(?i)^\s*(?:#{{1,6}}\s*)?{_LOGIN_WALL_MARKER}\s*[.!]?\s*$"
+)
+
+LOGIN_WALL_RESPONSE = re.compile(
+    rf"(?i)^\s*{_LOGIN_WALL_MARKER}"
+    r"(?:\s*[.!]\s*|\s*[.!;\-]\s*(?:you\s+(?:do\s+not|don't)\s+have\s+permission|"
+    r"contact\s+(?:the|your)\s+administrator|use\s+your\s+(?:account|credentials)|"
+    r"(?:reference|request)\s+(?:id|number)\s*[:#\-]?\s*[a-z0-9\-]+"
+    r"(?:\s*[.!;\-]\s*contact\s+(?:the|your)\s+administrator)?"
+    r")"
+    r"(?:\s+[^\n]{0,100})?\s*[.!]?)?\s*$"
+)
+
+AUTH_PORTAL_HEADING = re.compile(
+    r"(?i)^\s*(?:#{1,6}\s*)?(?:account\s+portal|login|log\s*in|sign\s*in)\s*[.!]?\s*$"
+)
 
 # These phrases also occur legitimately in articles and JavaScript bundles.
 # Treat them as a wall only in a structural wall context (a leading response
@@ -50,9 +91,13 @@ GENERIC_ACCESS_HEADING = re.compile(
 GENERIC_ACCESS_RESPONSE = re.compile(
     rf"(?i)^\s*{_ACCESS_PREFIX}(?:"
     r"(?:access\s+denied|unauthorized(?:\s+access)?)"
-    r"(?:\s*[.!:;\-]\s*[^\n]{0,160})?"
+    r"(?:\s*[.!;\-]\s*(?:contact\s+(?:the|your)\s+administrator|"
+    r"you\s+(?:do\s+not|don't)\s+have\s+(?:access|permission)|"
+    r"your\s+request\s+(?:cannot|could\s+not)\s+be\s+completed|"
+    r"please\s+(?:log|sign)\s*in)"
+    r"(?:\s+[^\n]{0,100})?\s*[.!]?)?"
     r"|you\s+are\s+not\s+authorized"
-    r"(?:(?:\s+(?:to|for)\b[^\n]{0,160})|(?:\s*[.!:;\-]\s*[^\n]{0,160}))?"
+    r"(?:\s+to\s+(?:access|continue|open|use|view)\b[^\n]{0,120})?"
     r")\s*$"
 )
 
@@ -64,43 +109,178 @@ ERROR_PATTERNS = [
     r"(?i)502\s+bad\s+gateway",
 ]
 
+_ERROR_MARKER = (
+    r"(?:page\s+not\s+found|error\s+404|"
+    r"(?:http\s*)?404(?:\s+error|\s*[:\-]?\s*not\s+found)?|"
+    r"(?:http\s*)?500\s+internal\s+server\s+error|service\s+unavailable|"
+    r"(?:http\s*)?502\s+bad\s+gateway|(?:http\s*)?503\s+service\s+unavailable)"
+)
+
+ERROR_PAGE_HEADING = re.compile(
+    rf"(?i)^\s*(?:#{{1,6}}\s*)?{_ERROR_MARKER}\s*[.!]?\s*$"
+)
+
+ERROR_PAGE_RESPONSE = re.compile(
+    rf"(?i)^\s*{_ERROR_MARKER}"
+    r"(?:\s+(?:occurred|nginx|apache|cloudflare)|"
+    r"\s*[.!;\-]\s*(?:(?:the|this)\s+(?:page|url)\s+(?:does\s+not|doesn't)\s+exist|"
+    r"(?:the\s+)?url\s+may\s+be\s+incorrect|please\s+try\s+again\s+later|"
+    r"the\s+server\s+is\s+temporarily\s+unavailable|(?:an?\s+)?error\s+occurred|"
+    r"occurred)"
+    r"(?:\s*[.!]\s*(?:visit\s+(?:the\s+)?homepage|contact\s+support)"
+    r"(?:\s+or\s+(?:visit\s+(?:the\s+)?homepage|contact\s+support))?)?"
+    r")?\s*[.!]?\s*$"
+)
+
+_WALL_DOMINANT_MAX_CHARS = 1200
+_NON_CONTENT_CONTAINERS = {"aside", "footer", "header", "nav"}
+
 
 def _has_generic_access_marker(text: str) -> bool:
     return any(re.search(pattern, text) for pattern in GENERIC_ACCESS_PATTERNS)
 
 
-def _login_form_has_access_marker(form: Any) -> bool:
-    """Require a marker inside, adjacent to, or tightly wrapping a real login form."""
-    if _has_generic_access_marker(form.get_text(" ", strip=True)):
+def _has_login_wall_marker(text: str) -> bool:
+    return any(re.search(pattern, text) for pattern in LOGIN_PATTERNS)
+
+
+def _matches_wall_heading(text: str) -> bool:
+    return bool(
+        GENERIC_ACCESS_HEADING.fullmatch(text) or LOGIN_WALL_HEADING.fullmatch(text)
+    )
+
+
+def _matches_wall_response(text: str) -> bool:
+    return bool(
+        GENERIC_ACCESS_RESPONSE.fullmatch(text) or LOGIN_WALL_RESPONSE.fullmatch(text)
+    )
+
+
+def _matches_error_heading(text: str) -> bool:
+    return bool(ERROR_PAGE_HEADING.fullmatch(text))
+
+
+def _matches_error_response(text: str) -> bool:
+    return bool(ERROR_PAGE_RESPONSE.fullmatch(text))
+
+
+def _normalized_text(element: Any) -> str:
+    return re.sub(r"\s+", " ", element.get_text(" ", strip=True) or "").strip()
+
+
+def _has_widget_ancestor(form: Any, primary: Any) -> bool:
+    for ancestor in form.parents:
+        if ancestor is primary:
+            break
+        attributes = " ".join(
+            [
+                str(ancestor.get("id") or ""),
+                " ".join(str(item) for item in (ancestor.get("class") or [])),
+                str(ancestor.get("role") or ""),
+            ]
+        )
+        if re.search(r"(?i)\b(?:account-)?widget\b|\bsidebar\b|\bmenu\b", attributes):
+            return True
+    return False
+
+
+def _login_form_has_access_marker(
+    form: Any,
+    *,
+    primary: Any,
+    primary_text_length: int,
+) -> bool:
+    """Identify a primary-content login form without trusting global widgets."""
+    short_shell = primary_text_length <= _WALL_DOMINANT_MAX_CHARS
+    if short_shell:
+        return True
+    if _has_widget_ancestor(form, primary):
+        return False
+
+    form_text = _normalized_text(form)
+    if (
+        _matches_wall_response(form_text)
+        or _has_generic_access_marker(form_text)
+        or _has_login_wall_marker(form_text)
+    ):
         return True
 
     for sibling in (form.find_previous_sibling(), form.find_next_sibling()):
         if sibling is None:
             continue
-        sibling_text = sibling.get_text(" ", strip=True)
-        if GENERIC_ACCESS_HEADING.fullmatch(sibling_text) or GENERIC_ACCESS_RESPONSE.fullmatch(
-            sibling_text
+        sibling_text = _normalized_text(sibling)
+        if (
+            _matches_wall_heading(sibling_text)
+            or _matches_wall_response(sibling_text)
+            or AUTH_PORTAL_HEADING.fullmatch(sibling_text)
         ):
             return True
 
-    parent = form.parent
-    if getattr(parent, "name", None) in {"main", "section", "div", "dialog"}:
-        parent_text = parent.get_text(" ", strip=True)
-        if len(parent_text) <= 500 and GENERIC_ACCESS_RESPONSE.fullmatch(parent_text):
+    for container in form.parents:
+        if getattr(container, "name", None) not in {"main", "section", "div", "dialog"}:
+            continue
+        container_text = _normalized_text(container)
+        if len(container_text) <= 600 and any(
+            _matches_wall_heading(_normalized_text(element))
+            or _matches_wall_response(_normalized_text(element))
+            or AUTH_PORTAL_HEADING.fullmatch(_normalized_text(element))
+            for element in container.select(
+                "h1, h2, h3, h4, h5, h6, p, [role='alert' i]"
+            )
+        ):
             return True
+        if container is primary:
+            break
     return False
 
 
-def _visible_text_and_access_signals(text: str) -> tuple[str, bool, bool]:
-    """Return visible text and contextual access-wall evidence."""
-    if not re.search(r"<\s*(?:!doctype|html|head|body|main|article|form|script)\b", text, re.IGNORECASE):
-        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
-        first_line_pattern = (
-            GENERIC_ACCESS_HEADING
-            if re.match(r"^\s*#{1,6}\s", first_line)
-            else GENERIC_ACCESS_RESPONSE
+def _plain_text_quality_signals(text: str) -> tuple[bool, bool]:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False, False
+
+    first_line = lines[0]
+    short_shell = len(text.strip()) <= _WALL_DOMINANT_MAX_CHARS
+    normalized_text = re.sub(r"\s+", " ", text).strip()
+    if not short_shell:
+        return False, False
+
+    candidate_lines = lines[:5]
+    access_wall = _matches_wall_response(normalized_text) or any(
+        _matches_wall_heading(line) or _matches_wall_response(line)
+        for line in candidate_lines
+    )
+    error_page = _matches_error_response(normalized_text) or any(
+        _matches_error_heading(line) or _matches_error_response(line)
+        for line in candidate_lines
+    )
+
+    if short_shell and AUTH_PORTAL_HEADING.fullmatch(first_line):
+        access_wall = len(lines) == 1 or any(
+            _matches_wall_response(line) for line in lines[1:3]
         )
-        return text, False, bool(first_line_pattern.fullmatch(first_line))
+    return access_wall, error_page
+
+
+def _primary_content(soup: BeautifulSoup) -> Any:
+    return (
+        soup.find("main")
+        or soup.find(attrs={"role": re.compile(r"^main$", re.IGNORECASE)})
+        or soup.find("article")
+        or soup.body
+        or soup
+    )
+
+
+def _visible_text_and_quality_signals(text: str) -> tuple[str, bool, bool]:
+    """Return visible text plus structural access-wall and error-page evidence."""
+    if not re.search(
+        r"<\s*(?:!doctype|html|head|body|main|article|section|div|p|h[1-6]|form|script)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        access_wall, error_page = _plain_text_quality_signals(text)
+        return text, access_wall, error_page
 
     soup = BeautifulSoup(text, "lxml")
     for element in soup.select("script, style, noscript, template, svg"):
@@ -112,42 +292,94 @@ def _visible_text_and_access_signals(text: str) -> tuple[str, bool, bool]:
     ):
         element.decompose()
 
-    login_forms = soup.select(
+    visible_text = soup.get_text(" ", strip=True)
+    for element in soup.find_all(_NON_CONTENT_CONTAINERS):
+        element.decompose()
+    primary = _primary_content(soup)
+    primary_text = _normalized_text(primary)
+    short_shell = len(primary_text) <= _WALL_DOMINANT_MAX_CHARS
+
+    login_forms = primary.select(
         "form:has(input[type='password']), form:has(input[name*='password' i]), "
         "form[action*='login' i], form[action*='signin' i], "
         "form[id*='login' i], form[class*='login' i]"
     )
-    form_has_access_marker = any(_login_form_has_access_marker(form) for form in login_forms)
-    heading_has_access_marker = any(
-        GENERIC_ACCESS_HEADING.fullmatch(element.get_text(" ", strip=True) or "")
-        for element in soup.select("title, h1, h2")
-    ) or any(
-        GENERIC_ACCESS_RESPONSE.fullmatch(element.get_text(" ", strip=True) or "")
-        for element in soup.select("[role='alert' i]")
+    headings = primary.select("h1, h2, h3, h4, h5, h6")
+    title_text = _normalized_text(soup.title) if soup.title else ""
+    heading_has_access_marker = short_shell and any(
+        _matches_wall_heading(_normalized_text(element)) for element in headings
     )
-    return soup.get_text(" ", strip=True), form_has_access_marker, heading_has_access_marker
+    title_has_access_marker = short_shell and bool(
+        title_text and _matches_wall_heading(title_text)
+    )
+    alert_has_access_marker = any(
+        _matches_wall_response(_normalized_text(element))
+        for element in primary.select("[role='alert' i]")
+    )
+    form_has_access_marker = any(
+        _login_form_has_access_marker(
+            form,
+            primary=primary,
+            primary_text_length=len(primary_text),
+        )
+        for form in login_forms
+    )
+
+    block_texts = [
+        _normalized_text(element)
+        for element in primary.select("h1, h2, h3, h4, h5, h6, p, [role='alert' i], div")
+        if _normalized_text(element)
+    ]
+    short_shell_has_access_response = short_shell and any(
+        _matches_wall_heading(block_text) or _matches_wall_response(block_text)
+        for block_text in block_texts[:12]
+    )
+    access_wall = (
+        heading_has_access_marker
+        or title_has_access_marker
+        or alert_has_access_marker
+        or form_has_access_marker
+        or short_shell_has_access_response
+    )
+
+    heading_has_error_marker = short_shell and any(
+        _matches_error_heading(_normalized_text(element)) for element in headings
+    )
+    title_has_error_marker = short_shell and bool(
+        title_text and _matches_error_heading(title_text)
+    )
+    alert_has_error_marker = any(
+        _matches_error_response(_normalized_text(element))
+        for element in primary.select("[role='alert' i]")
+    )
+    short_shell_has_error_response = short_shell and any(
+        _matches_error_heading(block_text) or _matches_error_response(block_text)
+        for block_text in block_texts[:12]
+    )
+    error_page = (
+        heading_has_error_marker
+        or title_has_error_marker
+        or alert_has_error_marker
+        or short_shell_has_error_response
+    )
+
+    return visible_text, access_wall, error_page
 
 
 def _check_quality(text: str, min_length: int, detect_login: bool) -> str | None:
     """Return a rejection reason string, or None if the content passes."""
-    visible_text, form_has_access_marker, heading_has_access_marker = (
-        _visible_text_and_access_signals(text)
-    )
+    visible_text, access_wall, error_page = _visible_text_and_quality_signals(text)
     stripped_text = visible_text.strip()
 
     if len(stripped_text) < min_length:
         return "too_short"
 
     if detect_login:
-        for pattern in LOGIN_PATTERNS:
-            if re.search(pattern, stripped_text):
-                return "login_wall"
-        if form_has_access_marker or heading_has_access_marker:
+        if access_wall:
             return "login_wall"
 
-    for pattern in ERROR_PATTERNS:
-        if re.search(pattern, stripped_text):
-            return "error_page"
+    if error_page:
+        return "error_page"
 
     return None
 
