@@ -10,22 +10,51 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Set
 
+from bs4 import BeautifulSoup
+
 from pipeline.core.base import QualityGate, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
 
-# Patterns indicating login walls or access-denied pages
+# Strong patterns indicating a login wall or access-denied response. These are
+# specific enough to reject whenever they appear in visible page text.
 LOGIN_PATTERNS = [
     r"(?i)sign\s*in\s+to\s+continue",
     r"(?i)log\s*in\s+required",
-    r"(?i)access\s+denied",
     r"(?i)please\s+log\s*in",
     r"(?i)authentication\s+required",
     r"(?i)403\s+forbidden",
-    r"(?i)unauthorized",
 ]
+
+# These phrases also occur legitimately in articles and JavaScript bundles.
+# Treat them as a wall only in a structural wall context (a leading response
+# line, heading/alert, or authentication form), rather than rejecting a full
+# public page on one token.
+GENERIC_ACCESS_PATTERNS = [
+    r"(?i)access\s+denied",
+    r"(?i)unauthorized",
+    r"(?i)you\s+are\s+not\s+authorized",
+]
+
+_ACCESS_PREFIX = r"(?:error\s*[:\-]\s*|(?:http\s*)?(?:401|403)\s*[:\-]?\s*)?"
+_ACCESS_MARKER = (
+    r"(?:access\s+denied|unauthorized(?:\s+access)?|you\s+are\s+not\s+authorized)"
+)
+
+GENERIC_ACCESS_HEADING = re.compile(
+    rf"(?i)^\s*(?:#{{1,6}}\s*)?{_ACCESS_PREFIX}{_ACCESS_MARKER}\s*[.!]?\s*$"
+)
+
+GENERIC_ACCESS_RESPONSE = re.compile(
+    rf"(?i)^\s*{_ACCESS_PREFIX}(?:"
+    r"(?:access\s+denied|unauthorized(?:\s+access)?)"
+    r"(?:\s*[.!:;\-]\s*[^\n]{0,160})?"
+    r"|you\s+are\s+not\s+authorized"
+    r"(?:(?:\s+(?:to|for)\b[^\n]{0,160})|(?:\s*[.!:;\-]\s*[^\n]{0,160}))?"
+    r")\s*$"
+)
 
 ERROR_PATTERNS = [
     r"(?i)page\s+not\s+found",
@@ -36,18 +65,88 @@ ERROR_PATTERNS = [
 ]
 
 
+def _has_generic_access_marker(text: str) -> bool:
+    return any(re.search(pattern, text) for pattern in GENERIC_ACCESS_PATTERNS)
+
+
+def _login_form_has_access_marker(form: Any) -> bool:
+    """Require a marker inside, adjacent to, or tightly wrapping a real login form."""
+    if _has_generic_access_marker(form.get_text(" ", strip=True)):
+        return True
+
+    for sibling in (form.find_previous_sibling(), form.find_next_sibling()):
+        if sibling is None:
+            continue
+        sibling_text = sibling.get_text(" ", strip=True)
+        if GENERIC_ACCESS_HEADING.fullmatch(sibling_text) or GENERIC_ACCESS_RESPONSE.fullmatch(
+            sibling_text
+        ):
+            return True
+
+    parent = form.parent
+    if getattr(parent, "name", None) in {"main", "section", "div", "dialog"}:
+        parent_text = parent.get_text(" ", strip=True)
+        if len(parent_text) <= 500 and GENERIC_ACCESS_RESPONSE.fullmatch(parent_text):
+            return True
+    return False
+
+
+def _visible_text_and_access_signals(text: str) -> tuple[str, bool, bool]:
+    """Return visible text and contextual access-wall evidence."""
+    if not re.search(r"<\s*(?:!doctype|html|head|body|main|article|form|script)\b", text, re.IGNORECASE):
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        first_line_pattern = (
+            GENERIC_ACCESS_HEADING
+            if re.match(r"^\s*#{1,6}\s", first_line)
+            else GENERIC_ACCESS_RESPONSE
+        )
+        return text, False, bool(first_line_pattern.fullmatch(first_line))
+
+    soup = BeautifulSoup(text, "lxml")
+    for element in soup.select("script, style, noscript, template, svg"):
+        element.decompose()
+    for element in soup.select(
+        "[hidden], [aria-hidden='true' i], "
+        "[style*='display:none' i], [style*='display: none' i], "
+        "[style*='visibility:hidden' i], [style*='visibility: hidden' i]"
+    ):
+        element.decompose()
+
+    login_forms = soup.select(
+        "form:has(input[type='password']), form:has(input[name*='password' i]), "
+        "form[action*='login' i], form[action*='signin' i], "
+        "form[id*='login' i], form[class*='login' i]"
+    )
+    form_has_access_marker = any(_login_form_has_access_marker(form) for form in login_forms)
+    heading_has_access_marker = any(
+        GENERIC_ACCESS_HEADING.fullmatch(element.get_text(" ", strip=True) or "")
+        for element in soup.select("title, h1, h2")
+    ) or any(
+        GENERIC_ACCESS_RESPONSE.fullmatch(element.get_text(" ", strip=True) or "")
+        for element in soup.select("[role='alert' i]")
+    )
+    return soup.get_text(" ", strip=True), form_has_access_marker, heading_has_access_marker
+
+
 def _check_quality(text: str, min_length: int, detect_login: bool) -> str | None:
     """Return a rejection reason string, or None if the content passes."""
-    if len(text.strip()) < min_length:
+    visible_text, form_has_access_marker, heading_has_access_marker = (
+        _visible_text_and_access_signals(text)
+    )
+    stripped_text = visible_text.strip()
+
+    if len(stripped_text) < min_length:
         return "too_short"
 
     if detect_login:
         for pattern in LOGIN_PATTERNS:
-            if re.search(pattern, text):
+            if re.search(pattern, stripped_text):
                 return "login_wall"
+        if form_has_access_marker or heading_has_access_marker:
+            return "login_wall"
 
     for pattern in ERROR_PATTERNS:
-        if re.search(pattern, text):
+        if re.search(pattern, stripped_text):
             return "error_page"
 
     return None
@@ -70,6 +169,11 @@ def _remove_file(path_str: str, removed_artifact_ids: List[str], artifact_ids_by
     path = Path(path_str)
     path.unlink(missing_ok=True)
     removed_artifact_ids.extend(artifact_ids_by_path.get(str(path.resolve()), []))
+
+
+def _mapping_value_is_available(value: str) -> bool:
+    """Keep durable crawler evidence sentinels as well as existing files."""
+    return value.startswith("SKIPPED") or Path(value).exists()
 
 
 @register_stage
@@ -190,8 +294,12 @@ class QualityScorer(QualityGate):
             else:
                 passed += 1
 
-        url_to_html = {url: path for url, path in url_to_html.items() if Path(path).exists()}
-        url_to_md = {url: path for url, path in url_to_md.items() if Path(path).exists()}
+        url_to_html = {
+            url: path for url, path in url_to_html.items() if _mapping_value_is_available(path)
+        }
+        url_to_md = {
+            url: path for url, path in url_to_md.items() if _mapping_value_is_available(path)
+        }
 
         outputs = {
             "passed_count": passed,

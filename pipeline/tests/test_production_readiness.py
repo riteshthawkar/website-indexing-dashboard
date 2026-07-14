@@ -2452,6 +2452,116 @@ class TestQualityScorer:
         text = "403 Forbidden - You don't have permission. " * 5
         assert _check_quality(text, 10, True) == "login_wall"
 
+    def test_detects_short_access_denied_page(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "Access denied. Contact the administrator if you believe this is an error."
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_markdown_access_denied_heading(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        assert _check_quality("# Access denied", 10, True) == "login_wall"
+
+    def test_detects_error_prefixed_access_denied_heading(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = "<html><body><h1>Error: Access denied</h1></body></html>"
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_status_prefixed_access_denied_heading(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        for heading in ("403 Access denied", "403 - Access denied", "HTTP 403: Access denied"):
+            text = f"<html><body><h1>{heading}</h1></body></html>"
+            assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_access_denied_alert_with_explanation(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><div role="alert">
+        Access denied. Your request cannot be completed.
+        </div></body></html>"""
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_access_denied_with_login_form_even_when_page_is_long(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body>
+        <nav>{navigation}</nav>
+        <main><h1>Account portal</h1>
+        <form action="/login"><p>Unauthorized access</p>
+        <input name="username"><input type="password"></form>
+        </main></body></html>""".format(navigation="Navigation content. " * 200)
+        assert _check_quality(text, 100, True) == "login_wall"
+
+    def test_detects_access_message_adjacent_to_login_form(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><div class="auth-shell">
+        <p>You are not authorized to view this resource.</p>
+        <form action="/login"><input type="password"></form>
+        </div></main></body></html>"""
+        assert _check_quality(text, 10, True) == "login_wall"
+
+    def test_detects_long_access_denied_shell_without_login_form(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><nav>{navigation}</nav>
+        <main><h1>Access denied</h1><p>Your request cannot be completed.</p></main>
+        </body></html>""".format(navigation="Navigation content. " * 200)
+        assert _check_quality(text, 100, True) == "login_wall"
+
+    def test_large_public_article_can_discuss_unauthorized_access(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Responsible AI systems</h1>
+        <p>Researchers study unauthorized model access and cases where access denied
+        messages help protect sensitive systems.</p>
+        <p>{article}</p></main></body></html>""".format(
+            article="Public research article content with evidence and analysis. " * 80
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_script_access_markers_do_not_filter_public_html(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><head><script>
+        const unauthorized = "access denied";
+        </script></head><body><main><h1>Public page</h1>
+        <p>{content}</p></main></body></html>""".format(
+            content="Useful public university information. " * 20
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_short_public_security_article_is_not_a_login_wall(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main><h1>Securing AI services</h1>
+        <p>Unauthorized requests and access denied responses are useful signals for
+        defenders studying model security. This public article explains the research.</p>
+        </main></body></html>"""
+        assert _check_quality(text, 100, True) is None
+
+    def test_public_article_title_starting_access_denied_is_not_a_login_wall(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><main>
+        <h1>Access Denied: A History of Authorization Systems</h1>
+        <p>{article}</p></main></body></html>""".format(
+            article="Public research article content with evidence and analysis. " * 20
+        )
+        assert _check_quality(text, 100, True) is None
+
+    def test_hidden_access_marker_is_not_visible_wall_evidence(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><div style="display: none">Unauthorized</div>
+        <main><h1>Public information</h1><p>{content}</p></main></body></html>""".format(
+            content="Useful public university information. " * 10
+        )
+        assert _check_quality(text, 100, True) is None
+
     def test_detects_error_page_500(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
         text = "500 Internal Server Error occurred. " * 5
@@ -2540,6 +2650,8 @@ class TestQualityScorer:
             {
                 "https://example.com/good": str(good_html),
                 "https://example.com/login": str(bad_html),
+                "https://example.com/verified-empty": "SKIPPED_VERIFIED_EMPTY_COHORT:test-policy",
+                "https://example.com/not-found": "SKIPPED_HTTP_404",
             },
         )
         atomic_write_json(
@@ -2594,7 +2706,11 @@ class TestQualityScorer:
         assert good_md.exists()
         assert not bad_html.exists()
         assert not bad_md.exists()
-        assert load_json_safe(mapping_file) == {"https://example.com/good": str(good_html)}
+        assert load_json_safe(mapping_file) == {
+            "https://example.com/good": str(good_html),
+            "https://example.com/not-found": "SKIPPED_HTTP_404",
+            "https://example.com/verified-empty": "SKIPPED_VERIFIED_EMPTY_COHORT:test-policy",
+        }
         assert load_json_safe(md_mapping_file) == {"https://example.com/good": str(good_md)}
         assert load_json_safe(page_media_file) == {"https://example.com/good": [{"type": "image", "url": "https://example.com/good.jpg"}]}
         assert load_json_safe(page_images_file) == {"https://example.com/good": [{"url": "https://example.com/good.jpg"}]}
