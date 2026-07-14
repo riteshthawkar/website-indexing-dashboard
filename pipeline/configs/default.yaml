@@ -112,7 +112,6 @@ crawler:
     - "https://mbzuai.ac.ae/about/contact"
     - "https://mbzuai.ac.ae/study/graduate-admission-process"
     - "https://mbzuai.ac.ae/study/undergraduate-admission-process"
-    - "https://mbzuai.ac.ae/student-resources"
     - "https://mbzuai.ac.ae/student-resources/campus-facilities"
   respect_robots_txt: true
   include_external: false
@@ -315,7 +314,6 @@ formatter:
     - "/about/leadership"
     - "/about/contact/?$"
     - "/study/"
-    - "/student-resources/?$"
   official_source_host_suffixes:
     - "mbzuai.ac.ae"
     - "staticcdn.mbzuai.ac.ae"

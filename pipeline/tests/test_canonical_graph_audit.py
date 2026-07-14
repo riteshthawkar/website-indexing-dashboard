@@ -12,10 +12,7 @@ from pipeline.core.knowledge_graph import validate_graph_bundle
 from pipeline.core.run_audit import audit_run
 from pipeline.core.state import PipelineState, StageState
 from pipeline.stages.formatters import mbzuai_index_readiness_formatter as readiness_module
-from pipeline.stages.formatters.mbzuai_index_readiness_formatter import (
-    DEFAULT_CRITICAL_URL_PATTERNS,
-    _coverage_gate,
-)
+from pipeline.stages.formatters.mbzuai_index_readiness_formatter import _coverage_gate
 
 
 def _valid_canonical_graph() -> dict:
@@ -172,8 +169,8 @@ def test_stage2_fails_before_publishing_an_invalid_canonical_graph(
     assert not (tmp_path / "stage_outputs" / "prepare_mbzuai_index").exists()
 
 
-def test_student_resources_critical_pattern_is_route_exact():
-    pattern = DEFAULT_CRITICAL_URL_PATTERNS[-1]
+def test_coverage_gate_supports_route_exact_critical_pattern():
+    pattern = r"/student-resources/?$"
     failure_manifest = {
         "hard_failure_count": 0,
         "expected_site_inventory_count": 0,
@@ -455,48 +452,27 @@ def test_stage2_fails_closed_for_present_but_noindex_critical_route(tmp_path):
 
 
 @pytest.mark.parametrize("config_name", ["default", "mbzuai_production"])
-def test_resolved_student_resources_critical_pattern_is_route_exact(config_name):
+def test_resolved_student_resources_hub_is_not_required_or_forced(config_name):
     config = load_config(config_name)
     patterns = config["formatter"]["critical_url_patterns"]
     student_resources_patterns = [
         str(pattern) for pattern in patterns if "student-resources" in str(pattern)
     ]
-    failure_manifest = {
-        "hard_failure_count": 0,
-        "expected_site_inventory_count": 0,
-        "inventory_coverage_ratio": None,
-        "cohort_evidence_errors": [],
-        "failed_urls": [],
-    }
+    priority_seed_urls = config["crawler"]["priority_seed_urls"]
 
-    assert student_resources_patterns == [r"/student-resources/?$"]
+    assert student_resources_patterns == []
+    assert r"/student-resources/?$" not in (
+        readiness_module.DEFAULT_CRITICAL_URL_PATTERNS
+    )
+    assert "https://mbzuai.ac.ae/student-resources" not in priority_seed_urls
+    assert (
+        "https://mbzuai.ac.ae/student-resources/campus-facilities"
+        in priority_seed_urls
+    )
     assert config["formatter"]["require_critical_url_markdown_evidence"] is True
     assert config["formatter"]["critical_url_min_markdown_words"] >= 40
     assert config["formatter"]["critical_url_min_substantive_words"] >= 20
     assert config["formatter"]["critical_url_max_link_word_ratio"] <= 0.60
-
-    near_match = _coverage_gate(
-        canonical_metadata={
-            "https://mbzuai.ac.ae/student-resources-archive": {"indexable": True}
-        },
-        failure_manifest=failure_manifest,
-        formatter_config={"critical_url_patterns": student_resources_patterns},
-    )
-    assert near_match["missing_critical_count"] == 1
-    assert [item["pattern"] for item in near_match["missing_critical_patterns"]] == [
-        r"/student-resources/?$"
-    ]
-
-    for exact_url in (
-        "https://mbzuai.ac.ae/student-resources",
-        "https://mbzuai.ac.ae/student-resources/",
-    ):
-        exact_match = _coverage_gate(
-            canonical_metadata={exact_url: {"indexable": True}},
-            failure_manifest=failure_manifest,
-            formatter_config={"critical_url_patterns": student_resources_patterns},
-        )
-        assert exact_match["missing_critical_count"] == 0
 
 
 def test_critical_markdown_threshold_config_is_validated_fail_closed():

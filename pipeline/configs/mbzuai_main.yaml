@@ -25,7 +25,7 @@ crawler:
     - "/ar/tag/"
     # This transient, noindex outage notice is stale and must never become
     # retrievable chatbot evidence. Keep the exclusion route-specific so the
-    # intentionally indexed student-resources hub remains available.
+    # substantive student-resource child pages remain available.
     - "/moodle-service-interruption"
     - "/ar/moodle-service-interruption"
     # These two Arabic faculty aliases redirect to each other indefinitely.

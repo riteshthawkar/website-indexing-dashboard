@@ -48,7 +48,6 @@ DEFAULT_CRITICAL_URL_PATTERNS = [
     r"/about/leadership",
     r"/about/contact/?$",
     r"/study/",
-    r"/student-resources/?$",
 ]
 DEFAULT_CRITICAL_URL_MIN_MARKDOWN_WORDS = 40
 DEFAULT_CRITICAL_URL_MIN_MARKDOWN_CHARACTERS = 240
