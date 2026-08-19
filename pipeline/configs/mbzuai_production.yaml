@@ -56,6 +56,14 @@ formatter:
   critical_url_navigation_min_links: 8
   critical_url_max_link_word_ratio: 0.55
   critical_url_markdown_read_max_bytes: 2000000
+  # Use exact routes for the admissions pages that users depend on.
+  # A healthy but unrelated /study/ child must not satisfy these checks.
+  critical_url_patterns:
+    - "/about/office-of-the-president/?$"
+    - "/about/leadership/?$"
+    - "/about/contact/?$"
+    - "/study/graduate-admission-process/?$"
+    - "/study/(?:undergraduate|ug)-admission-process/?$"
 
 # The production sequence is explicit so inherited development profiles cannot
 # move upload ahead of coverage validation or the final knowledge graph.

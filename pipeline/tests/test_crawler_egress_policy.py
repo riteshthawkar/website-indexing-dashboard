@@ -18,6 +18,29 @@ def _crawler():
     return crawler
 
 
+def test_validate_config_rejects_plaintext_start_and_unknown_source_mode():
+    errors = asyncio.run(
+        Crawl4AICrawler().validate_config(
+            {
+                "crawler": {
+                    "start_url": "http://mbzuai.ac.ae",
+                    "require_https": True,
+                    "validate_source_html_mode": "sometimes",
+                }
+            }
+        )
+    )
+
+    assert (
+        "crawler.start_url must use HTTPS when crawler.require_https is true"
+        in errors
+    )
+    assert (
+        "crawler.validate_source_html_mode must be always, on_quality_warning, or never"
+        in errors
+    )
+
+
 def test_egress_policy_blocks_private_addresses(monkeypatch):
     crawler = _crawler()
     crawler_module._host_resolves_to_private_or_reserved.cache_clear()
@@ -234,3 +257,115 @@ def test_safe_redirects_stop_before_request_beyond_hop_limit(monkeypatch):
         "https://mbzuai.ac.ae/next",
     ]
     assert all(call[1]["allow_redirects"] is False for call in session.calls)
+
+
+def test_public_external_fetch_mode_still_blocks_private_redirect_target(monkeypatch):
+    crawler = _crawler()
+    crawler.require_https = True
+    crawler_module._host_resolves_to_private_or_reserved.cache_clear()
+    monkeypatch.setattr(
+        crawler_module.socket,
+        "getaddrinfo",
+        lambda host, *args, **kwargs: [
+            (None, None, None, None, ("93.184.216.34", 443))
+        ],
+    )
+
+    class RedirectResponse:
+        status = 302
+        headers = {"Location": "http://169.254.169.254/latest/meta-data"}
+
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class RedirectSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if len(self.calls) > 1:
+                raise AssertionError("private redirect target must never be requested")
+            return RedirectResponse(url)
+
+    session = RedirectSession()
+
+    async def fetch():
+        async with crawler._get_with_safe_redirects(
+            session=session,
+            url="https://cdn.example.edu/campus.jpg",
+            enforce_allowed_domain=False,
+        ):
+            raise AssertionError("a blocked redirect must not yield a response")
+
+    try:
+        asyncio.run(fetch())
+    except crawler_module._RedirectEgressPolicyError:
+        pass
+    else:
+        raise AssertionError("private redirect target must fail the request")
+
+    assert [call[0] for call in session.calls] == [
+        "https://cdn.example.edu/campus.jpg"
+    ]
+    assert session.calls[0][1]["allow_redirects"] is False
+
+
+def test_video_transcript_redirect_never_requests_external_target(monkeypatch):
+    crawler = _crawler()
+    crawler.require_https = True
+    crawler._download_semaphore = asyncio.Semaphore(1)
+    crawler.max_video_transcript_bytes = 1024
+    crawler.stats = {"video_transcripts_fetched": 0}
+    monkeypatch.setattr(
+        crawler,
+        "_url_allowed_for_fetch",
+        lambda url: url.startswith("https://mbzuai.ac.ae/"),
+    )
+
+    class RedirectResponse:
+        status = 302
+        headers = {"Location": "https://untrusted.example/captions.vtt"}
+
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class RedirectSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            if len(self.calls) > 1:
+                raise AssertionError("external transcript target must never be requested")
+            return RedirectResponse(url)
+
+    session = RedirectSession()
+    crawler._session = session
+    video = {}
+
+    asyncio.run(
+        crawler._fetch_video_transcript(
+            video,
+            "https://mbzuai.ac.ae/media/captions.vtt",
+        )
+    )
+
+    assert video == {}
+    assert crawler.stats["video_transcripts_fetched"] == 0
+    assert [call[0] for call in session.calls] == [
+        "https://mbzuai.ac.ae/media/captions.vtt"
+    ]
+    assert session.calls[0][1]["allow_redirects"] is False

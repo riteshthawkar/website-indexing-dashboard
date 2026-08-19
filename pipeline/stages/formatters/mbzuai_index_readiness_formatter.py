@@ -467,6 +467,8 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
             "critical_url_min_substantive_words": 0,
             "critical_url_navigation_min_links": 1,
             "critical_url_markdown_read_max_bytes": 1,
+            "expected_site_inventory_count": 0,
+            "maximum_hard_failure_count": 0,
         }
         for key, minimum in integer_minimums.items():
             if key not in formatter_config:
@@ -486,7 +488,38 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
                 errors.append("formatter.critical_url_max_link_word_ratio must be numeric")
             else:
                 if not 0.0 <= ratio <= 1.0:
-                    errors.append("formatter.critical_url_max_link_word_ratio must be between 0 and 1")
+                    errors.append(
+                        "formatter.critical_url_max_link_word_ratio must be between 0 and 1"
+                    )
+
+        if "minimum_inventory_coverage_ratio" in formatter_config:
+            try:
+                ratio = float(formatter_config["minimum_inventory_coverage_ratio"])
+            except (TypeError, ValueError):
+                errors.append("formatter.minimum_inventory_coverage_ratio must be numeric")
+            else:
+                if not 0.0 <= ratio <= 1.0:
+                    errors.append(
+                        "formatter.minimum_inventory_coverage_ratio must be between 0 and 1"
+                    )
+
+        if "critical_url_patterns" in formatter_config:
+            patterns = formatter_config["critical_url_patterns"]
+            if not isinstance(patterns, list):
+                errors.append("formatter.critical_url_patterns must be a list")
+            else:
+                for index, pattern in enumerate(patterns):
+                    if not str(pattern or "").strip():
+                        errors.append(
+                            f"formatter.critical_url_patterns[{index}] must be non-empty"
+                        )
+                        continue
+                    try:
+                        re.compile(str(pattern), re.IGNORECASE)
+                    except re.error as exc:
+                        errors.append(
+                            f"formatter.critical_url_patterns[{index}] is invalid: {exc}"
+                        )
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:

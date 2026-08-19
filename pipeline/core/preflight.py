@@ -6,6 +6,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
+from urllib.parse import urlparse
 
 from pipeline.core.config import configured_secret_paths
 
@@ -53,6 +54,14 @@ LEGACY_STAGE_PLUGINS = {
     "gliner_extract",
     "semantic_graph_extract",
     "semantic_graph_canonicalize",
+}
+
+MBZUAI_REQUIRED_CRITICAL_URL_PATTERNS = {
+    "/about/office-of-the-president/?$",
+    "/about/leadership/?$",
+    "/about/contact/?$",
+    "/study/graduate-admission-process/?$",
+    "/study/(?:undergraduate|ug)-admission-process/?$",
 }
 
 
@@ -236,6 +245,149 @@ def assess_production_readiness(
             production_contract_errors.append("pipeline.require_assertion_first must be true")
         if not bool(pipeline_cfg.get("require_query_planner", False)):
             production_contract_errors.append("pipeline.require_query_planner must be true")
+
+        start_url = str(crawler_cfg.get("start_url") or "").strip()
+        try:
+            parsed_start_url = urlparse(start_url)
+            start_scheme = parsed_start_url.scheme.lower()
+            start_hostname = (parsed_start_url.hostname or "").lower()
+        except ValueError:
+            start_scheme = ""
+            start_hostname = ""
+        if start_scheme != "https" or start_hostname != "mbzuai.ac.ae":
+            production_contract_errors.append(
+                "crawler.start_url must target https://mbzuai.ac.ae"
+            )
+        allowed_domains = {
+            str(value).strip().lower().strip(".")
+            for value in (crawler_cfg.get("allowed_domains") or [])
+            if str(value).strip()
+        }
+        if allowed_domains != {"mbzuai.ac.ae"}:
+            production_contract_errors.append(
+                "crawler.allowed_domains must contain only mbzuai.ac.ae"
+            )
+        if not bool(crawler_cfg.get("respect_robots_txt", False)):
+            production_contract_errors.append("crawler.respect_robots_txt must be true")
+        if bool(crawler_cfg.get("include_external", False)):
+            production_contract_errors.append("crawler.include_external must be false")
+        if bool(crawler_cfg.get("allow_query_urls", False)):
+            production_contract_errors.append("crawler.allow_query_urls must be false")
+        if not bool(crawler_cfg.get("fail_on_empty_result", False)):
+            production_contract_errors.append("crawler.fail_on_empty_result must be true")
+        if not bool(crawler_cfg.get("sitemap_enabled", False)):
+            production_contract_errors.append("crawler.sitemap_enabled must be true")
+
+        try:
+            minimum_sitemap_seed_count = int(
+                crawler_cfg.get("minimum_sitemap_seed_count") or 0
+            )
+        except (TypeError, ValueError):
+            minimum_sitemap_seed_count = 0
+        if minimum_sitemap_seed_count < 2100:
+            production_contract_errors.append(
+                "crawler.minimum_sitemap_seed_count must be >= 2100"
+            )
+        for key in ("sitemap_seed_limit", "sitemap_frontier_seed_limit", "max_pages"):
+            try:
+                value = int(crawler_cfg.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value < minimum_sitemap_seed_count:
+                production_contract_errors.append(
+                    f"crawler.{key} must be >= crawler.minimum_sitemap_seed_count"
+                )
+        bounded_crawl_limits = {
+            "robots_max_response_bytes": (1, 512 * 1024),
+            "sitemap_max_response_bytes": (1, 16 * 1024 * 1024),
+            "sitemap_max_sources": (32, 100),
+            "sitemap_max_depth": (1, 4),
+        }
+        for key, (minimum_value, maximum_value) in bounded_crawl_limits.items():
+            try:
+                value = int(crawler_cfg.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if not minimum_value <= value <= maximum_value:
+                production_contract_errors.append(
+                    f"crawler.{key} must be between {minimum_value} and {maximum_value}"
+                )
+        if not bool(crawler_cfg.get("validate_source_html", False)):
+            production_contract_errors.append("crawler.validate_source_html must be true")
+        source_validation_mode = str(
+            crawler_cfg.get("validate_source_html_mode") or ""
+        ).strip().lower()
+        if source_validation_mode != "always":
+            production_contract_errors.append(
+                "crawler.validate_source_html_mode must be always"
+            )
+        if not bool(crawler_cfg.get("retry_recoverable_skipped_on_resume", False)):
+            production_contract_errors.append(
+                "crawler.retry_recoverable_skipped_on_resume must be true"
+            )
+        known_empty_cohorts = crawler_cfg.get("known_empty_sitemap_cohorts")
+        if not isinstance(known_empty_cohorts, list) or not known_empty_cohorts:
+            production_contract_errors.append(
+                "crawler.known_empty_sitemap_cohorts must be configured"
+            )
+
+        formatter_contract = (
+            config.get("formatter", {})
+            if isinstance(config.get("formatter"), Mapping)
+            else {}
+        )
+        for key in (
+            "fail_on_critical_coverage",
+            "fail_on_inventory_gap",
+            "fail_on_hard_failure_gap",
+            "require_critical_url_markdown_evidence",
+        ):
+            if not bool(formatter_contract.get(key, False)):
+                production_contract_errors.append(f"formatter.{key} must be true")
+        try:
+            expected_inventory = int(
+                formatter_contract.get("expected_site_inventory_count") or 0
+            )
+        except (TypeError, ValueError):
+            expected_inventory = 0
+        if expected_inventory < 2600:
+            production_contract_errors.append(
+                "formatter.expected_site_inventory_count must be >= 2600"
+            )
+        try:
+            minimum_inventory_coverage = float(
+                formatter_contract.get("minimum_inventory_coverage_ratio") or 0.0
+            )
+        except (TypeError, ValueError):
+            minimum_inventory_coverage = 0.0
+        if minimum_inventory_coverage < 0.90:
+            production_contract_errors.append(
+                "formatter.minimum_inventory_coverage_ratio must be >= 0.90"
+            )
+        try:
+            maximum_hard_failures = int(
+                formatter_contract.get("maximum_hard_failure_count")
+            )
+        except (TypeError, ValueError):
+            maximum_hard_failures = -1
+        if maximum_hard_failures < 0 or maximum_hard_failures > 25:
+            production_contract_errors.append(
+                "formatter.maximum_hard_failure_count must be between 0 and 25"
+            )
+        configured_critical_patterns = {
+            str(value).strip()
+            for value in (formatter_contract.get("critical_url_patterns") or [])
+            if str(value).strip()
+        }
+        missing_critical_patterns = sorted(
+            MBZUAI_REQUIRED_CRITICAL_URL_PATTERNS - configured_critical_patterns
+        )
+        if missing_critical_patterns:
+            production_contract_errors.append(
+                "formatter.critical_url_patterns is missing required exact MBZUAI routes: "
+                + ", ".join(missing_critical_patterns)
+            )
+
         retrieval_contract = config.get("retrieval", {}) if isinstance(config.get("retrieval"), Mapping) else {}
         if str(retrieval_contract.get("retriever_backend") or "").strip() != "routed_hybrid":
             production_contract_errors.append("retrieval.retriever_backend must be routed_hybrid")

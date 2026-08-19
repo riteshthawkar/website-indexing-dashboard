@@ -245,7 +245,10 @@ def test_fresh_session_removes_cookie_header_and_retains_tls_policy(monkeypatch)
 
     asyncio.run(open_session())
 
-    assert captured["connector"]["ssl"] is True
+    tls_context = captured["connector"]["ssl"]
+    assert isinstance(tls_context, crawler_module.ssl.SSLContext)
+    assert tls_context.check_hostname is True
+    assert tls_context.verify_mode == crawler_module.ssl.CERT_REQUIRED
     assert captured["connector"]["limit"] == 1
     assert captured["session"]["headers"] == {
         "Accept": "application/pdf",

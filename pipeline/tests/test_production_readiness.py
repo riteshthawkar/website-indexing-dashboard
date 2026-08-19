@@ -192,6 +192,86 @@ def test_canonical_production_name_cannot_use_downgraded_effective_config(monkey
     assert "pipeline.production_profile must be true" in contract["details"]["errors"]
 
 
+def test_canonical_production_rejects_downgraded_crawl_contract(monkeypatch):
+    from pipeline.core.config import load_config
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    config = load_config("mbzuai_production")
+    config["crawler"].update(
+        {
+            "start_url": "https://untrusted.example",
+            "allowed_domains": ["untrusted.example"],
+            "respect_robots_txt": False,
+            "minimum_sitemap_seed_count": 0,
+            "sitemap_max_sources": 1000,
+            "validate_source_html_mode": "on_quality_warning",
+            "known_empty_sitemap_cohorts": [],
+        }
+    )
+    config["formatter"].update(
+        {
+            "fail_on_inventory_gap": False,
+            "minimum_inventory_coverage_ratio": 0.5,
+            "critical_url_patterns": [".*"],
+        }
+    )
+
+    report = assess_production_readiness(
+        config,
+        config_name="mbzuai_production",
+        validation_errors={},
+    )
+
+    contract = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "canonical_production_contract"
+    )
+    assert contract["status"] == "error"
+    errors = contract["details"]["errors"]
+    assert "crawler.start_url must target https://mbzuai.ac.ae" in errors
+    assert "crawler.allowed_domains must contain only mbzuai.ac.ae" in errors
+    assert "crawler.respect_robots_txt must be true" in errors
+    assert "crawler.minimum_sitemap_seed_count must be >= 2100" in errors
+    assert "crawler.sitemap_max_sources must be between 32 and 100" in errors
+    assert "crawler.validate_source_html_mode must be always" in errors
+    assert "crawler.known_empty_sitemap_cohorts must be configured" in errors
+    assert "formatter.fail_on_inventory_gap must be true" in errors
+    assert "formatter.minimum_inventory_coverage_ratio must be >= 0.90" in errors
+    assert any(
+        error.startswith(
+            "formatter.critical_url_patterns is missing required exact MBZUAI routes:"
+        )
+        for error in errors
+    )
+
+
+def test_canonical_production_crawl_contract_is_satisfied(monkeypatch):
+    from pipeline.core.config import load_config
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    config = load_config("mbzuai_production")
+
+    report = assess_production_readiness(
+        config,
+        config_name="mbzuai_production",
+        validation_errors={},
+    )
+
+    contract = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "canonical_production_contract"
+    )
+    assert contract["status"] == "ok"
+
+
 def test_preflight_neo4j_backend_requires_upload_stage_and_credentials(monkeypatch):
     from pipeline.core.preflight import assess_production_readiness
 
@@ -1166,6 +1246,37 @@ class TestCrawlerHelpers:
         )
         assert child_sitemaps == []
         assert page_urls == ["https://example.com/a", "https://example.com/b"]
+
+    def test_parse_gzipped_sitemap_rejects_oversized_decoded_payload(self):
+        import gzip
+
+        from pipeline.stages.crawlers.crawl4ai_crawler import _parse_sitemap_xml
+
+        payload = gzip.compress(
+            b"<urlset>" + (b" " * 256) + b"</urlset>"
+        )
+
+        with pytest.raises(ValueError, match="decoded sitemap exceeds"):
+            _parse_sitemap_xml(
+                payload,
+                source_url="https://example.com/sitemap.xml.gz",
+                max_decoded_bytes=64,
+            )
+
+    def test_bounded_response_reader_rejects_stream_over_limit(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import (
+            _read_bounded_response,
+        )
+
+        class FakeContent:
+            async def iter_chunked(self, _size):
+                yield b"12345"
+                yield b"678901"
+
+        response = SimpleNamespace(content=FakeContent())
+
+        with pytest.raises(ValueError, match="response exceeds configured size limit"):
+            run_async(_read_bounded_response(response, 10))
 
     def test_build_initial_crawl_state_seeds_unique_urls(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _build_initial_crawl_state
@@ -15133,6 +15244,36 @@ class TestMBZLegacyVectorStoreFormatterQualityMetadata:
 
 
 class TestMBZUAIIndexReadiness:
+    def test_validate_config_rejects_invalid_coverage_values_and_patterns(self):
+        from pipeline.stages.formatters.mbzuai_index_readiness_formatter import (
+            MBZUAIIndexReadinessFormatter,
+        )
+
+        errors = run_async(
+            MBZUAIIndexReadinessFormatter().validate_config(
+                {
+                    "formatter": {
+                        "expected_site_inventory_count": -1,
+                        "maximum_hard_failure_count": -1,
+                        "minimum_inventory_coverage_ratio": 1.1,
+                        "critical_url_patterns": ["", "[invalid"],
+                    }
+                }
+            )
+        )
+
+        assert "formatter.expected_site_inventory_count must be >= 0" in errors
+        assert "formatter.maximum_hard_failure_count must be >= 0" in errors
+        assert (
+            "formatter.minimum_inventory_coverage_ratio must be between 0 and 1"
+            in errors
+        )
+        assert "formatter.critical_url_patterns[0] must be non-empty" in errors
+        assert any(
+            error.startswith("formatter.critical_url_patterns[1] is invalid:")
+            for error in errors
+        )
+
     def test_inventory_coverage_excludes_intentional_url_exclusions(self, tmp_dir):
         from pipeline.stages.formatters.mbzuai_index_readiness_formatter import (
             _coverage_gate,

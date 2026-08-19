@@ -12,6 +12,7 @@ import asyncio
 import contextlib
 import gzip
 import hashlib
+import io
 import inspect
 import ipaddress
 import json
@@ -20,6 +21,7 @@ import math
 import mimetypes
 import re
 import socket
+import ssl
 import time
 import xml.etree.ElementTree as ET
 from functools import lru_cache
@@ -184,6 +186,8 @@ VIDEO_EMBED_HOSTS = {
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
 SAFE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 SAFE_REDIRECT_MAX_HOPS = 10
+DEFAULT_ROBOTS_MAX_RESPONSE_BYTES = 512 * 1024
+DEFAULT_SITEMAP_MAX_RESPONSE_BYTES = 16 * 1024 * 1024
 CRAWL_SKIP_EXTENSIONS = DOWNLOADABLE_EXTENSIONS | EXCLUDED_EXTENSIONS | IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | TEXT_TRACK_EXTENSIONS
 GENERIC_MBZUAI_PAGE_TITLES = {
     "mbzuai mohamed bin zayed university of artificial intelligence",
@@ -519,6 +523,21 @@ def _host_resolves_to_private_or_reserved(host: str) -> bool:
         logger.debug("Failed to resolve host for egress validation: %s", host, exc_info=True)
         return True
     return any(_is_private_or_reserved_address(info[4][0]) for info in infos if info and info[4])
+
+
+def _build_verified_ssl_context() -> ssl.SSLContext:
+    """Build strict TLS trust from the host store plus Certifi's CA bundle."""
+
+    context = ssl.create_default_context()
+    try:
+        import certifi
+
+        context.load_verify_locations(cafile=certifi.where())
+    except ImportError:
+        # Validation reports the missing production dependency. Retaining the
+        # host trust store keeps the helper usable in reduced installations.
+        pass
+    return context
 
 
 def _strip_namespace(tag: str) -> str:
@@ -1068,22 +1087,74 @@ def _html_to_markdown(html: str, page_url: str = "") -> str:
     return _ensure_markdown_has_page_title(extracted, html)
 
 
-def _decode_sitemap_payload(payload: bytes, source_url: str = "", content_type: str = "") -> bytes:
+async def _read_bounded_response(response: Any, max_bytes: int) -> bytes:
+    """Read a streaming response without allowing an unbounded allocation."""
+
+    limit = max(1, int(max_bytes))
+    chunks: List[bytes] = []
+    total = 0
+    async for chunk in response.content.iter_chunked(64 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"response exceeds configured size limit ({limit} bytes)")
+        chunks.append(chunk)
+    if not chunks:
+        reader = getattr(response, "read", None)
+        if callable(reader):
+            payload = await reader()
+            if len(payload) > limit:
+                raise ValueError(
+                    f"response exceeds configured size limit ({limit} bytes)"
+                )
+            return bytes(payload)
+    return b"".join(chunks)
+
+
+def _decode_sitemap_payload(
+    payload: bytes,
+    source_url: str = "",
+    content_type: str = "",
+    *,
+    max_decoded_bytes: int = DEFAULT_SITEMAP_MAX_RESPONSE_BYTES,
+) -> bytes:
     if not payload:
         return b""
+
+    limit = max(1, int(max_decoded_bytes))
+    if len(payload) > limit:
+        raise ValueError(f"sitemap payload exceeds configured size limit ({limit} bytes)")
 
     looks_gzipped = payload[:2] == b"\x1f\x8b"
     if source_url.endswith(".gz") or "gzip" in content_type.lower() or looks_gzipped:
         try:
-            return gzip.decompress(payload)
+            with gzip.GzipFile(fileobj=io.BytesIO(payload)) as compressed:
+                decoded = compressed.read(limit + 1)
+            if len(decoded) > limit:
+                raise ValueError(
+                    f"decoded sitemap exceeds configured size limit ({limit} bytes)"
+                )
+            return decoded
         except OSError:
             return payload
     return payload
 
 
-def _parse_sitemap_xml(payload: bytes, source_url: str = "", content_type: str = "") -> tuple[list[str], list[str]]:
+def _parse_sitemap_xml(
+    payload: bytes,
+    source_url: str = "",
+    content_type: str = "",
+    *,
+    max_decoded_bytes: int = DEFAULT_SITEMAP_MAX_RESPONSE_BYTES,
+) -> tuple[list[str], list[str]]:
     """Parse a sitemap payload and return child sitemap URLs and page URLs."""
-    decoded = _decode_sitemap_payload(payload, source_url=source_url, content_type=content_type)
+    decoded = _decode_sitemap_payload(
+        payload,
+        source_url=source_url,
+        content_type=content_type,
+        max_decoded_bytes=max_decoded_bytes,
+    )
     if not decoded:
         return ([], [])
 
@@ -2296,6 +2367,20 @@ class Crawl4AICrawler(CrawlerStage):
             errors.append("crawler.start_url is required")
         elif not _normalize_http_url(start_url):
             errors.append("crawler.start_url must be a valid http(s) URL")
+        elif (
+            bool(crawler.get("require_https", True))
+            and urlparse(str(start_url)).scheme.lower() != "https"
+        ):
+            errors.append("crawler.start_url must use HTTPS when crawler.require_https is true")
+
+        source_validation_mode = str(
+            crawler.get("validate_source_html_mode", "on_quality_warning")
+            or "on_quality_warning"
+        ).strip().lower()
+        if source_validation_mode not in {"always", "on_quality_warning", "never"}:
+            errors.append(
+                "crawler.validate_source_html_mode must be always, on_quality_warning, or never"
+            )
 
         for key in (
             "max_pages",
@@ -2305,6 +2390,9 @@ class Crawl4AICrawler(CrawlerStage):
             "max_images_per_page",
             "max_videos_per_page",
             "max_video_transcript_kb",
+            "robots_max_response_bytes",
+            "sitemap_max_response_bytes",
+            "sitemap_max_sources",
         ):
             value = crawler.get(key)
             if value is None:
@@ -2319,13 +2407,15 @@ class Crawl4AICrawler(CrawlerStage):
             except (TypeError, ValueError):
                 errors.append(f"crawler.{key} must be numeric")
 
-        max_depth = crawler.get("max_depth")
-        if max_depth is not None:
+        for depth_key in ("max_depth", "sitemap_max_depth"):
+            max_depth = crawler.get(depth_key)
+            if max_depth is None:
+                continue
             try:
                 if int(max_depth) < 0:
-                    errors.append("crawler.max_depth must be >= 0")
+                    errors.append(f"crawler.{depth_key} must be >= 0")
             except (TypeError, ValueError):
-                errors.append("crawler.max_depth must be an integer")
+                errors.append(f"crawler.{depth_key} must be an integer")
 
         minimum_sitemap_seed_count = crawler.get("minimum_sitemap_seed_count")
         if minimum_sitemap_seed_count is not None:
@@ -2383,6 +2473,11 @@ class Crawl4AICrawler(CrawlerStage):
         except ImportError:
             errors.append("beautifulsoup4 is not installed. Run: pip install beautifulsoup4")
 
+        try:
+            import certifi  # noqa: F401
+        except ImportError:
+            errors.append("certifi is not installed. Run: pip install certifi")
+
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
@@ -2427,6 +2522,32 @@ class Crawl4AICrawler(CrawlerStage):
         self.max_image_size_bytes = int(float(self.config.get("max_image_size_mb", 10)) * 1024 * 1024)
         self.max_video_transcript_bytes = int(
             float(self.config.get("max_video_transcript_kb", 128)) * 1024
+        )
+        self.robots_max_response_bytes = max(
+            1,
+            int(
+                self.config.get(
+                    "robots_max_response_bytes",
+                    DEFAULT_ROBOTS_MAX_RESPONSE_BYTES,
+                )
+            ),
+        )
+        self.sitemap_max_response_bytes = max(
+            1,
+            int(
+                self.config.get(
+                    "sitemap_max_response_bytes",
+                    DEFAULT_SITEMAP_MAX_RESPONSE_BYTES,
+                )
+            ),
+        )
+        self.sitemap_max_sources = max(
+            1,
+            int(self.config.get("sitemap_max_sources", 100)),
+        )
+        self.sitemap_max_depth = max(
+            0,
+            int(self.config.get("sitemap_max_depth", 4)),
         )
         self.max_images_per_page = max(0, int(self.config.get("max_images_per_page", 20)))
         self.max_videos_per_page = max(0, int(self.config.get("max_videos_per_page", 10)))
@@ -3162,7 +3283,7 @@ class Crawl4AICrawler(CrawlerStage):
 
         connector = aiohttp.TCPConnector(
             limit=max(self.fetch_concurrency, self.download_concurrency),
-            ssl=False if self.ignore_https_errors else True,
+            ssl=False if self.ignore_https_errors else _build_verified_ssl_context(),
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
 
@@ -3197,7 +3318,10 @@ class Crawl4AICrawler(CrawlerStage):
 
         redirects_followed = 0
         while True:
-            if enforce_allowed_domain and not self._url_allowed_for_fetch(current_url):
+            if not self._url_allowed_for_request(
+                current_url,
+                enforce_allowed_domain=enforce_allowed_domain,
+            ):
                 raise _RedirectEgressPolicyError(
                     current_url,
                     current_url,
@@ -3230,8 +3354,10 @@ class Crawl4AICrawler(CrawlerStage):
                         base_url=response_url,
                     )
                     if not target_url or (
-                        enforce_allowed_domain
-                        and not self._url_allowed_for_fetch(target_url)
+                        not self._url_allowed_for_request(
+                            target_url,
+                            enforce_allowed_domain=enforce_allowed_domain,
+                        )
                     ):
                         raise _RedirectEgressPolicyError(
                             current_url,
@@ -3368,7 +3494,7 @@ class Crawl4AICrawler(CrawlerStage):
 
         connector = aiohttp.TCPConnector(
             limit=self.cohort_probe_concurrency,
-            ssl=False if self.ignore_https_errors else True,
+            ssl=False if self.ignore_https_errors else _build_verified_ssl_context(),
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         semaphore = asyncio.Semaphore(self.cohort_probe_concurrency)
@@ -3475,6 +3601,53 @@ class Crawl4AICrawler(CrawlerStage):
         if not self._session:
             return []
 
+        robots_max_response_bytes = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "robots_max_response_bytes",
+                    self.config.get(
+                        "robots_max_response_bytes",
+                        DEFAULT_ROBOTS_MAX_RESPONSE_BYTES,
+                    ),
+                )
+            ),
+        )
+        sitemap_max_response_bytes = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "sitemap_max_response_bytes",
+                    self.config.get(
+                        "sitemap_max_response_bytes",
+                        DEFAULT_SITEMAP_MAX_RESPONSE_BYTES,
+                    ),
+                )
+            ),
+        )
+        sitemap_max_sources = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "sitemap_max_sources",
+                    self.config.get("sitemap_max_sources", 100),
+                )
+            ),
+        )
+        sitemap_max_depth = max(
+            0,
+            int(
+                getattr(
+                    self,
+                    "sitemap_max_depth",
+                    self.config.get("sitemap_max_depth", 4),
+                )
+            ),
+        )
+
         start_parsed = urlparse(self.start_url)
         candidates = []
         if self.respect_robots_txt:
@@ -3486,7 +3659,14 @@ class Crawl4AICrawler(CrawlerStage):
                     enforce_allowed_domain=True,
                 ) as response:
                     if response.status == 200:
-                        robots_text = await response.text()
+                        robots_payload = await _read_bounded_response(
+                            response,
+                            robots_max_response_bytes,
+                        )
+                        robots_text = robots_payload.decode(
+                            "utf-8-sig",
+                            errors="replace",
+                        )
                         for line in robots_text.splitlines():
                             if line.lower().startswith("sitemap:"):
                                 sitemap_url = line.split(":", 1)[1].strip()
@@ -3509,9 +3689,23 @@ class Crawl4AICrawler(CrawlerStage):
         collected_urls: list[str] = []
         sitemap_limit = max(0, int(self.config.get("sitemap_seed_limit", 500)))
 
-        async def _walk(sitemap_url: str) -> None:
+        async def _walk(sitemap_url: str, depth: int = 0) -> None:
+            if depth > sitemap_max_depth:
+                logger.warning(
+                    "Skipping sitemap beyond configured nesting depth %d: %s",
+                    sitemap_max_depth,
+                    sitemap_url,
+                )
+                return
             normalized = _normalize_http_url(sitemap_url)
             if not normalized or normalized in seen_sitemaps:
+                return
+            if len(seen_sitemaps) >= sitemap_max_sources:
+                logger.warning(
+                    "Skipping sitemap after reaching configured source limit %d: %s",
+                    sitemap_max_sources,
+                    normalized,
+                )
                 return
             if not self._url_allowed_for_fetch(normalized):
                 logger.debug("Skipping sitemap outside allowed egress policy: %s", normalized)
@@ -3535,7 +3729,10 @@ class Crawl4AICrawler(CrawlerStage):
                     source_fetches[normalized] = source_record
                     if response.status != 200:
                         return
-                    payload = await response.read()
+                    payload = await _read_bounded_response(
+                        response,
+                        sitemap_max_response_bytes,
+                    )
                     content_type = response.headers.get("Content-Type", "")
                     source_record["payload_sha256"] = hashlib.sha256(payload).hexdigest()
             except Exception as exc:
@@ -3551,6 +3748,7 @@ class Crawl4AICrawler(CrawlerStage):
                 payload,
                 source_url=normalized,
                 content_type=content_type,
+                max_decoded_bytes=sitemap_max_response_bytes,
             )
             source_fetches[normalized]["child_sitemap_count"] = len(child_sitemaps)
             source_fetches[normalized]["page_url_count"] = len(page_urls)
@@ -3572,7 +3770,7 @@ class Crawl4AICrawler(CrawlerStage):
                 return
 
             for child in child_sitemaps:
-                await _walk(child)
+                await _walk(child, depth + 1)
                 if sitemap_limit and len(collected_urls) >= sitemap_limit:
                     return
 
@@ -3627,6 +3825,32 @@ class Crawl4AICrawler(CrawlerStage):
         if _host_resolves_to_private_or_reserved(host):
             return False
         return True
+
+    def _url_allowed_for_request(
+        self,
+        url: str,
+        *,
+        enforce_allowed_domain: bool,
+    ) -> bool:
+        """Apply the non-negotiable network policy to every direct HTTP hop.
+
+        Some optional media downloads intentionally permit public third-party
+        hosts.  They still must never reach plaintext, loopback, link-local,
+        private, reserved, or DNS-unresolvable targets.  Same-site content
+        gathering additionally uses the crawler allowlist.
+        """
+
+        if enforce_allowed_domain:
+            return self._url_allowed_for_fetch(url)
+
+        normalized = _normalize_http_url(url)
+        parsed = urlparse(normalized or "")
+        host = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or not host:
+            return False
+        if getattr(self, "require_https", True) and parsed.scheme != "https":
+            return False
+        return not _host_resolves_to_private_or_reserved(host)
 
     def _allow_frontier_url(self, url: str) -> bool:
         normalized = _normalize_http_url(url)
@@ -4311,10 +4535,7 @@ class Crawl4AICrawler(CrawlerStage):
         return list(dict.fromkeys(candidates))
 
     def _track_url_allowed(self, url: str) -> bool:
-        host = (urlparse(url).hostname or "").lower()
-        if not host:
-            return False
-        return any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
+        return self._url_allowed_for_fetch(url)
 
     async def _populate_video_transcripts(self, videos: List[Dict[str, Any]]) -> None:
         if not self.fetch_video_transcripts or not self._session:
@@ -4345,11 +4566,18 @@ class Crawl4AICrawler(CrawlerStage):
 
         try:
             async with self._download_semaphore:
-                async with self._session.get(normalized, proxy=self.proxy) as response:
+                async with self._get_with_safe_redirects(
+                    session=self._session,
+                    url=normalized,
+                    enforce_allowed_domain=True,
+                ) as response:
                     if response.status >= 400:
                         return
+                    final_url = _normalize_http_url(str(response.url))
+                    if not final_url or not self._url_allowed_for_fetch(final_url):
+                        return
                     content_type = (response.headers.get("Content-Type") or "").lower()
-                    ext = _url_extension(normalized)
+                    ext = _url_extension(final_url)
                     if ext not in TEXT_TRACK_EXTENSIONS and "text" not in content_type and "vtt" not in content_type:
                         return
 
@@ -4366,7 +4594,7 @@ class Crawl4AICrawler(CrawlerStage):
                     transcript = _strip_webvtt(b"".join(chunks).decode("utf-8", errors="replace"))
                     if transcript:
                         video["transcript"] = transcript[:4000]
-                        video["transcript_url"] = normalized
+                        video["transcript_url"] = final_url
                         self.stats["video_transcripts_fetched"] += 1
         except Exception as exc:
             logger.debug("Failed to fetch transcript %s: %s", normalized, exc)
@@ -4520,7 +4748,7 @@ class Crawl4AICrawler(CrawlerStage):
 
         connector = aiohttp.TCPConnector(
             limit=1,
-            ssl=False if self.ignore_https_errors else True,
+            ssl=False if self.ignore_https_errors else _build_verified_ssl_context(),
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
         async with aiohttp.ClientSession(
