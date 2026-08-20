@@ -233,7 +233,10 @@ def test_canonical_production_rejects_downgraded_crawl_contract(monkeypatch):
     assert contract["status"] == "error"
     errors = contract["details"]["errors"]
     assert "crawler.start_url must target https://mbzuai.ac.ae" in errors
-    assert "crawler.allowed_domains must contain only mbzuai.ac.ae" in errors
+    assert (
+        "crawler.allowed_domains must contain only mbzuai.ac.ae and ifm.ai"
+        in errors
+    )
     assert "crawler.respect_robots_txt must be true" in errors
     assert "crawler.minimum_sitemap_seed_count must be >= 2100" in errors
     assert "crawler.sitemap_max_sources must be between 32 and 100" in errors
@@ -678,7 +681,7 @@ class TestConfig:
         assert config["crawler"]["cohort_probe_attempts"] == 3
         assert config["crawler"]["cohort_probe_backoff_sec"] == 2.0
         assert config["crawler"]["cohort_probe_min_interval_sec"] == 1.5
-        assert config["formatter"]["expected_site_inventory_count"] == 2600
+        assert config["formatter"]["expected_site_inventory_count"] == 2700
         assert config["retrieval"]["retriever_backend"] == "routed_hybrid"
         assert config["retrieval"]["query_planner_enabled"] is True
         assert config["retrieval"]["evidence_adjudicator_max_workers"] == 2

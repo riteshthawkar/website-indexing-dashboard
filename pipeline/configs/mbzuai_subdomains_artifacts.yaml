@@ -1,0 +1,75 @@
+# Artifact-only validation crawl for the approved MBZUAI public subdomains.
+# The canonical production config includes the same origins; this smaller
+# profile lets operators refresh/test them without re-crawling the main site.
+_inherit: mbzuai_main.yaml
+
+project_name: "mbzuai_subdomains"
+
+pipeline:
+  production_profile: false
+
+crawler:
+  start_url: "https://careers.mbzuai.ac.ae/"
+  max_pages: 1000
+  max_depth: 4
+  sitemap_seed_limit: 1000
+  sitemap_frontier_seed_limit: 1000
+  minimum_sitemap_seed_count: 70
+  sitemap_crawl_batch_size: 20
+  known_empty_sitemap_cohorts: []
+  allowed_hosts:
+    - "mbzuai.ac.ae"
+    - "careers.mbzuai.ac.ae"
+    - "research.mbzuai.ac.ae"
+    - "ai-nexus.mbzuai.ac.ae"
+    - "library.mbzuai.ac.ae"
+    - "metaverse.mbzuai.ac.ae"
+    - "buildit.mbzuai.ac.ae"
+    - "hpp.mbzuai.ac.ae"
+    - "ifm.mbzuai.ac.ae"
+    - "ifm.ai"
+  sitemap_origins:
+    - "https://careers.mbzuai.ac.ae"
+    - "https://research.mbzuai.ac.ae"
+    - "https://ai-nexus.mbzuai.ac.ae"
+    - "https://hpp.mbzuai.ac.ae"
+    - "https://ifm.ai"
+  sitemap_entry_urls:
+    - "https://careers.mbzuai.ac.ae/wp-sitemap.xml"
+    - "https://research.mbzuai.ac.ae/sitemap.xml"
+    - "https://ai-nexus.mbzuai.ac.ae/sitemap_index.xml"
+    - "https://hpp.mbzuai.ac.ae/sitemap_index.xml"
+    - "https://ifm.ai/sitemap_index.xml"
+  minimum_sitemap_urls_by_host:
+    "mbzuai.ac.ae": 0
+    "careers.mbzuai.ac.ae": 40
+    "research.mbzuai.ac.ae": 8
+    "ai-nexus.mbzuai.ac.ae": 8
+    "hpp.mbzuai.ac.ae": 3
+    "ifm.ai": 15
+  minimum_crawled_pages_by_host:
+    "mbzuai.ac.ae": 0
+    "careers.mbzuai.ac.ae": 40
+    "research.mbzuai.ac.ae": 8
+    "ai-nexus.mbzuai.ac.ae": 8
+    "hpp.mbzuai.ac.ae": 3
+    "ifm.ai": 15
+    "library.mbzuai.ac.ae": 1
+    "metaverse.mbzuai.ac.ae": 1
+    "buildit.mbzuai.ac.ae": 1
+  priority_seed_urls:
+    - "https://careers.mbzuai.ac.ae/"
+    - "https://research.mbzuai.ac.ae/"
+    - "https://ai-nexus.mbzuai.ac.ae/"
+    - "https://hpp.mbzuai.ac.ae/"
+    - "https://ifm.ai/"
+    - "https://library.mbzuai.ac.ae/"
+    - "https://metaverse.mbzuai.ac.ae/"
+    - "https://buildit.mbzuai.ac.ae/"
+
+# This profile intentionally contains no cleaner, converter, chunker, or
+# upload stages. It stops after durable source artifacts and crawl metadata.
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai

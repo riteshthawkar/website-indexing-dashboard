@@ -101,3 +101,68 @@ def test_sitemap_coverage_gate_configuration_is_fail_closed():
 
     assert any("sitemap_enabled must be true" in error for error in disabled_errors)
     assert any("must not exceed" in error for error in over_limit_errors)
+
+
+def test_per_host_sitemap_coverage_cannot_be_masked_by_main_site_volume():
+    crawler = crawler_module.Crawl4AICrawler()
+    urls = [f"https://mbzuai.ac.ae/page-{index}" for index in range(100)]
+    urls.extend(
+        [f"https://careers.mbzuai.ac.ae/job-{index}" for index in range(2)]
+    )
+
+    try:
+        crawler._enforce_host_minimums(
+            urls,
+            {"mbzuai.ac.ae": 50, "careers.mbzuai.ac.ae": 3},
+            label="Sitemap origin coverage",
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("missing Careers coverage must fail the origin gate")
+
+    assert "careers.mbzuai.ac.ae: found=2 required=3" in message
+
+
+def test_bounded_link_discovery_stays_on_the_approved_source_host(monkeypatch):
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.start_url = "https://library.mbzuai.ac.ae/"
+    crawler.allowed_domains = {"mbzuai.ac.ae"}
+    crawler.allowed_hosts = {"library.mbzuai.ac.ae", "careers.mbzuai.ac.ae"}
+    crawler.excluded_subdomains = set()
+    crawler.excluded_path_prefixes = set()
+    crawler.allow_query_urls = False
+    crawler.allowed_query_param_names = set()
+    crawler.require_https = True
+    crawler.max_depth = 4
+    crawler.max_pages = 20
+    crawler.link_discovery_hosts = {"library.mbzuai.ac.ae"}
+    crawler.link_discovery_max_pages_by_host = {"library.mbzuai.ac.ae": 3}
+    source_url = "https://library.mbzuai.ac.ae"
+    crawler.page_links = {
+        source_url: [
+            {"target_url": "https://library.mbzuai.ac.ae/services"},
+            {"target_url": "https://library.mbzuai.ac.ae/research"},
+            {"target_url": "https://library.mbzuai.ac.ae/third"},
+            {"target_url": "https://careers.mbzuai.ac.ae/vacancies/"},
+            {"target_url": "https://admin.hci.mbzuai.ac.ae/"},
+        ]
+    }
+    monkeypatch.setattr(
+        crawler_module,
+        "_host_resolves_to_private_or_reserved",
+        lambda _host: False,
+    )
+
+    discovered = crawler._discover_link_frontier_items(
+        [source_url],
+        visited=[source_url],
+        pending=[],
+        depths={source_url: 1},
+    )
+
+    assert [item["url"] for item in discovered] == [
+        "https://library.mbzuai.ac.ae/services",
+        "https://library.mbzuai.ac.ae/research",
+    ]
+    assert all(item["parent_url"] == source_url for item in discovered)

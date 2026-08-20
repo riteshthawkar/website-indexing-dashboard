@@ -20,6 +20,94 @@ crawler:
   cohort_probe_backoff_sec: 2.0
   cohort_probe_min_interval_sec: 1.5
   cohort_probe_max_bytes: 4096
+  # Researched public-origin inventory (2026-08-20). Production uses an exact
+  # host list so certificate/DNS discoveries cannot pull admin, auth, tracking,
+  # or research-service hosts into the crawler by suffix alone.
+  origin_inventory_revision: "2026-08-20-v1"
+  allowed_domains:
+    - "mbzuai.ac.ae"
+    - "ifm.ai"
+  allowed_hosts:
+    - "mbzuai.ac.ae"
+    - "www.mbzuai.ac.ae"
+    - "careers.mbzuai.ac.ae"
+    - "research.mbzuai.ac.ae"
+    - "ai-nexus.mbzuai.ac.ae"
+    - "library.mbzuai.ac.ae"
+    - "metaverse.mbzuai.ac.ae"
+    - "buildit.mbzuai.ac.ae"
+    - "hpp.mbzuai.ac.ae"
+    - "ifm.mbzuai.ac.ae"
+    - "ifm.ai"
+  excluded_subdomains:
+    - "academy.mbzuai.ac.ae"
+    - "irep.mbzuai.ac.ae"
+    - "dclibrary.mbzuai.ac.ae"
+    - "xing.mbzuai.ac.ae"
+  sitemap_origins:
+    - "https://mbzuai.ac.ae"
+    - "https://careers.mbzuai.ac.ae"
+    - "https://research.mbzuai.ac.ae"
+    - "https://ai-nexus.mbzuai.ac.ae"
+    - "https://hpp.mbzuai.ac.ae"
+    - "https://ifm.ai"
+  sitemap_entry_urls:
+    - "https://mbzuai.ac.ae/sitemap.xml"
+    - "https://careers.mbzuai.ac.ae/wp-sitemap.xml"
+    - "https://research.mbzuai.ac.ae/sitemap.xml"
+    - "https://ai-nexus.mbzuai.ac.ae/sitemap_index.xml"
+    - "https://hpp.mbzuai.ac.ae/sitemap_index.xml"
+    - "https://ifm.ai/sitemap_index.xml"
+  minimum_sitemap_urls_by_host:
+    "mbzuai.ac.ae": 2100
+    "careers.mbzuai.ac.ae": 40
+    "research.mbzuai.ac.ae": 8
+    "ai-nexus.mbzuai.ac.ae": 8
+    "hpp.mbzuai.ac.ae": 3
+    "ifm.ai": 15
+  # These origins do not currently publish usable XML sitemaps. Their roots
+  # are deterministic seeds and link expansion is allowed only within the same
+  # exact host and bounded by the per-host budgets below.
+  link_discovery_hosts:
+    - "library.mbzuai.ac.ae"
+    - "metaverse.mbzuai.ac.ae"
+    - "buildit.mbzuai.ac.ae"
+  link_discovery_max_pages_by_host:
+    "library.mbzuai.ac.ae": 300
+    "metaverse.mbzuai.ac.ae": 100
+    "buildit.mbzuai.ac.ae": 100
+  minimum_crawled_pages_by_host:
+    "mbzuai.ac.ae": 2100
+    "careers.mbzuai.ac.ae": 40
+    "research.mbzuai.ac.ae": 8
+    "ai-nexus.mbzuai.ac.ae": 8
+    "hpp.mbzuai.ac.ae": 3
+    "ifm.ai": 15
+    "library.mbzuai.ac.ae": 1
+    "metaverse.mbzuai.ac.ae": 1
+    "buildit.mbzuai.ac.ae": 1
+  priority_seed_urls:
+    - "https://mbzuai.ac.ae/about/office-of-the-president"
+    - "https://mbzuai.ac.ae/about/leadership"
+    - "https://mbzuai.ac.ae/about/contact"
+    - "https://mbzuai.ac.ae/study/graduate-admission-process"
+    - "https://mbzuai.ac.ae/study/ug-admission-process"
+    - "https://mbzuai.ac.ae/student-resources/campus-facilities"
+    - "https://library.mbzuai.ac.ae/"
+    - "https://metaverse.mbzuai.ac.ae/"
+    - "https://buildit.mbzuai.ac.ae/"
+  origin_inventory:
+    canonical_aliases:
+      "ifm.mbzuai.ac.ae": "ifm.ai"
+    deferred_specialized_crawls:
+      "irep.mbzuai.ac.ae": "Public DSpace repository; robots.txt requires Crawl-delay: 10 and a separate rate-limited ingester."
+    policy_exclusions:
+      "academy.mbzuai.ac.ae": "robots.txt disallows all crawling."
+      "dclibrary.mbzuai.ac.ae": "TLS certificate does not match the hostname."
+      "xing.mbzuai.ac.ae": "robots.txt returns HTTP 403, so crawl permission cannot be established."
+      "apply.mbzuai.ac.ae": "Applicant workflow rather than public institutional content."
+      "engage.mbzuai.ac.ae": "Authenticated login workflow."
+      "staticcdn.mbzuai.ac.ae": "Static asset delivery, not a page corpus."
   excluded_path_prefixes:
     - "/tag/"
     - "/ar/tag/"
@@ -104,11 +192,6 @@ crawler:
       allowed_path_prefixes: ["/research-center"]
       expected_member_count: 1
       max_members: 1
-  allowed_domains:
-    - "mbzuai.ac.ae"
-  excluded_subdomains:
-    - "library.mbzuai.ac.ae"
-
 embedder:
   # Candidate runs must never clear or mutate the active release namespaces.
   # The upload manifest records the resolved names and the retriever consumes

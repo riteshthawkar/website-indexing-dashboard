@@ -16,8 +16,8 @@ crawler:
   ignore_https_errors: false
   require_https: true
   # Fail before the expensive browser crawl when TLS or sitemap changes collapse
-  # the eligible frontier. The raw ~2.6k inventory and evidence-backed empty
-  # members are checked separately by the stricter index-readiness gate.
+  # the eligible frontier. Per-origin minimums inherited from mbzuai_main also
+  # prevent the main sitemap from masking a missing Careers, IFM, or research site.
   minimum_sitemap_seed_count: 2100
 
 graph:
@@ -38,10 +38,11 @@ embedder:
   gemini_request_timeout_ms: 30000
 
 formatter:
-  # The verified live sitemap inventory on 2026-07-13 contains 2,636 raw URLs.
+  # The researched 2026-08-20 multi-origin sitemap inventory contains roughly
+  # 2.75k raw URLs before the main site's verified-empty CMS cohorts.
   # Defective CMS members are excluded only after fresh, run-scoped HTTP proof;
   # the raw inventory baseline remains independent of the eligible crawl count.
-  expected_site_inventory_count: 2600
+  expected_site_inventory_count: 2700
   minimum_inventory_coverage_ratio: 0.90
   maximum_hard_failure_count: 25
   fail_on_critical_coverage: true

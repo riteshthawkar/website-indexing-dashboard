@@ -1755,12 +1755,55 @@ def _extract_page_metadata(
     }
 
 
-def _link_type_for_url(url: str, allowed_domains: set[str]) -> str:
+def _host_allowed_by_policy(
+    host: str,
+    *,
+    allowed_domains: Iterable[str],
+    excluded_subdomains: Iterable[str] = (),
+    allowed_hosts: Iterable[str] = (),
+) -> bool:
+    """Apply an exact-host allowlist when configured, otherwise legacy suffix rules."""
+    normalized_host = str(host or "").lower().strip(".")
+    if not normalized_host:
+        return False
+    excluded = {
+        str(value or "").lower().strip(".")
+        for value in excluded_subdomains
+        if str(value or "").strip()
+    }
+    if any(_host_matches_domain(normalized_host, value) for value in excluded):
+        return False
+    exact_hosts = {
+        str(value or "").lower().strip(".")
+        for value in allowed_hosts
+        if str(value or "").strip()
+    }
+    if exact_hosts:
+        return normalized_host in exact_hosts
+    return any(
+        _host_matches_domain(normalized_host, str(value or ""))
+        for value in allowed_domains
+        if str(value or "").strip()
+    )
+
+
+def _link_type_for_url(
+    url: str,
+    allowed_domains: set[str],
+    *,
+    allowed_hosts: Iterable[str] = (),
+    excluded_subdomains: Iterable[str] = (),
+) -> str:
     extension = _url_extension(url)
     if extension in DOWNLOADABLE_EXTENSIONS:
         return "document"
     host = (urlparse(url).hostname or "").lower()
-    if any(_host_matches_domain(host, allowed) for allowed in allowed_domains):
+    if _host_allowed_by_policy(
+        host,
+        allowed_domains=allowed_domains,
+        allowed_hosts=allowed_hosts,
+        excluded_subdomains=excluded_subdomains,
+    ):
         return "internal"
     return "external"
 
@@ -1771,6 +1814,8 @@ def _extract_page_links(
     base_url: str,
     *,
     allowed_domains: set[str],
+    allowed_hosts: Iterable[str] = (),
+    excluded_subdomains: Iterable[str] = (),
 ) -> List[Dict[str, Any]]:
     links_by_target: Dict[str, Dict[str, Any]] = {}
 
@@ -1783,7 +1828,12 @@ def _extract_page_links(
             {
                 "source_url": base_url,
                 "target_url": target_url,
-                "link_type": _link_type_for_url(target_url, allowed_domains),
+                "link_type": _link_type_for_url(
+                    target_url,
+                    allowed_domains,
+                    allowed_hosts=allowed_hosts,
+                    excluded_subdomains=excluded_subdomains,
+                ),
                 "anchor_texts": [],
                 "rels": [],
                 "sources": [],
@@ -2263,12 +2313,20 @@ def _merge_counter_dict(base: Dict[str, int], loaded: Dict[str, Any]) -> Dict[st
 
 
 class AllowedDomainFilter(URLFilter):
-    """Allow only configured domains while excluding known subdomains."""
+    """Allow configured domains, narrowed to exact hosts when provided."""
 
-    def __init__(self, allowed_domains: Iterable[str], excluded_subdomains: Iterable[str]):
+    def __init__(
+        self,
+        allowed_domains: Iterable[str],
+        excluded_subdomains: Iterable[str],
+        allowed_hosts: Iterable[str] = (),
+    ):
         super().__init__(name="AllowedDomainFilter")
         self.allowed_domains = {domain.lower() for domain in allowed_domains if domain}
         self.excluded_subdomains = {domain.lower() for domain in excluded_subdomains if domain}
+        self.allowed_hosts = {
+            host.lower().strip(".") for host in allowed_hosts if host
+        }
 
     def apply(self, url: str) -> bool:
         host = (urlparse(url).hostname or "").lower()
@@ -2277,10 +2335,12 @@ class AllowedDomainFilter(URLFilter):
         # Helper-level tests and resume recovery can construct a crawler from
         # persisted state before the full execute() initialization path runs.
         # Missing optional policy collections must default closed/safely.
-        excluded_subdomains = getattr(self, "excluded_subdomains", set()) or set()
-        if any(_host_matches_domain(host, excluded) for excluded in excluded_subdomains):
-            return False
-        return any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
+        return _host_allowed_by_policy(
+            host,
+            allowed_domains=self.allowed_domains,
+            allowed_hosts=getattr(self, "allowed_hosts", set()) or set(),
+            excluded_subdomains=getattr(self, "excluded_subdomains", set()) or set(),
+        )
 
 
 class SkipExtensionFilter(URLFilter):
@@ -2372,6 +2432,78 @@ class Crawl4AICrawler(CrawlerStage):
             and urlparse(str(start_url)).scheme.lower() != "https"
         ):
             errors.append("crawler.start_url must use HTTPS when crawler.require_https is true")
+
+        allowed_hosts = {
+            str(value or "").lower().strip(".")
+            for value in (crawler.get("allowed_hosts") or [])
+            if str(value or "").strip()
+        }
+        for value in crawler.get("allowed_hosts") or []:
+            host = str(value or "").strip()
+            if (
+                not host
+                or "://" in host
+                or "/" in host
+                or not (urlparse(f"//{host}").hostname or "")
+            ):
+                errors.append(
+                    "crawler.allowed_hosts entries must be exact hostnames without schemes or paths"
+                )
+                break
+        start_host = (urlparse(str(start_url or "")).hostname or "").lower()
+        if allowed_hosts and start_host and start_host not in allowed_hosts:
+            errors.append("crawler.allowed_hosts must include the crawler.start_url host")
+
+        configured_origin_urls = [
+            *(crawler.get("sitemap_origins") or []),
+            *(crawler.get("sitemap_entry_urls") or []),
+        ]
+        for value in configured_origin_urls:
+            normalized = _normalize_http_url(value)
+            parsed = urlparse(normalized or "")
+            if not normalized or (
+                bool(crawler.get("require_https", True)) and parsed.scheme != "https"
+            ):
+                errors.append(
+                    "crawler.sitemap_origins and crawler.sitemap_entry_urls must contain valid HTTPS URLs"
+                )
+                break
+            if allowed_hosts and (parsed.hostname or "").lower() not in allowed_hosts:
+                errors.append(
+                    "crawler sitemap origins and entry URLs must use crawler.allowed_hosts"
+                )
+                break
+
+        for key in (
+            "minimum_sitemap_urls_by_host",
+            "minimum_crawled_pages_by_host",
+            "link_discovery_max_pages_by_host",
+        ):
+            host_values = crawler.get(key) or {}
+            if not isinstance(host_values, dict):
+                errors.append(f"crawler.{key} must be a hostname-to-integer mapping")
+                continue
+            for host, value in host_values.items():
+                normalized_host = str(host or "").lower().strip(".")
+                if allowed_hosts and normalized_host not in allowed_hosts:
+                    errors.append(f"crawler.{key} contains a host outside crawler.allowed_hosts")
+                    break
+                try:
+                    if int(value) < 0:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(f"crawler.{key} values must be non-negative integers")
+                    break
+
+        link_discovery_hosts = {
+            str(value or "").lower().strip(".")
+            for value in (crawler.get("link_discovery_hosts") or [])
+            if str(value or "").strip()
+        }
+        if allowed_hosts and not link_discovery_hosts.issubset(allowed_hosts):
+            errors.append(
+                "crawler.link_discovery_hosts must be a subset of crawler.allowed_hosts"
+            )
 
         source_validation_mode = str(
             crawler.get("validate_source_html_mode", "on_quality_warning")
@@ -2572,6 +2704,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.require_https = bool(self.config.get("require_https", True))
         self.enable_stealth = bool(self.config.get("enable_stealth", False))
         self.allowed_domains = self._resolve_allowed_domains()
+        self.allowed_hosts = self._resolve_allowed_hosts()
         self.excluded_subdomains = {
             value.lower()
             for value in (self.config.get("excluded_subdomains") or [])
@@ -2590,6 +2723,22 @@ class Crawl4AICrawler(CrawlerStage):
             for value in (self.config.get("excluded_path_prefixes") or [])
             if _normalize_path_prefix(value)
         }
+        self.sitemap_origins = self._resolve_sitemap_origins()
+        self.sitemap_entry_urls = self._resolve_sitemap_entry_urls()
+        self.minimum_sitemap_urls_by_host = self._resolve_host_minimums(
+            "minimum_sitemap_urls_by_host"
+        )
+        self.minimum_crawled_pages_by_host = self._resolve_host_minimums(
+            "minimum_crawled_pages_by_host"
+        )
+        self.link_discovery_hosts = {
+            str(value or "").lower().strip(".")
+            for value in (self.config.get("link_discovery_hosts") or [])
+            if str(value or "").strip()
+        }
+        self.link_discovery_max_pages_by_host = self._resolve_host_minimums(
+            "link_discovery_max_pages_by_host"
+        )
         self.known_empty_sitemap_cohorts, cohort_errors = (
             _normalize_known_empty_cohort_policies(
                 self.config.get("known_empty_sitemap_cohorts"),
@@ -2624,7 +2773,7 @@ class Crawl4AICrawler(CrawlerStage):
             if (
                 url
                 and self._allow_frontier_url(url)
-                and any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
+                and self._host_allowed(host)
             ):
                 self.priority_seed_urls.append(url)
 
@@ -2667,6 +2816,7 @@ class Crawl4AICrawler(CrawlerStage):
             "sitemap_urls_discovered": 0,
             "verified_empty_urls": 0,
             "sitemap_batches_completed": 0,
+            "frontier_urls_discovered": 0,
             "skipped_urls": 0,
             "excluded_frontier_urls": 0,
             "recoverable_skips_exhausted": 0,
@@ -2727,6 +2877,11 @@ class Crawl4AICrawler(CrawlerStage):
                         f"required={minimum_sitemap_seed_count}. "
                         "Check verified TLS trust, sitemap availability, and the configured inventory baseline."
                     )
+                self._enforce_host_minimums(
+                    sitemap_urls,
+                    self.minimum_sitemap_urls_by_host,
+                    label="Sitemap origin coverage",
+                )
                 self.crawl_state = _build_initial_crawl_state(
                     self.start_url,
                     sitemap_urls,
@@ -2771,6 +2926,12 @@ class Crawl4AICrawler(CrawlerStage):
 
             self._flush_runtime_state(force=True)
 
+            self._enforce_host_minimums(
+                self.page_metadata.keys(),
+                self.minimum_crawled_pages_by_host,
+                label="Crawled origin coverage",
+            )
+
             if bool(self.config.get("fail_on_empty_result", True)) and not self._has_crawl_output():
                 return StageResult.failure(
                     "Crawler produced no pages, markdown, or downloaded documents. Check start_url, allowed_domains, robots/auth requirements, or remote blocking.",
@@ -2790,6 +2951,7 @@ class Crawl4AICrawler(CrawlerStage):
                     "page_link_graph_file": str(self.page_link_graph_file),
                     "runtime_state_file": str(self.runtime_state_file),
                     "crawler_runtime_state_file": str(self.runtime_state_file),
+                    "sitemap_discovery_file": str(self.sitemap_state_file),
                     "sitemap_cohort_verification_file": str(
                         self.sitemap_cohort_verification_file
                     ),
@@ -2813,6 +2975,25 @@ class Crawl4AICrawler(CrawlerStage):
                             "nodes": len(self.page_metadata),
                             "edges": sum(len(links) for links in self.page_links.values()),
                         },
+                    ),
+                    *(
+                        [
+                            ctx.make_artifact(
+                                self.sitemap_state_file,
+                                artifact_type="sitemap_discovery",
+                                role="multi_origin_sitemap_inventory",
+                                metadata={
+                                    "sources": len(
+                                        self.discovered_sitemaps.get("sources", [])
+                                    ),
+                                    "eligible_urls": len(
+                                        self.discovered_sitemaps.get("urls", [])
+                                    ),
+                                },
+                            )
+                        ]
+                        if self.sitemap_state_file.exists()
+                        else []
                     ),
                     *(
                         [
@@ -2855,11 +3036,94 @@ class Crawl4AICrawler(CrawlerStage):
             configured.add(start_domain)
         return configured
 
+    def _resolve_allowed_hosts(self) -> set[str]:
+        return {
+            str(value or "").lower().strip(".")
+            for value in (self.config.get("allowed_hosts") or [])
+            if str(value or "").strip()
+        }
+
+    def _host_allowed(self, host: str) -> bool:
+        return _host_allowed_by_policy(
+            host,
+            allowed_domains=getattr(self, "allowed_domains", set()) or set(),
+            allowed_hosts=getattr(self, "allowed_hosts", set()) or set(),
+            excluded_subdomains=getattr(self, "excluded_subdomains", set()) or set(),
+        )
+
+    def _resolve_sitemap_origins(self) -> List[str]:
+        configured = self.config.get("sitemap_origins")
+        values = configured if configured is not None else [self.start_url]
+        origins: list[str] = []
+        for value in values or []:
+            normalized = _normalize_http_url(value)
+            if not normalized:
+                continue
+            parsed = urlparse(normalized)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if origin not in origins:
+                origins.append(origin)
+        return origins
+
+    def _resolve_sitemap_entry_urls(self) -> List[str]:
+        entries: list[str] = []
+        for value in self.config.get("sitemap_entry_urls") or []:
+            normalized = _normalize_http_url(value)
+            if normalized and normalized not in entries:
+                entries.append(normalized)
+        return entries
+
+    def _resolve_host_minimums(self, config_key: str) -> Dict[str, int]:
+        configured = self.config.get(config_key) or {}
+        if not isinstance(configured, dict):
+            return {}
+        resolved: Dict[str, int] = {}
+        for host, value in configured.items():
+            normalized_host = str(host or "").lower().strip(".")
+            if not normalized_host:
+                continue
+            resolved[normalized_host] = max(0, int(value or 0))
+        return resolved
+
+    @staticmethod
+    def _count_urls_by_host(urls: Iterable[str]) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for value in urls:
+            normalized = _normalize_http_url(value)
+            host = (urlparse(normalized or "").hostname or "").lower()
+            if host:
+                counts[host] = counts.get(host, 0) + 1
+        return {host: counts[host] for host in sorted(counts)}
+
+    def _enforce_host_minimums(
+        self,
+        urls: Iterable[str],
+        minimums: Dict[str, int],
+        *,
+        label: str,
+    ) -> None:
+        if not minimums:
+            return
+        counts = self._count_urls_by_host(urls)
+        failures = [
+            f"{host}: found={counts.get(host, 0)} required={minimum}"
+            for host, minimum in sorted(minimums.items())
+            if counts.get(host, 0) < minimum
+        ]
+        if failures:
+            raise RuntimeError(f"{label} gate failed: " + "; ".join(failures))
+
     def _should_include_external_links(self) -> bool:
         configured = bool(self.config.get("include_external", False))
         start_domain = (urlparse(self.start_url).hostname or "").lower()
         if not start_domain:
             return configured
+        exact_hosts = getattr(self, "allowed_hosts", set()) or set()
+        if exact_hosts:
+            external_hosts = {
+                host for host in exact_hosts if not _host_matches_domain(host, start_domain)
+            }
+            return configured or bool(external_hosts)
         external_domains = {
             domain for domain in self.allowed_domains if not _host_matches_domain(domain, start_domain)
         }
@@ -2946,7 +3210,12 @@ class Crawl4AICrawler(CrawlerStage):
                     {
                         "source_url": source_url,
                         "target_url": target_url,
-                        "link_type": properties.get("link_type") or _link_type_for_url(target_url, self.allowed_domains),
+                        "link_type": properties.get("link_type") or _link_type_for_url(
+                            target_url,
+                            self.allowed_domains,
+                            allowed_hosts=getattr(self, "allowed_hosts", set()),
+                            excluded_subdomains=self.excluded_subdomains,
+                        ),
                         "anchor_texts": list(properties.get("anchor_texts") or []),
                         "rels": list(properties.get("rels") or []),
                         "sources": list(properties.get("sources") or []),
@@ -3648,40 +3917,57 @@ class Crawl4AICrawler(CrawlerStage):
             ),
         )
 
-        start_parsed = urlparse(self.start_url)
-        candidates = []
-        if self.respect_robots_txt:
-            robots_url = urljoin(self.start_url, "/robots.txt")
-            try:
-                async with self._get_with_safe_redirects(
-                    session=self._session,
-                    url=robots_url,
-                    enforce_allowed_domain=True,
-                ) as response:
-                    if response.status == 200:
-                        robots_payload = await _read_bounded_response(
-                            response,
-                            robots_max_response_bytes,
-                        )
-                        robots_text = robots_payload.decode(
-                            "utf-8-sig",
-                            errors="replace",
-                        )
-                        for line in robots_text.splitlines():
-                            if line.lower().startswith("sitemap:"):
-                                sitemap_url = line.split(":", 1)[1].strip()
-                                if sitemap_url:
-                                    candidates.append(sitemap_url)
-            except Exception as exc:
-                logger.debug("Could not read robots.txt for sitemap discovery: %s", exc)
-
-        root_url = f"{start_parsed.scheme}://{start_parsed.netloc}"
-        candidates.extend(
-            [
-                urljoin(root_url, "/sitemap.xml"),
-                urljoin(root_url, "/sitemap_index.xml"),
-            ]
+        configured_origins = list(
+            getattr(self, "sitemap_origins", None)
+            or self._resolve_sitemap_origins()
         )
+        configured_entries = list(
+            getattr(self, "sitemap_entry_urls", None)
+            or self._resolve_sitemap_entry_urls()
+        )
+        candidates = list(configured_entries)
+        for origin in configured_origins:
+            if not self._url_allowed_for_fetch(origin):
+                logger.warning(
+                    "Skipping configured sitemap origin outside allowed egress policy: %s",
+                    origin,
+                )
+                continue
+            if self.respect_robots_txt:
+                robots_url = urljoin(origin, "/robots.txt")
+                try:
+                    async with self._get_with_safe_redirects(
+                        session=self._session,
+                        url=robots_url,
+                        enforce_allowed_domain=True,
+                    ) as response:
+                        if response.status == 200:
+                            robots_payload = await _read_bounded_response(
+                                response,
+                                robots_max_response_bytes,
+                            )
+                            robots_text = robots_payload.decode(
+                                "utf-8-sig",
+                                errors="replace",
+                            )
+                            for line in robots_text.splitlines():
+                                if line.lower().startswith("sitemap:"):
+                                    sitemap_url = line.split(":", 1)[1].strip()
+                                    if sitemap_url:
+                                        candidates.append(sitemap_url)
+                except Exception as exc:
+                    logger.debug(
+                        "Could not read robots.txt for sitemap discovery at %s: %s",
+                        origin,
+                        exc,
+                    )
+            candidates.extend(
+                [
+                    urljoin(origin, "/sitemap.xml"),
+                    urljoin(origin, "/sitemap_index.xml"),
+                ]
+            )
+        candidates = list(dict.fromkeys(candidates))
 
         seen_sitemaps = set()
         source_fetches: Dict[str, Dict[str, Any]] = {}
@@ -3757,7 +4043,7 @@ class Crawl4AICrawler(CrawlerStage):
                 if not normalized_page:
                     continue
                 host = (urlparse(normalized_page).hostname or "").lower()
-                if not any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains):
+                if not self._host_allowed(host):
                     continue
                 url_sources.setdefault(normalized_page, []).append(normalized)
                 if not self._allow_frontier_url(normalized_page):
@@ -3788,9 +4074,13 @@ class Crawl4AICrawler(CrawlerStage):
             source_fetches,
         )
         self.discovered_sitemaps = {
+            "configured_origins": configured_origins,
+            "configured_entry_urls": configured_entries,
             "sources": sorted(seen_sitemaps),
             "urls": deduped,
             "raw_urls": raw_urls,
+            "eligible_url_counts_by_host": self._count_urls_by_host(deduped),
+            "raw_url_counts_by_host": self._count_urls_by_host(raw_urls),
             "url_sources": {
                 url: sorted(set(sources)) for url, sources in sorted(url_sources.items())
             },
@@ -3809,9 +4099,6 @@ class Crawl4AICrawler(CrawlerStage):
             return False
         if getattr(self, "require_https", True) and parsed.scheme != "https":
             return False
-        excluded_subdomains = getattr(self, "excluded_subdomains", set()) or set()
-        if any(_host_matches_domain(host, excluded) for excluded in excluded_subdomains):
-            return False
         allowed_domains = getattr(self, "allowed_domains", None)
         if not allowed_domains:
             configured_host = (
@@ -3820,7 +4107,12 @@ class Crawl4AICrawler(CrawlerStage):
             allowed_domains = {configured_host} if configured_host else set()
         if not allowed_domains:
             return False
-        if not any(_host_matches_domain(host, allowed) for allowed in allowed_domains):
+        if not _host_allowed_by_policy(
+            host,
+            allowed_domains=allowed_domains,
+            allowed_hosts=getattr(self, "allowed_hosts", set()) or set(),
+            excluded_subdomains=getattr(self, "excluded_subdomains", set()) or set(),
+        ):
             return False
         if _host_resolves_to_private_or_reserved(host):
             return False
@@ -3905,7 +4197,11 @@ class Crawl4AICrawler(CrawlerStage):
 
         filter_chain = FilterChain(
             filters=[
-                AllowedDomainFilter(self.allowed_domains, self.excluded_subdomains),
+                AllowedDomainFilter(
+                    self.allowed_domains,
+                    self.excluded_subdomains,
+                    getattr(self, "allowed_hosts", set()),
+                ),
                 SkipQueryFilter(
                     allow_query_urls=self.allow_query_urls,
                     allowed_query_param_names=self.allowed_query_param_names,
@@ -4001,6 +4297,73 @@ class Crawl4AICrawler(CrawlerStage):
         )
         self._last_crawl_state_update_at = time.time()
 
+    def _discover_link_frontier_items(
+        self,
+        source_urls: Iterable[str],
+        *,
+        visited: Iterable[str],
+        pending: List[Dict[str, Optional[str]]],
+        depths: Dict[str, int],
+    ) -> List[Dict[str, Optional[str]]]:
+        """Expand only explicitly approved no-sitemap origins from saved page links."""
+        discovery_hosts = getattr(self, "link_discovery_hosts", set()) or set()
+        if not discovery_hosts:
+            return []
+
+        queued = {
+            normalized
+            for value in visited
+            for normalized in [_normalize_http_url(value)]
+            if normalized
+        }
+        queued.update(
+            normalized
+            for item in pending
+            for normalized in [_normalize_http_url(item.get("url"))]
+            if normalized
+        )
+        host_counts = self._count_urls_by_host(queued)
+        discovered: List[Dict[str, Optional[str]]] = []
+
+        for source_value in source_urls:
+            source_url = _normalize_http_url(source_value)
+            source_host = (urlparse(source_url or "").hostname or "").lower()
+            if not source_url or source_host not in discovery_hosts:
+                continue
+            source_depth = int(depths.get(source_url, 1) or 0)
+            if source_depth >= self.max_depth:
+                continue
+            host_limit = int(
+                (getattr(self, "link_discovery_max_pages_by_host", {}) or {}).get(
+                    source_host,
+                    0,
+                )
+            )
+            if host_limit <= 0:
+                continue
+            for link in self.page_links.get(source_url, []):
+                target_url = _normalize_http_url(link.get("target_url"))
+                target_host = (urlparse(target_url or "").hostname or "").lower()
+                if (
+                    not target_url
+                    or target_host != source_host
+                    or target_url in queued
+                    or _url_extension(target_url) in CRAWL_SKIP_EXTENSIONS
+                    or not self._allow_frontier_url(target_url)
+                ):
+                    continue
+                if host_counts.get(source_host, 0) >= host_limit:
+                    break
+                queued.add(target_url)
+                host_counts[source_host] = host_counts.get(source_host, 0) + 1
+                depths[target_url] = source_depth + 1
+                discovered.append(
+                    {"url": target_url, "parent_url": source_url}
+                )
+                if len(queued) >= self.max_pages:
+                    return discovered
+        return discovered
+
     async def _crawl_seed_frontier(self, crawler_holder: Dict[str, Any], run_config: CrawlerRunConfig, browser_config: Any) -> None:
         pending: List[Dict[str, Optional[str]]] = [
             {"url": item.get("url"), "parent_url": item.get("parent_url")}
@@ -4073,6 +4436,7 @@ class Crawl4AICrawler(CrawlerStage):
             }
 
             failed_batch_urls: Dict[str, Dict[str, Any]] = {}
+            processed_page_urls: List[str] = []
             for result in batch_results:
                 result_url = _normalize_http_url(getattr(result, "url", None))
                 if result_url and result_url not in visited_set:
@@ -4081,6 +4445,8 @@ class Crawl4AICrawler(CrawlerStage):
                 if getattr(result, "success", False):
                     pages_crawled += 1
                 processed = await self._process_result(result, mark_failure=False)
+                if processed and result_url:
+                    processed_page_urls.append(result_url)
                 if not processed and result_url:
                     failed_batch_urls[result_url] = {
                         "status_code": getattr(result, "status_code", None),
@@ -4105,6 +4471,7 @@ class Crawl4AICrawler(CrawlerStage):
                 for url, failure in failed_batch_urls.items():
                     if await self._recover_url_with_http_retry(url):
                         recovered += 1
+                        processed_page_urls.append(url)
                     else:
                         self._mark_url_skipped(
                             url,
@@ -4120,6 +4487,18 @@ class Crawl4AICrawler(CrawlerStage):
                     )
 
             pending = pending[len(batch):]
+            discovered_items = self._discover_link_frontier_items(
+                processed_page_urls,
+                visited=visited,
+                pending=pending,
+                depths=depths,
+            )
+            if discovered_items:
+                pending.extend(discovered_items)
+                self.stats["frontier_urls_discovered"] = (
+                    self.stats.get("frontier_urls_discovered", 0)
+                    + len(discovered_items)
+                )
             self.stats["sitemap_batches_completed"] = self.stats.get("sitemap_batches_completed", 0) + 1
             pages_crawled = max(pages_crawled, int(self.stats.get("pages_scraped", 0)))
             self._set_crawl_state(
@@ -4169,7 +4548,7 @@ class Crawl4AICrawler(CrawlerStage):
         if _url_extension(normalized) in CRAWL_SKIP_EXTENSIONS:
             return False
         host = (urlparse(normalized).hostname or "").lower()
-        return any(_host_matches_domain(host, allowed) for allowed in self.allowed_domains)
+        return self._host_allowed(host)
 
     async def _process_result(self, result: Any, *, mark_failure: bool = True) -> bool:
         page_url = _normalize_http_url(getattr(result, "url", None))
@@ -4345,6 +4724,8 @@ class Crawl4AICrawler(CrawlerStage):
                 html,
                 page_url,
                 allowed_domains=self.allowed_domains,
+                allowed_hosts=getattr(self, "allowed_hosts", set()),
+                excluded_subdomains=self.excluded_subdomains,
             )
             page_media = self.page_media.get(page_url, [])
             depth = (self.crawl_state.get("depths") or {}).get(page_url)

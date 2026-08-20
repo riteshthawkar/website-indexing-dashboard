@@ -64,6 +64,51 @@ MBZUAI_REQUIRED_CRITICAL_URL_PATTERNS = {
     "/study/(?:undergraduate|ug)-admission-process/?$",
 }
 
+MBZUAI_REQUIRED_CRAWL_HOSTS = {
+    "mbzuai.ac.ae",
+    "www.mbzuai.ac.ae",
+    "careers.mbzuai.ac.ae",
+    "research.mbzuai.ac.ae",
+    "ai-nexus.mbzuai.ac.ae",
+    "library.mbzuai.ac.ae",
+    "metaverse.mbzuai.ac.ae",
+    "buildit.mbzuai.ac.ae",
+    "hpp.mbzuai.ac.ae",
+    "ifm.mbzuai.ac.ae",
+    "ifm.ai",
+}
+
+MBZUAI_REQUIRED_SITEMAP_ORIGINS = {
+    "mbzuai.ac.ae",
+    "careers.mbzuai.ac.ae",
+    "research.mbzuai.ac.ae",
+    "ai-nexus.mbzuai.ac.ae",
+    "hpp.mbzuai.ac.ae",
+    "ifm.ai",
+}
+
+MBZUAI_MINIMUM_SITEMAP_URLS_BY_HOST = {
+    "mbzuai.ac.ae": 2100,
+    "careers.mbzuai.ac.ae": 40,
+    "research.mbzuai.ac.ae": 8,
+    "ai-nexus.mbzuai.ac.ae": 8,
+    "hpp.mbzuai.ac.ae": 3,
+    "ifm.ai": 15,
+}
+
+MBZUAI_MINIMUM_CRAWLED_PAGES_BY_HOST = {
+    **MBZUAI_MINIMUM_SITEMAP_URLS_BY_HOST,
+    "library.mbzuai.ac.ae": 1,
+    "metaverse.mbzuai.ac.ae": 1,
+    "buildit.mbzuai.ac.ae": 1,
+}
+
+MBZUAI_LINK_DISCOVERY_HOSTS = {
+    "library.mbzuai.ac.ae",
+    "metaverse.mbzuai.ac.ae",
+    "buildit.mbzuai.ac.ae",
+}
+
 
 @dataclass
 class PreflightCheck:
@@ -263,10 +308,91 @@ def assess_production_readiness(
             for value in (crawler_cfg.get("allowed_domains") or [])
             if str(value).strip()
         }
-        if allowed_domains != {"mbzuai.ac.ae"}:
+        if allowed_domains != {"mbzuai.ac.ae", "ifm.ai"}:
             production_contract_errors.append(
-                "crawler.allowed_domains must contain only mbzuai.ac.ae"
+                "crawler.allowed_domains must contain only mbzuai.ac.ae and ifm.ai"
             )
+        allowed_hosts = {
+            str(value).strip().lower().strip(".")
+            for value in (crawler_cfg.get("allowed_hosts") or [])
+            if str(value).strip()
+        }
+        if allowed_hosts != MBZUAI_REQUIRED_CRAWL_HOSTS:
+            production_contract_errors.append(
+                "crawler.allowed_hosts must equal the approved MBZUAI public-content host set"
+            )
+        sitemap_origin_hosts = {
+            (urlparse(str(value)).hostname or "").lower()
+            for value in (crawler_cfg.get("sitemap_origins") or [])
+            if str(value).strip()
+        }
+        if sitemap_origin_hosts != MBZUAI_REQUIRED_SITEMAP_ORIGINS:
+            production_contract_errors.append(
+                "crawler.sitemap_origins must cover every approved sitemap origin"
+            )
+        sitemap_entry_urls = {
+            str(value).strip().rstrip("/")
+            for value in (crawler_cfg.get("sitemap_entry_urls") or [])
+            if str(value).strip()
+        }
+        if "https://careers.mbzuai.ac.ae/wp-sitemap.xml" not in sitemap_entry_urls:
+            production_contract_errors.append(
+                "crawler.sitemap_entry_urls must include the Careers WordPress sitemap"
+            )
+        link_discovery_hosts = {
+            str(value).strip().lower().strip(".")
+            for value in (crawler_cfg.get("link_discovery_hosts") or [])
+            if str(value).strip()
+        }
+        if link_discovery_hosts != MBZUAI_LINK_DISCOVERY_HOSTS:
+            production_contract_errors.append(
+                "crawler.link_discovery_hosts must equal the approved no-sitemap host set"
+            )
+        priority_seed_hosts = {
+            (urlparse(str(value)).hostname or "").lower()
+            for value in (crawler_cfg.get("priority_seed_urls") or [])
+            if str(value).strip()
+        }
+        missing_seed_hosts = MBZUAI_LINK_DISCOVERY_HOSTS - priority_seed_hosts
+        if missing_seed_hosts:
+            production_contract_errors.append(
+                "crawler.priority_seed_urls is missing no-sitemap origins: "
+                + ", ".join(sorted(missing_seed_hosts))
+            )
+        discovery_budgets = crawler_cfg.get("link_discovery_max_pages_by_host") or {}
+        for host in MBZUAI_LINK_DISCOVERY_HOSTS:
+            try:
+                budget = int(discovery_budgets.get(host) or 0)
+            except (AttributeError, TypeError, ValueError):
+                budget = 0
+            if budget < 1:
+                production_contract_errors.append(
+                    f"crawler.link_discovery_max_pages_by_host[{host}] must be >= 1"
+                )
+        if not str(crawler_cfg.get("origin_inventory_revision") or "").strip():
+            production_contract_errors.append(
+                "crawler.origin_inventory_revision must identify the researched origin set"
+            )
+        for key, required_values in (
+            (
+                "minimum_sitemap_urls_by_host",
+                MBZUAI_MINIMUM_SITEMAP_URLS_BY_HOST,
+            ),
+            (
+                "minimum_crawled_pages_by_host",
+                MBZUAI_MINIMUM_CRAWLED_PAGES_BY_HOST,
+            ),
+        ):
+            configured_values = crawler_cfg.get(key) or {}
+            for host, required in required_values.items():
+                try:
+                    configured_minimum = int(configured_values.get(host) or 0)
+                except (AttributeError, TypeError, ValueError):
+                    configured_minimum = 0
+                if configured_minimum < required:
+                    production_contract_errors.append(
+                        f"crawler.{key}[{host}] must be >= {required}"
+                    )
         if not bool(crawler_cfg.get("respect_robots_txt", False)):
             production_contract_errors.append("crawler.respect_robots_txt must be true")
         if bool(crawler_cfg.get("include_external", False)):

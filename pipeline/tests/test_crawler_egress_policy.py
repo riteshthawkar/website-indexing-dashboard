@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
 from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+from pipeline.stages.crawlers.crawl4ai_crawler import AllowedDomainFilter
 
 
 def _crawler():
@@ -57,6 +58,37 @@ def test_egress_policy_blocks_private_addresses(monkeypatch):
     assert not crawler._url_allowed_for_fetch("http://169.254.169.254/latest/meta-data/foo.pdf")
     assert not crawler._url_allowed_for_fetch("https://evil.example/file.pdf")
     assert not crawler._url_allowed_for_fetch("https://library.mbzuai.ac.ae/private.pdf")
+
+
+def test_exact_host_allowlist_blocks_unapproved_mbzuai_subdomains(monkeypatch):
+    crawler = _crawler()
+    crawler.excluded_subdomains = set()
+    crawler.allowed_hosts = {
+        "mbzuai.ac.ae",
+        "careers.mbzuai.ac.ae",
+        "ifm.ai",
+    }
+    crawler_module._host_resolves_to_private_or_reserved.cache_clear()
+    monkeypatch.setattr(
+        crawler_module.socket,
+        "getaddrinfo",
+        lambda host, *args, **kwargs: [
+            (None, None, None, None, ("93.184.216.34", 443))
+        ],
+    )
+
+    assert crawler._url_allowed_for_fetch("https://careers.mbzuai.ac.ae/vacancies/")
+    assert crawler._url_allowed_for_fetch("https://ifm.ai/collaborate/")
+    assert not crawler._url_allowed_for_fetch("https://admin.hci.mbzuai.ac.ae/")
+    assert not crawler._url_allowed_for_fetch("https://academy.mbzuai.ac.ae/")
+
+    url_filter = AllowedDomainFilter(
+        crawler.allowed_domains,
+        crawler.excluded_subdomains,
+        crawler.allowed_hosts,
+    )
+    assert url_filter.apply("https://careers.mbzuai.ac.ae/")
+    assert not url_filter.apply("https://admin.hci.mbzuai.ac.ae/")
 
 
 def test_egress_policy_derives_missing_allowlist_only_from_start_host(monkeypatch):
