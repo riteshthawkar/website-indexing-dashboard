@@ -200,6 +200,47 @@ def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     assert crawler.stats == {"pages_failed": 1, "skipped_urls": 1}
 
 
+def test_raw_source_404_overrides_renderer_http_200(monkeypatch):
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.validate_source_html = True
+    crawler.validate_source_html_mode = "always"
+    crawler.stats = {
+        "pages_failed": 0,
+        "skipped_urls": 0,
+        "source_html_validations": 0,
+    }
+    crawler.url_mapping = {}
+    monkeypatch.setattr(crawler, "_should_validate_source_html", lambda _url: True)
+    monkeypatch.setattr(
+        crawler,
+        "_fetch_raw_source_page",
+        lambda _url: asyncio.sleep(0, result=("", 404)),
+    )
+    monkeypatch.setattr(crawler, "_flush_runtime_state", lambda *args, **kwargs: None)
+
+    processed = asyncio.run(
+        crawler._process_result(
+            SimpleNamespace(
+                url="https://careers.mbzuai.ac.ae/careers/stale-vacancy",
+                status_code=200,
+                success=True,
+                html="<html><body>Rendered WordPress 404 shell</body></html>",
+                error_message="",
+                markdown=None,
+            )
+        )
+    )
+
+    assert processed is False
+    assert crawler.url_mapping == {
+        "https://careers.mbzuai.ac.ae/careers/stale-vacancy": (
+            "SKIPPED_HTTP_404:raw_source_terminal_http_status"
+        )
+    }
+    assert crawler.stats["pages_failed"] == 1
+    assert crawler.stats["source_html_validations"] == 0
+
+
 def test_terminal_http_statuses_are_not_retried_as_browser_failures():
     assert not crawler_module._should_retry_page_failure(404)
     assert not crawler_module._should_retry_page_failure(401)

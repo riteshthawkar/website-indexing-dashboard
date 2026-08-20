@@ -185,6 +185,7 @@ VIDEO_EMBED_HOSTS = {
     "player.youku.com": "youku",
 }
 RETRYABLE_STATUSES = {408, 425, 429, 500, 502, 503, 504}
+AUTHORITATIVE_TERMINAL_PAGE_STATUSES = {400, 401, 404, 410, 451}
 SAFE_REDIRECT_STATUSES = {301, 302, 303, 307, 308}
 SAFE_REDIRECT_MAX_HOPS = 10
 DEFAULT_ROBOTS_MAX_RESPONSE_BYTES = 512 * 1024
@@ -4778,6 +4779,14 @@ class Crawl4AICrawler(CrawlerStage):
             raw_source_html, raw_source_status = await self._fetch_raw_source_page(page_url)
             if raw_source_html:
                 self.stats["source_html_validations"] += 1
+            if raw_source_status in AUTHORITATIVE_TERMINAL_PAGE_STATUSES:
+                self._mark_url_skipped(
+                    page_url,
+                    status_code=raw_source_status,
+                    error_message="raw_source_terminal_http_status",
+                )
+                self._flush_runtime_state()
+                return False
 
         html, capture_source, quality_report = _select_preferred_page_capture(
             page_url,
