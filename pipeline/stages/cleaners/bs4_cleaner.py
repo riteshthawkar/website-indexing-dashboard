@@ -179,8 +179,14 @@ def _keep_main_content(soup):
     main = (
         soup.find("main")
         or soup.find(attrs={"role": "main"})
-        or soup.find("article")
     )
+    if main is None:
+        articles = soup.find_all("article")
+        # A single article is normally the page body. Multiple articles are
+        # commonly cards in a listing or program page; selecting the first one
+        # would discard substantive sibling content.
+        if len(articles) == 1:
+            main = articles[0]
     if main:
         return BeautifulSoup(f"<html><body>{main}</body></html>", "html.parser")
     return soup

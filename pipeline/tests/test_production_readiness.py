@@ -2993,6 +2993,17 @@ class TestQualityScorer:
         )
         assert _check_quality(text, 100, True) is None
 
+    def test_article_cards_do_not_hide_substantive_body_content(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body>
+        <article>Small card</article><article>Second card</article>
+        <section><h1>Undergraduate research program</h1>
+        <p>{content}</p></section>
+        </body></html>""".format(content="Substantive program information. " * 20)
+
+        assert _check_quality(text, 300, True) is None
+
     def test_detects_error_page_500(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
         text = "# 500 Internal Server Error\n\nPlease try again later."
@@ -4276,6 +4287,21 @@ class TestBS4Cleaner:
         assert status == "cleaned"
         assert "Primary page" in cleaned_html
         assert "Unrelated teaser" not in cleaned_html
+
+    def test_multiple_article_cards_do_not_discard_sibling_page_content(self):
+        from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+
+        raw = """<html><body>
+        <article>Small card</article><article>Second card</article>
+        <section><h1>Undergraduate research program</h1>
+        <p>{content}</p></section>
+        </body></html>""".format(content="Substantive program information. " * 20)
+
+        status, cleaned_html = clean_html_content(raw)
+
+        assert status == "cleaned"
+        assert "Undergraduate research program" in cleaned_html
+        assert "Substantive program information" in cleaned_html
 
 
 # ─────────────────────────────────────────────────────────────

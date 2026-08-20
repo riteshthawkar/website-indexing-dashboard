@@ -273,7 +273,6 @@ def _primary_content(soup: BeautifulSoup) -> Any:
     return (
         soup.find("main")
         or soup.find(attrs={"role": re.compile(r"^main$", re.IGNORECASE)})
-        or soup.find("article")
         or soup.body
         or soup
     )
