@@ -101,13 +101,27 @@ MBZUAI_MINIMUM_CRAWLED_PAGES_BY_HOST = {
     "careers.mbzuai.ac.ae": 30,
     "library.mbzuai.ac.ae": 15,
     "metaverse.mbzuai.ac.ae": 30,
-    "buildit.mbzuai.ac.ae": 7,
+    "buildit.mbzuai.ac.ae": 1,
+}
+
+MBZUAI_REQUIRED_NO_SITEMAP_SEED_HOSTS = {
+    "library.mbzuai.ac.ae",
+    "metaverse.mbzuai.ac.ae",
+    "buildit.mbzuai.ac.ae",
 }
 
 MBZUAI_LINK_DISCOVERY_HOSTS = {
     "library.mbzuai.ac.ae",
     "metaverse.mbzuai.ac.ae",
-    "buildit.mbzuai.ac.ae",
+}
+
+MBZUAI_INTENTIONAL_CONTENT_EXCLUSIONS = {
+    "https://buildit.mbzuai.ac.ae/about",
+    "https://buildit.mbzuai.ac.ae/apply",
+    "https://buildit.mbzuai.ac.ae/highlights",
+    "https://buildit.mbzuai.ac.ae/benefits",
+    "https://buildit.mbzuai.ac.ae/network",
+    "https://buildit.mbzuai.ac.ae/faqs",
 }
 
 
@@ -379,18 +393,30 @@ def assess_production_readiness(
         }
         if link_discovery_hosts != MBZUAI_LINK_DISCOVERY_HOSTS:
             production_contract_errors.append(
-                "crawler.link_discovery_hosts must equal the approved no-sitemap host set"
+                "crawler.link_discovery_hosts must equal the approved bounded-discovery host set"
             )
-        priority_seed_hosts = {
-            (urlparse(str(value)).hostname or "").lower()
+        priority_seed_urls = {
+            str(value).strip().rstrip("/")
             for value in (crawler_cfg.get("priority_seed_urls") or [])
             if str(value).strip()
         }
-        missing_seed_hosts = MBZUAI_LINK_DISCOVERY_HOSTS - priority_seed_hosts
+        priority_seed_hosts = {
+            (urlparse(value).hostname or "").lower()
+            for value in priority_seed_urls
+        }
+        missing_seed_hosts = MBZUAI_REQUIRED_NO_SITEMAP_SEED_HOSTS - priority_seed_hosts
         if missing_seed_hosts:
             production_contract_errors.append(
                 "crawler.priority_seed_urls is missing no-sitemap origins: "
                 + ", ".join(sorted(missing_seed_hosts))
+            )
+        excluded_priority_seeds = (
+            MBZUAI_INTENTIONAL_CONTENT_EXCLUSIONS & priority_seed_urls
+        )
+        if excluded_priority_seeds:
+            production_contract_errors.append(
+                "crawler.priority_seed_urls must not include intentional content exclusions: "
+                + ", ".join(sorted(excluded_priority_seeds))
             )
         discovery_budgets = crawler_cfg.get("link_discovery_max_pages_by_host") or {}
         for host in MBZUAI_LINK_DISCOVERY_HOSTS:
@@ -405,6 +431,29 @@ def assess_production_readiness(
         if not str(crawler_cfg.get("origin_inventory_revision") or "").strip():
             production_contract_errors.append(
                 "crawler.origin_inventory_revision must identify the researched origin set"
+            )
+        origin_inventory = crawler_cfg.get("origin_inventory") or {}
+        intentional_exclusions = (
+            origin_inventory.get("intentional_content_exclusions") or {}
+            if isinstance(origin_inventory, Mapping)
+            else {}
+        )
+        recorded_exclusions = {
+            str(value).strip().rstrip("/")
+            for value in (
+                intentional_exclusions.keys()
+                if isinstance(intentional_exclusions, Mapping)
+                else []
+            )
+            if str(value).strip()
+        }
+        missing_exclusions = (
+            MBZUAI_INTENTIONAL_CONTENT_EXCLUSIONS - recorded_exclusions
+        )
+        if missing_exclusions:
+            production_contract_errors.append(
+                "crawler.origin_inventory.intentional_content_exclusions is missing: "
+                + ", ".join(sorted(missing_exclusions))
             )
         for key, required_values in (
             (

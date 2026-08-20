@@ -70,7 +70,7 @@ crawler:
     "ifm.ai": 15
     "library.mbzuai.ac.ae": 15
     "metaverse.mbzuai.ac.ae": 30
-    "buildit.mbzuai.ac.ae": 7
+    "buildit.mbzuai.ac.ae": 1
   priority_seed_urls:
     - "https://careers.mbzuai.ac.ae/"
     - "https://research.mbzuai.ac.ae/"
@@ -80,12 +80,6 @@ crawler:
     - "https://library.mbzuai.ac.ae/"
     - "https://metaverse.mbzuai.ac.ae/"
     - "https://buildit.mbzuai.ac.ae/"
-    - "https://buildit.mbzuai.ac.ae/about"
-    - "https://buildit.mbzuai.ac.ae/apply"
-    - "https://buildit.mbzuai.ac.ae/highlights"
-    - "https://buildit.mbzuai.ac.ae/benefits"
-    - "https://buildit.mbzuai.ac.ae/network"
-    - "https://buildit.mbzuai.ac.ae/faqs"
 
 # This profile intentionally contains no cleaner, converter, chunker, or
 # upload stages. It stops after durable source artifacts and crawl metadata.

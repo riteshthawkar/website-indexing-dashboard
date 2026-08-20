@@ -260,6 +260,28 @@ def test_canonical_production_crawl_contract_is_satisfied(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
     monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
     config = load_config("mbzuai_production")
+    crawler = config["crawler"]
+    buildit_seeds = {
+        str(value).rstrip("/")
+        for value in crawler["priority_seed_urls"]
+        if str(value).startswith("https://buildit.mbzuai.ac.ae")
+    }
+    excluded_buildit_routes = {
+        "https://buildit.mbzuai.ac.ae/about",
+        "https://buildit.mbzuai.ac.ae/apply",
+        "https://buildit.mbzuai.ac.ae/highlights",
+        "https://buildit.mbzuai.ac.ae/benefits",
+        "https://buildit.mbzuai.ac.ae/network",
+        "https://buildit.mbzuai.ac.ae/faqs",
+    }
+
+    assert crawler["origin_inventory_revision"] == "2026-08-20-v3"
+    assert buildit_seeds == {"https://buildit.mbzuai.ac.ae"}
+    assert "buildit.mbzuai.ac.ae" not in crawler["link_discovery_hosts"]
+    assert crawler["minimum_crawled_pages_by_host"]["buildit.mbzuai.ac.ae"] == 1
+    assert excluded_buildit_routes.issubset(
+        crawler["origin_inventory"]["intentional_content_exclusions"]
+    )
 
     report = assess_production_readiness(
         config,
@@ -273,6 +295,37 @@ def test_canonical_production_crawl_contract_is_satisfied(monkeypatch):
         if check["name"] == "canonical_production_contract"
     )
     assert contract["status"] == "ok"
+
+
+def test_canonical_production_rejects_intentionally_excluded_buildit_seed(monkeypatch):
+    from pipeline.core.config import load_config
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    config = load_config("mbzuai_production")
+    config["crawler"]["priority_seed_urls"].append(
+        "https://buildit.mbzuai.ac.ae/about/"
+    )
+
+    report = assess_production_readiness(
+        config,
+        config_name="mbzuai_production",
+        validation_errors={},
+    )
+
+    contract = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "canonical_production_contract"
+    )
+    assert contract["status"] == "error"
+    assert (
+        "crawler.priority_seed_urls must not include intentional content exclusions: "
+        "https://buildit.mbzuai.ac.ae/about"
+        in contract["details"]["errors"]
+    )
 
 
 def test_canonical_production_rejects_downgraded_content_processing_contract(monkeypatch):

@@ -1,7 +1,7 @@
 # MBZUAI public-origin crawl inventory
 
 Reviewed: 2026-08-20 (Asia/Dubai)
-Configuration revision: `2026-08-20-v2`
+Configuration revision: `2026-08-20-v3`
 
 This inventory separates public institutional content from every hostname that
 merely appears in DNS, certificate transparency, or the main site's link graph.
@@ -19,7 +19,7 @@ Only explicitly approved hosts are eligible for production egress.
 | `hpp.mbzuai.ac.ae` | Yoast sitemap index | 4 URLs | Sitemap seeds |
 | `library.mbzuai.ac.ae` | No usable sitemap | 19 live pages in the validation crawl | Root seed plus same-host bounded link discovery; minimum 15 successful pages |
 | `metaverse.mbzuai.ac.ae` | No usable sitemap | 38 live pages in the validation crawl | Root seed plus same-host bounded link discovery; minimum 30 successful pages |
-| `buildit.mbzuai.ac.ae` | No usable sitemap; robots path returns a real HTTP 404 | 7 live pages in the validation crawl | Seven explicit seeds plus same-host bounded link discovery; minimum 7 successful pages |
+| `buildit.mbzuai.ac.ae` | No usable sitemap; robots path returns a real HTTP 404 | 7 live pages in the validation crawl | Retain the substantive root only; minimum 1 successful page |
 
 `www.mbzuai.ac.ae` and `ifm.mbzuai.ac.ae` are approved redirect aliases, but
 they are not independent required content inventories.
@@ -82,13 +82,13 @@ Metaverse links as HTTP 400; none were saved as successful pages. Five robots
 policy encounters were blocked, and no Library login/search URL appears in
 successful page metadata.
 
-BuildIt's browser-rendered pages currently raise a client-side exception even
-though their HTTP source contains valid content. The crawler now recognizes
-that error shell, selects the healthy raw source, and discovers the six public
-child routes (`about`, `apply`, `highlights`, `benefits`, `network`, and `faqs`).
-All seven BuildIt routes are explicit future-run seeds and coverage requirements.
-The six child pages currently have no server-rendered visible text, so their raw
-HTML is retained while their browser-error Markdown is explicitly suppressed.
+BuildIt's browser-rendered pages currently raise a client-side exception. The
+crawler recognizes that error shell and retains the substantive root from its
+healthy raw source. Cleaning review confirmed that the six child routes
+(`about`, `apply`, `highlights`, `benefits`, `network`, and `faqs`) contain no
+server-rendered visible content and are not required for the chatbot. They are
+therefore no longer seeded, added to the crawl frontier, or counted as future
+coverage requirements.
 
 Only the crawler stage ran. No cleaner, converter, chunker, embedder, or upload
 stage was executed.
