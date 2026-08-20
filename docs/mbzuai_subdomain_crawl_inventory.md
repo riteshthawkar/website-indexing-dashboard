@@ -60,9 +60,10 @@ artifact collection stage.
 
 ## Artifact collection validation run
 
-Run `mbzuai-subdomains-artifacts-20260820-v7` completed the crawler stage on
+Run `mbzuai-subdomains-artifacts-20260820-v9` completed the crawler stage on
 2026-08-20 and passed an independent run audit with zero errors and zero
-warnings. It saved 145 successful page captures and one PDF:
+warnings. It saved 145 successful page captures, 131 accepted crawler Markdown
+sidecars, and one PDF:
 
 | Host | Successful pages |
 | --- | ---: |
@@ -86,6 +87,8 @@ though their HTTP source contains valid content. The crawler now recognizes
 that error shell, selects the healthy raw source, and discovers the six public
 child routes (`about`, `apply`, `highlights`, `benefits`, `network`, and `faqs`).
 All seven BuildIt routes are explicit future-run seeds and coverage requirements.
+The six child pages currently have no server-rendered visible text, so their raw
+HTML is retained while their browser-error Markdown is explicitly suppressed.
 
 Only the crawler stage ran. No cleaner, converter, chunker, embedder, or upload
 stage was executed.
