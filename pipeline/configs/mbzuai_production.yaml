@@ -62,6 +62,15 @@ formatter:
   require_multimodal_media: true
   minimum_multimodal_media_records: 100
   maximum_image_text_only_ratio: 0.0
+  media_semantics:
+    mode: "gemini"
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    # Escalate only uncertain, text-heavy high-value visuals; ordinary photos
+    # remain on Flash-Lite for predictable throughput and cost.
+    enable_escalation: true
+    require_complete: true
+    minimum_completion_ratio: 1.0
   # The researched 2026-08-20 multi-origin sitemap inventory contains roughly
   # 2.75k raw URLs before the main site's verified-empty CMS cohorts.
   # Defective CMS members are excluded only after fresh, run-scoped HTTP proof;
@@ -114,6 +123,9 @@ stages:
   - id: enrich_media
     type: formatter
     plugin: media_enrichment
+  - id: annotate_media
+    type: formatter
+    plugin: media_semantics
   - id: deduplicate_markdown
     type: quality_gate
     plugin: dedup_filter

@@ -578,10 +578,29 @@ def _build_media_embedding_input(item: Dict[str, Any], *, document_title: str = 
         lines.append(f"DOCUMENT: {document_title}")
     if section_path:
         lines.append(f"SECTION: {' > '.join(section_path)}")
-    for key in ("caption", "description", "context", "ocr_text", "transcript"):
+    for key in (
+        "caption",
+        "description",
+        "context",
+        "semantic_caption",
+        "contextual_caption",
+        "visual_description",
+        "visible_text",
+        "ocr_text",
+        "transcript",
+    ):
         value = _clean_text(item.get(key))
         if value and value != title:
             lines.append(f"{key.upper()}: {value}")
+    semantic_tags = [
+        _clean_text(value) for value in item.get("semantic_tags") or [] if _clean_text(value)
+    ]
+    if semantic_tags:
+        lines.append(f"SEMANTIC_TAGS: {', '.join(semantic_tags[:16])}")
+    if item.get("image_kind"):
+        lines.append(f"IMAGE_KIND: {_clean_text(item.get('image_kind'))}")
+    if item.get("semantic_relevance"):
+        lines.append(f"SEMANTIC_RELEVANCE: {_clean_text(item.get('semantic_relevance'))}")
     if item.get("source_url"):
         lines.append(f"SOURCE_URL: {item['source_url']}")
     return "\n".join(lines).strip()
@@ -1052,6 +1071,22 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "ocr_text": normalized.get("ocr_text", ""),
                 "ocr_model": normalized.get("ocr_model", ""),
                 "ocr_model_revision": normalized.get("ocr_model_revision", ""),
+                "semantic_caption": normalized.get("semantic_caption", ""),
+                "contextual_caption": normalized.get("contextual_caption", ""),
+                "visual_description": normalized.get("visual_description", ""),
+                "visible_text": normalized.get("visible_text", ""),
+                "image_kind": normalized.get("image_kind", ""),
+                "semantic_tags": normalized.get("semantic_tags") or [],
+                "semantic_relevance": normalized.get("semantic_relevance", ""),
+                "annotation_status": normalized.get("annotation_status", ""),
+                "annotation_provider": normalized.get("annotation_provider", ""),
+                "annotation_model": normalized.get("annotation_model", ""),
+                "annotation_model_revision": normalized.get("annotation_model_revision", ""),
+                "annotation_prompt_revision": normalized.get("annotation_prompt_revision", ""),
+                "annotation_confidence": normalized.get("annotation_confidence"),
+                "contains_text": normalized.get("contains_text"),
+                "needs_ocr": normalized.get("needs_ocr"),
+                "needs_review": normalized.get("needs_review"),
                 "bbox": normalized.get("bbox") or {},
                 "can_embed_multimodal": bool(
                     local_path

@@ -272,6 +272,11 @@ def assess_production_readiness(
         if isinstance(formatter_cfg.get("media_enrichment"), Mapping)
         else {}
     )
+    media_semantics_cfg = (
+        formatter_cfg.get("media_semantics", {})
+        if isinstance(formatter_cfg.get("media_semantics"), Mapping)
+        else {}
+    )
     multimodal_required = bool(formatter_cfg.get("require_multimodal_media", False))
     if multimodal_required:
         media_stage_valid = "enrich_media" in stage_ids
@@ -300,6 +305,39 @@ def assess_production_readiness(
                 "multimodal_media_stage",
                 "ok",
                 "Media acquisition is allowlisted and runs before deduplication.",
+            )
+
+        semantics_stage_valid = "annotate_media" in stage_ids
+        if semantics_stage_valid and "enrich_media" in stage_ids and "deduplicate_markdown" in stage_ids:
+            semantics_position = stage_ids.index("annotate_media")
+            semantics_stage_valid = (
+                stage_ids.index("enrich_media")
+                < semantics_position
+                < stage_ids.index("deduplicate_markdown")
+            )
+        semantics_mode = str(media_semantics_cfg.get("mode") or "").strip().lower()
+        if not semantics_stage_valid:
+            _add(
+                checks,
+                "multimodal_semantics_stage",
+                "error",
+                "Multimodal production requires annotate_media between enrichment and deduplication.",
+            )
+        elif semantics_mode != "gemini" or not bool(
+            media_semantics_cfg.get("require_complete", False)
+        ):
+            _add(
+                checks,
+                "multimodal_semantics_stage",
+                "error",
+                "Production media semantics must use Gemini and fail closed on incomplete annotations.",
+            )
+        else:
+            _add(
+                checks,
+                "multimodal_semantics_stage",
+                "ok",
+                "Grounded visual semantics run once per content hash before deduplication.",
             )
 
         embedder_cfg = config.get("embedder", {}) if isinstance(config.get("embedder"), Mapping) else {}

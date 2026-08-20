@@ -332,6 +332,34 @@ formatter:
     manifest_flush_every: 25
     minimum_accepted_assets: 1
     maximum_download_failure_ratio: 0.25
+  # Grounded visual semantics are generated once per exact content hash and
+  # propagated to every webpage/PDF reference. `plan` is a zero-cost dry run;
+  # production profiles override it with Gemini and fail closed on gaps.
+  media_semantics:
+    mode: "plan"                       # plan | gemini
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    enable_escalation: false
+    escalation_confidence_threshold: 0.72
+    escalation_image_kinds:
+      - "diagram"
+      - "chart"
+      - "infographic"
+      - "map"
+      - "document_fragment"
+    prompt_revision: "mbzuai-media-semantics-v1"
+    concurrency: 4
+    request_timeout_sec: 90
+    retry_attempts: 3
+    retry_backoff_sec: 1.0
+    retry_max_delay_sec: 12.0
+    cache_flush_every: 10
+    max_output_tokens: 1200
+    image_max_side: 1600
+    image_max_pixels: 1800000
+    max_images: 0                       # 0 annotates every unique visual
+    require_complete: false
+    minimum_completion_ratio: 1.0
   chunk_documents: false
   chunk_size_chars: 4000
   chunk_overlap_chars: 400

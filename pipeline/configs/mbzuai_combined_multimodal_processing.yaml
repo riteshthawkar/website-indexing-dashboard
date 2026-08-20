@@ -1,0 +1,103 @@
+# One-time immutable merge of the completed 2026-08-20 main-site and
+# supplemental-subdomain processing runs. This profile prepares the semantic
+# annotation queue and intentionally stops before deduplication.
+_inherit: mbzuai_crawl_artifacts_processing.yaml
+
+project_name: "mbzuai_crawl_processing"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    source_run_dirs:
+      - "runs/mbzuai_crawl_processing/mbzuai-crawl-processing-20260820-v5"
+      - "runs/mbzuai_subdomains_processing/mbzuai-subdomains-processing-20260820-v5"
+    allowed_source_projects:
+      - "mbzuai_crawl_processing"
+      - "mbzuai_subdomains_processing"
+    required_source_stage_ids:
+      - "enrich_media"
+    require_source_audit_ok: true
+    minimum_source_count: 2
+  # No provider credential is available in this local run. Plan mode still
+  # combines the media and builds the exact content-hash queue. A subsequent
+  # Gemini candidate can bootstrap through merge_corpora from this run without
+  # re-crawling or re-extracting images; config snapshots remain immutable.
+  media_semantics:
+    mode: "plan"
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    enable_escalation: true
+    require_complete: false
+    minimum_completion_ratio: 1.0
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: prepare_mbzuai_index
+    type: formatter
+    plugin: mbzuai_index_readiness
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: enrich_media
+    type: formatter
+    plugin: media_enrichment
+  - id: merge_corpora
+    type: formatter
+    plugin: corpus_merge
+  - id: annotate_media
+    type: formatter
+    plugin: media_semantics
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_assertion_slices
+    type: formatter
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone

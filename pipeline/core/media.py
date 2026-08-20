@@ -55,6 +55,34 @@ def _coerce_float(value: Any) -> Optional[float]:
         return None
 
 
+def _coerce_bool(value: Any) -> Optional[bool]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = _clean_text(value).lower()
+    if text in {"true", "yes", "1"}:
+        return True
+    if text in {"false", "no", "0"}:
+        return False
+    return None
+
+
+def _clean_text_list(value: Any, *, max_items: int = 24, max_chars: int = 160) -> List[str]:
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    output: List[str] = []
+    for item in value:
+        text = _clean_text(item)[:max_chars]
+        if text and text not in output:
+            output.append(text)
+        if len(output) >= max_items:
+            break
+    return output
+
+
 def _normalize_bbox(value: Any) -> Dict[str, Any]:
     if not isinstance(value, dict):
         return {}
@@ -111,6 +139,27 @@ def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "ocr_text": _clean_text(item.get("ocr_text")),
         "ocr_model": _clean_text(item.get("ocr_model")),
         "ocr_model_revision": _clean_text(item.get("ocr_model_revision")),
+        # Model-authored semantics are separate from website-authored
+        # alt/caption/context so retrieval can preserve provenance and avoid
+        # presenting contextual hints as literal visual observations.
+        "semantic_caption": _clean_text(item.get("semantic_caption")),
+        "contextual_caption": _clean_text(item.get("contextual_caption")),
+        "visual_description": _clean_text(item.get("visual_description")),
+        "visible_text": _clean_text(item.get("visible_text")),
+        "image_kind": _clean_text(item.get("image_kind")),
+        "semantic_tags": _clean_text_list(item.get("semantic_tags")),
+        "semantic_relevance": _clean_text(item.get("semantic_relevance")),
+        "annotation_status": _clean_text(item.get("annotation_status")),
+        "annotation_provider": _clean_text(item.get("annotation_provider")),
+        "annotation_model": _clean_text(item.get("annotation_model")),
+        "annotation_model_revision": _clean_text(item.get("annotation_model_revision")),
+        "annotation_prompt_revision": _clean_text(item.get("annotation_prompt_revision")),
+        "annotation_confidence": _coerce_float(item.get("annotation_confidence")),
+        "annotation_error": _clean_text(item.get("annotation_error")),
+        "contains_text": _coerce_bool(item.get("contains_text")),
+        "needs_ocr": _coerce_bool(item.get("needs_ocr")),
+        "needs_review": _coerce_bool(item.get("needs_review")),
+        "uncertain_details": _clean_text_list(item.get("uncertain_details"), max_items=12),
         "bbox": _normalize_bbox(item.get("bbox")),
         "bbox_area_ratio": _coerce_float(item.get("bbox_area_ratio")),
         "visual_stddev": _coerce_float(item.get("visual_stddev")),
@@ -211,6 +260,23 @@ def compact_media_for_metadata(
             "crop_source": item.get("crop_source", "")[:80],
             "ocr_model": item.get("ocr_model", "")[:120],
             "ocr_model_revision": item.get("ocr_model_revision", "")[:120],
+            "semantic_caption": item.get("semantic_caption", "")[:max_text_len],
+            "contextual_caption": item.get("contextual_caption", "")[: max_text_len * 2],
+            "visual_description": item.get("visual_description", "")[: max_text_len * 2],
+            "visible_text": item.get("visible_text", "")[: max_text_len * 2],
+            "image_kind": item.get("image_kind", "")[:60],
+            "semantic_tags": list(item.get("semantic_tags") or [])[:16],
+            "semantic_relevance": item.get("semantic_relevance", "")[:40],
+            "annotation_status": item.get("annotation_status", "")[:40],
+            "annotation_provider": item.get("annotation_provider", "")[:80],
+            "annotation_model": item.get("annotation_model", "")[:120],
+            "annotation_model_revision": item.get("annotation_model_revision", "")[:120],
+            "annotation_prompt_revision": item.get("annotation_prompt_revision", "")[:120],
+            "annotation_confidence": item.get("annotation_confidence"),
+            "contains_text": item.get("contains_text"),
+            "needs_ocr": item.get("needs_ocr"),
+            "needs_review": item.get("needs_review"),
+            "uncertain_details": list(item.get("uncertain_details") or [])[:8],
             "bbox": item.get("bbox") or {},
         }
         if include_local_path and item.get("local_path"):
@@ -234,6 +300,16 @@ def build_media_embedding_text(
             parts.append(f"caption={item['caption']}")
         if item.get("description") and item["description"] != title:
             parts.append(f"description={item['description'][:max_transcript_chars]}")
+        if item.get("semantic_caption"):
+            parts.append(f"visual_caption={item['semantic_caption']}")
+        if item.get("contextual_caption"):
+            parts.append(f"contextual_caption={item['contextual_caption']}")
+        if item.get("visual_description"):
+            parts.append(f"visual_description={item['visual_description'][:max_transcript_chars]}")
+        if item.get("visible_text"):
+            parts.append(f"visible_text={item['visible_text'][:max_transcript_chars]}")
+        if item.get("semantic_tags"):
+            parts.append(f"tags={', '.join(item['semantic_tags'])}")
         if item.get("context"):
             parts.append(f"context={item['context']}")
         if item.get("provider"):
