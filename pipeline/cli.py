@@ -21,7 +21,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Mapping
 
-from .core.config import list_configs, load_config
+from .core.config import (
+    ProductionConfigMismatchError,
+    list_configs,
+    load_config,
+    load_effective_config,
+)
 from .core.artifacts import load_artifact_catalog
 from .core.io import atomic_write_json, load_json_safe
 from .evaluation import (
@@ -175,9 +180,24 @@ def setup_logging(verbose: bool = False) -> None:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the pipeline, optionally stopping at an intentional stage checkpoint."""
-    config = load_config(args.config)
-    orchestrator = PipelineOrchestrator(config, run_id=args.run_id)
     should_resume = args.resume or bool(args.restart_from_stage)
+    config = load_config(args.config)
+    if should_resume and args.run_id:
+        run_work_dir = (
+            Path(config.get("work_dir", "./runs"))
+            / str(config.get("project_name", "default"))
+            / str(args.run_id)
+        ).resolve()
+        if (run_work_dir / "resolved_config.json").exists():
+            try:
+                config = load_effective_config(
+                    args.config,
+                    work_dir=run_work_dir,
+                )
+            except ProductionConfigMismatchError as exc:
+                print(f"\n{exc}")
+                return 1
+    orchestrator = PipelineOrchestrator(config, run_id=args.run_id)
     stop_after_stage = getattr(args, "stop_after_stage", None)
     restart_from_index = None
     stop_after_index = None

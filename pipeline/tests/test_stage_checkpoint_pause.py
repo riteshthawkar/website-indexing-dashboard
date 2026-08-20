@@ -290,6 +290,74 @@ def test_cli_returns_success_for_intentional_pause_and_forwards_selector(
     assert "intentionally paused" in capsys.readouterr().out
 
 
+def test_cli_resume_prefers_saved_run_config_snapshot(monkeypatch, tmp_path):
+    from pipeline import cli
+    from pipeline.core.config import production_indexing_contract_fingerprint
+    from pipeline.core.io import atomic_write_json
+
+    work_root = tmp_path / "runs"
+    current_config = {
+        "project_name": "snapshot-test",
+        "work_dir": str(work_root),
+        "pipeline": {"production_profile": False},
+        "chunker": {"chunk_size": 900},
+        "stages": [],
+    }
+    saved_config = {
+        **current_config,
+        "chunker": {"chunk_size": 800},
+    }
+    run_id = "saved-run"
+    run_work_dir = work_root / "snapshot-test" / run_id
+    run_work_dir.mkdir(parents=True)
+    atomic_write_json(
+        run_work_dir / "resolved_config.json",
+        {
+            "run_id": run_id,
+            "project_name": "snapshot-test",
+            "production_indexing_contract_fingerprint": (
+                production_indexing_contract_fingerprint(saved_config)
+            ),
+            "config": saved_config,
+        },
+    )
+    captured = {}
+
+    class FakeOrchestrator:
+        def __init__(self, config, run_id=None):
+            captured["config"] = config
+            captured["run_id"] = run_id
+
+        async def run(self, **kwargs):
+            captured["run_kwargs"] = kwargs
+            return SimpleNamespace(
+                status="paused",
+                run_id=run_id,
+                current_stage_index=1,
+                stages=[],
+            )
+
+    monkeypatch.setattr(cli, "load_config", lambda _name: current_config)
+    monkeypatch.setattr(cli, "PipelineOrchestrator", FakeOrchestrator)
+    args = SimpleNamespace(
+        config="snapshot-test",
+        run_id=run_id,
+        resume=True,
+        restart_from_stage=None,
+        stop_after_stage=None,
+        preflight=False,
+        skip_preflight=False,
+    )
+
+    assert cli.cmd_run(args) == 0
+    assert captured["config"]["chunker"]["chunk_size"] == 800
+    assert captured["run_kwargs"] == {
+        "resume": True,
+        "restart_from": None,
+        "stop_after_stage": None,
+    }
+
+
 def test_cli_rejects_invalid_selector_before_required_preflight(monkeypatch, capsys):
     from pipeline import cli
 
