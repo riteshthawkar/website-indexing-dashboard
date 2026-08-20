@@ -1840,6 +1840,46 @@ class TestCrawlerHelpers:
         assert "transcripts" in markdown
         assert "Thoughtcurators" not in markdown
 
+    def test_selects_raw_source_and_links_when_rendered_nextjs_page_crashes(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import (
+            _extract_page_links,
+            _select_preferred_page_capture,
+        )
+
+        page_url = "https://buildit.mbzuai.ac.ae/"
+        rendered_html = """
+        <html><body><h2>Application error: a client-side exception has occurred
+        (see the browser console for more information).</h2></body></html>
+        """
+        raw_source_html = """
+        <html><head><title>Build It</title></head><body>
+        <main><h1>Build It Demo Days</h1>
+        <a href="/about">About</a><a href="/benefits">Benefits</a>
+        </main></body></html>
+        """
+
+        selected_html, selected_source, report = _select_preferred_page_capture(
+            page_url,
+            rendered_html,
+            raw_source_html=raw_source_html,
+            rendered_markdown="## Application error: a client-side exception has occurred",
+        )
+        links = _extract_page_links(
+            SimpleNamespace(links={}),
+            selected_html,
+            page_url,
+            allowed_domains={"mbzuai.ac.ae"},
+            allowed_hosts={"buildit.mbzuai.ac.ae"},
+        )
+
+        assert selected_source == "raw_source"
+        assert report["selection_reason"] == "rendered_capture_unusable"
+        assert "blocked_or_error_page" in report["rendered"]["reasons"]
+        assert [link["target_url"] for link in links] == [
+            "https://buildit.mbzuai.ac.ae/about",
+            "https://buildit.mbzuai.ac.ae/benefits",
+        ]
+
     def test_markdown_quality_rejects_blocked_pages_before_indexing(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
 
