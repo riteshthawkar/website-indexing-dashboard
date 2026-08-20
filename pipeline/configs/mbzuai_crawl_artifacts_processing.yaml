@@ -1,0 +1,14 @@
+# Process an immutable MBZUAI crawl artifact run with the current canonical
+# indexing contract. The source crawler stage is bootstrapped into a new run;
+# operators can stop after cleaning and resume later without rewriting crawl
+# history or weakening production content gates.
+_inherit: mbzuai_production.yaml
+
+project_name: "mbzuai_crawl_processing"
+
+pipeline:
+  # This is a derived processing run, not a fresh canonical production crawl.
+  # It still inherits the canonical quality, cleaner, conversion, retrieval,
+  # and graph contracts from mbzuai_production.yaml.
+  production_profile: false
+  require_production_preflight: false

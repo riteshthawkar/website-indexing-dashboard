@@ -1,0 +1,36 @@
+# Process the immutable supplemental MBZUAI subdomain crawl without re-crawling.
+# The subdomain sample intentionally lacks the main-site critical routes, so its
+# cleaner uses the same yield/error gates but does not claim main-route survival.
+_inherit: mbzuai_subdomains_artifacts.yaml
+
+project_name: "mbzuai_subdomains_processing"
+
+cleaner:
+  require_critical_url_survival: false
+
+formatter:
+  critical_url_patterns: []
+  fail_on_critical_coverage: false
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
