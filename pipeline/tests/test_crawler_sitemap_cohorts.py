@@ -344,6 +344,38 @@ def test_atomic_runtime_checkpoint_precedes_public_frontier_projection(tmp_path,
     assert persisted["discovered_sitemaps"] == crawler.discovered_sitemaps
 
 
+def test_stage_outputs_omit_unconfigured_cohort_evidence(tmp_path):
+    crawler = _crawler(tmp_path)
+    for attribute, filename in {
+        "html_dir": "html",
+        "md_dir": "markdown",
+        "download_dir": "downloads",
+        "mapping_file": "mappings.json",
+        "page_images_file": "page_images.json",
+        "page_videos_file": "page_videos.json",
+        "page_media_file": "page_media.json",
+        "page_metadata_file": "page_metadata.json",
+        "page_link_graph_file": "page_link_graph.json",
+        "runtime_state_file": "crawler_checkpoint.json",
+        "sitemap_state_file": "sitemap_discovery.json",
+        "images_dir": "downloaded_page_images",
+        "url_to_md_mapping_file": "url_to_markdown.json",
+    }.items():
+        setattr(crawler, attribute, tmp_path / filename)
+
+    crawler.sitemap_cohort_verification = None
+    outputs = crawler._build_stage_outputs()
+
+    assert "sitemap_cohort_verification_file" not in outputs
+
+    crawler.sitemap_cohort_verification = {"evidence_sha256": "proof"}
+    outputs = crawler._build_stage_outputs()
+
+    assert outputs["sitemap_cohort_verification_file"] == str(
+        crawler.sitemap_cohort_verification_file
+    )
+
+
 def test_probe_never_requests_external_redirect_target(tmp_path, monkeypatch):
     crawler = _crawler(tmp_path)
     monkeypatch.setattr(

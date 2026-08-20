@@ -2991,25 +2991,7 @@ class Crawl4AICrawler(CrawlerStage):
                 )
 
             return StageResult.success(
-                outputs={
-                    "html_dir": str(self.html_dir),
-                    "md_dir": str(self.md_dir),
-                    "download_dir": str(self.download_dir),
-                    "mapping_file": str(self.mapping_file),
-                    "page_images_file": str(self.page_images_file),
-                    "page_videos_file": str(self.page_videos_file),
-                    "page_media_file": str(self.page_media_file),
-                    "page_metadata_file": str(self.page_metadata_file),
-                    "page_link_graph_file": str(self.page_link_graph_file),
-                    "runtime_state_file": str(self.runtime_state_file),
-                    "crawler_runtime_state_file": str(self.runtime_state_file),
-                    "sitemap_discovery_file": str(self.sitemap_state_file),
-                    "sitemap_cohort_verification_file": str(
-                        self.sitemap_cohort_verification_file
-                    ),
-                    "images_dir": str(self.images_dir),
-                    "md_mapping_file": str(self.url_to_md_mapping_file),
-                },
+                outputs=self._build_stage_outputs(),
                 metrics=self._build_metrics(),
                 checkpoint={"runtime_state_file": str(self.runtime_state_file)},
                 artifacts=[
@@ -5618,6 +5600,29 @@ class Crawl4AICrawler(CrawlerStage):
             "updated_at": time.time(),
         }
         atomic_write_json(self.crawl_state_file, public_state)
+
+    def _build_stage_outputs(self) -> Dict[str, str]:
+        outputs = {
+            "html_dir": str(self.html_dir),
+            "md_dir": str(self.md_dir),
+            "download_dir": str(self.download_dir),
+            "mapping_file": str(self.mapping_file),
+            "page_images_file": str(self.page_images_file),
+            "page_videos_file": str(self.page_videos_file),
+            "page_media_file": str(self.page_media_file),
+            "page_metadata_file": str(self.page_metadata_file),
+            "page_link_graph_file": str(self.page_link_graph_file),
+            "runtime_state_file": str(self.runtime_state_file),
+            "crawler_runtime_state_file": str(self.runtime_state_file),
+            "sitemap_discovery_file": str(self.sitemap_state_file),
+            "images_dir": str(self.images_dir),
+            "md_mapping_file": str(self.url_to_md_mapping_file),
+        }
+        if self.sitemap_cohort_verification:
+            outputs["sitemap_cohort_verification_file"] = str(
+                self.sitemap_cohort_verification_file
+            )
+        return outputs
 
     def _serialize_runtime_state(self) -> Dict[str, Any]:
         return {
