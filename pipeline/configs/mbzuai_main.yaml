@@ -23,7 +23,7 @@ crawler:
   # Researched public-origin inventory (2026-08-20). Production uses an exact
   # host list so certificate/DNS discoveries cannot pull admin, auth, tracking,
   # or research-service hosts into the crawler by suffix alone.
-  origin_inventory_revision: "2026-08-20-v1"
+  origin_inventory_revision: "2026-08-20-v2"
   allowed_domains:
     - "mbzuai.ac.ae"
     - "ifm.ai"
@@ -106,9 +106,11 @@ crawler:
     "ai-nexus.mbzuai.ac.ae": 8
     "hpp.mbzuai.ac.ae": 3
     "ifm.ai": 15
-    "library.mbzuai.ac.ae": 1
-    "metaverse.mbzuai.ac.ae": 1
-    "buildit.mbzuai.ac.ae": 1
+    # Baselines below the 2026-08-20 validated counts (19/38/7) allow modest
+    # editorial churn while still failing a collapsed no-sitemap crawl.
+    "library.mbzuai.ac.ae": 15
+    "metaverse.mbzuai.ac.ae": 30
+    "buildit.mbzuai.ac.ae": 7
   priority_seed_urls:
     - "https://mbzuai.ac.ae/about/office-of-the-president"
     - "https://mbzuai.ac.ae/about/leadership"
@@ -119,6 +121,12 @@ crawler:
     - "https://library.mbzuai.ac.ae/"
     - "https://metaverse.mbzuai.ac.ae/"
     - "https://buildit.mbzuai.ac.ae/"
+    - "https://buildit.mbzuai.ac.ae/about"
+    - "https://buildit.mbzuai.ac.ae/apply"
+    - "https://buildit.mbzuai.ac.ae/highlights"
+    - "https://buildit.mbzuai.ac.ae/benefits"
+    - "https://buildit.mbzuai.ac.ae/network"
+    - "https://buildit.mbzuai.ac.ae/faqs"
   origin_inventory:
     canonical_aliases:
       "ifm.mbzuai.ac.ae": "ifm.ai"

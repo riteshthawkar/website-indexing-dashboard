@@ -99,9 +99,9 @@ MBZUAI_MINIMUM_SITEMAP_URLS_BY_HOST = {
 MBZUAI_MINIMUM_CRAWLED_PAGES_BY_HOST = {
     **MBZUAI_MINIMUM_SITEMAP_URLS_BY_HOST,
     "careers.mbzuai.ac.ae": 30,
-    "library.mbzuai.ac.ae": 1,
-    "metaverse.mbzuai.ac.ae": 1,
-    "buildit.mbzuai.ac.ae": 1,
+    "library.mbzuai.ac.ae": 15,
+    "metaverse.mbzuai.ac.ae": 30,
+    "buildit.mbzuai.ac.ae": 7,
 }
 
 MBZUAI_LINK_DISCOVERY_HOSTS = {

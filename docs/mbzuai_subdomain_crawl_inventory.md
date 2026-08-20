@@ -1,7 +1,7 @@
 # MBZUAI public-origin crawl inventory
 
 Reviewed: 2026-08-20 (Asia/Dubai)
-Configuration revision: `2026-08-20-v1`
+Configuration revision: `2026-08-20-v2`
 
 This inventory separates public institutional content from every hostname that
 merely appears in DNS, certificate transparency, or the main site's link graph.
@@ -17,9 +17,9 @@ Only explicitly approved hosts are eligible for production egress.
 | `research.mbzuai.ac.ae` | Robots-declared XML sitemap | 10 URLs | Sitemap seeds |
 | `ai-nexus.mbzuai.ac.ae` | Robots-declared Yoast sitemap | 10 URLs | Sitemap seeds |
 | `hpp.mbzuai.ac.ae` | Yoast sitemap index | 4 URLs | Sitemap seeds |
-| `library.mbzuai.ac.ae` | No usable sitemap | Not fixed | Root seed plus same-host bounded link discovery |
-| `metaverse.mbzuai.ac.ae` | No usable sitemap | Not fixed | Root seed plus same-host bounded link discovery |
-| `buildit.mbzuai.ac.ae` | No usable sitemap; robots path returns a real HTTP 404 | Not fixed | Root seed plus same-host bounded link discovery |
+| `library.mbzuai.ac.ae` | No usable sitemap | 19 live pages in the validation crawl | Root seed plus same-host bounded link discovery; minimum 15 successful pages |
+| `metaverse.mbzuai.ac.ae` | No usable sitemap | 38 live pages in the validation crawl | Root seed plus same-host bounded link discovery; minimum 30 successful pages |
+| `buildit.mbzuai.ac.ae` | No usable sitemap; robots path returns a real HTTP 404 | 7 live pages in the validation crawl | Seven explicit seeds plus same-host bounded link discovery; minimum 7 successful pages |
 
 `www.mbzuai.ac.ae` and `ifm.mbzuai.ac.ae` are approved redirect aliases, but
 they are not independent required content inventories.
@@ -57,3 +57,35 @@ The production crawler now enforces:
 The smaller `mbzuai_subdomains_artifacts` profile exercises the same subdomain
 contract without re-crawling the main MBZUAI sitemap and contains only the
 artifact collection stage.
+
+## Artifact collection validation run
+
+Run `mbzuai-subdomains-artifacts-20260820-v7` completed the crawler stage on
+2026-08-20 and passed an independent run audit with zero errors and zero
+warnings. It saved 145 successful page captures and one PDF:
+
+| Host | Successful pages |
+| --- | ---: |
+| `careers.mbzuai.ac.ae` | 35 |
+| `research.mbzuai.ac.ae` | 10 |
+| `ai-nexus.mbzuai.ac.ae` | 10 |
+| `hpp.mbzuai.ac.ae` | 4 |
+| `ifm.ai` | 22 |
+| `library.mbzuai.ac.ae` | 19 |
+| `metaverse.mbzuai.ac.ae` | 38 |
+| `buildit.mbzuai.ac.ae` | 7 |
+
+The run discovered 95 sitemap URLs. It classified 14 stale Careers entries as
+HTTP 404, 42 broken Metaverse publication links as HTTP 404, and three malformed
+Metaverse links as HTTP 400; none were saved as successful pages. Five robots
+policy encounters were blocked, and no Library login/search URL appears in
+successful page metadata.
+
+BuildIt's browser-rendered pages currently raise a client-side exception even
+though their HTTP source contains valid content. The crawler now recognizes
+that error shell, selects the healthy raw source, and discovers the six public
+child routes (`about`, `apply`, `highlights`, `benefits`, `network`, and `faqs`).
+All seven BuildIt routes are explicit future-run seeds and coverage requirements.
+
+Only the crawler stage ran. No cleaner, converter, chunker, embedder, or upload
+stage was executed.
