@@ -7,6 +7,10 @@ project_name: "mbzuai_subdomains"
 
 pipeline:
   production_profile: false
+  # This profile intentionally has no downstream indexing stages, so the full
+  # assertion-first production preflight is not applicable. Stage validation
+  # and the crawler's live origin/sitemap coverage gates still run.
+  require_production_preflight: false
 
 crawler:
   start_url: "https://careers.mbzuai.ac.ae/"
