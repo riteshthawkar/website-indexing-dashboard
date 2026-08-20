@@ -14,7 +14,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from pipeline.cli import load_env_files
-from pipeline.core.artifacts import ArtifactCatalog, save_artifact_catalog
+from pipeline.core.artifacts import ArtifactCatalog, load_artifact_catalog, save_artifact_catalog
 from pipeline.core.config import load_config
 from pipeline.core.io import ensure_dir
 from pipeline.core.orchestrator import PipelineOrchestrator
@@ -82,7 +82,7 @@ def _build_bootstrap_state(
                     finished_at=source_stage.finished_at,
                     outputs=copy.deepcopy(source_stage.outputs),
                     metrics=copy.deepcopy(source_stage.metrics),
-                    artifact_ids=[],
+                    artifact_ids=list(source_stage.artifact_ids or []),
                 )
             )
             continue
@@ -222,7 +222,21 @@ def main() -> int:
         shutil.rmtree(work_dir)
 
     ensure_dir(work_dir)
-    save_artifact_catalog(ArtifactCatalog(), work_dir)
+    source_catalog = load_artifact_catalog(source_run_dir)
+    bootstrapped_stage_ids = {
+        str(stage.stage_id or "")
+        for stage in source_state.stages[: args.bootstrap_stage_count]
+        if str(stage.stage_id or "")
+    }
+    bootstrapped_catalog = ArtifactCatalog(
+        version=source_catalog.version,
+        records=[
+            copy.deepcopy(record)
+            for record in source_catalog.records
+            if record.producer_stage in bootstrapped_stage_ids
+        ],
+    )
+    save_artifact_catalog(bootstrapped_catalog, work_dir)
 
     state = _build_bootstrap_state(
         source_state=source_state,
@@ -238,6 +252,7 @@ def main() -> int:
         "work_dir": str(work_dir),
         "run_id": args.run_id,
         "bootstrap_stage_count": args.bootstrap_stage_count,
+        "bootstrap_artifact_count": len(bootstrapped_catalog.records),
         "current_stage_index": state.current_stage_index,
         "max_slices": args.max_slices,
         "pinecone_index": config.get("embedder", {}).get("pinecone_index"),

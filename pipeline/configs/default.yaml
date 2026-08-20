@@ -296,6 +296,42 @@ formatter:
   include_full_content: true
   include_summary: true
   include_media_context: true
+  require_multimodal_media: false
+  minimum_multimodal_media_records: 1
+  maximum_image_text_only_ratio: 0.05
+  media_enrichment:
+    # Media is acquired in a derived stage so a completed raw crawl remains
+    # immutable. Projects must explicitly allow every first-party/CDN host.
+    download_web_images: true
+    extract_pdf_figures: true
+    allowed_media_hosts: []
+    download_concurrency: 8
+    per_host_concurrency: 4
+    request_timeout_sec: 45
+    download_retry_attempts: 3
+    retry_backoff_sec: 1.0
+    redirect_limit: 5
+    max_image_size_mb: 10
+    max_image_pixels: 50000000
+    min_web_width: 120
+    min_web_height: 90
+    min_web_area: 30000
+    max_aspect_ratio: 12.0
+    min_visual_stddev: 2.0
+    pdf_crop_scale: 2.0
+    pdf_crop_padding_points: 3.0
+    min_pdf_bbox_area_ratio: 0.003
+    max_pdf_bbox_area_ratio: 0.88
+    min_pdf_crop_width: 96
+    min_pdf_crop_height: 72
+    min_pdf_crop_area: 12000
+    max_pdf_crop_aspect_ratio: 12.0
+    max_pdf_crops_per_page: 8
+    pdf_perceptual_duplicate_distance: 2
+    include_unused_fallback_layouts: true
+    manifest_flush_every: 25
+    minimum_accepted_assets: 1
+    maximum_download_failure_ratio: 0.25
   chunk_documents: false
   chunk_size_chars: 4000
   chunk_overlap_chars: 400
@@ -611,6 +647,9 @@ embedder:
   batch_size: 32
   media_text_batch_size: 32
   media_multimodal_batch_size: 4
+  # A release must not claim image retrieval when an image batch was actually
+  # embedded from text-only fallback content.
+  media_multimodal_fallback_enabled: false
   upsert_batch_size: 100
   enable_dense_facts: true
   enable_dense_evidence_spans: true

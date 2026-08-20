@@ -224,6 +224,31 @@ crawler:
       allowed_path_prefixes: ["/research-center"]
       expected_member_count: 1
       max_members: 1
+
+formatter:
+  media_enrichment:
+    # Exact asset-host inventory observed in the 2026-08-19/20 crawl. The
+    # unrelated Wired/Bloomberg/Substack preview hosts are intentionally not
+    # included because those thumbnails are not MBZUAI source evidence.
+    allowed_media_hosts:
+      - "mbzuai.ac.ae"
+      - "www.mbzuai.ac.ae"
+      - "staticcdn.mbzuai.ac.ae"
+      - "sambzuaiwpprd01.blob.core.windows.net"
+      - "careers.mbzuai.ac.ae"
+      - "research.mbzuai.ac.ae"
+      - "ai-nexus.mbzuai.ac.ae"
+      - "library.mbzuai.ac.ae"
+      - "metaverse.mbzuai.ac.ae"
+      - "buildit.mbzuai.ac.ae"
+      - "hpp.mbzuai.ac.ae"
+      - "ifm.mbzuai.ac.ae"
+      - "ifm.ai"
+      - "mbzuai.netlify.app"
+      - "cdn.prod.website-files.com"
+      - "live.staticflickr.com"
+    minimum_accepted_assets: 100
+
 embedder:
   # Candidate runs must never clear or mutate the active release namespaces.
   # The upload manifest records the resolved names and the retriever consumes

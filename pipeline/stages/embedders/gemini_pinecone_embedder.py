@@ -451,6 +451,13 @@ def _record_metadata(record: Dict[str, Any], *, kind: str) -> Dict[str, Any]:
         "title": record.get("title"),
         "caption": record.get("caption"),
         "provider": record.get("provider"),
+        "content_hash": record.get("content_hash"),
+        "perceptual_hash": record.get("perceptual_hash"),
+        "source_backend": record.get("source_backend"),
+        "crop_source": record.get("crop_source"),
+        "ocr_model": record.get("ocr_model"),
+        "ocr_model_revision": record.get("ocr_model_revision"),
+        "bbox": record.get("bbox"),
         "predicate": record.get("predicate"),
         "answer_type": record.get("answer_type"),
         "answer_subtype": record.get("answer_subtype"),
@@ -1460,6 +1467,9 @@ class GeminiPineconeEmbedder(EmbedderStage):
         text_batch_size = int(config.get("batch_size") or 32)
         media_text_batch_size = int(config.get("media_text_batch_size") or text_batch_size)
         media_multimodal_batch_size = int(config.get("media_multimodal_batch_size") or 4)
+        media_multimodal_fallback_enabled = bool(
+            config.get("media_multimodal_fallback_enabled", True)
+        )
         upsert_batch_size = int(config.get("upsert_batch_size") or 100)
         max_retries = max(1, int(config.get("max_retries") or 6))
         retry_base_delay_sec = float(config.get("retry_base_delay_sec") or 5.0)
@@ -2061,6 +2071,8 @@ class GeminiPineconeEmbedder(EmbedderStage):
                         max_delay_sec=retry_max_delay_sec,
                     )
                 except Exception:
+                    if not media_multimodal_fallback_enabled:
+                        raise
                     media_metrics["media_multimodal_fallbacks"] += len(batch_records)
                     vectors = _call_with_retry(
                         "embed_media_fallback_text_batch",

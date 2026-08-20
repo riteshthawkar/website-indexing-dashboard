@@ -266,6 +266,58 @@ def assess_production_readiness(
     else:
         _add(checks, "stage_order", "ok", f"Production {stage_profile} stage order is complete.")
 
+    formatter_cfg = config.get("formatter", {}) if isinstance(config.get("formatter"), Mapping) else {}
+    media_cfg = (
+        formatter_cfg.get("media_enrichment", {})
+        if isinstance(formatter_cfg.get("media_enrichment"), Mapping)
+        else {}
+    )
+    multimodal_required = bool(formatter_cfg.get("require_multimodal_media", False))
+    if multimodal_required:
+        media_stage_valid = "enrich_media" in stage_ids
+        if media_stage_valid and "convert_html" in stage_ids and "deduplicate_markdown" in stage_ids:
+            media_position = stage_ids.index("enrich_media")
+            media_stage_valid = (
+                stage_ids.index("convert_html") < media_position < stage_ids.index("deduplicate_markdown")
+            )
+        if not media_stage_valid:
+            _add(
+                checks,
+                "multimodal_media_stage",
+                "error",
+                "Multimodal production requires enrich_media between conversion and deduplication.",
+            )
+        elif not media_cfg.get("allowed_media_hosts"):
+            _add(
+                checks,
+                "multimodal_media_stage",
+                "error",
+                "Multimodal production requires an explicit media host allowlist.",
+            )
+        else:
+            _add(
+                checks,
+                "multimodal_media_stage",
+                "ok",
+                "Media acquisition is allowlisted and runs before deduplication.",
+            )
+
+        embedder_cfg = config.get("embedder", {}) if isinstance(config.get("embedder"), Mapping) else {}
+        if bool(embedder_cfg.get("media_multimodal_fallback_enabled", True)):
+            _add(
+                checks,
+                "multimodal_embedding_fallback",
+                "error",
+                "Production multimodal embeddings must fail closed instead of silently using text fallback.",
+            )
+        else:
+            _add(
+                checks,
+                "multimodal_embedding_fallback",
+                "ok",
+                "Multimodal embedding failures are configured to fail closed.",
+            )
+
     legacy_plugins = sorted(set(stage_plugins).intersection(LEGACY_STAGE_PLUGINS))
     if legacy_plugins:
         _add(

@@ -46,6 +46,29 @@ def _coerce_position(value: Any) -> Optional[int]:
         return None
 
 
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_bbox(value: Any) -> Dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    bbox: Dict[str, Any] = {}
+    for key in ("l", "t", "r", "b"):
+        coordinate = _coerce_float(value.get(key))
+        if coordinate is not None:
+            bbox[key] = coordinate
+    origin = _clean_text(value.get("coord_origin")).upper()
+    if origin in {"TOPLEFT", "BOTTOMLEFT"}:
+        bbox["coord_origin"] = origin
+    return bbox if all(key in bbox for key in ("l", "t", "r", "b")) else {}
+
+
 def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
     """Normalize a media item to the canonical schema."""
     media_type = _clean_text(item.get("type") or item.get("media_type") or "image").lower()
@@ -78,6 +101,20 @@ def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "width": _coerce_position(item.get("width")),
         "height": _coerce_position(item.get("height")),
         "mime_type": _clean_text(item.get("mime_type")),
+        "content_hash": _clean_text(item.get("content_hash")),
+        "perceptual_hash": _clean_text(item.get("perceptual_hash")),
+        "duplicate_of": _clean_url(item.get("duplicate_of")),
+        "final_url": _clean_url(item.get("final_url")),
+        "download_status": _clean_text(item.get("download_status")),
+        "source_backend": _clean_text(item.get("source_backend")),
+        "crop_source": _clean_text(item.get("crop_source")),
+        "ocr_text": _clean_text(item.get("ocr_text")),
+        "ocr_model": _clean_text(item.get("ocr_model")),
+        "ocr_model_revision": _clean_text(item.get("ocr_model_revision")),
+        "bbox": _normalize_bbox(item.get("bbox")),
+        "bbox_area_ratio": _coerce_float(item.get("bbox_area_ratio")),
+        "visual_stddev": _coerce_float(item.get("visual_stddev")),
+        "file_size_bytes": _coerce_position(item.get("file_size_bytes")),
         "track_urls": [
             _clean_url(track_url)
             for track_url in (item.get("track_urls") or [])
@@ -169,6 +206,12 @@ def compact_media_for_metadata(
             "position": item.get("position"),
             "transcript_url": item.get("transcript_url", ""),
             "mime_type": item.get("mime_type", "")[:80],
+            "content_hash": item.get("content_hash", "")[:80],
+            "perceptual_hash": item.get("perceptual_hash", "")[:32],
+            "crop_source": item.get("crop_source", "")[:80],
+            "ocr_model": item.get("ocr_model", "")[:120],
+            "ocr_model_revision": item.get("ocr_model_revision", "")[:120],
+            "bbox": item.get("bbox") or {},
         }
         if include_local_path and item.get("local_path"):
             compact["local_path"] = item["local_path"]

@@ -11,6 +11,8 @@ cleaner:
 formatter:
   critical_url_patterns: []
   fail_on_critical_coverage: false
+  media_enrichment:
+    minimum_accepted_assets: 10
 
 stages:
   - id: crawl_web
@@ -28,6 +30,9 @@ stages:
   - id: convert_html
     type: converter
     plugin: markitdown
+  - id: enrich_media
+    type: formatter
+    plugin: media_enrichment
   - id: deduplicate_markdown
     type: quality_gate
     plugin: dedup_filter

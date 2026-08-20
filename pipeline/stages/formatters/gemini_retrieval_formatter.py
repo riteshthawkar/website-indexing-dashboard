@@ -578,7 +578,7 @@ def _build_media_embedding_input(item: Dict[str, Any], *, document_title: str = 
         lines.append(f"DOCUMENT: {document_title}")
     if section_path:
         lines.append(f"SECTION: {' > '.join(section_path)}")
-    for key in ("caption", "description", "context", "transcript"):
+    for key in ("caption", "description", "context", "ocr_text", "transcript"):
         value = _clean_text(item.get(key))
         if value and value != title:
             lines.append(f"{key.upper()}: {value}")
@@ -1045,6 +1045,14 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "context": normalized.get("context", ""),
                 "transcript": normalized.get("transcript", ""),
                 "provider": normalized.get("provider", ""),
+                "content_hash": normalized.get("content_hash", ""),
+                "perceptual_hash": normalized.get("perceptual_hash", ""),
+                "source_backend": normalized.get("source_backend", ""),
+                "crop_source": normalized.get("crop_source", ""),
+                "ocr_text": normalized.get("ocr_text", ""),
+                "ocr_model": normalized.get("ocr_model", ""),
+                "ocr_model_revision": normalized.get("ocr_model_revision", ""),
+                "bbox": normalized.get("bbox") or {},
                 "can_embed_multimodal": bool(
                     local_path
                     and Path(local_path).is_file()
@@ -1501,6 +1509,48 @@ class GeminiRetrievalFormatter(FormatterStage):
                 }
             )
 
+        image_media_records = [
+            record
+            for record in media_records
+            if record.get("media_type") in {"image", "page_visual"}
+        ]
+        multimodal_media_records = [
+            record for record in image_media_records if record.get("can_embed_multimodal")
+        ]
+        text_only_image_records = len(image_media_records) - len(multimodal_media_records)
+        image_text_only_ratio = text_only_image_records / max(1, len(image_media_records))
+        if bool(ctx.formatter_config.get("require_multimodal_media", False)):
+            minimum_multimodal = max(
+                1,
+                int(ctx.formatter_config.get("minimum_multimodal_media_records") or 1),
+            )
+            maximum_text_only_ratio = max(
+                0.0,
+                float(ctx.formatter_config.get("maximum_image_text_only_ratio") or 0.0),
+            )
+            if len(multimodal_media_records) < minimum_multimodal:
+                return StageResult.failure(
+                    "Retrieval formatting produced "
+                    f"{len(multimodal_media_records)} multimodal image records; "
+                    f"minimum is {minimum_multimodal}",
+                    metrics={
+                        "image_media_records": len(image_media_records),
+                        "multimodal_media_records": len(multimodal_media_records),
+                        "text_only_image_records": text_only_image_records,
+                    },
+                )
+            if image_text_only_ratio > maximum_text_only_ratio:
+                return StageResult.failure(
+                    "Text-only image ratio "
+                    f"{image_text_only_ratio:.6f} exceeds {maximum_text_only_ratio:.6f}",
+                    metrics={
+                        "image_media_records": len(image_media_records),
+                        "multimodal_media_records": len(multimodal_media_records),
+                        "text_only_image_records": text_only_image_records,
+                        "image_text_only_ratio": image_text_only_ratio,
+                    },
+                )
+
         bundle = {
             "version": 5,
             "generated_at": ctx.run_id,
@@ -1517,6 +1567,10 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "chunk_count": len(chunk_dense_records),
                 "parent_count": len(parent_records),
                 "media_count": len(media_records),
+                "image_media_count": len(image_media_records),
+                "multimodal_media_count": len(multimodal_media_records),
+                "text_only_image_count": text_only_image_records,
+                "image_text_only_ratio": round(image_text_only_ratio, 6),
                 "fact_count": len(fact_records),
                 "evidence_span_count": len(evidence_span_records),
                 "summary_count": len(summary_records),
@@ -1654,6 +1708,10 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "chunk_records": len(chunk_dense_records),
                 "parent_records": len(parent_records),
                 "media_records": len(media_records),
+                "image_media_records": len(image_media_records),
+                "multimodal_media_records": len(multimodal_media_records),
+                "text_only_image_records": text_only_image_records,
+                "image_text_only_ratio": round(image_text_only_ratio, 6),
                 "fact_records": len(fact_records),
                 "evidence_span_records": len(evidence_span_records),
                 "summary_records": len(summary_records),

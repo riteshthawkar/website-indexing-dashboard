@@ -59,6 +59,9 @@ cleaner:
   require_critical_url_survival: true
 
 formatter:
+  require_multimodal_media: true
+  minimum_multimodal_media_records: 100
+  maximum_image_text_only_ratio: 0.0
   # The researched 2026-08-20 multi-origin sitemap inventory contains roughly
   # 2.75k raw URLs before the main site's verified-empty CMS cohorts.
   # Defective CMS members are excluded only after fresh, run-scoped HTTP proof;
@@ -108,6 +111,9 @@ stages:
   - id: convert_html
     type: converter
     plugin: markitdown
+  - id: enrich_media
+    type: formatter
+    plugin: media_enrichment
   - id: deduplicate_markdown
     type: quality_gate
     plugin: dedup_filter
