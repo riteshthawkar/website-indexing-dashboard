@@ -247,7 +247,10 @@ CONTENT_ERROR_PATTERNS = (
     re.compile(r"\b403\s+forbidden\b", re.I),
     re.compile(r"\b404\s+not\s+found\b", re.I),
     re.compile(r"\b500\s+internal\s+server\s+error\b", re.I),
-    re.compile(r"\bapplication\s+error:\s+a\s+client-side\s+exception\s+has\s+occurred\b", re.I),
+    re.compile(
+        r"\bapplication\s+error:\s+a\s+client(?:-|\s+)side\s+exception\s+has\s+occurred\b",
+        re.I,
+    ),
     re.compile(r"\baccess\s+denied\b", re.I),
     re.compile(r"\bcss\s+error\b", re.I),
     re.compile(r"\bsorry\s+to\s+interrupt\b", re.I),

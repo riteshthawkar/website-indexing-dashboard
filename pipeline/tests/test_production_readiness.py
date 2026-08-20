@@ -1842,6 +1842,7 @@ class TestCrawlerHelpers:
 
     def test_selects_raw_source_and_links_when_rendered_nextjs_page_crashes(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import (
+            Crawl4AICrawler,
             _extract_page_links,
             _select_preferred_page_capture,
         )
@@ -1879,6 +1880,34 @@ class TestCrawlerHelpers:
             "https://buildit.mbzuai.ac.ae/about",
             "https://buildit.mbzuai.ac.ae/benefits",
         ]
+
+        markdown, markdown_source, markdown_reason = Crawl4AICrawler()._extract_markdown(
+            SimpleNamespace(markdown=None),
+            html=selected_html,
+            page_url=page_url,
+            rendered_markdown="## Application error: a client-side exception has occurred",
+            capture_source=selected_source,
+        )
+
+        assert "Application error" not in markdown
+        assert "Build It Demo Days" in markdown
+        assert markdown_source == "source_html"
+        assert markdown_reason == ""
+
+    def test_suppresses_rendered_error_markdown_when_raw_source_has_no_text(self):
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        markdown, markdown_source, markdown_reason = Crawl4AICrawler()._extract_markdown(
+            SimpleNamespace(markdown=None),
+            html="<html><head><title>Build It</title></head><body></body></html>",
+            page_url="https://buildit.mbzuai.ac.ae/apply",
+            rendered_markdown="## Application error: a client-side exception has occurred",
+            capture_source="raw_source",
+        )
+
+        assert markdown == ""
+        assert markdown_source == ""
+        assert markdown_reason == "empty_markdown"
 
     def test_markdown_quality_rejects_blocked_pages_before_indexing(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _markdown_quality_reason
