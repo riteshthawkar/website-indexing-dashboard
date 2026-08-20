@@ -224,11 +224,20 @@ class StageResult:
         )
 
     @staticmethod
-    def failure(error_message: str, checkpoint: Dict = None) -> "StageResult":
+    def failure(
+        error_message: str,
+        checkpoint: Dict = None,
+        outputs: Dict[str, Any] = None,
+        metrics: Dict[str, Any] = None,
+        artifacts: List[Dict[str, Any] | ArtifactRecord] = None,
+    ) -> "StageResult":
         return StageResult(
             status=StageStatus.FAILED,
+            outputs=outputs or {},
+            metrics=metrics or {},
             error_message=error_message,
             checkpoint=checkpoint,
+            artifacts=artifacts or [],
         )
 
     @staticmethod

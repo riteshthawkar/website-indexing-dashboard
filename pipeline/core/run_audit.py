@@ -403,6 +403,139 @@ def _audit_index_coverage_gate(report: RunAuditReport, work_dir: Path) -> None:
     )
 
 
+def _audit_content_disposition_manifests(
+    report: RunAuditReport,
+    state: PipelineState,
+) -> None:
+    """Require auditable, fail-closed manifests for quality and cleaning stages."""
+
+    for index, stage in enumerate(state.stages):
+        if stage.status != "completed":
+            continue
+        if stage.name == "quality_scorer":
+            manifest_key = "quality_manifest_file"
+            manifest_label = "quality"
+            accepted_output_key = "passed_count"
+        elif stage.stage_type == "cleaner":
+            manifest_key = "cleaning_manifest_file"
+            manifest_label = "cleaning"
+            accepted_output_key = "cleaned_count"
+        else:
+            continue
+
+        stage_id = stage.stage_id or f"{stage.stage_type}_{stage.name}_{index}"
+        manifest_path_value = stage.outputs.get(manifest_key)
+        if not manifest_path_value:
+            report.errors.append(
+                AuditIssue(
+                    severity="error",
+                    code=f"missing_{manifest_label}_manifest",
+                    message=f"Completed {manifest_label} stage has no disposition manifest",
+                    stage_id=stage_id,
+                )
+            )
+            continue
+
+        manifest_path = Path(str(manifest_path_value))
+        manifest = load_json_safe(manifest_path)
+        if not isinstance(manifest, dict):
+            report.errors.append(
+                AuditIssue(
+                    severity="error",
+                    code=f"invalid_{manifest_label}_manifest",
+                    message=f"{manifest_label.title()} disposition manifest is unreadable",
+                    path=str(manifest_path),
+                    stage_id=stage_id,
+                )
+            )
+            continue
+
+        gate = manifest.get("gate")
+        dispositions = manifest.get("dispositions")
+        if (
+            manifest.get("application_status") != "completed"
+            or not isinstance(gate, dict)
+            or gate.get("ok") is not True
+            or not isinstance(dispositions, list)
+        ):
+            report.errors.append(
+                AuditIssue(
+                    severity="error",
+                    code=f"failed_{manifest_label}_manifest_gate",
+                    message=f"{manifest_label.title()} manifest does not prove a passed gate",
+                    path=str(manifest_path),
+                    stage_id=stage_id,
+                )
+            )
+            continue
+
+        status_counts: Dict[str, int] = {"accepted": 0, "filtered": 0, "failed": 0}
+        invalid_dispositions = 0
+        missing_outputs = 0
+        missing_sources = 0
+        in_place_outputs = 0
+        for item in dispositions:
+            if not isinstance(item, dict):
+                invalid_dispositions += 1
+                continue
+            status = str(item.get("status") or "")
+            reason_code = str(item.get("reason_code") or "")
+            if status not in status_counts or not reason_code:
+                invalid_dispositions += 1
+                continue
+            status_counts[status] += 1
+            source_path = _resolve_path_str(item.get("source_path"))
+            if source_path and not Path(source_path).is_file():
+                missing_sources += 1
+            if status == "accepted":
+                output_path = _resolve_path_str(item.get("output_path"))
+                if not output_path or not Path(output_path).is_file():
+                    missing_outputs += 1
+                if manifest_label == "quality" and source_path == output_path:
+                    in_place_outputs += 1
+
+        manifest_counts = {
+            "input_count": len(dispositions),
+            "accepted_count": status_counts["accepted"],
+            "filtered_count": status_counts["filtered"],
+            "failed_count": status_counts["failed"],
+        }
+        inconsistent_counts = {
+            key: {"manifest": value, "gate": gate.get(key)}
+            for key, value in manifest_counts.items()
+            if gate.get(key) != value
+        }
+        output_accepted_count = stage.outputs.get(accepted_output_key)
+        if output_accepted_count != status_counts["accepted"]:
+            inconsistent_counts[accepted_output_key] = {
+                "manifest": status_counts["accepted"],
+                "stage_output": output_accepted_count,
+            }
+        if (
+            invalid_dispositions
+            or inconsistent_counts
+            or missing_outputs
+            or missing_sources
+            or in_place_outputs
+        ):
+            report.errors.append(
+                AuditIssue(
+                    severity="error",
+                    code=f"inconsistent_{manifest_label}_manifest",
+                    message=f"{manifest_label.title()} disposition evidence is inconsistent",
+                    path=str(manifest_path),
+                    stage_id=stage_id,
+                    metadata={
+                        "invalid_dispositions": invalid_dispositions,
+                        "inconsistent_counts": inconsistent_counts,
+                        "missing_outputs": missing_outputs,
+                        "missing_sources": missing_sources,
+                        "in_place_outputs": in_place_outputs,
+                    },
+                )
+            )
+
+
 def audit_run(
     work_dir: str | Path,
     *,
@@ -437,6 +570,7 @@ def audit_run(
     _audit_stage_output_paths(report, state)
     _audit_artifact_catalog(report, state, artifact_catalog)
     _audit_mapping_files(report, state)
+    _audit_content_disposition_manifests(report, state)
     _audit_chunk_indexes(report, artifact_catalog)
     _audit_knowledge_graphs(report, artifact_catalog)
     _audit_index_coverage_gate(report, work_dir)

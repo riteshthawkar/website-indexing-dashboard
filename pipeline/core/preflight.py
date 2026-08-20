@@ -490,6 +490,109 @@ def assess_production_readiness(
                 "crawler.known_empty_sitemap_cohorts must be configured"
             )
 
+        quality_contract = (
+            config.get("quality", {})
+            if isinstance(config.get("quality"), Mapping)
+            else {}
+        )
+        for key in (
+            "detect_login_walls",
+            "fail_on_empty_input",
+            "fail_on_zero_output",
+        ):
+            if not bool(quality_contract.get(key, False)):
+                production_contract_errors.append(f"quality.{key} must be true")
+        try:
+            quality_retention = float(
+                quality_contract.get("minimum_retention_ratio") or 0.0
+            )
+        except (TypeError, ValueError):
+            quality_retention = 0.0
+        if quality_retention < 0.70:
+            production_contract_errors.append(
+                "quality.minimum_retention_ratio must be >= 0.70"
+            )
+        try:
+            quality_maximum_errors = int(quality_contract.get("maximum_error_count"))
+        except (TypeError, ValueError):
+            quality_maximum_errors = -1
+        if quality_maximum_errors != 0:
+            production_contract_errors.append("quality.maximum_error_count must be 0")
+        try:
+            quality_maximum_error_ratio = float(
+                quality_contract.get("maximum_error_ratio")
+            )
+        except (TypeError, ValueError):
+            quality_maximum_error_ratio = -1.0
+        if quality_maximum_error_ratio != 0.0:
+            production_contract_errors.append("quality.maximum_error_ratio must be 0")
+
+        cleaner_contract = (
+            config.get("cleaner", {})
+            if isinstance(config.get("cleaner"), Mapping)
+            else {}
+        )
+        for key in (
+            "include_tables",
+            "include_links",
+            "preserve_embedded_media",
+            "recursive",
+            "fail_on_empty_input",
+            "fail_on_zero_output",
+            "require_critical_url_survival",
+        ):
+            if not bool(cleaner_contract.get(key, False)):
+                production_contract_errors.append(f"cleaner.{key} must be true")
+        for key, minimum in (
+            ("min_content_length", 100),
+            ("min_content_words", 5),
+            ("minimum_host_input_count", 1),
+        ):
+            try:
+                value = int(cleaner_contract.get(key))
+            except (TypeError, ValueError):
+                value = -1
+            if value < minimum:
+                production_contract_errors.append(
+                    f"cleaner.{key} must be >= {minimum}"
+                )
+        try:
+            minimum_host_input_count = int(
+                cleaner_contract.get("minimum_host_input_count")
+            )
+        except (TypeError, ValueError):
+            minimum_host_input_count = 0
+        if minimum_host_input_count > 10:
+            production_contract_errors.append(
+                "cleaner.minimum_host_input_count must be <= 10"
+            )
+        for key, minimum in (
+            ("minimum_retention_ratio", 0.75),
+            ("minimum_host_retention_ratio", 0.50),
+        ):
+            try:
+                value = float(cleaner_contract.get(key) or 0.0)
+            except (TypeError, ValueError):
+                value = 0.0
+            if value < minimum:
+                production_contract_errors.append(
+                    f"cleaner.{key} must be >= {minimum:.2f}"
+                )
+        try:
+            cleaner_maximum_errors = int(cleaner_contract.get("maximum_error_count"))
+        except (TypeError, ValueError):
+            cleaner_maximum_errors = -1
+        if cleaner_maximum_errors != 0:
+            production_contract_errors.append("cleaner.maximum_error_count must be 0")
+        try:
+            cleaner_maximum_error_ratio = float(
+                cleaner_contract.get("maximum_error_ratio")
+            )
+        except (TypeError, ValueError):
+            cleaner_maximum_error_ratio = -1.0
+        if cleaner_maximum_error_ratio != 0.0:
+            production_contract_errors.append("cleaner.maximum_error_ratio must be 0")
+
         formatter_contract = (
             config.get("formatter", {})
             if isinstance(config.get("formatter"), Mapping)

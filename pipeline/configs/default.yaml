@@ -168,8 +168,18 @@ cleaner:
   include_tables: true
   include_links: true
   preserve_embedded_media: true
+  # Content thresholds are measured from normalized visible text, not markup.
   min_content_length: 100
+  min_content_words: 5
   recursive: true
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.75
+  minimum_host_retention_ratio: 0.50
+  minimum_host_input_count: 5
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+  require_critical_url_survival: true
 
 # ─── Converter ──────────────────────────────────────────────
 converter:
@@ -259,6 +269,11 @@ chunker:
 quality:
   min_content_length: 100
   detect_login_walls: true
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.70
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
   dedup_threshold: 0.85
   dedup_num_perm: 128
   dedup_ngram_size: 5

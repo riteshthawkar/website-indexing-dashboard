@@ -22,7 +22,14 @@ from .artifacts import (
 from .registry import register_stage, get_stage, list_stages
 from .orchestrator import PipelineOrchestrator
 from .config import load_config, merge_configs
-from .io import atomic_write_json, load_json_safe, ensure_dir
+from .io import (
+    atomic_copy_file,
+    atomic_write_json,
+    atomic_write_text,
+    ensure_dir,
+    load_json_safe,
+    reset_stage_output_directory,
+)
 from .storage import ArtifactStore, LocalArtifactStore, create_artifact_store
 from .chunking import (
     estimate_token_count,
@@ -46,5 +53,6 @@ __all__ = [
     "register_stage", "get_stage", "list_stages",
     "PipelineOrchestrator",
     "load_config", "merge_configs",
-    "atomic_write_json", "load_json_safe", "ensure_dir",
+    "atomic_copy_file", "atomic_write_json", "atomic_write_text", "load_json_safe", "ensure_dir",
+    "reset_stage_output_directory",
 ]

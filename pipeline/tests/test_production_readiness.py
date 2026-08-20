@@ -275,6 +275,63 @@ def test_canonical_production_crawl_contract_is_satisfied(monkeypatch):
     assert contract["status"] == "ok"
 
 
+def test_canonical_production_rejects_downgraded_content_processing_contract(monkeypatch):
+    from pipeline.core.config import load_config
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv("PINECONE_API_KEY", "test-pinecone")
+    config = load_config("mbzuai_production")
+    config["quality"].update(
+        {
+            "fail_on_empty_input": False,
+            "minimum_retention_ratio": 0.1,
+            "maximum_error_count": 2,
+            "maximum_error_ratio": 0.1,
+        }
+    )
+    config["cleaner"].update(
+        {
+            "min_content_length": 1,
+            "min_content_words": 0,
+            "fail_on_zero_output": False,
+            "minimum_retention_ratio": 0.1,
+            "minimum_host_retention_ratio": 0.1,
+            "minimum_host_input_count": 50,
+            "maximum_error_count": 2,
+            "maximum_error_ratio": 0.1,
+            "require_critical_url_survival": False,
+        }
+    )
+
+    report = assess_production_readiness(
+        config,
+        config_name="mbzuai_production",
+        validation_errors={},
+    )
+
+    contract = next(
+        check
+        for check in report["checks"]
+        if check["name"] == "canonical_production_contract"
+    )
+    errors = contract["details"]["errors"]
+    assert "quality.fail_on_empty_input must be true" in errors
+    assert "quality.minimum_retention_ratio must be >= 0.70" in errors
+    assert "quality.maximum_error_count must be 0" in errors
+    assert "quality.maximum_error_ratio must be 0" in errors
+    assert "cleaner.fail_on_zero_output must be true" in errors
+    assert "cleaner.min_content_length must be >= 100" in errors
+    assert "cleaner.min_content_words must be >= 5" in errors
+    assert "cleaner.minimum_retention_ratio must be >= 0.75" in errors
+    assert "cleaner.minimum_host_retention_ratio must be >= 0.50" in errors
+    assert "cleaner.minimum_host_input_count must be <= 10" in errors
+    assert "cleaner.maximum_error_count must be 0" in errors
+    assert "cleaner.maximum_error_ratio must be 0" in errors
+    assert "cleaner.require_critical_url_survival must be true" in errors
+
+
 def test_preflight_neo4j_backend_requires_upload_stage_and_credentials(monkeypatch):
     from pipeline.core.preflight import assess_production_readiness
 
@@ -2606,6 +2663,27 @@ class TestCrawlerStage:
 # ─────────────────────────────────────────────────────────────
 
 class TestQualityScorer:
+    def test_validate_config_rejects_invalid_fail_closed_policy(self):
+        from pipeline.stages.quality.quality_scorer import QualityScorer
+
+        errors = run_async(
+            QualityScorer().validate_config(
+                {
+                    "quality": {
+                        "min_content_length": -1,
+                        "minimum_retention_ratio": "bad",
+                        "maximum_error_count": -1,
+                        "fail_on_zero_output": "yes",
+                    }
+                }
+            )
+        )
+
+        assert "quality.min_content_length must be a non-negative integer" in errors
+        assert "quality.minimum_retention_ratio must be a number between 0 and 1" in errors
+        assert "quality.maximum_error_count must be a non-negative integer" in errors
+        assert "quality.fail_on_zero_output must be a boolean" in errors
+
     def test_boundary_exactly_at_min_length(self):
         """Text with exactly min_length chars should pass."""
         from pipeline.stages.quality.quality_scorer import _check_quality
@@ -2988,10 +3066,11 @@ class TestQualityScorer:
         and computer vision. The university was established in 2019."""
         assert _check_quality(text, 100, True) is None
 
-    def test_execute_filters_files_on_disk(self, tmp_dir):
-        """Full execute test: creates files, runs quality gate, verifies deletions."""
+    def test_execute_filters_to_out_of_place_directory(self, tmp_dir):
+        """Rejected inputs stay immutable while accepted content is materialized."""
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
         from pipeline.stages.quality.quality_scorer import QualityScorer
-        from pipeline.core.base import StageContext
 
         md_dir = tmp_dir / "markdown"
         md_dir.mkdir()
@@ -3011,23 +3090,69 @@ class TestQualityScorer:
 
         ctx = StageContext(
             run_id="test", project_name="test",
-            config={"quality": {"min_content_length": 50, "detect_login_walls": True}},
+            config={
+                "quality": {
+                    "min_content_length": 50,
+                    "detect_login_walls": True,
+                    "minimum_retention_ratio": 0.0,
+                }
+            },
             work_dir=tmp_dir,
             previous_outputs={"md_dir": str(md_dir)},
+            stage_id="score_raw_content",
         )
 
         scorer = QualityScorer()
         result = run_async(scorer.execute(ctx))
 
+        assert result.status == StageStatus.COMPLETED
         assert result.outputs["passed_count"] == 1
         assert result.outputs["filtered_count"] == 3
+        accepted_dir = Path(result.outputs["md_dir"])
+        assert (accepted_dir / "good.md").exists()
+        assert not (accepted_dir / "short.md").exists()
+        assert not (accepted_dir / "login.md").exists()
+        assert not (accepted_dir / "error.md").exists()
         assert (md_dir / "good.md").exists()
-        assert not (md_dir / "short.md").exists()
-        assert not (md_dir / "login.md").exists()
-        assert not (md_dir / "error.md").exists()
+        assert (md_dir / "short.md").exists()
+        assert (md_dir / "login.md").exists()
+        assert (md_dir / "error.md").exists()
+        manifest = load_json_safe(result.outputs["quality_manifest_file"])
+        assert manifest["gate"]["ok"] is True
+        assert manifest["gate"]["reason_counts"] == {
+            "accepted_quality": 1,
+            "error_page": 1,
+            "login_wall": 1,
+            "too_short": 1,
+        }
 
-    def test_execute_on_raw_html_prunes_related_markdown_and_media(self, tmp_dir):
-        from pipeline.core.base import StageContext
+    def test_execute_fails_closed_on_empty_input(self, tmp_dir):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.quality.quality_scorer import QualityScorer
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        ctx = StageContext(
+            run_id="test",
+            project_name="test",
+            config={"quality": {"min_content_length": 50}},
+            work_dir=tmp_dir,
+            previous_outputs={"html_dir": str(html_dir)},
+            stage_id="score_raw_content",
+        )
+
+        result = run_async(QualityScorer().execute(ctx))
+
+        assert result.status == StageStatus.FAILED
+        manifest = load_json_safe(result.outputs["quality_manifest_file"])
+        assert manifest["gate"]["ok"] is False
+        assert {item["code"] for item in manifest["gate"]["failures"]} == {
+            "empty_input"
+        }
+
+    def test_execute_on_raw_html_projects_mapping_and_media_without_mutating_sources(self, tmp_dir):
+        from pipeline.core.base import StageContext, StageStatus
         from pipeline.core.io import atomic_write_json, load_json_safe
         from pipeline.stages.quality.quality_scorer import QualityScorer
 
@@ -3093,7 +3218,13 @@ class TestQualityScorer:
         ctx = StageContext(
             run_id="test",
             project_name="test",
-            config={"quality": {"min_content_length": 50, "detect_login_walls": True}},
+            config={
+                "quality": {
+                    "min_content_length": 50,
+                    "detect_login_walls": True,
+                    "minimum_retention_ratio": 0.5,
+                }
+            },
             work_dir=tmp_dir,
             previous_outputs={
                 "html_dir": str(html_dir),
@@ -3104,24 +3235,53 @@ class TestQualityScorer:
                 "page_images_file": str(page_images_file),
                 "page_videos_file": str(page_videos_file),
             },
+            stage_id="score_raw_content",
         )
 
         result = run_async(QualityScorer().execute(ctx))
+        assert result.status == StageStatus.COMPLETED
         assert result.outputs["passed_count"] == 1
         assert result.outputs["filtered_count"] == 1
         assert good_html.exists()
         assert good_md.exists()
-        assert not bad_html.exists()
-        assert not bad_md.exists()
+        assert bad_html.exists()
+        assert bad_md.exists()
         assert load_json_safe(mapping_file) == {
             "https://example.com/good": str(good_html),
+            "https://example.com/login": str(bad_html),
             "https://example.com/not-found": "SKIPPED_HTTP_404",
             "https://example.com/verified-empty": "SKIPPED_VERIFIED_EMPTY_COHORT:test-policy",
         }
-        assert load_json_safe(md_mapping_file) == {"https://example.com/good": str(good_md)}
-        assert load_json_safe(page_media_file) == {"https://example.com/good": [{"type": "image", "url": "https://example.com/good.jpg"}]}
-        assert load_json_safe(page_images_file) == {"https://example.com/good": [{"url": "https://example.com/good.jpg"}]}
-        assert load_json_safe(page_videos_file) == {"https://example.com/good": [{"url": "https://example.com/good.mp4"}]}
+        assert load_json_safe(md_mapping_file) == {
+            "https://example.com/good": str(good_md),
+            "https://example.com/login": str(bad_md),
+        }
+        assert "https://example.com/login" in load_json_safe(page_media_file)
+        assert "https://example.com/login" in load_json_safe(page_images_file)
+        assert "https://example.com/login" in load_json_safe(page_videos_file)
+
+        accepted_html = Path(result.outputs["html_dir"]) / "good.html"
+        assert accepted_html.exists()
+        assert not (Path(result.outputs["html_dir"]) / "login.html").exists()
+        assert load_json_safe(result.outputs["mapping_file"]) == {
+            "https://example.com/good": str(accepted_html.resolve()),
+            "https://example.com/not-found": "SKIPPED_HTTP_404",
+            "https://example.com/verified-empty": "SKIPPED_VERIFIED_EMPTY_COHORT:test-policy",
+        }
+        assert load_json_safe(result.outputs["md_mapping_file"]) == {
+            "https://example.com/good": str(good_md),
+        }
+        assert load_json_safe(result.outputs["page_media_file"]) == {
+            "https://example.com/good": [
+                {"type": "image", "url": "https://example.com/good.jpg"}
+            ]
+        }
+        assert load_json_safe(result.outputs["page_images_file"]) == {
+            "https://example.com/good": [{"url": "https://example.com/good.jpg"}]
+        }
+        assert load_json_safe(result.outputs["page_videos_file"]) == {
+            "https://example.com/good": [{"url": "https://example.com/good.mp4"}]
+        }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -4061,6 +4221,61 @@ class TestBS4Cleaner:
         status, cleaned_html = clean_html_content("<html><body><div>Visible content</div></body></html>")
         assert status == "cleaned"
         assert "Visible content" in cleaned_html
+
+    def test_hidden_content_with_spaced_css_is_removed_before_attributes(self):
+        from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+
+        raw = """<html><body><main>
+        <div style="display: none">Hidden prompt injection text</div>
+        <div style="visibility : hidden">Hidden navigation text</div>
+        <p>Visible public university content.</p>
+        </main></body></html>"""
+
+        status, cleaned_html = clean_html_content(raw)
+
+        assert status == "cleaned"
+        assert "Visible public university content" in cleaned_html
+        assert "Hidden prompt injection text" not in cleaned_html
+        assert "Hidden navigation text" not in cleaned_html
+
+    def test_page_not_found_phrase_inside_script_does_not_remove_public_page(self):
+        from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+
+        raw = """<html><head><script>const message = 'page not found';</script></head>
+        <body><main><h1>Public page</h1><p>{content}</p></main></body></html>""".format(
+            content="Useful public university information. " * 10
+        )
+        status, cleaned_html = clean_html_content(raw)
+
+        assert status == "cleaned"
+        assert "Public page" in cleaned_html
+
+    def test_page_not_found_heading_inside_long_article_is_not_an_error_shell(self):
+        from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+
+        raw = """<html><body><main><h1>Web reliability handbook</h1>
+        <p>{content}</p><h2>Page not found</h2>
+        <p>This section explains how public 404 responses are designed.</p>
+        </main></body></html>""".format(content="Substantive engineering guidance. " * 80)
+
+        status, cleaned_html = clean_html_content(raw)
+
+        assert status == "cleaned"
+        assert "Web reliability handbook" in cleaned_html
+
+    def test_main_element_is_preferred_over_earlier_article_teaser(self):
+        from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+
+        raw = """<html><body>
+        <article><p>Unrelated teaser</p></article>
+        <main><h1>Primary page</h1><p>{content}</p></main>
+        </body></html>""".format(content="Substantive primary content. " * 20)
+
+        status, cleaned_html = clean_html_content(raw)
+
+        assert status == "cleaned"
+        assert "Primary page" in cleaned_html
+        assert "Unrelated teaser" not in cleaned_html
 
 
 # ─────────────────────────────────────────────────────────────
@@ -13737,6 +13952,7 @@ class TestRunAudit:
         assert state.stages[0].artifact_ids == [existing.artifact_id]
 
     def test_audit_allows_pruned_crawler_intermediates_after_downstream_stage(self, tmp_dir):
+        from pipeline.core.io import atomic_write_json
         from pipeline.core.run_audit import audit_run
         from pipeline.core.state import PipelineState, StageState, save_state
 
@@ -13744,6 +13960,34 @@ class TestRunAudit:
         run_dir.mkdir()
         cleaned_dir = run_dir / "stage_outputs" / "clean_html" / "cleaned_html"
         cleaned_dir.mkdir(parents=True)
+        source_file = run_dir / "stage_outputs" / "score_raw_content" / "accepted_html" / "page.html"
+        source_file.parent.mkdir(parents=True)
+        source_file.write_text("<html><body>Source content</body></html>", encoding="utf-8")
+        cleaned_file = cleaned_dir / "page.html"
+        cleaned_file.write_text("<html><body>Cleaned content</body></html>", encoding="utf-8")
+        manifest_file = run_dir / "stage_outputs" / "clean_html" / "cleaning_manifest.json"
+        atomic_write_json(
+            manifest_file,
+            {
+                "schema_version": 1,
+                "application_status": "completed",
+                "gate": {
+                    "ok": True,
+                    "input_count": 1,
+                    "accepted_count": 1,
+                    "filtered_count": 0,
+                    "failed_count": 0,
+                },
+                "dispositions": [
+                    {
+                        "source_path": str(source_file),
+                        "output_path": str(cleaned_file),
+                        "status": "accepted",
+                        "reason_code": "accepted_trafilatura",
+                    }
+                ],
+            },
+        )
 
         save_state(
             PipelineState(
@@ -13766,7 +14010,11 @@ class TestRunAudit:
                         stage_type="cleaner",
                         stage_id="clean_html",
                         status="completed",
-                        outputs={"cleaned_dir": str(cleaned_dir)},
+                        outputs={
+                            "cleaned_dir": str(cleaned_dir),
+                            "cleaned_count": 1,
+                            "cleaning_manifest_file": str(manifest_file),
+                        },
                     ),
                 ],
                 current_stage_index=2,
@@ -13807,6 +14055,37 @@ class TestRunAudit:
         report = audit_run(run_dir)
         assert not report.ok
         assert any(issue.code == "missing_output_dir" for issue in report.errors)
+
+    def test_audit_rejects_completed_cleaner_without_disposition_manifest(self, tmp_dir):
+        from pipeline.core.run_audit import audit_run
+        from pipeline.core.state import PipelineState, StageState, save_state
+
+        run_dir = tmp_dir / "run"
+        cleaned_dir = run_dir / "stage_outputs" / "clean_html" / "cleaned_html"
+        cleaned_dir.mkdir(parents=True)
+        save_state(
+            PipelineState(
+                run_id="r1",
+                project_name="p1",
+                status="completed",
+                current_stage_index=1,
+                stages=[
+                    StageState(
+                        name="trafilatura",
+                        stage_type="cleaner",
+                        stage_id="clean_html",
+                        status="completed",
+                        outputs={"cleaned_dir": str(cleaned_dir), "cleaned_count": 0},
+                    )
+                ],
+            ),
+            run_dir,
+        )
+
+        report = audit_run(run_dir)
+
+        assert not report.ok
+        assert any(issue.code == "missing_cleaning_manifest" for issue in report.errors)
 
     def test_audit_detects_accepted_report_with_missing_markdown(self, tmp_dir):
         from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record, save_artifact_catalog
@@ -14149,6 +14428,286 @@ class TestCleanerContracts:
         assert "Real Content" in cleaned
         assert "Menu 1" not in cleaned
         assert result.metrics["fallback_cleaned"] == 1
+
+    def test_trafilatura_fails_closed_on_empty_input(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        monkeypatch.setitem(
+            sys.modules,
+            "trafilatura",
+            SimpleNamespace(extract=lambda *args, **kwargs: ""),
+        )
+        ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config={"cleaner": {"min_content_length": 10}},
+            work_dir=tmp_dir,
+            previous_outputs={"html_dir": str(html_dir)},
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+        )
+
+        result = run_async(TrafilaturaCleaner().execute(ctx))
+
+        assert result.status == StageStatus.FAILED
+        manifest = load_json_safe(result.outputs["cleaning_manifest_file"])
+        assert manifest["gate"]["ok"] is False
+        assert {item["code"] for item in manifest["gate"]["failures"]} == {
+            "empty_input"
+        }
+
+    def test_trafilatura_fails_closed_when_every_page_is_filtered(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        (html_dir / "page.html").write_text(
+            "<html><body><script>only javascript</script></body></html>",
+            encoding="utf-8",
+        )
+        monkeypatch.setitem(
+            sys.modules,
+            "trafilatura",
+            SimpleNamespace(extract=lambda *args, **kwargs: ""),
+        )
+        ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config={"cleaner": {"min_content_length": 100}},
+            work_dir=tmp_dir,
+            previous_outputs={"html_dir": str(html_dir)},
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+        )
+
+        result = run_async(TrafilaturaCleaner().execute(ctx))
+
+        assert result.status == StageStatus.FAILED
+        assert result.outputs["cleaned_count"] == 0
+        manifest = load_json_safe(result.outputs["cleaning_manifest_file"])
+        assert manifest["gate"]["reason_counts"] == {"empty_content": 1}
+        assert "zero_output" in {
+            item["code"] for item in manifest["gate"]["failures"]
+        }
+
+    def test_trafilatura_threshold_uses_visible_text_not_markup(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import load_json_safe
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        (html_dir / "page.html").write_text("<html><body>x</body></html>", encoding="utf-8")
+        markup_heavy = "<html><body>" + ("<span></span>" * 30) + "x</body></html>"
+        monkeypatch.setitem(
+            sys.modules,
+            "trafilatura",
+            SimpleNamespace(extract=lambda *args, **kwargs: markup_heavy),
+        )
+        ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config={"cleaner": {"min_content_length": 100}},
+            work_dir=tmp_dir,
+            previous_outputs={"html_dir": str(html_dir)},
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+        )
+
+        result = run_async(TrafilaturaCleaner().execute(ctx))
+
+        assert result.status == StageStatus.FAILED
+        manifest = load_json_safe(result.outputs["cleaning_manifest_file"])
+        disposition = manifest["dispositions"][0]
+        assert disposition["status"] == "filtered"
+        assert disposition["reason_code"] == "insufficient_visible_content"
+        assert disposition["content_metrics"]["visible_characters"] == 1
+
+    def test_trafilatura_resets_stale_output_before_retry(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        (html_dir / "page.html").write_text(
+            "<html><body><main>" + ("Source content " * 20) + "</main></body></html>",
+            encoding="utf-8",
+        )
+        stale_file = tmp_dir / "stage_outputs" / "clean_html" / "cleaned_html" / "stale.html"
+        stale_file.parent.mkdir(parents=True)
+        stale_file.write_text("stale", encoding="utf-8")
+        monkeypatch.setitem(
+            sys.modules,
+            "trafilatura",
+            SimpleNamespace(
+                extract=lambda *args, **kwargs: (
+                    "<html><body><main>" + ("Accepted content " * 20) + "</main></body></html>"
+                )
+            ),
+        )
+        ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config={"cleaner": {"min_content_length": 100}},
+            work_dir=tmp_dir,
+            previous_outputs={"html_dir": str(html_dir)},
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+        )
+
+        result = run_async(TrafilaturaCleaner().execute(ctx))
+
+        assert result.status == StageStatus.COMPLETED
+        assert not stale_file.exists()
+        assert (Path(result.outputs["cleaned_dir"]) / "page.html").exists()
+
+    def test_trafilatura_validate_config_rejects_invalid_policy(self):
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        errors = run_async(
+            TrafilaturaCleaner().validate_config(
+                {
+                    "cleaner": {
+                        "min_content_length": "bad",
+                        "minimum_retention_ratio": 1.1,
+                        "fail_on_empty_input": "yes",
+                    }
+                }
+            )
+        )
+
+        assert "cleaner.min_content_length must be a non-negative integer" in errors
+        assert "cleaner.minimum_retention_ratio must be between 0 and 1" in errors
+        assert "cleaner.fail_on_empty_input must be a boolean" in errors
+
+    def test_trafilatura_requires_critical_url_to_survive_cleaning(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        source_file = html_dir / "page.html"
+        source_file.write_text(
+            "<html><body><main>" + ("Public content " * 20) + "</main></body></html>",
+            encoding="utf-8",
+        )
+        mapping_file = tmp_dir / "mapping.json"
+        atomic_write_json(mapping_file, {"https://example.com/other": str(source_file)})
+        monkeypatch.setitem(
+            sys.modules,
+            "trafilatura",
+            SimpleNamespace(
+                extract=lambda *args, **kwargs: (
+                    "<html><body><main>" + ("Public content " * 20) + "</main></body></html>"
+                )
+            ),
+        )
+        ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config={
+                "cleaner": {"min_content_length": 10},
+                "formatter": {"critical_url_patterns": [r"/critical/?$"]},
+            },
+            work_dir=tmp_dir,
+            previous_outputs={
+                "html_dir": str(html_dir),
+                "mapping_file": str(mapping_file),
+            },
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+        )
+
+        result = run_async(TrafilaturaCleaner().execute(ctx))
+
+        assert result.status == StageStatus.FAILED
+        manifest = load_json_safe(result.outputs["cleaning_manifest_file"])
+        assert manifest["gate"]["missing_critical_url_patterns"] == [r"/critical/?$"]
+        assert "missing_critical_url_after_cleaning" in {
+            item["code"] for item in manifest["gate"]["failures"]
+        }
+
+    def test_quality_to_cleaner_artifact_lineage_is_preserved(self, tmp_dir, monkeypatch):
+        from pipeline.core.artifacts import ArtifactCatalog
+        from pipeline.core.base import StageContext, StageStatus
+        from pipeline.core.io import atomic_write_json
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+        from pipeline.stages.quality.quality_scorer import QualityScorer
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        source_file = html_dir / "page.html"
+        source_file.write_text(
+            "<html><body><main>" + ("Lineage content " * 20) + "</main></body></html>",
+            encoding="utf-8",
+        )
+        mapping_file = tmp_dir / "mapping.json"
+        atomic_write_json(mapping_file, {"https://example.com/page": str(source_file)})
+        config = {
+            "quality": {"min_content_length": 10, "minimum_retention_ratio": 1.0},
+            "cleaner": {"min_content_length": 10},
+        }
+        catalog = ArtifactCatalog()
+        quality_ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config=config,
+            work_dir=tmp_dir,
+            previous_outputs={
+                "html_dir": str(html_dir),
+                "mapping_file": str(mapping_file),
+            },
+            stage_definition={"type": "quality_gate", "plugin": "quality_scorer"},
+            stage_id="score_raw_content",
+            artifact_catalog=catalog,
+        )
+        quality_result = run_async(QualityScorer().execute(quality_ctx))
+        catalog.extend(quality_result.artifacts)
+        accepted_artifact = catalog.filter(artifact_type="quality_accepted_html")[0]
+
+        monkeypatch.setitem(
+            sys.modules,
+            "trafilatura",
+            SimpleNamespace(
+                extract=lambda *args, **kwargs: (
+                    "<html><body><main>" + ("Lineage content " * 20) + "</main></body></html>"
+                )
+            ),
+        )
+        cleaner_inputs = {
+            "html_dir": str(html_dir),
+            "mapping_file": str(mapping_file),
+            **quality_result.outputs,
+        }
+        cleaner_ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config=config,
+            work_dir=tmp_dir,
+            previous_outputs=cleaner_inputs,
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+            artifact_catalog=catalog,
+        )
+
+        cleaner_result = run_async(TrafilaturaCleaner().execute(cleaner_ctx))
+
+        assert quality_result.status == StageStatus.COMPLETED
+        assert cleaner_result.status == StageStatus.COMPLETED
+        cleaned_artifact = next(
+            artifact
+            for artifact in cleaner_result.artifacts
+            if artifact.artifact_type == "cleaned_html"
+        )
+        assert cleaned_artifact.source_artifact_ids == [accepted_artifact.artifact_id]
+        assert source_file.exists()
 
 
 class TestFormatterContracts:

@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -39,6 +40,67 @@ def atomic_write_json(filepath: str | Path, data: Any, indent: int = 2) -> None:
         except OSError:
             pass
         raise
+
+
+def atomic_write_text(
+    filepath: str | Path,
+    text: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """Write text atomically using a sibling temporary file."""
+
+    filepath = Path(filepath)
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(filepath.parent), suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding=encoding) as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, filepath)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def atomic_copy_file(source: str | Path, destination: str | Path) -> None:
+    """Copy a file into place atomically without modifying the source."""
+
+    source = Path(source)
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=str(destination.parent), suffix=".tmp")
+    os.close(fd)
+    try:
+        shutil.copy2(source, tmp_path)
+        os.replace(tmp_path, destination)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def reset_stage_output_directory(path: str | Path, stage_work_dir: str | Path) -> Path:
+    """Reset one named output directory after proving it belongs to a stage."""
+
+    path = Path(path).resolve()
+    stage_work_dir = Path(stage_work_dir).resolve()
+    if path == stage_work_dir:
+        raise ValueError("Refusing to reset the stage work directory itself")
+    try:
+        path.relative_to(stage_work_dir)
+    except ValueError as exc:
+        raise ValueError(f"Output directory escapes stage work directory: {path}") from exc
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def load_json_safe(filepath: str | Path, default: Any = None) -> Any:

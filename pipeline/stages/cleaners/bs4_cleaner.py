@@ -14,8 +14,22 @@ from typing import Any, Dict, List, Optional, Tuple
 from bs4 import BeautifulSoup, Comment, Doctype
 
 from pipeline.core.base import CleanerStage, StageContext, StageResult
-from pipeline.core.io import load_json_safe
+from pipeline.core.io import (
+    atomic_write_json,
+    atomic_write_text,
+    load_json_safe,
+    reset_stage_output_directory,
+)
 from pipeline.core.registry import register_stage
+from pipeline.stages.cleaners.common import (
+    CleaningPolicy,
+    content_meets_policy,
+    evaluate_cleaning_gate,
+    normalized_visible_text,
+    urls_by_source_path,
+    validate_cleaner_policy_config,
+    visible_content_metrics,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +44,30 @@ BODY_CLEAN_TAGS = [
     "button", "input", "svg", "canvas", "template",
 ]
 KEEP_META_NAMES = ["description", "keywords"]
-NOISE_KEYS = [
-    "cookie", "consent", "subscribe", "newsletter", "advert", "ad-",
-    "promo", "banner", "share", "social", "breadcrumb", "sidebar",
-    "toc", "related", "comments", "rating",
-]
+NOISE_TOKENS = {
+    "ad",
+    "ads",
+    "advert",
+    "advertisement",
+    "banner",
+    "breadcrumb",
+    "comments",
+    "consent",
+    "cookie",
+    "newsletter",
+    "promo",
+    "rating",
+    "related",
+    "share",
+    "sidebar",
+    "social",
+    "subscribe",
+    "toc",
+}
+ERROR_PAGE_HEADING = re.compile(
+    r"(?i)^\s*(?:(?:error|http)\s*[:\-]?\s*)?"
+    r"(?:404(?:\s+(?:error|not\s+found))?|page\s+not\s+found)\s*[.!]?\s*$"
+)
 
 
 # ── helpers ──────────────────────────────────────────────────────────
@@ -104,7 +137,7 @@ def _remove_hidden(soup):
             el.decompose()
             continue
 
-        style = str(attrs.get("style", "")).lower()
+        style = re.sub(r"\s+", "", str(attrs.get("style", "")).lower())
         if "display:none" in style or "visibility:hidden" in style:
             el.decompose()
 
@@ -132,13 +165,22 @@ def _remove_noise(soup):
             classes_value = [classes_value]
         classes = " ".join(classes_value).lower()
         id_ = str(_safe_tag_attr(tag, "id", "")).lower()
-        return any(k in classes or k in id_ for k in NOISE_KEYS)
+        tokens = {
+            token
+            for token in re.split(r"[^a-z0-9]+", f"{classes} {id_}")
+            if token
+        }
+        return bool(tokens.intersection(NOISE_TOKENS))
     for tag in soup.find_all(is_noise):
         tag.decompose()
 
 
 def _keep_main_content(soup):
-    main = soup.find(["main", "article"]) or soup.find(attrs={"role": "main"})
+    main = (
+        soup.find("main")
+        or soup.find(attrs={"role": "main"})
+        or soup.find("article")
+    )
     if main:
         return BeautifulSoup(f"<html><body>{main}</body></html>", "html.parser")
     return soup
@@ -148,12 +190,38 @@ def _collapse_blanks(text: str) -> str:
     return re.sub(r"\n\s*\n+", "\n", text)
 
 
+def _is_structural_error_page(soup: BeautifulSoup) -> bool:
+    """Detect an error shell from visible structural elements only."""
+
+    probe = BeautifulSoup(str(soup), "html.parser")
+    _remove_unwanted_tags(probe, ["script", "style", "noscript", "template"])
+    _remove_unwanted_tags(probe, ["nav", "header", "footer", "aside"])
+    _remove_hidden(probe)
+    primary = (
+        probe.find("main")
+        or probe.find(attrs={"role": "main"})
+        or probe.find("article")
+        or probe.body
+        or probe
+    )
+    visible_text = normalized_visible_text(str(primary))
+    if len(visible_text) > 1200:
+        return False
+
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    if title and ERROR_PAGE_HEADING.fullmatch(title):
+        return True
+    for heading in primary.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        if ERROR_PAGE_HEADING.fullmatch(heading.get_text(" ", strip=True)):
+            return True
+    return len(visible_text) <= 240 and bool(ERROR_PAGE_HEADING.fullmatch(visible_text))
+
+
 def clean_html_content(raw: str, preserve_media: bool = False) -> Tuple[str, Optional[str]]:
     """Clean HTML content and return (status, cleaned_html)."""
-    if re.search(r"(?i)page not found", raw):
-        return "removed", None
-
     soup = BeautifulSoup(raw, "html.parser")
+    if _is_structural_error_page(soup):
+        return "removed", None
 
     _remove_unwanted_tags(soup, REMOVE_TAGS)
     _remove_comments(soup)
@@ -209,8 +277,7 @@ def clean_single_file(file_path: str, preserve_media: bool = False) -> str:
     if status != "cleaned" or cleaned_html is None:
         return status
 
-    with open(file_path, "w", encoding="utf-8") as f:
-        f.write(cleaned_html)
+    atomic_write_text(file_path, cleaned_html)
     return status
 
 
@@ -221,8 +288,19 @@ class BS4Cleaner(CleanerStage):
     name = "bs4"
     description = "BeautifulSoup-based HTML cleaner — strips boilerplate, noise, and empty pages."
 
+    async def validate_config(self, config: Dict[str, Any]) -> List[str]:
+        cleaner_config = config.get("cleaner", {})
+        if not isinstance(cleaner_config, dict):
+            return ["cleaner must be a mapping"]
+        return validate_cleaner_policy_config(cleaner_config)
+
     async def execute(self, ctx: StageContext) -> StageResult:
         config = ctx.cleaner_config
+        try:
+            policy = CleaningPolicy.from_config(config)
+        except ValueError as exc:
+            return StageResult.failure(f"Invalid cleaner configuration: {exc}")
+
         html_dir = ctx.previous_outputs.get("html_dir")
         if not html_dir:
             return StageResult.failure("No html_dir in previous outputs")
@@ -236,65 +314,214 @@ class BS4Cleaner(CleanerStage):
             "preserve_embedded_media",
             ctx.crawler_config.get("extract_images", True) or ctx.crawler_config.get("extract_videos", True),
         )
-        cleaned_dir = ctx.output_dir("cleaned_html")
+        cleaned_dir = reset_stage_output_directory(
+            ctx.stage_work_dir / "cleaned_html",
+            ctx.stage_work_dir,
+        )
         pattern = "**/*.html" if recursive else "*.html"
-        files = list(html_dir.glob(pattern))
+        accepted_html_artifacts = ctx.find_artifacts(artifact_type="quality_accepted_html")
+        files = (
+            [Path(record.local_path) for record in accepted_html_artifacts if record.local_path]
+            if accepted_html_artifacts
+            else list(html_dir.glob(pattern))
+        )
+        files = sorted(set(files), key=lambda path: str(path))
         logger.info("BS4 cleaner found %d HTML files in %s", len(files), html_dir)
 
-        counts = {"cleaned": 0, "removed": 0, "removed_empty": 0, "error": 0}
-        artifacts = []
+        content_artifacts = []
         url_mapping = load_json_safe(ctx.previous_outputs.get("mapping_file"), {}) or {}
+        urls_by_path = urls_by_source_path(url_mapping if isinstance(url_mapping, dict) else {})
+        artifact_by_path = {
+            str(Path(record.local_path).resolve()): record
+            for record in accepted_html_artifacts
+            if record.local_path
+        }
+        dispositions: List[Dict[str, Any]] = []
+
         for i, fp in enumerate(files, 1):
+            resolved_source = str(fp.resolve())
+            source_artifact = artifact_by_path.get(resolved_source)
+            source_urls = set(urls_by_path.get(resolved_source, []))
+            if source_artifact:
+                artifact_urls = source_artifact.metadata.get("source_urls") or []
+                if isinstance(artifact_urls, list):
+                    source_urls.update(str(url) for url in artifact_urls if str(url).strip())
+                source_url = str(source_artifact.metadata.get("source_url") or "")
+                if source_url:
+                    source_urls.add(source_url)
+            relative_value = (
+                source_artifact.metadata.get("relative_path")
+                if source_artifact
+                else None
+            )
+            try:
+                relative = Path(str(relative_value)) if relative_value else fp.relative_to(html_dir)
+            except ValueError:
+                relative = Path(fp.name)
+            disposition: Dict[str, Any] = {
+                "source_path": resolved_source,
+                "source_urls": sorted(source_urls),
+                "relative_path": relative.as_posix(),
+            }
             try:
                 raw = fp.read_text(encoding="utf-8", errors="replace")
             except Exception as exc:
                 logger.error("Read error %s: %s", fp, exc)
-                counts["error"] = counts.get("error", 0) + 1
+                disposition.update(
+                    {
+                        "status": "failed",
+                        "reason_code": "read_error",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                dispositions.append(disposition)
                 continue
 
-            status, cleaned_html = clean_html_content(raw, preserve_media=preserve_media)
-            counts[status] = counts.get(status, 0) + 1
-            if status == "cleaned" and cleaned_html is not None:
-                relative = fp.relative_to(html_dir)
-                out_path = cleaned_dir / relative
-                out_path.parent.mkdir(parents=True, exist_ok=True)
-                out_path.write_text(cleaned_html, encoding="utf-8")
+            try:
+                status, cleaned_html = clean_html_content(raw, preserve_media=preserve_media)
+            except Exception as exc:
+                logger.error("Cleaning error %s: %s", fp, exc)
+                disposition.update(
+                    {
+                        "status": "failed",
+                        "reason_code": "cleaning_error",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                dispositions.append(disposition)
+                continue
 
-                source_url = next(
-                    (
-                        url
-                        for url, html_path in url_mapping.items()
-                        if Path(html_path).name == fp.name
+            metrics = visible_content_metrics(cleaned_html or "")
+            disposition["content_metrics"] = metrics.to_dict()
+            if status != "cleaned" or cleaned_html is None:
+                disposition.update(
+                    {
+                        "status": "filtered",
+                        "reason_code": (
+                            "structural_error_page" if status == "removed" else "empty_content"
+                        ),
+                    }
+                )
+                dispositions.append(disposition)
+                continue
+            if not content_meets_policy(metrics, policy):
+                disposition.update(
+                    {
+                        "status": "filtered",
+                        "reason_code": "insufficient_visible_content",
+                    }
+                )
+                dispositions.append(disposition)
+                continue
+
+            out_path = cleaned_dir / relative
+            try:
+                atomic_write_text(out_path, cleaned_html)
+            except Exception as exc:
+                logger.error("Write error %s: %s", out_path, exc)
+                disposition.update(
+                    {
+                        "status": "failed",
+                        "reason_code": "write_error",
+                        "error_type": type(exc).__name__,
+                    }
+                )
+                dispositions.append(disposition)
+                continue
+
+            disposition.update(
+                {
+                    "status": "accepted",
+                    "reason_code": "accepted_bs4",
+                    "output_path": str(out_path.resolve()),
+                }
+            )
+            dispositions.append(disposition)
+            source_url = sorted(source_urls)[0] if source_urls else ""
+            content_artifacts.append(
+                ctx.make_artifact(
+                    out_path,
+                    artifact_type="cleaned_html",
+                    role="content",
+                    metadata={
+                        "source_path": resolved_source,
+                        "source_url": source_url,
+                        "source_urls": sorted(source_urls),
+                        "relative_path": relative.as_posix(),
+                        "content_metrics": metrics.to_dict(),
+                    },
+                    source_artifact_ids=(
+                        [source_artifact.artifact_id] if source_artifact else None
                     ),
-                    "",
                 )
-
-                artifacts.append(
-                    ctx.make_artifact(
-                        out_path,
-                        artifact_type="cleaned_html",
-                        role="content",
-                        metadata={
-                            "source_path": str(fp),
-                            "source_url": source_url,
-                            "relative_path": relative.as_posix(),
-                        },
-                    )
-                )
+            )
             if i % 100 == 0:
                 logger.info("Progress: %d/%d", i, len(files))
 
-        logger.info(
-            "BS4 cleaner done: cleaned=%d removed=%d removed_empty=%d errors=%d",
-            counts["cleaned"], counts["removed"], counts["removed_empty"], counts["error"],
+        critical_patterns = ctx.formatter_config.get("critical_url_patterns") or []
+        gate = evaluate_cleaning_gate(
+            dispositions,
+            policy=policy,
+            critical_url_patterns=critical_patterns,
+        )
+        manifest_path = ctx.stage_work_dir / "cleaning_manifest.json"
+        manifest = {
+            "schema_version": 1,
+            "stage_id": ctx.stage_id or "clean_html",
+            "engine": self.name,
+            "application_status": "completed" if gate["ok"] else "failed",
+            "policy": policy.to_dict(),
+            "gate": gate,
+            "dispositions": dispositions,
+        }
+        atomic_write_json(manifest_path, manifest)
+        manifest_artifact = ctx.make_artifact(
+            manifest_path,
+            artifact_type="cleaning_manifest",
+            role="cleaning_dispositions",
+            metadata={
+                "input_count": gate["input_count"],
+                "accepted_count": gate["accepted_count"],
+                "filtered_count": gate["filtered_count"],
+                "failed_count": gate["failed_count"],
+                "gate_ok": gate["ok"],
+            },
         )
 
+        logger.info(
+            "BS4 cleaner done: accepted=%d filtered=%d failed=%d retention=%.3f",
+            gate["accepted_count"],
+            gate["filtered_count"],
+            gate["failed_count"],
+            gate["retention_ratio"],
+        )
+
+        outputs = {
+            "cleaned_dir": str(cleaned_dir),
+            "cleaned_count": gate["accepted_count"],
+            "removed_count": gate["filtered_count"],
+            "failed_count": gate["failed_count"],
+            "cleaning_manifest_file": str(manifest_path),
+        }
+        metrics = {
+            "cleaned": gate["accepted_count"],
+            "removed": gate["filtered_count"],
+            "errors": gate["failed_count"],
+            "retention_ratio": gate["retention_ratio"],
+        }
+        if not gate["ok"]:
+            failure_codes = ", ".join(item["code"] for item in gate["failures"])
+            return StageResult.failure(
+                f"Cleaning quality gate failed: {failure_codes}",
+                checkpoint={"cleaning_manifest_file": str(manifest_path)},
+                outputs=outputs,
+                metrics=metrics,
+                artifacts=[manifest_artifact],
+            )
+
         return StageResult.success(
-            outputs={
-                "cleaned_dir": str(cleaned_dir),
-                "cleaned_count": counts["cleaned"],
-                "removed_count": counts["removed"] + counts["removed_empty"],
-            },
-            metrics=counts,
-            artifacts=artifacts,
+            outputs=outputs,
+            metrics=metrics,
+            checkpoint={"cleaning_manifest_file": str(manifest_path)},
+            artifacts=[*content_artifacts, manifest_artifact],
         )

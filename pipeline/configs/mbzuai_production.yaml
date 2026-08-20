@@ -37,6 +37,27 @@ embedder:
   # attempts plus backoff comfortably inside the 110-second request budget.
   gemini_request_timeout_ms: 30000
 
+# Raw crawl evidence stays immutable. These stages materialize accepted content
+# in stage-owned directories and fail closed on unexplained yield loss.
+quality:
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.70
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+
+cleaner:
+  min_content_length: 100
+  min_content_words: 5
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.75
+  minimum_host_retention_ratio: 0.50
+  minimum_host_input_count: 5
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+  require_critical_url_survival: true
+
 formatter:
   # The researched 2026-08-20 multi-origin sitemap inventory contains roughly
   # 2.75k raw URLs before the main site's verified-empty CMS cohorts.
