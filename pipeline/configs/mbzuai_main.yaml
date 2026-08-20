@@ -93,7 +93,9 @@ crawler:
     "buildit.mbzuai.ac.ae": 100
   minimum_crawled_pages_by_host:
     "mbzuai.ac.ae": 2100
-    "careers.mbzuai.ac.ae": 40
+    # The 2026-08-20 sitemap has 49 entries: 35 live and 14 stale HTTP 404
+    # vacancy URLs. Only successful pages can satisfy this separate gate.
+    "careers.mbzuai.ac.ae": 30
     "research.mbzuai.ac.ae": 8
     "ai-nexus.mbzuai.ac.ae": 8
     "hpp.mbzuai.ac.ae": 3

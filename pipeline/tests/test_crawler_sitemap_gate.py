@@ -1,4 +1,5 @@
 import asyncio
+from types import SimpleNamespace
 
 from pipeline.core.base import StageContext, StageStatus
 from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
@@ -172,3 +173,37 @@ def test_bounded_link_discovery_stays_on_the_approved_source_host(monkeypatch):
         "https://library.mbzuai.ac.ae/research",
     ]
     assert all(item["parent_url"] == source_url for item in discovered)
+
+
+def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.stats = {"pages_failed": 0, "skipped_urls": 0}
+    crawler.url_mapping = {}
+    monkeypatch.setattr(crawler, "_flush_runtime_state", lambda *args, **kwargs: None)
+
+    processed = asyncio.run(
+        crawler._process_result(
+            SimpleNamespace(
+                url="https://careers.mbzuai.ac.ae/careers/stale-vacancy",
+                status_code=404,
+                success=True,
+                html="<html><body>Careers site shell</body></html>",
+                error_message="",
+            )
+        )
+    )
+
+    assert processed is False
+    assert crawler.url_mapping == {
+        "https://careers.mbzuai.ac.ae/careers/stale-vacancy": "SKIPPED_HTTP_404"
+    }
+    assert crawler.stats == {"pages_failed": 1, "skipped_urls": 1}
+
+
+def test_terminal_http_statuses_are_not_retried_as_browser_failures():
+    assert not crawler_module._should_retry_page_failure(404)
+    assert not crawler_module._should_retry_page_failure(401)
+    assert crawler_module._should_retry_page_failure(None)
+    assert crawler_module._should_retry_page_failure(301)
+    assert crawler_module._should_retry_page_failure(403)
+    assert crawler_module._should_retry_page_failure(503)

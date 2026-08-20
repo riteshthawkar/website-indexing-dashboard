@@ -63,7 +63,7 @@ crawler:
     "ifm.ai": 15
   minimum_crawled_pages_by_host:
     "mbzuai.ac.ae": 0
-    "careers.mbzuai.ac.ae": 40
+    "careers.mbzuai.ac.ae": 30
     "research.mbzuai.ac.ae": 8
     "ai-nexus.mbzuai.ac.ae": 8
     "hpp.mbzuai.ac.ae": 3

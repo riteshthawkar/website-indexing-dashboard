@@ -335,6 +335,54 @@ def test_raw_source_fetch_never_requests_external_redirect_target(monkeypatch):
     assert session.calls[0][1]["allow_redirects"] is False
 
 
+def test_raw_source_terminal_404_is_not_retried(monkeypatch):
+    crawler = _crawler()
+    crawler.raw_source_retry_attempts = 5
+    crawler.raw_source_retry_backoff = 0
+    crawler.require_https = True
+    crawler_module._host_resolves_to_private_or_reserved.cache_clear()
+    monkeypatch.setattr(
+        crawler_module.socket,
+        "getaddrinfo",
+        lambda host, *args, **kwargs: [
+            (None, None, None, None, ("93.184.216.34", 443))
+        ],
+    )
+
+    class NotFoundResponse:
+        status = 404
+        headers = {}
+
+        def __init__(self, url):
+            self.url = url
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class NotFoundSession:
+        def __init__(self):
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return NotFoundResponse(url)
+
+    crawler._session = NotFoundSession()
+
+    html, status = asyncio.run(
+        crawler._fetch_raw_source_page(
+            "https://careers.mbzuai.ac.ae/careers/stale-vacancy"
+        )
+    )
+
+    assert html == ""
+    assert status == 404
+    assert len(crawler._session.calls) == 1
+
+
 def test_safe_redirects_stop_before_request_beyond_hop_limit(monkeypatch):
     crawler = _crawler()
     monkeypatch.setattr(crawler_module, "SAFE_REDIRECT_MAX_HOPS", 1)

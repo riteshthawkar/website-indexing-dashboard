@@ -12,7 +12,7 @@ Only explicitly approved hosts are eligible for production egress.
 | Origin | Discovery | Observed inventory | Run policy |
 | --- | --- | ---: | --- |
 | `mbzuai.ac.ae` | XML sitemap and robots declaration | 2,664 raw; 2,205 eligible after fresh empty-cohort verification | Sitemap seeds |
-| `careers.mbzuai.ac.ae` | WordPress `wp-sitemap.xml` | 49 URLs | Sitemap seeds |
+| `careers.mbzuai.ac.ae` | WordPress `wp-sitemap.xml` | 49 raw; 35 HTTP 200 and 14 stale HTTP 404 on review | Sitemap seeds; only successful pages count toward crawl coverage |
 | `ifm.ai` | Yoast sitemap index | 22 URLs | Sitemap seeds; canonical target of `ifm.mbzuai.ac.ae` |
 | `research.mbzuai.ac.ae` | Robots-declared XML sitemap | 10 URLs | Sitemap seeds |
 | `ai-nexus.mbzuai.ac.ae` | Robots-declared Yoast sitemap | 10 URLs | Sitemap seeds |

@@ -337,6 +337,20 @@ def _compact_failure_reason(value: Any, *, max_chars: int = 220) -> str:
     return text[:max_chars]
 
 
+def _should_retry_page_failure(status_code: Any) -> bool:
+    """Retry transient, anti-bot, redirect, and missing-status browser failures."""
+    try:
+        status = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        status = None
+    return (
+        status is None
+        or status in RETRYABLE_STATUSES
+        or status in SAFE_REDIRECT_STATUSES
+        or status == 403
+    )
+
+
 def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
     text = str(value or "").lower()
     if not text.startswith("skipped"):
@@ -4598,10 +4612,9 @@ class Crawl4AICrawler(CrawlerStage):
                 if result_url and result_url not in visited_set:
                     visited.append(result_url)
                     visited_set.add(result_url)
-                if getattr(result, "success", False):
-                    pages_crawled += 1
                 processed = await self._process_result(result, mark_failure=False)
                 if processed and result_url:
+                    pages_crawled += 1
                     processed_page_urls.append(result_url)
                 if not processed and result_url:
                     failed_batch_urls[result_url] = {
@@ -4625,7 +4638,9 @@ class Crawl4AICrawler(CrawlerStage):
             if failed_batch_urls:
                 recovered = 0
                 for url, failure in failed_batch_urls.items():
-                    if await self._recover_url_with_http_retry(url):
+                    if _should_retry_page_failure(
+                        failure.get("status_code")
+                    ) and await self._recover_url_with_http_retry(url):
                         recovered += 1
                         processed_page_urls.append(url)
                     else:
@@ -4715,6 +4730,20 @@ class Crawl4AICrawler(CrawlerStage):
         status_code = getattr(result, "status_code", None)
         rendered_html = getattr(result, "html", None) or ""
         html = rendered_html
+
+        try:
+            numeric_status = int(status_code) if status_code is not None else None
+        except (TypeError, ValueError):
+            numeric_status = None
+        if numeric_status is not None and numeric_status >= 400:
+            if mark_failure:
+                self._mark_url_skipped(
+                    page_url,
+                    status_code=numeric_status,
+                    error_message=getattr(result, "error_message", ""),
+                )
+                self._flush_runtime_state()
+            return False
 
         if not getattr(result, "success", False) or not html:
             fallback_html, fallback_status = await self._fetch_raw_source_page(page_url)
@@ -5181,6 +5210,8 @@ class Crawl4AICrawler(CrawlerStage):
                                 attempt,
                                 self.raw_source_retry_attempts,
                             )
+                            if not _should_retry_page_failure(response.status):
+                                return "", response.status
                             continue
                         return await response.text(), response.status
                 except _RedirectEgressPolicyError as exc:
