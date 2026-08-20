@@ -341,6 +341,19 @@ def assess_production_readiness(
             production_contract_errors.append(
                 "crawler.robots_user_agent must identify the MBZUAI knowledge indexer"
             )
+        crawler_headers = crawler_cfg.get("headers") or {}
+        normalized_crawler_headers = {
+            str(key).strip().lower(): str(value).strip().lower()
+            for key, value in crawler_headers.items()
+        } if isinstance(crawler_headers, Mapping) else {}
+        if normalized_crawler_headers.get("x-crawler-name") != "mbzuaiknowledgeindexer":
+            production_contract_errors.append(
+                "crawler.headers must identify MBZUAIKnowledgeIndexer"
+            )
+        if normalized_crawler_headers.get("x-crawler-purpose") != "search-index-reference":
+            production_contract_errors.append(
+                "crawler.headers must declare search-index-reference purpose"
+            )
         sitemap_origin_hosts = {
             (urlparse(str(value)).hostname or "").lower()
             for value in (crawler_cfg.get("sitemap_origins") or [])
