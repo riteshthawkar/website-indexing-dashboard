@@ -141,6 +141,7 @@ def test_bounded_link_discovery_stays_on_the_approved_source_host(monkeypatch):
     source_url = "https://library.mbzuai.ac.ae"
     crawler.page_links = {
         source_url: [
+            {"target_url": "https://library.mbzuai.ac.ae/user/login"},
             {"target_url": "https://library.mbzuai.ac.ae/services"},
             {"target_url": "https://library.mbzuai.ac.ae/research"},
             {"target_url": "https://library.mbzuai.ac.ae/third"},
@@ -152,6 +153,11 @@ def test_bounded_link_discovery_stays_on_the_approved_source_host(monkeypatch):
         crawler_module,
         "_host_resolves_to_private_or_reserved",
         lambda _host: False,
+    )
+    monkeypatch.setattr(
+        crawler,
+        "_robots_allows_url",
+        lambda url: not url.endswith("/user/login"),
     )
 
     discovered = crawler._discover_link_frontier_items(

@@ -50,7 +50,9 @@ The production crawler now enforces:
 2. multi-origin robots and sitemap discovery;
 3. per-host minimum sitemap URL counts before browser startup;
 4. same-host-only, depth- and page-bounded discovery for approved sites without sitemaps; and
-5. per-host successful page minimums before the crawl stage can complete.
+5. live per-origin robots policies on the browser frontier, raw HTTP fallback,
+   every redirect hop, and same-site downloads; and
+6. per-host successful page minimums before the crawl stage can complete.
 
 The smaller `mbzuai_subdomains_artifacts` profile exercises the same subdomain
 contract without re-crawling the main MBZUAI sitemap and contains only the

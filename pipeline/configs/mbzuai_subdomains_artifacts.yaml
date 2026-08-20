@@ -32,6 +32,16 @@ crawler:
     - "hpp.mbzuai.ac.ae"
     - "ifm.mbzuai.ac.ae"
     - "ifm.ai"
+  robots_origins:
+    - "https://careers.mbzuai.ac.ae"
+    - "https://research.mbzuai.ac.ae"
+    - "https://ai-nexus.mbzuai.ac.ae"
+    - "https://library.mbzuai.ac.ae"
+    - "https://metaverse.mbzuai.ac.ae"
+    - "https://buildit.mbzuai.ac.ae"
+    - "https://hpp.mbzuai.ac.ae"
+    - "https://ifm.mbzuai.ac.ae"
+    - "https://ifm.ai"
   sitemap_origins:
     - "https://careers.mbzuai.ac.ae"
     - "https://research.mbzuai.ac.ae"

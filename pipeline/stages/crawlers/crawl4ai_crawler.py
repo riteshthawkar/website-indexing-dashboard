@@ -29,6 +29,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
+from urllib.robotparser import RobotFileParser
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -316,6 +317,15 @@ class _SafeRedirectLimitError(RuntimeError):
 
     def __init__(self, url: str, *, status: Optional[int]):
         super().__init__(f"redirect limit exceeded while fetching {url}")
+        self.url = url
+        self.status = status
+
+
+class _RobotsPolicyError(RuntimeError):
+    """Raised before a URL disallowed by the origin's robots policy is fetched."""
+
+    def __init__(self, url: str, *, status: Optional[int] = None):
+        super().__init__(f"robots policy disallows fetching {url}")
         self.url = url
         self.status = status
 
@@ -2457,6 +2467,7 @@ class Crawl4AICrawler(CrawlerStage):
         configured_origin_urls = [
             *(crawler.get("sitemap_origins") or []),
             *(crawler.get("sitemap_entry_urls") or []),
+            *(crawler.get("robots_origins") or []),
         ]
         for value in configured_origin_urls:
             normalized = _normalize_http_url(value)
@@ -2465,14 +2476,22 @@ class Crawl4AICrawler(CrawlerStage):
                 bool(crawler.get("require_https", True)) and parsed.scheme != "https"
             ):
                 errors.append(
-                    "crawler.sitemap_origins and crawler.sitemap_entry_urls must contain valid HTTPS URLs"
+                    "crawler sitemap/robots origins and sitemap entry URLs must contain valid HTTPS URLs"
                 )
                 break
             if allowed_hosts and (parsed.hostname or "").lower() not in allowed_hosts:
                 errors.append(
-                    "crawler sitemap origins and entry URLs must use crawler.allowed_hosts"
+                    "crawler sitemap/robots origins and entry URLs must use crawler.allowed_hosts"
                 )
                 break
+
+        robots_unknown_host_policy = str(
+            crawler.get("robots_unknown_host_policy", "allow") or "allow"
+        ).strip().lower()
+        if robots_unknown_host_policy not in {"allow", "deny"}:
+            errors.append(
+                "crawler.robots_unknown_host_policy must be allow or deny"
+            )
 
         for key in (
             "minimum_sitemap_urls_by_host",
@@ -2725,6 +2744,18 @@ class Crawl4AICrawler(CrawlerStage):
         }
         self.sitemap_origins = self._resolve_sitemap_origins()
         self.sitemap_entry_urls = self._resolve_sitemap_entry_urls()
+        self.robots_origins = self._resolve_robots_origins()
+        self.robots_unknown_host_policy = str(
+            self.config.get("robots_unknown_host_policy", "allow") or "allow"
+        ).strip().lower()
+        self.robots_user_agent = str(
+            self.config.get("robots_user_agent")
+            or self.config.get("user_agent")
+            or "*"
+        )
+        self.robots_policies: Dict[str, RobotFileParser] = {}
+        self.robots_records: Dict[str, Dict[str, Any]] = {}
+        self.robots_policies_loaded = False
         self.minimum_sitemap_urls_by_host = self._resolve_host_minimums(
             "minimum_sitemap_urls_by_host"
         )
@@ -2817,6 +2848,7 @@ class Crawl4AICrawler(CrawlerStage):
             "verified_empty_urls": 0,
             "sitemap_batches_completed": 0,
             "frontier_urls_discovered": 0,
+            "robots_urls_blocked": 0,
             "skipped_urls": 0,
             "excluded_frontier_urls": 0,
             "recoverable_skips_exhausted": 0,
@@ -2858,8 +2890,13 @@ class Crawl4AICrawler(CrawlerStage):
 
         try:
             await self._open_http_session()
-            if not self._allow_frontier_url(self.start_url):
+            await self._load_robots_policies()
+            if not self._url_allowed_for_fetch(self.start_url):
                 raise ValueError("crawler.start_url is outside the allowed egress policy")
+            if not self._robots_allows_url(self.start_url):
+                raise ValueError("crawler.start_url is disallowed by robots.txt")
+            if not self._allow_frontier_url(self.start_url):
+                raise ValueError("crawler.start_url is excluded from the crawl frontier")
 
             if not _has_resumable_crawl_state(self.crawl_state):
                 sitemap_urls = []
@@ -3072,6 +3109,131 @@ class Crawl4AICrawler(CrawlerStage):
             if normalized and normalized not in entries:
                 entries.append(normalized)
         return entries
+
+    def _resolve_robots_origins(self) -> List[str]:
+        configured = self.config.get("robots_origins")
+        values: list[Any]
+        if configured is not None:
+            values = list(configured or [])
+        else:
+            values = [self.start_url, *self._resolve_sitemap_origins()]
+            values.extend(self.config.get("priority_seed_urls") or [])
+        origins: list[str] = []
+        for value in values:
+            normalized = _normalize_http_url(value)
+            if not normalized:
+                continue
+            parsed = urlparse(normalized)
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if origin not in origins:
+                origins.append(origin)
+        return origins
+
+    def _robots_allows_url(self, url: str) -> bool:
+        if not bool(getattr(self, "respect_robots_txt", True)):
+            return True
+        normalized = _normalize_http_url(url)
+        parsed = urlparse(normalized or "")
+        host = (parsed.hostname or "").lower()
+        if not normalized or not host:
+            return False
+        if parsed.path == "/robots.txt":
+            return True
+        # Configuration validation and initial frontier construction happen
+        # before network policy documents can be loaded. The frontier is
+        # filtered again immediately after the live policies are available.
+        if not bool(getattr(self, "robots_policies_loaded", False)):
+            return True
+        parser = (getattr(self, "robots_policies", {}) or {}).get(host)
+        if parser is not None:
+            return bool(parser.can_fetch(getattr(self, "robots_user_agent", "*"), normalized))
+        record = (getattr(self, "robots_records", {}) or {}).get(host) or {}
+        if record.get("classification") == "not_found":
+            return True
+        return getattr(self, "robots_unknown_host_policy", "allow") != "deny"
+
+    async def _load_robots_policies(self) -> None:
+        if bool(getattr(self, "robots_policies_loaded", False)):
+            return
+        self.robots_policies = {}
+        self.robots_records = {}
+        if not self.respect_robots_txt:
+            self.robots_policies_loaded = True
+            return
+        if not self._session:
+            return
+
+        robots_origins = list(
+            getattr(self, "robots_origins", None) or self._resolve_robots_origins()
+        )
+        robots_max_response_bytes = max(
+            1,
+            int(
+                getattr(
+                    self,
+                    "robots_max_response_bytes",
+                    self.config.get(
+                        "robots_max_response_bytes",
+                        DEFAULT_ROBOTS_MAX_RESPONSE_BYTES,
+                    ),
+                )
+            ),
+        )
+        for origin in robots_origins:
+            normalized_origin = _normalize_http_url(origin)
+            host = (urlparse(normalized_origin or "").hostname or "").lower()
+            if not normalized_origin or not host or not self._url_allowed_for_fetch(normalized_origin):
+                continue
+            robots_url = urljoin(normalized_origin, "/robots.txt")
+            record: Dict[str, Any] = {
+                "origin": normalized_origin,
+                "url": robots_url,
+                "status": None,
+                "classification": "request_error",
+                "payload_sha256": "",
+                "sitemap_urls": [],
+            }
+            try:
+                async with self._get_with_safe_redirects(
+                    session=self._session,
+                    url=robots_url,
+                    enforce_allowed_domain=True,
+                ) as response:
+                    record["status"] = response.status
+                    if response.status == 200:
+                        payload = await _read_bounded_response(
+                            response,
+                            robots_max_response_bytes,
+                        )
+                        robots_text = payload.decode("utf-8-sig", errors="replace")
+                        parser = RobotFileParser()
+                        parser.set_url(robots_url)
+                        parser.parse(robots_text.splitlines())
+                        self.robots_policies[host] = parser
+                        record["classification"] = "loaded"
+                        record["payload_sha256"] = hashlib.sha256(payload).hexdigest()
+                        record["sitemap_urls"] = list(
+                            dict.fromkeys(
+                                line.split(":", 1)[1].strip()
+                                for line in robots_text.splitlines()
+                                if line.lower().startswith("sitemap:")
+                                and line.split(":", 1)[1].strip()
+                            )
+                        )
+                    elif response.status in {404, 410}:
+                        record["classification"] = "not_found"
+                    else:
+                        record["classification"] = "unavailable"
+            except Exception as exc:
+                record["error_type"] = type(exc).__name__
+                logger.warning("Could not load robots policy for %s: %s", origin, exc)
+            self.robots_records[host] = record
+        self.robots_policies_loaded = True
+        if isinstance(getattr(self, "discovered_sitemaps", None), dict):
+            self.discovered_sitemaps["robots"] = {
+                host: record
+                for host, record in sorted(self.robots_records.items())
+            }
 
     def _resolve_host_minimums(self, config_key: str) -> Dict[str, int]:
         configured = self.config.get(config_key) or {}
@@ -3430,6 +3592,16 @@ class Crawl4AICrawler(CrawlerStage):
             normalized = _normalize_http_url(item.get("url"))
             if not normalized or normalized in seen:
                 continue
+            if not self._robots_allows_url(normalized):
+                self._mark_url_excluded_from_frontier(
+                    normalized,
+                    reason="robots_policy",
+                )
+                if isinstance(getattr(self, "stats", None), dict):
+                    self.stats["robots_urls_blocked"] = (
+                        self.stats.get("robots_urls_blocked", 0) + 1
+                    )
+                continue
             if not self._allow_frontier_url(normalized):
                 self._mark_url_excluded_from_frontier(normalized)
                 continue
@@ -3570,6 +3742,7 @@ class Crawl4AICrawler(CrawlerStage):
         session: aiohttp.ClientSession,
         url: str,
         enforce_allowed_domain: bool,
+        enforce_robots: bool = False,
         before_request: Optional[Any] = None,
     ):
         """Stream one GET response while approving every redirect before fetch.
@@ -3596,6 +3769,9 @@ class Crawl4AICrawler(CrawlerStage):
                     current_url,
                     status=None,
                 )
+
+            if enforce_robots and not self._robots_allows_url(current_url):
+                raise _RobotsPolicyError(current_url)
 
             if before_request is not None:
                 await before_request()
@@ -3692,6 +3868,7 @@ class Crawl4AICrawler(CrawlerStage):
                         session=session,
                         url=url,
                         enforce_allowed_domain=True,
+                        enforce_robots=True,
                         before_request=self._pace_cohort_probe_request,
                     ) as response:
                         final_url = _normalize_http_url(str(response.url))
@@ -3723,6 +3900,11 @@ class Crawl4AICrawler(CrawlerStage):
                 record["final_status"] = exc.status
                 record["classification"] = "egress_rejected"
                 record["error_type"] = "redirect_egress_policy"
+                break
+            except _RobotsPolicyError as exc:
+                record["final_status"] = exc.status
+                record["classification"] = "robots_rejected"
+                record["error_type"] = "robots_policy"
                 break
             except _SafeRedirectLimitError as exc:
                 record["final_status"] = exc.status
@@ -3869,20 +4051,7 @@ class Crawl4AICrawler(CrawlerStage):
     async def _discover_sitemap_urls(self) -> List[str]:
         if not self._session:
             return []
-
-        robots_max_response_bytes = max(
-            1,
-            int(
-                getattr(
-                    self,
-                    "robots_max_response_bytes",
-                    self.config.get(
-                        "robots_max_response_bytes",
-                        DEFAULT_ROBOTS_MAX_RESPONSE_BYTES,
-                    ),
-                )
-            ),
-        )
+        await self._load_robots_policies()
         sitemap_max_response_bytes = max(
             1,
             int(
@@ -3934,33 +4103,12 @@ class Crawl4AICrawler(CrawlerStage):
                 )
                 continue
             if self.respect_robots_txt:
-                robots_url = urljoin(origin, "/robots.txt")
-                try:
-                    async with self._get_with_safe_redirects(
-                        session=self._session,
-                        url=robots_url,
-                        enforce_allowed_domain=True,
-                    ) as response:
-                        if response.status == 200:
-                            robots_payload = await _read_bounded_response(
-                                response,
-                                robots_max_response_bytes,
-                            )
-                            robots_text = robots_payload.decode(
-                                "utf-8-sig",
-                                errors="replace",
-                            )
-                            for line in robots_text.splitlines():
-                                if line.lower().startswith("sitemap:"):
-                                    sitemap_url = line.split(":", 1)[1].strip()
-                                    if sitemap_url:
-                                        candidates.append(sitemap_url)
-                except Exception as exc:
-                    logger.debug(
-                        "Could not read robots.txt for sitemap discovery at %s: %s",
-                        origin,
-                        exc,
-                    )
+                host = (urlparse(origin).hostname or "").lower()
+                candidates.extend(
+                    (getattr(self, "robots_records", {}) or {})
+                    .get(host, {})
+                    .get("sitemap_urls", [])
+                )
             candidates.extend(
                 [
                     urljoin(origin, "/sitemap.xml"),
@@ -4081,6 +4229,12 @@ class Crawl4AICrawler(CrawlerStage):
             "raw_urls": raw_urls,
             "eligible_url_counts_by_host": self._count_urls_by_host(deduped),
             "raw_url_counts_by_host": self._count_urls_by_host(raw_urls),
+            "robots": {
+                host: record
+                for host, record in sorted(
+                    (getattr(self, "robots_records", {}) or {}).items()
+                )
+            },
             "url_sources": {
                 url: sorted(set(sources)) for url, sources in sorted(url_sources.items())
             },
@@ -4150,6 +4304,8 @@ class Crawl4AICrawler(CrawlerStage):
         if not parsed.scheme or not parsed.netloc:
             return False
         if not self._url_allowed_for_fetch(normalized or ""):
+            return False
+        if not self._robots_allows_url(normalized or ""):
             return False
         if _url_matches_path_prefix(normalized or "", self.excluded_path_prefixes):
             return False
@@ -4916,7 +5072,7 @@ class Crawl4AICrawler(CrawlerStage):
         return list(dict.fromkeys(candidates))
 
     def _track_url_allowed(self, url: str) -> bool:
-        return self._url_allowed_for_fetch(url)
+        return self._url_allowed_for_fetch(url) and self._robots_allows_url(url)
 
     async def _populate_video_transcripts(self, videos: List[Dict[str, Any]]) -> None:
         if not self.fetch_video_transcripts or not self._session:
@@ -4951,6 +5107,7 @@ class Crawl4AICrawler(CrawlerStage):
                     session=self._session,
                     url=normalized,
                     enforce_allowed_domain=True,
+                    enforce_robots=True,
                 ) as response:
                     if response.status >= 400:
                         return
@@ -4984,13 +5141,18 @@ class Crawl4AICrawler(CrawlerStage):
         if not self._session:
             return "", None
         normalized_page = _normalize_http_url(page_url)
-        if not normalized_page or not self._url_allowed_for_fetch(normalized_page):
+        if (
+            not normalized_page
+            or not self._url_allowed_for_fetch(normalized_page)
+            or not self._robots_allows_url(normalized_page)
+        ):
             return "", None
         last_status: Optional[int] = None
         candidates = [
             candidate
             for candidate in (_raw_source_candidate_urls(normalized_page) or [normalized_page])
             if self._url_allowed_for_fetch(candidate)
+            and self._robots_allows_url(candidate)
         ]
         for attempt in range(1, self.raw_source_retry_attempts + 1):
             for candidate in candidates:
@@ -4999,6 +5161,7 @@ class Crawl4AICrawler(CrawlerStage):
                         session=self._session,
                         url=candidate,
                         enforce_allowed_domain=True,
+                        enforce_robots=True,
                     ) as response:
                         last_status = response.status
                         final_url = _normalize_http_url(str(response.url))
@@ -5027,6 +5190,10 @@ class Crawl4AICrawler(CrawlerStage):
                         exc.source_url,
                         exc.target_url,
                     )
+                    return "", last_status
+                except _RobotsPolicyError as exc:
+                    last_status = exc.status
+                    logger.info("Blocked raw page source by robots policy: %s", exc.url)
                     return "", last_status
                 except _SafeRedirectLimitError as exc:
                     last_status = exc.status
@@ -5073,6 +5240,7 @@ class Crawl4AICrawler(CrawlerStage):
             max_bytes=self.max_image_size_bytes,
             expected_prefix="image/",
             status_on_failure=None,
+            enforce_allowed_domain=self._url_allowed_for_fetch(url),
         )
         if path:
             path_str = str(path)
@@ -5088,6 +5256,13 @@ class Crawl4AICrawler(CrawlerStage):
         if ext in EXCLUDED_EXTENSIONS:
             self.url_mapping[url] = "SKIPPED_EXCLUDED"
             self.stats["skipped_urls"] += 1
+            return
+        if not self._robots_allows_url(url):
+            self.url_mapping[url] = "SKIPPED_ROBOTS_POLICY"
+            self.stats["skipped_urls"] += 1
+            self.stats["robots_urls_blocked"] = (
+                self.stats.get("robots_urls_blocked", 0) + 1
+            )
             return
 
         path = await self._download_binary(
@@ -5165,6 +5340,7 @@ class Crawl4AICrawler(CrawlerStage):
                     session=session,
                     url=normalized,
                     enforce_allowed_domain=enforce_allowed_domain,
+                    enforce_robots=enforce_allowed_domain,
                 ) as response:
                     if enforce_allowed_domain:
                         final_url = _normalize_http_url(str(response.url))
@@ -5212,6 +5388,8 @@ class Crawl4AICrawler(CrawlerStage):
                     return target_path, None, False
         except _RedirectEgressPolicyError:
             return None, "SKIPPED_EGRESS_POLICY", False
+        except _RobotsPolicyError:
+            return None, "SKIPPED_ROBOTS_POLICY", False
         except _SafeRedirectLimitError:
             return None, "SKIPPED_REDIRECT_LIMIT", False
         except BaseException:
@@ -5229,6 +5407,10 @@ class Crawl4AICrawler(CrawlerStage):
             return
         self.url_mapping[normalized] = failure_reason or status_on_failure
         self.stats["skipped_urls"] += 1
+        if failure_reason == "SKIPPED_ROBOTS_POLICY":
+            self.stats["robots_urls_blocked"] = (
+                self.stats.get("robots_urls_blocked", 0) + 1
+            )
 
     async def _recover_same_site_pdf_after_403(
         self,
@@ -5252,6 +5434,9 @@ class Crawl4AICrawler(CrawlerStage):
                 # DNS/private-address egress guard even if resolution changed.
                 if not self._url_allowed_for_fetch(normalized):
                     last_reason = "SKIPPED_EGRESS_POLICY"
+                    break
+                if not self._robots_allows_url(normalized):
+                    last_reason = "SKIPPED_ROBOTS_POLICY"
                     break
                 async with self._fresh_cookie_isolated_download_session() as session:
                     path, failure_reason, retryable = await self._download_binary_once(
@@ -5309,6 +5494,14 @@ class Crawl4AICrawler(CrawlerStage):
             if status_on_failure:
                 self.url_mapping[normalized] = "SKIPPED_EGRESS_POLICY"
                 self.stats["skipped_urls"] += 1
+            return None
+        if enforce_allowed_domain and not self._robots_allows_url(normalized):
+            if status_on_failure:
+                self.url_mapping[normalized] = "SKIPPED_ROBOTS_POLICY"
+                self.stats["skipped_urls"] += 1
+                self.stats["robots_urls_blocked"] = (
+                    self.stats.get("robots_urls_blocked", 0) + 1
+                )
             return None
 
         is_same_site_pdf = (

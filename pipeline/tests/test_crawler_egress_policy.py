@@ -1,5 +1,6 @@
 import asyncio
 from types import SimpleNamespace
+from urllib.robotparser import RobotFileParser
 
 from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
 from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
@@ -89,6 +90,101 @@ def test_exact_host_allowlist_blocks_unapproved_mbzuai_subdomains(monkeypatch):
     )
     assert url_filter.apply("https://careers.mbzuai.ac.ae/")
     assert not url_filter.apply("https://admin.hci.mbzuai.ac.ae/")
+
+
+def test_raw_http_fallback_never_fetches_robots_disallowed_url(monkeypatch):
+    crawler = _crawler()
+    crawler.allowed_hosts = {"mbzuai.ac.ae", "library.mbzuai.ac.ae"}
+    crawler.excluded_subdomains = set()
+    crawler.respect_robots_txt = True
+    crawler.robots_user_agent = "MBZUAIKnowledgeIndexer"
+    crawler.robots_unknown_host_policy = "deny"
+    crawler.robots_policies_loaded = True
+    parser = RobotFileParser()
+    parser.parse(
+        [
+            "User-agent: *",
+            "Disallow: /user/login",
+            "Allow: /",
+        ]
+    )
+    crawler.robots_policies = {"library.mbzuai.ac.ae": parser}
+    crawler.robots_records = {
+        "library.mbzuai.ac.ae": {"classification": "loaded"}
+    }
+    session_calls = []
+
+    class SessionMustNotFetch:
+        def get(self, *args, **kwargs):
+            session_calls.append((args, kwargs))
+            raise AssertionError("robots-disallowed fallback must not issue a request")
+
+    crawler._session = SessionMustNotFetch()
+    monkeypatch.setattr(
+        crawler_module,
+        "_host_resolves_to_private_or_reserved",
+        lambda _host: False,
+    )
+
+    html, status = asyncio.run(
+        crawler._fetch_raw_source_page("https://library.mbzuai.ac.ae/user/login")
+    )
+
+    assert html == ""
+    assert status is None
+    assert session_calls == []
+    assert not crawler._robots_allows_url(
+        "https://library.mbzuai.ac.ae/user/login"
+    )
+    assert crawler._robots_allows_url(
+        "https://library.mbzuai.ac.ae/opening-hours"
+    )
+
+
+def test_redirect_guard_checks_robots_before_each_request(monkeypatch):
+    crawler = _crawler()
+    crawler.allowed_hosts = {"mbzuai.ac.ae", "library.mbzuai.ac.ae"}
+    crawler.excluded_subdomains = set()
+    crawler.respect_robots_txt = True
+    crawler.robots_user_agent = "MBZUAIKnowledgeIndexer"
+    crawler.robots_unknown_host_policy = "deny"
+    crawler.robots_policies_loaded = True
+    parser = RobotFileParser()
+    parser.parse(["User-agent: *", "Disallow: /private"])
+    crawler.robots_policies = {"library.mbzuai.ac.ae": parser}
+    crawler.robots_records = {
+        "library.mbzuai.ac.ae": {"classification": "loaded"}
+    }
+    session_calls = []
+
+    class SessionMustNotFetch:
+        def get(self, *args, **kwargs):
+            session_calls.append((args, kwargs))
+            raise AssertionError("robots policy must run before session.get")
+
+    monkeypatch.setattr(
+        crawler_module,
+        "_host_resolves_to_private_or_reserved",
+        lambda _host: False,
+    )
+
+    async def fetch():
+        async with crawler._get_with_safe_redirects(
+            session=SessionMustNotFetch(),
+            url="https://library.mbzuai.ac.ae/private",
+            enforce_allowed_domain=True,
+            enforce_robots=True,
+        ):
+            raise AssertionError("robots-disallowed URL must not yield a response")
+
+    try:
+        asyncio.run(fetch())
+    except crawler_module._RobotsPolicyError:
+        pass
+    else:
+        raise AssertionError("robots-disallowed URL must fail closed")
+
+    assert session_calls == []
 
 
 def test_egress_policy_derives_missing_allowlist_only_from_start_host(monkeypatch):

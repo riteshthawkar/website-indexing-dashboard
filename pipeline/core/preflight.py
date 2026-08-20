@@ -321,6 +321,25 @@ def assess_production_readiness(
             production_contract_errors.append(
                 "crawler.allowed_hosts must equal the approved MBZUAI public-content host set"
             )
+        robots_origin_hosts = {
+            (urlparse(str(value)).hostname or "").lower()
+            for value in (crawler_cfg.get("robots_origins") or [])
+            if str(value).strip()
+        }
+        if robots_origin_hosts != MBZUAI_REQUIRED_CRAWL_HOSTS:
+            production_contract_errors.append(
+                "crawler.robots_origins must cover every approved MBZUAI crawl host"
+            )
+        if str(crawler_cfg.get("robots_unknown_host_policy") or "").lower() != "deny":
+            production_contract_errors.append(
+                "crawler.robots_unknown_host_policy must be deny"
+            )
+        if "mbzuaiknowledgeindexer" not in str(
+            crawler_cfg.get("robots_user_agent") or ""
+        ).lower():
+            production_contract_errors.append(
+                "crawler.robots_user_agent must identify the MBZUAI knowledge indexer"
+            )
         sitemap_origin_hosts = {
             (urlparse(str(value)).hostname or "").lower()
             for value in (crawler_cfg.get("sitemap_origins") or [])
