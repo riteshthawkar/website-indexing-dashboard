@@ -115,6 +115,9 @@ formatter:
     maximum_single_character_token_ratio: 0.62
     minimum_unique_token_ratio: 0.14
     maximum_repeated_line_ratio: 0.55
+    maximum_short_fragment_line_ratio: 0.55
+    short_fragment_maximum_alphanumeric_chars: 8
+    short_fragment_minimum_line_count: 12
     minimum_quality_score: 0.55
     minimum_usable_text_ratio: 0.0
     maximum_rejected_ratio: 1.0

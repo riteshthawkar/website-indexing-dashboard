@@ -8,6 +8,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import ssl
 import time
 from collections import Counter
@@ -33,6 +34,14 @@ from pipeline.core.unlimited_ocr import (
 
 _TERMINAL_STATUSES = {"completed", "no_readable_text", "rejected_low_quality"}
 _PUBLIC_SPACE_HOST = "baidu-unlimited-ocr.hf.space"
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_REQUIRED_INPUT_ARTIFACT_KEYS = (
+    "page_media_file",
+    "page_images_file",
+    "extracted_images_index_file",
+    "media_manifest_file",
+)
+_OPTIONAL_INPUT_ARTIFACT_KEYS = ("page_videos_file",)
 
 
 def _now_iso() -> str:
@@ -101,15 +110,71 @@ def _input_hash(item: Mapping[str, Any], config: Mapping[str, Any]) -> str:
         "retry_mode": str(config.get("retry_mode") or "base"),
         "prompt": str(config.get("prompt") or "document parsing."),
         "prompt_revision": str(config.get("prompt_revision") or "unlimited-ocr-document-v1"),
-        "quality_revision": "unlimited-ocr-quality-v1",
+        "quality_revision": "unlimited-ocr-quality-v2-fragment-gate",
+        "minimum_alphanumeric_chars": int(config.get("minimum_alphanumeric_chars", 2)),
+        "maximum_single_character_token_ratio": float(
+            config.get("maximum_single_character_token_ratio", 0.62)
+        ),
+        "minimum_unique_token_ratio": float(config.get("minimum_unique_token_ratio", 0.14)),
+        "maximum_repeated_line_ratio": float(
+            config.get("maximum_repeated_line_ratio", 0.55)
+        ),
+        "maximum_short_fragment_line_ratio": float(
+            config.get("maximum_short_fragment_line_ratio", 0.55)
+        ),
+        "short_fragment_maximum_alphanumeric_chars": int(
+            config.get("short_fragment_maximum_alphanumeric_chars", 8)
+        ),
+        "short_fragment_minimum_line_count": int(
+            config.get("short_fragment_minimum_line_count", 12)
+        ),
+        "minimum_quality_score": float(config.get("minimum_quality_score", 0.55)),
     }
     return hashlib.sha256(
         json.dumps(contract, ensure_ascii=False, sort_keys=True).encode("utf-8")
     ).hexdigest()
 
 
-def _collect_unique_images(ctx: StageContext, config: Mapping[str, Any]) -> List[Dict[str, Any]]:
-    manifest_path = ctx.previous_outputs.get("media_manifest_file")
+def _resolve_input_outputs(
+    ctx: StageContext, config: Mapping[str, Any]
+) -> Tuple[Dict[str, Any], Dict[str, Dict[str, str]]]:
+    """Resolve optional standalone inputs and verify every configured digest."""
+
+    outputs = dict(ctx.previous_outputs)
+    specifications = config.get("input_artifacts")
+    if specifications is None:
+        return outputs, {}
+    if not isinstance(specifications, Mapping):
+        raise ValueError("input_artifacts must be a mapping")
+
+    evidence: Dict[str, Dict[str, str]] = {}
+    for key in (*_REQUIRED_INPUT_ARTIFACT_KEYS, *_OPTIONAL_INPUT_ARTIFACT_KEYS):
+        specification = specifications.get(key)
+        if specification is None and key in _OPTIONAL_INPUT_ARTIFACT_KEYS:
+            continue
+        if not isinstance(specification, Mapping):
+            raise ValueError(f"input_artifacts.{key} must be a mapping")
+        path = Path(str(specification.get("path") or "")).expanduser().resolve()
+        expected_sha256 = str(specification.get("sha256") or "").strip().lower()
+        if not path.is_file():
+            raise ValueError(f"Input artifact is missing for {key}: {path}")
+        if not _SHA256_RE.fullmatch(expected_sha256):
+            raise ValueError(f"input_artifacts.{key}.sha256 must be a SHA-256 digest")
+        actual_sha256 = sha256_file(path)
+        if actual_sha256 != expected_sha256:
+            raise ValueError(
+                f"Input artifact SHA-256 mismatch for {key}: "
+                f"expected {expected_sha256}, got {actual_sha256}"
+            )
+        outputs[key] = str(path)
+        evidence[key] = {"path": str(path), "sha256": actual_sha256}
+    return outputs, evidence
+
+
+def _collect_unique_images(
+    input_outputs: Mapping[str, Any], config: Mapping[str, Any]
+) -> List[Dict[str, Any]]:
+    manifest_path = input_outputs.get("media_manifest_file")
     manifest = load_json_safe(manifest_path, {}) if manifest_path else {}
     items = load_media_manifest_items(manifest)
     scope = str(config.get("scope") or "all").lower()
@@ -332,6 +397,16 @@ async def _provider_call(
         maximum_repeated_line_ratio=min(
             1.0, max(0.0, float(config.get("maximum_repeated_line_ratio", 0.55)))
         ),
+        maximum_short_fragment_line_ratio=min(
+            1.0,
+            max(0.0, float(config.get("maximum_short_fragment_line_ratio", 0.55))),
+        ),
+        short_fragment_maximum_alphanumeric_chars=max(
+            1, int(config.get("short_fragment_maximum_alphanumeric_chars", 8))
+        ),
+        short_fragment_minimum_line_count=max(
+            1, int(config.get("short_fragment_minimum_line_count", 12))
+        ),
         minimum_quality_score=min(
             1.0, max(0.0, float(config.get("minimum_quality_score", 0.55)))
         ),
@@ -483,6 +558,8 @@ async def _ocr_one(
 
 def _ocr_fields(result: Mapping[str, Any]) -> Dict[str, Any]:
     status = str(result.get("status") or "failed")
+    quality_flags = list(result.get("quality_flags") or [])
+    review_flags = [flag for flag in quality_flags if flag != "no_readable_text"]
     return {
         "ocr_text": str(result.get("text") or "") if status == "completed" else "",
         "ocr_status": status,
@@ -497,12 +574,102 @@ def _ocr_fields(result: Mapping[str, Any]) -> Dict[str, Any]:
         "ocr_latency_ms": result.get("latency_ms"),
         "ocr_attempts": result.get("attempts"),
         "ocr_quality_score": result.get("quality_score"),
-        "ocr_quality_flags": list(result.get("quality_flags") or []),
+        "ocr_quality_flags": quality_flags,
         "ocr_error": str(result.get("error") or ""),
         "ocr_completed_at": str(result.get("completed_at") or ""),
-        "needs_review": bool(result.get("quality_flags"))
-        or status in {"rejected_low_quality", "failed"},
+        "needs_review": bool(review_flags) or status in {"rejected_low_quality", "failed"},
     }
+
+
+def _load_adjudicated_batch_results(
+    config: Mapping[str, Any], selected: Sequence[Mapping[str, Any]]
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
+    specification = config.get("batch_results")
+    if not isinstance(specification, Mapping):
+        raise ValueError("batch_results must contain a SHA-pinned result manifest")
+    path = Path(str(specification.get("path") or "")).expanduser().resolve()
+    expected_sha256 = str(specification.get("sha256") or "").strip().lower()
+    if not path.is_file():
+        raise ValueError(f"Batch OCR result manifest is missing: {path}")
+    if not _SHA256_RE.fullmatch(expected_sha256):
+        raise ValueError("batch_results.sha256 must be a lowercase SHA-256 digest")
+    actual_sha256 = sha256_file(path)
+    if actual_sha256 != expected_sha256:
+        raise ValueError(
+            f"Batch OCR result SHA-256 mismatch: expected {expected_sha256}, got {actual_sha256}"
+        )
+    payload = load_json_safe(path, {}) or {}
+    if not isinstance(payload, dict) or payload.get("kind") != "hybrid_ocr_adjudicated_results":
+        raise ValueError("Batch OCR result is not a hybrid_ocr_adjudicated_results manifest")
+    expected_contract = str(config.get("batch_contract_sha256") or "").strip().lower()
+    if not _SHA256_RE.fullmatch(expected_contract):
+        raise ValueError("batch_contract_sha256 must be a lowercase SHA-256 digest")
+    if str(payload.get("batch_contract_sha256") or "") != expected_contract:
+        raise ValueError("Batch OCR result contract does not match batch_contract_sha256")
+    quality_revision = str(config.get("quality_revision") or "hybrid-exact-ocr-quality-v1")
+    if str(payload.get("quality_revision") or "") != quality_revision:
+        raise ValueError("Batch OCR quality revision does not match the configured revision")
+    raw_results = payload.get("results")
+    if not isinstance(raw_results, dict):
+        raise ValueError("Batch OCR result manifest does not contain a results mapping")
+    selected_hashes = {str(item.get("content_hash") or "") for item in selected}
+    result_hashes = {str(value) for value in raw_results}
+    missing = sorted(selected_hashes - result_hashes)
+    unexpected = sorted(result_hashes - selected_hashes)
+    if missing or unexpected:
+        raise ValueError(
+            "Batch OCR result coverage mismatch: "
+            f"missing={len(missing)}, unexpected={len(unexpected)}"
+        )
+    results: Dict[str, Dict[str, Any]] = {}
+    for content_hash in sorted(selected_hashes):
+        raw = raw_results.get(content_hash)
+        if not isinstance(raw, dict) or str(raw.get("content_hash") or "") != content_hash:
+            raise ValueError(f"Invalid batch OCR result identity: {content_hash}")
+        status = str(raw.get("status") or "failed")
+        if status not in _TERMINAL_STATUSES and status != "failed":
+            raise ValueError(f"Invalid batch OCR terminal status for {content_hash}: {status}")
+        text = str(raw.get("text") or "")
+        if status == "completed" and not any(character.isalnum() for character in text):
+            raise ValueError(f"Completed batch OCR result contains no readable text: {content_hash}")
+        if status != "completed" and text:
+            raise ValueError(f"Non-completed batch OCR result contains injectable text: {content_hash}")
+        provider = str(raw.get("provider") or "")
+        if provider not in {"paddleocr", "transformers_direct"}:
+            raise ValueError(f"Batch OCR result has an unapproved provider: {content_hash}")
+        if not str(raw.get("provider_revision") or "") or not str(raw.get("model_revision") or ""):
+            raise ValueError(f"Batch OCR result lacks pinned provider/model metadata: {content_hash}")
+        expected_raw_sha256 = str(raw.get("raw_output_sha256") or "")
+        if not _SHA256_RE.fullmatch(expected_raw_sha256):
+            raise ValueError(f"Batch OCR result lacks a raw-evidence SHA-256: {content_hash}")
+        raw_evidence = raw.get("raw_evidence")
+        if not isinstance(raw_evidence, Mapping):
+            raise ValueError(f"Batch OCR result lacks raw evidence: {content_hash}")
+        if provider == "paddleocr":
+            evidence_value = json.dumps(
+                raw_evidence.get("lines") or [],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+        else:
+            evidence_value = str(raw_evidence.get("raw_output") or "")
+        actual_raw_sha256 = hashlib.sha256(evidence_value.encode("utf-8")).hexdigest()
+        if actual_raw_sha256 != expected_raw_sha256:
+            raise ValueError(f"Batch OCR raw-evidence hash mismatch: {content_hash}")
+        expected_input_hash = hashlib.sha256(
+            f"{expected_contract}:{content_hash}:{quality_revision}".encode("utf-8")
+        ).hexdigest()
+        if str(raw.get("ocr_input_hash") or "") != expected_input_hash:
+            raise ValueError(f"Batch OCR input hash mismatch: {content_hash}")
+        results[content_hash] = dict(raw)
+    evidence = {
+        "path": str(path),
+        "sha256": actual_sha256,
+        "batch_contract_sha256": expected_contract,
+        "quality_revision": quality_revision,
+        "result_count": len(results),
+    }
+    return results, evidence
 
 
 def _apply_result(
@@ -533,7 +700,7 @@ def _apply_page_file(
 @register_stage
 class MediaOcrFormatter(FormatterStage):
     name = "media_ocr"
-    description = "Runs resumable Unlimited-OCR exact-text enrichment on selected visuals."
+    description = "Runs or imports quality-gated exact-text OCR enrichment on selected visuals."
 
     async def validate_config(self, config: Dict[str, Any]) -> List[str]:
         formatter = config.get("formatter") if isinstance(config.get("formatter"), dict) else {}
@@ -542,11 +709,50 @@ class MediaOcrFormatter(FormatterStage):
             return ["formatter.media_ocr must be a mapping"]
         errors: List[str] = []
         provider = str(stage_config.get("provider") or "gradio_space").lower()
-        if provider not in {"gradio_space", "openai_compatible"}:
-            errors.append("formatter.media_ocr.provider must be gradio_space or openai_compatible")
+        if provider not in {"gradio_space", "openai_compatible", "batch_manifest"}:
+            errors.append(
+                "formatter.media_ocr.provider must be gradio_space, openai_compatible, or batch_manifest"
+            )
         endpoint = _endpoint(stage_config.get("endpoint"))
-        if not endpoint:
+        if provider != "batch_manifest" and not endpoint:
             errors.append("formatter.media_ocr.endpoint must be an absolute HTTP(S) URL")
+        if provider == "batch_manifest":
+            specification = stage_config.get("batch_results")
+            if not isinstance(specification, dict):
+                errors.append("formatter.media_ocr.batch_results must be a mapping")
+            else:
+                if not str(specification.get("path") or "").strip():
+                    errors.append("formatter.media_ocr.batch_results.path is required")
+                if not _SHA256_RE.fullmatch(str(specification.get("sha256") or "").lower()):
+                    errors.append("formatter.media_ocr.batch_results.sha256 must be a SHA-256 digest")
+            if not _SHA256_RE.fullmatch(
+                str(stage_config.get("batch_contract_sha256") or "").lower()
+            ):
+                errors.append("formatter.media_ocr.batch_contract_sha256 must be a SHA-256 digest")
+        input_artifacts = stage_config.get("input_artifacts")
+        if input_artifacts is not None:
+            if not isinstance(input_artifacts, dict):
+                errors.append("formatter.media_ocr.input_artifacts must be a mapping")
+            else:
+                for key in (*_REQUIRED_INPUT_ARTIFACT_KEYS, *_OPTIONAL_INPUT_ARTIFACT_KEYS):
+                    specification = input_artifacts.get(key)
+                    if specification is None and key in _OPTIONAL_INPUT_ARTIFACT_KEYS:
+                        continue
+                    if not isinstance(specification, dict):
+                        errors.append(
+                            f"formatter.media_ocr.input_artifacts.{key} must be a mapping"
+                        )
+                        continue
+                    if not str(specification.get("path") or "").strip():
+                        errors.append(
+                            f"formatter.media_ocr.input_artifacts.{key}.path is required"
+                        )
+                    if not _SHA256_RE.fullmatch(
+                        str(specification.get("sha256") or "").lower()
+                    ):
+                        errors.append(
+                            f"formatter.media_ocr.input_artifacts.{key}.sha256 must be a SHA-256 digest"
+                        )
         if provider == "gradio_space":
             host = (urlsplit(endpoint).hostname or "").lower() if endpoint else ""
             if host != _PUBLIC_SPACE_HOST:
@@ -573,7 +779,8 @@ class MediaOcrFormatter(FormatterStage):
         if not isinstance(config, dict):
             return StageResult.failure("formatter.media_ocr must be a mapping")
         try:
-            selected = _collect_unique_images(ctx, config)
+            input_outputs, input_artifact_evidence = _resolve_input_outputs(ctx, config)
+            selected = _collect_unique_images(input_outputs, config)
         except (OSError, TypeError, ValueError) as exc:
             return StageResult.failure(f"Could not prepare OCR queue: {exc}")
         if not selected:
@@ -581,77 +788,99 @@ class MediaOcrFormatter(FormatterStage):
 
         queue_path = ctx.stage_work_dir / "media_ocr_queue.json"
         results_path = ctx.stage_work_dir / "media_ocr_results.json"
-        existing_payload = load_json_safe(results_path, {}) or {}
-        existing_results = existing_payload.get("results") if isinstance(existing_payload, dict) else {}
-        input_hash_by_content = {
-            str(item["content_hash"]): _input_hash(item, config) for item in selected
-        }
-        results: Dict[str, Dict[str, Any]] = {
-            str(content_hash): dict(value)
-            for content_hash, value in (existing_results or {}).items()
-            if isinstance(value, dict)
-            and str(value.get("ocr_input_hash") or "")
-            == input_hash_by_content.get(str(content_hash), "")
-            and str(value.get("status") or "") in _TERMINAL_STATUSES
-        }
-        resumed_count = len(results)
-        pending = [item for item in selected if str(item["content_hash"]) not in results]
-        timeout = aiohttp.ClientTimeout(
-            total=max(5.0, float(config.get("request_timeout_sec", 900.0)))
-        )
-        connector = aiohttp.TCPConnector(
-            limit=max(1, int(config.get("concurrency", 2))),
-            limit_per_host=max(1, int(config.get("concurrency", 2))),
-            ttl_dns_cache=60,
-            ssl=ssl.create_default_context(cafile=certifi.where()),
-        )
-        headers = {
-            "User-Agent": str(config.get("user_agent") or "MBZUAIKnowledgeIndexer/1.0")
-        }
-        headers.update(_session_auth_headers(config))
-        try:
-            async with aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers=headers,
-                trust_env=False,
-            ) as session:
-                semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 2))))
-                circuit_breaker = asyncio.Event()
-                circuit_state: Dict[str, str] = {}
-                tasks = [
-                    asyncio.create_task(
-                        _ocr_one(
-                            session,
-                            item=item,
-                            config=config,
-                            semaphore=semaphore,
-                            circuit_breaker=circuit_breaker,
-                            circuit_state=circuit_state,
-                        )
-                    )
-                    for item in pending
-                ]
-                flush_every = max(1, int(config.get("cache_flush_every", 5)))
-                for completed_count, task in enumerate(asyncio.as_completed(tasks), start=1):
-                    content_hash, result = await task
-                    results[content_hash] = result
-                    if completed_count % flush_every == 0:
-                        atomic_write_json(
-                            results_path,
-                            {
-                                "version": 1,
-                                "kind": "media_ocr_results",
-                                "provider": str(config.get("provider") or ""),
-                                "model": str(config.get("model") or "baidu/Unlimited-OCR"),
-                                "results": results,
-                            },
-                        )
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
-            return StageResult.failure(
-                f"Media OCR provider session failed: {_clean_error(exc)}",
-                checkpoint={"completed": len(results), "selected": len(selected)},
+        provider = str(config.get("provider") or "gradio_space").lower()
+        batch_import_evidence: Dict[str, Any] = {}
+        if provider == "batch_manifest":
+            try:
+                results, batch_import_evidence = _load_adjudicated_batch_results(
+                    config, selected
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                return StageResult.failure(f"Could not import batch OCR results: {exc}")
+            resumed_count = 0
+            pending: List[Dict[str, Any]] = []
+            input_hash_by_content = {
+                content_hash: str(value.get("ocr_input_hash") or "")
+                for content_hash, value in results.items()
+            }
+        else:
+            existing_payload = load_json_safe(results_path, {}) or {}
+            existing_results = (
+                existing_payload.get("results") if isinstance(existing_payload, dict) else {}
             )
+            input_hash_by_content = {
+                str(item["content_hash"]): _input_hash(item, config) for item in selected
+            }
+            results = {
+                str(content_hash): dict(value)
+                for content_hash, value in (existing_results or {}).items()
+                if isinstance(value, dict)
+                and str(value.get("ocr_input_hash") or "")
+                == input_hash_by_content.get(str(content_hash), "")
+                and str(value.get("status") or "") in _TERMINAL_STATUSES
+            }
+            resumed_count = len(results)
+            pending = [item for item in selected if str(item["content_hash"]) not in results]
+            timeout = aiohttp.ClientTimeout(
+                total=max(5.0, float(config.get("request_timeout_sec", 900.0)))
+            )
+            connector = aiohttp.TCPConnector(
+                limit=max(1, int(config.get("concurrency", 2))),
+                limit_per_host=max(1, int(config.get("concurrency", 2))),
+                ttl_dns_cache=60,
+                ssl=ssl.create_default_context(cafile=certifi.where()),
+            )
+            headers = {
+                "User-Agent": str(config.get("user_agent") or "MBZUAIKnowledgeIndexer/1.0")
+            }
+            headers.update(_session_auth_headers(config))
+            try:
+                async with aiohttp.ClientSession(
+                    timeout=timeout,
+                    connector=connector,
+                    headers=headers,
+                    trust_env=False,
+                ) as session:
+                    semaphore = asyncio.Semaphore(max(1, int(config.get("concurrency", 2))))
+                    circuit_breaker = asyncio.Event()
+                    circuit_state: Dict[str, str] = {}
+                    tasks = [
+                        asyncio.create_task(
+                            _ocr_one(
+                                session,
+                                item=item,
+                                config=config,
+                                semaphore=semaphore,
+                                circuit_breaker=circuit_breaker,
+                                circuit_state=circuit_state,
+                            )
+                        )
+                        for item in pending
+                    ]
+                    flush_every = max(1, int(config.get("cache_flush_every", 5)))
+                    for completed_count, task in enumerate(
+                        asyncio.as_completed(tasks), start=1
+                    ):
+                        content_hash, result = await task
+                        results[content_hash] = result
+                        if completed_count % flush_every == 0:
+                            atomic_write_json(
+                                results_path,
+                                {
+                                    "version": 1,
+                                    "kind": "media_ocr_results",
+                                    "provider": str(config.get("provider") or ""),
+                                    "model": str(
+                                        config.get("model") or "baidu/Unlimited-OCR"
+                                    ),
+                                    "results": results,
+                                },
+                            )
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                return StageResult.failure(
+                    f"Media OCR provider session failed: {_clean_error(exc)}",
+                    checkpoint={"completed": len(results), "selected": len(selected)},
+                )
 
         queue_items = []
         for item in selected:
@@ -696,12 +925,12 @@ class MediaOcrFormatter(FormatterStage):
             },
         )
 
-        page_media = _apply_page_file(ctx.previous_outputs.get("page_media_file"), results)
-        page_images = _apply_page_file(ctx.previous_outputs.get("page_images_file"), results)
+        page_media = _apply_page_file(input_outputs.get("page_media_file"), results)
+        page_images = _apply_page_file(input_outputs.get("page_images_file"), results)
         document_manifest = load_json_safe(
-            ctx.previous_outputs.get("extracted_images_index_file"), {}
+            input_outputs.get("extracted_images_index_file"), {}
         ) or {}
-        media_manifest = load_json_safe(ctx.previous_outputs.get("media_manifest_file"), {}) or {}
+        media_manifest = load_json_safe(input_outputs.get("media_manifest_file"), {}) or {}
         document_items = [
             _apply_result(item, results) for item in load_media_manifest_items(document_manifest)
         ]
@@ -760,6 +989,8 @@ class MediaOcrFormatter(FormatterStage):
             "model": str(config.get("model") or "baidu/Unlimited-OCR"),
             "model_revision": str(config.get("model_revision") or ""),
             "provider_revision": str(config.get("provider_revision") or ""),
+            "input_artifact_evidence": input_artifact_evidence,
+            "batch_import_evidence": batch_import_evidence,
             "prompt_revision": str(
                 config.get("prompt_revision") or "unlimited-ocr-document-v1"
             ),
@@ -806,7 +1037,7 @@ class MediaOcrFormatter(FormatterStage):
                 )
                 == "gradio_space",
                 "production_recommended": str(config.get("provider") or "")
-                == "openai_compatible",
+                in {"openai_compatible", "batch_manifest"},
             },
             "gates": {**gates, "passed": complete},
         }
@@ -815,7 +1046,6 @@ class MediaOcrFormatter(FormatterStage):
         outputs = {
             "page_media_file": str(page_media_path),
             "page_images_file": str(page_images_path),
-            "page_videos_file": str(ctx.previous_outputs.get("page_videos_file") or ""),
             "extracted_images_index_file": str(document_path),
             "extracted_images_count": len(document_items),
             "media_manifest_file": str(manifest_path),
@@ -824,6 +1054,9 @@ class MediaOcrFormatter(FormatterStage):
             "media_ocr_report_file": str(report_path),
             "media_ocr_complete": complete,
         }
+        page_videos_file = str(input_outputs.get("page_videos_file") or "")
+        if page_videos_file:
+            outputs["page_videos_file"] = page_videos_file
         current_media_artifacts = [
             record
             for artifact_type in ("web_image", "extracted_image")

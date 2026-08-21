@@ -187,6 +187,9 @@ def assess_ocr_quality(
     maximum_single_character_token_ratio: float = 0.62,
     minimum_unique_token_ratio: float = 0.14,
     maximum_repeated_line_ratio: float = 0.55,
+    maximum_short_fragment_line_ratio: float = 0.55,
+    short_fragment_maximum_alphanumeric_chars: int = 8,
+    short_fragment_minimum_line_count: int = 12,
     minimum_quality_score: float = 0.55,
 ) -> Dict[str, Any]:
     """Quality-gate exact OCR without fabricating a model confidence value."""
@@ -200,6 +203,13 @@ def assess_ocr_quality(
     lines = [line.strip().casefold() for line in text.splitlines() if line.strip()]
     repeated_line_count = sum(count - 1 for count in Counter(lines).values() if count > 1)
     repeated_line_ratio = repeated_line_count / max(1, len(lines))
+    short_fragment_limit = max(1, int(short_fragment_maximum_alphanumeric_chars))
+    short_fragment_count = sum(
+        1
+        for line in lines
+        if 0 < sum(character.isalnum() for character in line) <= short_fragment_limit
+    )
+    short_fragment_line_ratio = short_fragment_count / max(1, len(lines))
 
     flags: List[str] = []
     if alphanumeric_chars < max(0, int(minimum_alphanumeric_chars)):
@@ -210,6 +220,11 @@ def assess_ocr_quality(
         flags.append("excessive_token_repetition")
     if len(lines) >= 6 and repeated_line_ratio > maximum_repeated_line_ratio:
         flags.append("excessive_line_repetition")
+    if (
+        len(lines) >= max(1, int(short_fragment_minimum_line_count))
+        and short_fragment_line_ratio > maximum_short_fragment_line_ratio
+    ):
+        flags.append("excessive_short_line_fragments")
     if _SPECIAL_TOKEN_RE.search(text):
         flags.append("unremoved_special_tokens")
 
@@ -220,6 +235,7 @@ def assess_ocr_quality(
         score -= min(0.45, max(0.0, single_character_ratio - 0.15))
         score -= min(0.35, max(0.0, 0.45 - unique_token_ratio))
         score -= min(0.35, repeated_line_ratio)
+        score -= min(0.45, max(0.0, short_fragment_line_ratio - 0.20))
         score = max(0.0, min(1.0, score))
     if (
         "no_readable_text" not in flags
@@ -247,6 +263,8 @@ def assess_ocr_quality(
             "unique_token_ratio": round(unique_token_ratio, 6),
             "single_character_token_ratio": round(single_character_ratio, 6),
             "repeated_line_ratio": round(repeated_line_ratio, 6),
+            "short_fragment_line_count": short_fragment_count,
+            "short_fragment_line_ratio": round(short_fragment_line_ratio, 6),
         },
     }
 

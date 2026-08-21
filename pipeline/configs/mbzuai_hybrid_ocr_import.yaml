@@ -1,0 +1,54 @@
+# Standalone, immutable import of the hybrid OCR batch produced on ritesh_hpc.
+# It enriches the completed semantic-captioning manifests only. No cleaning,
+# conversion, deduplication, chunking, embedding, or indexing stage is included.
+
+project_name: "mbzuai_hybrid_ocr"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  media_ocr:
+    provider: "batch_manifest"
+    model: "PP-OCRv5 + baidu/Unlimited-OCR"
+    model_revision: "paddleocr-3.7.0/paddle-3.2.0 + 07dea832e22aefee32ad281d4b80551282e1c168"
+    provider_revision: "paddleocr-3.7.0 + transformers-direct"
+    quality_revision: "hybrid-exact-ocr-quality-v1"
+    batch_contract_sha256: "3c01c2b5fd82ae5bd020724d67fb61a3a6b9d2acb9275fea35788a2164a3e497"
+    batch_results:
+      path: "runs/mbzuai_hybrid_ocr/mbzuai-hybrid-ocr-20260821-v1/results/adjudicated.json"
+      sha256: "9084f7f51265b57393b5ca214b030c8b42de5cf96c2b00212855545c18d4dd3b"
+    input_artifacts:
+      page_media_file:
+        path: "runs/mbzuai_pdf_media_completion_v2/mbzuai-pdf-media-completion-20260821-v2/stage_outputs/annotate_recovered_media/semantically_annotated_page_media.json"
+        sha256: "d7537ab3dbd2b3d964ad1d69898cef7de013bac7ebc5902bc4e002df3043efe8"
+      page_images_file:
+        path: "runs/mbzuai_pdf_media_completion_v2/mbzuai-pdf-media-completion-20260821-v2/stage_outputs/annotate_recovered_media/semantically_annotated_page_images.json"
+        sha256: "f1a685c4279f6022b4d28c26d3e4fba42a6ffc5e9b7ed8d5a872ffd86a4706c7"
+      extracted_images_index_file:
+        path: "runs/mbzuai_pdf_media_completion_v2/mbzuai-pdf-media-completion-20260821-v2/stage_outputs/annotate_recovered_media/semantically_annotated_document_media.json"
+        sha256: "e5aff3673950d381589c7fbffa118fffbd616ff18a606e89c261f813eddb9626"
+      media_manifest_file:
+        path: "runs/mbzuai_pdf_media_completion_v2/mbzuai-pdf-media-completion-20260821-v2/stage_outputs/annotate_recovered_media/semantically_annotated_media_manifest.json"
+        sha256: "21b180c7ebd7a384ab3fc421591d5067007bc5bbd06d982d3cecc1832dc3a05f"
+    scope: "all"
+    needs_ocr_only: true
+    concurrency: 1
+    retry_attempts: 1
+    request_timeout_sec: 1
+    primary_mode: "gundam"
+    retry_mode: "base"
+    max_images: 0
+    minimum_usable_text_ratio: 0.55
+    maximum_rejected_ratio: 0.25
+    require_complete: true
+
+stages:
+  - id: enrich_exact_ocr
+    type: formatter
+    plugin: media_ocr

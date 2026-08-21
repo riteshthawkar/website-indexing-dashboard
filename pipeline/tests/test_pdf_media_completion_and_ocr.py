@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from pathlib import Path
 
 import fitz
@@ -11,6 +12,14 @@ from PIL import Image, ImageDraw
 from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record, save_artifact_catalog
 from pipeline.core.base import StageContext, StageStatus
 from pipeline.core.io import atomic_write_json, load_json_safe
+from pipeline.core.hybrid_ocr import (
+    SCENE_OCR_ROUTE,
+    UNLIMITED_OCR_ROUTE,
+    assess_scene_ocr_lines,
+    build_stratified_benchmark,
+    choose_ocr_route,
+    should_escalate_to_unlimited,
+)
 from pipeline.core.media import build_media_embedding_text, build_media_manifest, normalize_media_item
 from pipeline.core.state import PipelineState, StageState, save_state
 from pipeline.core.unlimited_ocr import (
@@ -20,8 +29,10 @@ from pipeline.core.unlimited_ocr import (
 )
 from pipeline.stages.formatters.media_ocr_formatter import (
     MediaOcrFormatter,
+    _load_adjudicated_batch_results,
     _ocr_one,
     _provider_block_code,
+    _resolve_input_outputs,
     _retryable_error,
     _session_auth_headers,
 )
@@ -32,6 +43,9 @@ from pipeline.stages.formatters.media_semantics_formatter import (
 from pipeline.stages.formatters.pdf_media_completion_formatter import (
     PdfMediaCompletionFormatter,
 )
+from scripts.ocr.run_scene_ocr_batch import _resolve_image_path as _resolve_scene_image_path
+from scripts.ocr.run_unlimited_ocr_batch import MODEL_REVISION as UNLIMITED_MODEL_REVISION
+from scripts.ocr.run_unlimited_ocr_batch import _model_source_evidence
 
 
 def _png(path: Path) -> str:
@@ -63,6 +77,48 @@ def test_unlimited_ocr_keeps_final_cumulative_snapshot_and_filters_layout_markup
     assert quality["text"] == "MBZUAI"
 
 
+def test_unlimited_ocr_rejects_fragmented_browser_chrome_but_keeps_document_text():
+    fragmented = "\n".join(
+        f"<|det|>header [{index},1,{index + 1},2]<|/det|>{fragment}"
+        for index, fragment in enumerate(
+            [
+                "or",
+                "acl",
+                "e.c",
+                "lom",
+                "d/s",
+                "upp",
+                "lier",
+                "reg",
+                "ist",
+                "rat",
+                "ion",
+                "page",
+                "Mohamed bin Zayed University of Artificial Intelligence",
+            ]
+        )
+    )
+    document = "\n".join(
+        [
+            "<|det|>title [1,1,2,2]<|/det|>Annual Performance Review",
+            *[
+                "<|det|>text [1,1,2,2]<|/det|>"
+                + f"Section {_index + 1} explains the documented annual faculty review process."
+                for _index in range(12)
+            ],
+        ]
+    )
+
+    fragmented_quality = assess_ocr_quality(fragmented)
+    document_quality = assess_ocr_quality(document)
+
+    assert fragmented_quality["status"] == "rejected_low_quality"
+    assert "excessive_short_line_fragments" in fragmented_quality["quality_flags"]
+    assert fragmented_quality["text"] == ""
+    assert document_quality["status"] == "completed"
+    assert document_quality["quality_metrics"]["short_fragment_line_ratio"] == 0.0
+
+
 def test_unlimited_ocr_auth_and_quota_circuit(monkeypatch):
     monkeypatch.setenv("TEST_HF_TOKEN", "private-token")
     config = {
@@ -79,6 +135,94 @@ def test_unlimited_ocr_auth_and_quota_circuit(monkeypatch):
     assert _session_auth_headers(config) == {"Authorization": "Bearer private-token"}
     assert _provider_block_code(quota_error) == "zerogpu_quota_exhausted"
     assert _retryable_error(quota_error) is False
+
+
+def test_hybrid_ocr_routing_and_stratified_benchmark_are_deterministic():
+    bucket_sizes = {
+        "document_fragment": 4,
+        "screenshot": 4,
+        "map": 3,
+        "diagram": 2,
+        "photo": 3,
+        "portrait": 2,
+        "logo": 1,
+        "illustration": 1,
+    }
+    items = []
+    counter = 0
+    for image_kind, count in bucket_sizes.items():
+        for index in range(count):
+            counter += 1
+            items.append(
+                {
+                    "type": "image",
+                    "needs_ocr": True,
+                    "content_hash": f"{counter:064x}",
+                    "image_kind": image_kind,
+                    "source_type": "pdf" if index % 2 == 0 else "html",
+                    "visible_text": "نص عربي" if index == 0 else f"Visible text {counter}",
+                }
+            )
+
+    first = build_stratified_benchmark(reversed(items))
+    second = build_stratified_benchmark(items)
+
+    assert len(first) == 20
+    assert [item["content_hash"] for item in first] == [
+        item["content_hash"] for item in second
+    ]
+    assert choose_ocr_route({"image_kind": "document_fragment"}) == SCENE_OCR_ROUTE
+    assert choose_ocr_route({"image_kind": "map"}) == SCENE_OCR_ROUTE
+    assert sum(item["ocr_route"] == UNLIMITED_OCR_ROUTE for item in first) == 0
+    assert should_escalate_to_unlimited(
+        {"image_kind": "screenshot"}, {"status": "rejected_low_quality"}
+    )
+    assert not should_escalate_to_unlimited(
+        {"image_kind": "map"}, {"status": "rejected_low_quality"}
+    )
+
+
+def test_scene_ocr_gate_uses_exact_high_confidence_lines_only():
+    quality = assess_scene_ocr_lines(
+        [
+            {"text": "MBZUAI", "confidence": 0.99, "box": [1, 2, 3, 4]},
+            {"text": "uncertain", "confidence": 0.2, "box": [5, 6, 7, 8]},
+        ]
+    )
+    rejected = assess_scene_ocr_lines(
+        [{"text": "uncertain", "confidence": 0.6}],
+        minimum_mean_confidence=0.75,
+    )
+
+    assert quality["status"] == "completed"
+    assert quality["text"] == "MBZUAI"
+    assert quality["quality_metrics"]["rejected_line_count"] == 1
+    assert rejected["status"] == "rejected_low_quality"
+    assert rejected["text"] == ""
+
+
+def test_scene_ocr_gate_rejects_confident_but_incomplete_reference_mismatch():
+    reference = " ".join(
+        "The applicant confirms that every submitted detail is correct and authentic".split()
+        * 3
+    )
+    quality = assess_scene_ocr_lines(
+        [{"text": "subtihelcaiokehe ieiat hioa", "confidence": 0.97}],
+        reference_text=reference,
+    )
+    expanded = assess_scene_ocr_lines(
+        [
+            {
+                "text": reference + " Additional exact labels found elsewhere in the image",
+                "confidence": 0.97,
+            }
+        ],
+        reference_text=reference,
+    )
+
+    assert quality["status"] == "rejected_low_quality"
+    assert "insufficient_visible_text_corroboration" in quality["quality_flags"]
+    assert expanded["status"] == "completed"
 
 
 def test_unlimited_ocr_provider_wide_failure_skips_remaining_requests(monkeypatch):
@@ -484,3 +628,137 @@ def test_media_ocr_propagates_only_quality_gated_exact_text(tmp_path: Path, monk
     assert "exact_ocr=MBZUAI OCR" in build_media_embedding_text([output_item])
     raw_result = load_json_safe(result.outputs["media_ocr_results_file"])["results"][content_hash]
     assert raw_result["raw_output"].startswith("<|det|>")
+
+
+def test_batch_ocr_import_is_sha_pinned_and_coverage_complete(tmp_path: Path):
+    content_hash = "a" * 64
+    contract_hash = "b" * 64
+    quality_revision = "hybrid-exact-ocr-quality-v1"
+    raw_lines = [{"text": "MBZUAI", "confidence": 0.99, "box": [1, 2, 3, 4]}]
+    raw_output_sha256 = hashlib.sha256(
+        json.dumps(raw_lines, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    input_hash = hashlib.sha256(
+        f"{contract_hash}:{content_hash}:{quality_revision}".encode()
+    ).hexdigest()
+    payload = {
+        "version": 1,
+        "kind": "hybrid_ocr_adjudicated_results",
+        "batch_contract_sha256": contract_hash,
+        "quality_revision": quality_revision,
+        "results": {
+            content_hash: {
+                "content_hash": content_hash,
+                "status": "completed",
+                "text": "MBZUAI",
+                "provider": "paddleocr",
+                "provider_revision": "3.7.0",
+                "model": "PP-OCRv5",
+                "model_revision": "paddleocr-3.7.0/paddle-3.2.0",
+                "raw_output_sha256": raw_output_sha256,
+                "raw_evidence": {"lines": raw_lines},
+                "ocr_input_hash": input_hash,
+                "quality_score": 0.99,
+                "quality_flags": [],
+            }
+        },
+    }
+    result_path = tmp_path / "adjudicated.json"
+    atomic_write_json(result_path, payload)
+    digest = hashlib.sha256(result_path.read_bytes()).hexdigest()
+    config = {
+        "batch_results": {"path": str(result_path), "sha256": digest},
+        "batch_contract_sha256": contract_hash,
+        "quality_revision": quality_revision,
+    }
+
+    imported, evidence = _load_adjudicated_batch_results(
+        config, [{"content_hash": content_hash}]
+    )
+
+    assert imported[content_hash]["text"] == "MBZUAI"
+    assert evidence["result_count"] == 1
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        _load_adjudicated_batch_results(
+            {**config, "batch_results": {"path": str(result_path), "sha256": "0" * 64}},
+            [{"content_hash": content_hash}],
+        )
+    with pytest.raises(ValueError, match="coverage mismatch"):
+        _load_adjudicated_batch_results(config, [{"content_hash": "c" * 64}])
+
+
+def test_standalone_ocr_inputs_are_sha_pinned(tmp_path: Path):
+    specifications = {}
+    for key in (
+        "page_media_file",
+        "page_images_file",
+        "extracted_images_index_file",
+        "media_manifest_file",
+    ):
+        path = tmp_path / f"{key}.json"
+        atomic_write_json(path, {"key": key})
+        specifications[key] = {
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+    context = StageContext(
+        run_id="standalone-ocr",
+        project_name="standalone-ocr",
+        config={},
+        work_dir=tmp_path / "run",
+    )
+
+    outputs, evidence = _resolve_input_outputs(
+        context, {"input_artifacts": specifications}
+    )
+
+    assert set(evidence) == set(specifications)
+    assert Path(outputs["media_manifest_file"]).is_file()
+    specifications["media_manifest_file"]["sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        _resolve_input_outputs(context, {"input_artifacts": specifications})
+
+
+def test_remote_ocr_runner_proves_model_revision_and_contains_batch_paths(
+    tmp_path: Path,
+):
+    model_dir = tmp_path / "model"
+    metadata_dir = model_dir / ".cache/huggingface/download"
+    metadata_dir.mkdir(parents=True)
+    model_files = {
+        "config.json": b"{}",
+        "tokenizer_config.json": b"{}",
+        "model.safetensors.index.json": json.dumps(
+            {"weight_map": {"layer": "model.safetensors"}}
+        ).encode(),
+        "model.safetensors": b"weights",
+    }
+    for filename, value in model_files.items():
+        (model_dir / filename).write_bytes(value)
+        (metadata_dir / f"{filename}.metadata").write_text(
+            f"{UNLIMITED_MODEL_REVISION}\netag-{filename}\n",
+            encoding="utf-8",
+        )
+
+    evidence = _model_source_evidence(model_dir)
+
+    assert evidence["revision"] == UNLIMITED_MODEL_REVISION
+    assert set(evidence["files"]) == set(model_files)
+    (metadata_dir / "config.json.metadata").write_text(
+        "wrong-revision\netag\n", encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="not from the pinned revision"):
+        _model_source_evidence(model_dir)
+
+    batch_dir = tmp_path / "batch"
+    assets_dir = batch_dir / "assets"
+    assets_dir.mkdir(parents=True)
+    manifest_path = batch_dir / "batch.json"
+    manifest_path.write_text("{}", encoding="utf-8")
+    image_path = assets_dir / "image.png"
+    image_path.write_bytes(b"image")
+    assert _resolve_scene_image_path(manifest_path, "assets/image.png") == image_path
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"outside")
+    with pytest.raises(ValueError, match="escapes the batch directory"):
+        _resolve_scene_image_path(manifest_path, "../outside.png")
