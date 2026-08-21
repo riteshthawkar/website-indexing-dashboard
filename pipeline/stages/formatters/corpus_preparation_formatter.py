@@ -8,6 +8,7 @@ from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
+from urllib.parse import urlsplit, urlunsplit
 
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe, sha256_file
@@ -36,6 +37,24 @@ def _resolved(value: Any) -> str:
         return str(Path(str(value)).resolve())
     except Exception:
         return ""
+
+
+def _normalized_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        parsed = urlsplit(raw)
+    except ValueError:
+        return raw
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        return raw
+    path = re.sub(r"/{2,}", "/", parsed.path or "/")
+    if path != "/":
+        path = path.rstrip("/")
+    return urlunsplit(
+        (parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, "")
+    )
 
 
 def _load_mapping(path: Any, *, label: str) -> Dict[str, Any]:
@@ -138,6 +157,7 @@ class CorpusPreparationFormatter(FormatterStage):
             "minimum_semantically_annotated_visuals",
             "minimum_ocr_adjudicated_visuals",
             "maximum_missing_media_files",
+            "maximum_unbound_media_assets",
         ):
             try:
                 if int(stage_config.get(key, 0)) < 0:
@@ -210,6 +230,16 @@ class CorpusPreparationFormatter(FormatterStage):
         mapping = payloads["md_mapping_file"]
         page_metadata = payloads["canonical_page_metadata_file"]
         page_media = payloads["page_media_file"]
+        page_media_by_normalized_url: Dict[str, List[Dict[str, Any]]] = defaultdict(
+            list
+        )
+        for raw_url, values in page_media.items():
+            normalized_url = _normalized_url(raw_url)
+            if not normalized_url or not isinstance(values, list):
+                continue
+            page_media_by_normalized_url[normalized_url].extend(
+                dict(value) for value in values if isinstance(value, dict)
+            )
         document_media = load_media_manifest_items(
             payloads["extracted_images_index_file"]
         )
@@ -254,6 +284,7 @@ class CorpusPreparationFormatter(FormatterStage):
         inventory_paths = set()
         source_file_only_document_count = 0
         unidentified_document_count = 0
+        referenced_image_hashes = set()
         # The artifact catalog is authoritative here. A URL mapping describes
         # web pages, but converted PDF/Office documents can legitimately have
         # only source_file provenance and must remain first-class documents.
@@ -293,11 +324,16 @@ class CorpusPreparationFormatter(FormatterStage):
                 unidentified_document_count += 1
             media_candidates: List[Mapping[str, Any]] = []
             for url in source_urls:
-                values = page_media.get(url)
+                values = page_media_by_normalized_url.get(_normalized_url(url))
                 if isinstance(values, list):
                     media_candidates.extend(value for value in values if isinstance(value, dict))
             media_candidates.extend(document_media_by_path.get(str(path), []))
             media_references = _dedupe_media_references(media_candidates)
+            referenced_image_hashes.update(
+                str(item.get("content_hash") or "").lower()
+                for item in media_references
+                if item.get("type") == "image" and item.get("content_hash")
+            )
             markdown_sha256 = hashlib.sha256(raw_bytes).hexdigest()
             stable_source_locator = source_url
             if not stable_source_locator and source_file:
@@ -399,6 +435,13 @@ class CorpusPreparationFormatter(FormatterStage):
         ocr_adjudicated = sum(
             status in _TERMINAL_OCR_STATUSES for status in ocr_status_by_hash.values()
         )
+        unbound_media_hashes = unique_media_hashes - referenced_image_hashes
+        dangling_document_media_hashes = referenced_image_hashes - unique_media_hashes
+        unbound_media_record_count = sum(
+            item.get("type") == "image"
+            and str(item.get("content_hash") or "").lower() in unbound_media_hashes
+            for item in all_media
+        )
         representation_artifact_count = sum(
             len(ctx.find_artifacts(artifact_type=artifact_type))
             for artifact_type in (
@@ -435,6 +478,17 @@ class CorpusPreparationFormatter(FormatterStage):
             <= int(config.get("maximum_missing_media_files", 0)),
             "media_hash_mismatch_count": media_hash_mismatches,
             "media_hashes_passed": media_hash_mismatches == 0,
+            "maximum_unbound_media_assets": int(
+                config.get("maximum_unbound_media_assets", 0)
+            ),
+            "unbound_media_asset_count": len(unbound_media_hashes),
+            "unbound_media_record_count": unbound_media_record_count,
+            "all_media_linked_to_documents": len(unbound_media_hashes)
+            <= int(config.get("maximum_unbound_media_assets", 0)),
+            "dangling_document_media_hash_count": len(
+                dangling_document_media_hashes
+            ),
+            "document_media_references_resolve": not dangling_document_media_hashes,
             "minimum_semantically_annotated_visuals": int(
                 config.get("minimum_semantically_annotated_visuals", 0)
             ),
@@ -463,6 +517,8 @@ class CorpusPreparationFormatter(FormatterStage):
                 "unique_media_assets_passed",
                 "missing_media_files_passed",
                 "media_hashes_passed",
+                "all_media_linked_to_documents",
+                "document_media_references_resolve",
                 "semantic_annotation_passed",
                 "ocr_adjudication_passed",
                 "ocr_text_isolation_passed",
@@ -498,6 +554,13 @@ class CorpusPreparationFormatter(FormatterStage):
                 "document_media_records": len(document_media),
                 "media_manifest_records": len(all_media),
                 "unique_media_assets": len(unique_media_hashes),
+                "document_linked_unique_media_assets": len(
+                    referenced_image_hashes & unique_media_hashes
+                ),
+                "unbound_media_assets": len(unbound_media_hashes),
+                "dangling_document_media_hashes": len(
+                    dangling_document_media_hashes
+                ),
                 "semantically_annotated_visuals": annotated_visuals,
                 "ocr_status_counts": dict(sorted(ocr_status_counts.items())),
             },

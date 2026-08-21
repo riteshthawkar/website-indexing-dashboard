@@ -273,7 +273,9 @@ def test_corpus_preparation_seals_inventory_without_representation(
         },
         "url_identity_map_file": {"records": []},
         "canonical_page_link_graph_file": {"nodes": [], "edges": []},
-        "page_media_file": {"https://example.com/document": [media_item]},
+        # The crawler may preserve a root trailing slash while the URL mapping
+        # canonicalizes it away; preparation must still bind the media.
+        "page_media_file": {"https://example.com/document/": [media_item]},
         "page_images_file": {"https://example.com/document": [media_item]},
         "page_videos_file": {},
         "extracted_images_index_file": build_media_manifest([]),
@@ -318,6 +320,7 @@ def test_corpus_preparation_seals_inventory_without_representation(
                     "minimum_document_count": 2,
                     "minimum_unique_media_assets": 1,
                     "maximum_missing_media_files": 0,
+                    "maximum_unbound_media_assets": 0,
                     "minimum_semantically_annotated_visuals": 1,
                     "minimum_ocr_adjudicated_visuals": 1,
                 }
@@ -347,6 +350,8 @@ def test_corpus_preparation_seals_inventory_without_representation(
     assert report["gates"]["passed"] is True
     assert report["counts"]["source_file_only_documents"] == 1
     assert report["gates"]["inventory_matches_live_markdown"] is True
+    assert report["gates"]["all_media_linked_to_documents"] is True
+    assert report["gates"]["document_media_references_resolve"] is True
     assert report["next_stage_boundary"] == {
         "chunking_performed": False,
         "document_representation_selected": False,
