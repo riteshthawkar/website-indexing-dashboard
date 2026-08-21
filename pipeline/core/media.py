@@ -32,6 +32,22 @@ def _clean_text(value: Any) -> str:
     return text.strip()
 
 
+def _clean_multiline_text(value: Any) -> str:
+    """Normalize exact text without destroying line and table boundaries."""
+    if value is None:
+        return ""
+    lines = [" ".join(line.split()).strip() for line in str(value).splitlines()]
+    output: List[str] = []
+    for line in lines:
+        if line:
+            output.append(line)
+        elif output and output[-1] != "":
+            output.append("")
+    while output and not output[-1]:
+        output.pop()
+    return "\n".join(output)
+
+
 def _clean_url(value: Any) -> str:
     text = _clean_text(value)
     return text
@@ -111,6 +127,22 @@ def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "caption": _clean_text(item.get("caption")),
         "description": _clean_text(item.get("description")),
         "context": _clean_text(item.get("context")),
+        # Page/section context is occurrence-specific.  It must remain
+        # separate from authored context and from the content-hash-level
+        # visual annotation because one image may be reused on several pages.
+        "context_reference_id": _clean_text(item.get("context_reference_id")),
+        "context_source": _clean_text(item.get("context_source")),
+        "context_association": _clean_text(item.get("context_association")),
+        "context_confidence": _coerce_float(item.get("context_confidence")),
+        "context_sha256": _clean_text(item.get("context_sha256")),
+        "context_source_path": _clean_text(item.get("context_source_path")),
+        "section_id": _clean_text(item.get("section_id")),
+        "section_path": _clean_text_list(item.get("section_path"), max_items=8, max_chars=300),
+        "section_heading": _clean_text(item.get("section_heading")),
+        "surrounding_text_before": _clean_text(item.get("surrounding_text_before")),
+        "surrounding_text_after": _clean_text(item.get("surrounding_text_after")),
+        "nearby_text": _clean_text(item.get("nearby_text")),
+        "page_title": _clean_text(item.get("page_title")),
         "poster_url": _clean_url(item.get("poster_url")),
         "provider": _clean_text(item.get("provider")),
         "transcript": _clean_text(item.get("transcript")),
@@ -136,9 +168,24 @@ def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "download_status": _clean_text(item.get("download_status")),
         "source_backend": _clean_text(item.get("source_backend")),
         "crop_source": _clean_text(item.get("crop_source")),
-        "ocr_text": _clean_text(item.get("ocr_text")),
+        # OCR is an exact-text evidence channel. Keep it distinct from the
+        # generative ``visible_text`` field and retain meaningful line breaks.
+        "ocr_text": _clean_multiline_text(item.get("ocr_text")),
+        "ocr_status": _clean_text(item.get("ocr_status")),
+        "ocr_provider": _clean_text(item.get("ocr_provider")),
+        "ocr_provider_revision": _clean_text(item.get("ocr_provider_revision")),
         "ocr_model": _clean_text(item.get("ocr_model")),
         "ocr_model_revision": _clean_text(item.get("ocr_model_revision")),
+        "ocr_mode": _clean_text(item.get("ocr_mode")),
+        "ocr_prompt_revision": _clean_text(item.get("ocr_prompt_revision")),
+        "ocr_input_hash": _clean_text(item.get("ocr_input_hash")),
+        "ocr_raw_output_sha256": _clean_text(item.get("ocr_raw_output_sha256")),
+        "ocr_latency_ms": _coerce_float(item.get("ocr_latency_ms")),
+        "ocr_attempts": _coerce_position(item.get("ocr_attempts")),
+        "ocr_quality_score": _coerce_float(item.get("ocr_quality_score")),
+        "ocr_quality_flags": _clean_text_list(item.get("ocr_quality_flags"), max_items=16),
+        "ocr_error": _clean_text(item.get("ocr_error")),
+        "ocr_completed_at": _clean_text(item.get("ocr_completed_at")),
         # Model-authored semantics are separate from website-authored
         # alt/caption/context so retrieval can preserve provenance and avoid
         # presenting contextual hints as literal visual observations.
@@ -154,8 +201,13 @@ def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "annotation_model": _clean_text(item.get("annotation_model")),
         "annotation_model_revision": _clean_text(item.get("annotation_model_revision")),
         "annotation_prompt_revision": _clean_text(item.get("annotation_prompt_revision")),
+        "annotation_input_hash": _clean_text(item.get("annotation_input_hash")),
         "annotation_confidence": _coerce_float(item.get("annotation_confidence")),
         "annotation_error": _clean_text(item.get("annotation_error")),
+        "contextual_caption_scope": _clean_text(item.get("contextual_caption_scope")),
+        "contextual_caption_reference_id": _clean_text(
+            item.get("contextual_caption_reference_id")
+        ),
         "contains_text": _coerce_bool(item.get("contains_text")),
         "needs_ocr": _coerce_bool(item.get("needs_ocr")),
         "needs_review": _coerce_bool(item.get("needs_review")),
@@ -242,6 +294,18 @@ def compact_media_for_metadata(
             "caption": item.get("caption", "")[:max_text_len],
             "description": item.get("description", "")[: max_text_len * 2],
             "context": item.get("context", "")[:max_text_len],
+            "context_reference_id": item.get("context_reference_id", "")[:120],
+            "context_source": item.get("context_source", "")[:80],
+            "context_association": item.get("context_association", "")[:80],
+            "context_confidence": item.get("context_confidence"),
+            "context_sha256": item.get("context_sha256", "")[:80],
+            "section_id": item.get("section_id", "")[:120],
+            "section_path": list(item.get("section_path") or [])[:8],
+            "section_heading": item.get("section_heading", "")[:max_text_len],
+            "surrounding_text_before": item.get("surrounding_text_before", "")[: max_text_len * 2],
+            "surrounding_text_after": item.get("surrounding_text_after", "")[: max_text_len * 2],
+            "nearby_text": item.get("nearby_text", "")[: max_text_len * 2],
+            "page_title": item.get("page_title", "")[:max_text_len],
             "poster_url": item.get("poster_url", ""),
             "asset_uri": item.get("asset_uri", ""),
             "provider": item.get("provider", "")[:80],
@@ -258,8 +322,21 @@ def compact_media_for_metadata(
             "content_hash": item.get("content_hash", "")[:80],
             "perceptual_hash": item.get("perceptual_hash", "")[:32],
             "crop_source": item.get("crop_source", "")[:80],
+            "ocr_text": item.get("ocr_text", "")[: max_text_len * 3],
+            "ocr_status": item.get("ocr_status", "")[:40],
+            "ocr_provider": item.get("ocr_provider", "")[:80],
+            "ocr_provider_revision": item.get("ocr_provider_revision", "")[:120],
             "ocr_model": item.get("ocr_model", "")[:120],
             "ocr_model_revision": item.get("ocr_model_revision", "")[:120],
+            "ocr_mode": item.get("ocr_mode", "")[:40],
+            "ocr_prompt_revision": item.get("ocr_prompt_revision", "")[:120],
+            "ocr_input_hash": item.get("ocr_input_hash", "")[:80],
+            "ocr_raw_output_sha256": item.get("ocr_raw_output_sha256", "")[:80],
+            "ocr_latency_ms": item.get("ocr_latency_ms"),
+            "ocr_attempts": item.get("ocr_attempts"),
+            "ocr_quality_score": item.get("ocr_quality_score"),
+            "ocr_quality_flags": list(item.get("ocr_quality_flags") or [])[:12],
+            "ocr_error": item.get("ocr_error", "")[:max_text_len],
             "semantic_caption": item.get("semantic_caption", "")[:max_text_len],
             "contextual_caption": item.get("contextual_caption", "")[: max_text_len * 2],
             "visual_description": item.get("visual_description", "")[: max_text_len * 2],
@@ -272,7 +349,12 @@ def compact_media_for_metadata(
             "annotation_model": item.get("annotation_model", "")[:120],
             "annotation_model_revision": item.get("annotation_model_revision", "")[:120],
             "annotation_prompt_revision": item.get("annotation_prompt_revision", "")[:120],
+            "annotation_input_hash": item.get("annotation_input_hash", "")[:80],
             "annotation_confidence": item.get("annotation_confidence"),
+            "contextual_caption_scope": item.get("contextual_caption_scope", "")[:40],
+            "contextual_caption_reference_id": item.get(
+                "contextual_caption_reference_id", ""
+            )[:120],
             "contains_text": item.get("contains_text"),
             "needs_ocr": item.get("needs_ocr"),
             "needs_review": item.get("needs_review"),
@@ -308,10 +390,24 @@ def build_media_embedding_text(
             parts.append(f"visual_description={item['visual_description'][:max_transcript_chars]}")
         if item.get("visible_text"):
             parts.append(f"visible_text={item['visible_text'][:max_transcript_chars]}")
+        if item.get("ocr_status") == "completed" and item.get("ocr_text"):
+            parts.append(f"exact_ocr={item['ocr_text'][:max_transcript_chars]}")
         if item.get("semantic_tags"):
             parts.append(f"tags={', '.join(item['semantic_tags'])}")
         if item.get("context"):
             parts.append(f"context={item['context']}")
+        if item.get("section_path"):
+            parts.append(f"section={' > '.join(item['section_path'])}")
+        if item.get("surrounding_text_before"):
+            parts.append(
+                f"surrounding_before={item['surrounding_text_before'][:max_transcript_chars]}"
+            )
+        if item.get("surrounding_text_after"):
+            parts.append(
+                f"surrounding_after={item['surrounding_text_after'][:max_transcript_chars]}"
+            )
+        if item.get("nearby_text") and item.get("nearby_text") != item.get("context"):
+            parts.append(f"nearby_text={item['nearby_text'][:max_transcript_chars]}")
         if item.get("provider"):
             parts.append(f"provider={item['provider']}")
         if item.get("transcript"):

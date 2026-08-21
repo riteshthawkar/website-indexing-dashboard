@@ -1,0 +1,14 @@
+# Immutable continuation candidate after the 2026-08-21 PDF recovery and
+# semantic-caption run. Recovered-document annotations are content-hash reused
+# from the fully completed v2 manifest, so a fresh run only needs provider work
+# for exact OCR. Set HF_TOKEN for the public Space, or override media_ocr with a
+# private openai_compatible Unlimited-OCR endpoint for production operation.
+_inherit: mbzuai_pdf_media_completion.yaml
+
+project_name: "mbzuai_pdf_media_ocr_completion"
+
+formatter:
+  media_semantics:
+    reuse_annotation_manifest_files:
+      - path: "runs/mbzuai_pdf_media_completion_v2/mbzuai-pdf-media-completion-20260821-v2/stage_outputs/annotate_recovered_media/semantically_annotated_document_media.json"
+        sha256: "e5aff3673950d381589c7fbffa118fffbd616ff18a606e89c261f813eddb9626"

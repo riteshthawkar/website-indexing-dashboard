@@ -1,0 +1,135 @@
+# Immutable PDF-media completion run. It starts from the fully captioned v2
+# corpus, repairs raw-crawl URL lineage, recovers Docling page-window and
+# fallback visuals, captions only new hashes, then adds exact OCR. No cleaning,
+# deduplication, chunking, or indexing stage is part of this run.
+_inherit: mbzuai_combined_multimodal_processing.yaml
+
+project_name: "mbzuai_pdf_media_completion"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    source_run_dirs:
+      - "runs/mbzuai_semantic_captioning/mbzuai-semantic-captioning-20260820-v2"
+    allowed_source_projects:
+      - "mbzuai_semantic_captioning"
+    required_source_stage_ids:
+      - "annotate_media"
+    require_source_audit_ok: true
+    minimum_source_count: 1
+
+  pdf_media_completion:
+    conversion_stage_id: "convert_documents"
+    conversion_run_dirs:
+      - "runs/mbzuai_crawl_processing/mbzuai-crawl-processing-20260820-v2"
+      - "runs/mbzuai_subdomains_processing/mbzuai-subdomains-processing-20260820-v2"
+    raw_mapping_files:
+      - "runs/mbzuai_main/mbzuai-crawl-artifacts-20260819-v1/mappings.json"
+      - "runs/mbzuai_subdomains/mbzuai-subdomains-artifacts-20260820-v2/mappings.json"
+    include_unused_fallback_layouts: true
+    pdf_crop_scale: 2.0
+    pdf_crop_padding_points: 3.0
+    min_pdf_bbox_area_ratio: 0.003
+    max_pdf_bbox_area_ratio: 0.90
+    min_pdf_crop_width: 96
+    min_pdf_crop_height: 72
+    min_pdf_crop_area: 12000
+    max_pdf_crop_aspect_ratio: 12.0
+    max_image_pixels: 50000000
+    min_visual_stddev: 2.0
+    pdf_perceptual_duplicate_distance: 2
+    # The five short map/governance PDFs need the complete page in addition to
+    # Docling regions, because their meaning depends on the whole layout.
+    fallback_full_page_max_pages: 3
+    fallback_full_page_only_when_unrepresented: false
+    minimum_pdf_documents: 51
+    maximum_failed_documents: 0
+
+  media_semantics:
+    mode: "gemini"
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    enable_escalation: true
+    escalation_confidence_threshold: 0.72
+    escalation_image_kinds:
+      - "diagram"
+      - "chart"
+      - "infographic"
+      - "map"
+      - "document_fragment"
+    prompt_revision: "mbzuai-media-semantics-v2-section-context"
+    reuse_input_annotations: true
+    context_before_blocks: 1
+    context_after_blocks: 2
+    context_max_chars: 1200
+    context_following_heading_max_distance: 4
+    context_html_fallback: true
+    max_reference_contexts_per_annotation: 12
+    concurrency: 4
+    request_timeout_sec: 90
+    retry_attempts: 3
+    retry_backoff_sec: 1.0
+    retry_max_delay_sec: 12.0
+    cache_flush_every: 10
+    max_output_tokens: 1200
+    image_max_side: 1600
+    image_max_pixels: 1800000
+    max_images: 0
+    require_complete: true
+    minimum_completion_ratio: 1.0
+
+  media_ocr:
+    provider: "gradio_space"
+    endpoint: "https://baidu-unlimited-ocr.hf.space"
+    # Optional authenticated ZeroGPU quota; the token value is never persisted.
+    auth_token_env: "HF_TOKEN"
+    upload_path: "/gradio_api/upload"
+    call_path: "/gradio_api/call/v2/run_ocr"
+    poll_path: "/gradio_api/call/run_ocr/{event_id}"
+    allow_public_demo_provider: true
+    model: "baidu/Unlimited-OCR"
+    model_revision: "07dea832e22aefee32ad281d4b80551282e1c168"
+    provider_revision: "fece8f832e1c8691b375da69f810191c67840a3d"
+    prompt: "document parsing."
+    prompt_revision: "unlimited-ocr-document-v1"
+    primary_mode: "gundam"
+    retry_mode: "base"
+    retry_low_quality_with_base: true
+    scope: "all"
+    needs_ocr_only: true
+    concurrency: 2
+    request_timeout_sec: 900
+    retry_attempts: 3
+    retry_backoff_sec: 2.0
+    retry_max_delay_sec: 20.0
+    cache_flush_every: 5
+    max_images: 0
+    minimum_alphanumeric_chars: 2
+    maximum_single_character_token_ratio: 0.62
+    minimum_unique_token_ratio: 0.14
+    maximum_repeated_line_ratio: 0.55
+    minimum_quality_score: 0.55
+    minimum_usable_text_ratio: 0.0
+    maximum_rejected_ratio: 1.0
+    require_complete: true
+
+stages:
+  - id: merge_captioned_corpus
+    type: formatter
+    plugin: corpus_merge
+  - id: complete_pdf_media
+    type: formatter
+    plugin: pdf_media_completion
+  - id: annotate_recovered_media
+    type: formatter
+    plugin: media_semantics
+  - id: enrich_exact_ocr
+    type: formatter
+    plugin: media_ocr

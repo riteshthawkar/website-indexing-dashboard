@@ -1,0 +1,13 @@
+# Fresh candidate created after the v1 run correctly stopped on 17 transient
+# Gemini transport failures. The partial v1 semantic manifest is immutable and
+# SHA-pinned; completed occurrences are imported, while the corrected retry
+# classifier sends only unresolved hashes back to Gemini.
+_inherit: mbzuai_pdf_media_completion.yaml
+
+project_name: "mbzuai_pdf_media_completion_v2"
+
+formatter:
+  media_semantics:
+    reuse_annotation_manifest_files:
+      - path: "runs/mbzuai_pdf_media_completion/mbzuai-pdf-media-completion-20260821-v1/stage_outputs/annotate_recovered_media/semantically_annotated_document_media.json"
+        sha256: "5820bd2efeeda43b247ec081d8d5b9c247bb29ef32669f3fe43b1757b9838bc2"
