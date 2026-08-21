@@ -1,0 +1,72 @@
+# Representation-neutral handoff after multimodal OCR. This run materializes
+# the audited text/media corpus, removes only proven duplicate Markdown, keeps
+# duplicate-source media lineage, and seals an inventory for representation
+# design. It contains no chunker, embedder, uploader, or indexing stage.
+
+project_name: "mbzuai_corpus_preparation"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+quality:
+  dedup_threshold: 0.85
+  dedup_num_perm: 128
+  dedup_ngram_size: 5
+  preserve_duplicate_source_media: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 2
+    # Ordering is intentional: the OCR overlay wins media-sidecar collisions,
+    # while the completed captioned corpus supplies Markdown and image files.
+    source_runs:
+      - role: "ocr_overlay"
+        run_dir: "runs/mbzuai_hybrid_ocr/mbzuai-hybrid-ocr-20260821-v4"
+        project_name: "mbzuai_hybrid_ocr"
+        required_stage_ids:
+          - "enrich_exact_ocr"
+        evidence:
+          pipeline_state_sha256: "678a761ddf9194051958bf62075c7eec844f64ced0058cda55c84e6634949602"
+          artifact_catalog_sha256: "6a08c17bdaf73ecc7f3887c23344df2919ba7b7726b36dd83d93f2dacb6f13bb"
+          run_audit_sha256: "61dc0eca1bf25dbc3680c238aecd71c73b29b912cdd8d0e178b5d7ebf43c5d96"
+          resolved_config_sha256: "ad3f7f88b76744843e1cafd9302af7f4d2bddc2216e3c557b52a3a4a1b58cb11"
+      - role: "captioned_corpus"
+        run_dir: "runs/mbzuai_pdf_media_completion_v2/mbzuai-pdf-media-completion-20260821-v2"
+        project_name: "mbzuai_pdf_media_completion_v2"
+        required_stage_ids:
+          - "merge_captioned_corpus"
+          - "complete_pdf_media"
+          - "annotate_recovered_media"
+        # The source failed only in the later public-Space OCR attempt. Its
+        # required captioned corpus prefix is complete and independently clean.
+        allow_failed_after_required_stages: true
+        evidence:
+          pipeline_state_sha256: "6dc6812aed32e3dca4c08565b32a20bc724140da1e5052f9488e7438e22a5fb4"
+          artifact_catalog_sha256: "3b0f7068ac30a2c2c3a9db807671944893a4ade23ef70791ceb01483029182d2"
+          run_audit_sha256: "a3f874261083e92b05c968068e9e6027d46c98bc873b5c73319750cb626246bf"
+          resolved_config_sha256: "3c187616222bc5349dd0ba67b6348beeea05df7c1e55c1db95f7890355385390"
+
+  corpus_preparation:
+    minimum_document_count: 2300
+    minimum_unique_media_assets: 4283
+    maximum_missing_media_files: 0
+    minimum_semantically_annotated_visuals: 4283
+    minimum_ocr_adjudicated_visuals: 508
+
+stages:
+  - id: merge_corpora
+    type: formatter
+    plugin: corpus_merge
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: prepare_corpus_boundary
+    type: formatter
+    plugin: corpus_preparation

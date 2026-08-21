@@ -11,11 +11,12 @@ import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, FrozenSet, List, Optional, Tuple
+from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from pipeline.core.base import QualityGate, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
+from pipeline.core.media import build_media_manifest, load_media_manifest_items
 from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,81 @@ def _remove_artifact_local_path(local_path: str) -> None:
         except OSError:
             break
         parent = parent.parent
+
+
+def _rebind_markdown_paths(
+    value: Mapping[str, Any], loser_to_winner_path: Mapping[str, str]
+) -> Dict[str, Any]:
+    rebound = dict(value)
+    for key in (
+        "md_path",
+        "context_source_path",
+        "source_document_path",
+        "source_markdown_path",
+        "selected_markdown_path",
+    ):
+        resolved = _resolved_path_str(rebound.get(key))
+        if resolved in loser_to_winner_path:
+            rebound[key] = loser_to_winner_path[resolved]
+    return rebound
+
+
+def _rebind_media_sidecars(
+    previous_outputs: Mapping[str, Any],
+    loser_to_winner_path: Mapping[str, str],
+) -> Dict[str, Dict[str, int]]:
+    """Preserve duplicate-source media while rebinding removed Markdown paths."""
+
+    evidence: Dict[str, Dict[str, int]] = {}
+    for output_key in ("page_media_file", "page_images_file", "page_videos_file"):
+        path_str = previous_outputs.get(output_key)
+        if not path_str:
+            continue
+        payload = load_json_safe(path_str, {}) or {}
+        if not isinstance(payload, dict):
+            raise ValueError(f"{output_key} must contain a page-to-media mapping")
+        rebound_count = 0
+        output: Dict[str, List[Dict[str, Any]]] = {}
+        for source_url, values in sorted(payload.items(), key=lambda item: str(item[0])):
+            if not isinstance(values, list):
+                continue
+            rebound_values: List[Dict[str, Any]] = []
+            for raw in values:
+                if not isinstance(raw, dict):
+                    continue
+                rebound = _rebind_markdown_paths(raw, loser_to_winner_path)
+                rebound_count += int(rebound != raw)
+                rebound_values.append(rebound)
+            output[str(source_url)] = rebound_values
+        atomic_write_json(Path(str(path_str)), output)
+        evidence[output_key] = {
+            "page_count": len(output),
+            "item_count": sum(len(values) for values in output.values()),
+            "rebound_item_count": rebound_count,
+        }
+
+    for output_key in ("extracted_images_index_file", "media_manifest_file"):
+        path_str = previous_outputs.get(output_key)
+        if not path_str:
+            continue
+        payload = load_json_safe(path_str, {}) or {}
+        items = load_media_manifest_items(payload)
+        rebound_items = [
+            _rebind_markdown_paths(item, loser_to_winner_path) for item in items
+        ]
+        rebound_count = sum(
+            int(left != right) for left, right in zip(items, rebound_items)
+        )
+        kind = str(payload.get("kind") or output_key) if isinstance(payload, dict) else output_key
+        atomic_write_json(
+            Path(str(path_str)),
+            build_media_manifest(rebound_items, kind=kind),
+        )
+        evidence[output_key] = {
+            "item_count": len(rebound_items),
+            "rebound_item_count": rebound_count,
+        }
+    return evidence
 
 
 def _normalize_url(value: Any) -> str:
@@ -482,6 +558,9 @@ class DedupFilter(QualityGate):
         threshold = config.get("dedup_threshold", 0.85)
         num_perm = config.get("dedup_num_perm", 128)
         ngram_size = config.get("dedup_ngram_size", 5)
+        preserve_duplicate_source_media = bool(
+            config.get("preserve_duplicate_source_media", False)
+        )
 
         threshold = float(threshold)
         num_perm = int(num_perm)
@@ -684,8 +763,34 @@ class DedupFilter(QualityGate):
         decisions.sort(key=lambda item: (item["winner"], item["loser"]))
         duplicates = sorted(item["loser"] for item in decisions)
         loser_paths = {_resolved_path_str(path) for path in duplicates}
+        loser_to_winner_path = {
+            _resolved_path_str(item["loser"]): _resolved_path_str(item["winner"])
+            for item in decisions
+        }
         kept = len(files) - len(duplicates)
         manifest_path = ctx.stage_work_dir / "dedup_manifest.json"
+        alias_path = ctx.stage_work_dir / "duplicate_source_aliases.json"
+        alias_records = [
+            {
+                "winner_markdown_path": _resolved_path_str(item["winner"]),
+                "loser_markdown_path": _resolved_path_str(item["loser"]),
+                "winner_source_url": str(item.get("winner_source_url") or ""),
+                "loser_source_url": str(item.get("loser_source_url") or ""),
+                "reason": str(item.get("reason") or ""),
+                "exact_similarity": item.get("exact_similarity"),
+            }
+            for item in decisions
+        ]
+        atomic_write_json(
+            alias_path,
+            {
+                "schema_version": 1,
+                "kind": "duplicate_source_aliases",
+                "preserves_source_occurrence_evidence": preserve_duplicate_source_media,
+                "alias_count": len(alias_records),
+                "aliases": alias_records,
+            },
+        )
         for decision in decisions:
             decision["planned_removed_artifact_ids"] = sorted(
                 artifact_ids_by_path.get(_resolved_path_str(decision["loser"]), [])
@@ -696,7 +801,9 @@ class DedupFilter(QualityGate):
             for artifact_id in decision["planned_removed_artifact_ids"]
         }
         dependent_plan_records: List[Tuple[Any, str]] = []
+        dependent_rebind_records: List[Tuple[Any, str, str]] = []
         dependent_plan: List[Dict[str, Any]] = []
+        dependent_rebind_plan: List[Dict[str, Any]] = []
         if ctx.artifact_catalog:
             for record in list(ctx.artifact_catalog.records):
                 if record.artifact_id in planned_markdown_artifact_ids:
@@ -710,6 +817,24 @@ class DedupFilter(QualityGate):
                 referenced_markdown = _artifact_markdown_reference(record)
                 if referenced_markdown not in loser_paths:
                     continue
+                if (
+                    preserve_duplicate_source_media
+                    and record.artifact_type == "extracted_image"
+                ):
+                    winner_markdown = loser_to_winner_path[referenced_markdown]
+                    dependent_rebind_records.append(
+                        (record, referenced_markdown, winner_markdown)
+                    )
+                    dependent_rebind_plan.append(
+                        {
+                            "artifact_id": record.artifact_id,
+                            "artifact_type": record.artifact_type,
+                            "local_path": str(record.local_path or ""),
+                            "referenced_markdown": referenced_markdown,
+                            "winner_markdown": winner_markdown,
+                        }
+                    )
+                    continue
                 dependent_plan_records.append((record, referenced_markdown))
                 dependent_plan.append(
                     {
@@ -720,6 +845,9 @@ class DedupFilter(QualityGate):
                     }
                 )
         dependent_plan.sort(key=lambda item: (item["artifact_id"], item["local_path"]))
+        dependent_rebind_plan.sort(
+            key=lambda item: (item["artifact_id"], item["local_path"])
+        )
         manifest_payload = {
             "schema_version": 1,
             "application_status": "planned",
@@ -734,8 +862,13 @@ class DedupFilter(QualityGate):
             "removed_count": len(duplicates),
             "planned_removed_markdown_paths": duplicates,
             "planned_dependent_artifacts": dependent_plan,
+            "preserve_duplicate_source_media": preserve_duplicate_source_media,
+            "planned_rebound_media_artifacts": dependent_rebind_plan,
+            "duplicate_source_aliases_file": str(alias_path),
             "removed_artifact_ids": [],
             "dependent_artifacts_removed": [],
+            "media_artifacts_rebound": [],
+            "media_sidecar_rebind_evidence": {},
             "decisions": decisions,
         }
         # Persist the complete decision plan before the first destructive
@@ -766,6 +899,43 @@ class DedupFilter(QualityGate):
                 }
             )
 
+        rebound_artifacts: List[Any] = []
+        media_artifact_rebindings: List[Dict[str, Any]] = []
+        for record, referenced_markdown, winner_markdown in dependent_rebind_records:
+            metadata = _rebind_markdown_paths(
+                dict(record.metadata or {}), loser_to_winner_path
+            )
+            metadata["deduplicated_from_markdown_path"] = referenced_markdown
+            metadata["dedup_winner_markdown_path"] = winner_markdown
+            rebound_artifacts.append(
+                ctx.make_artifact(
+                    record.local_path,
+                    artifact_type=record.artifact_type,
+                    role=record.role,
+                    metadata=metadata,
+                    source_artifact_ids=[
+                        record.artifact_id,
+                        *list(record.source_artifact_ids or []),
+                    ],
+                )
+            )
+            removed_artifact_ids.append(record.artifact_id)
+            media_artifact_rebindings.append(
+                {
+                    "artifact_id": record.artifact_id,
+                    "local_path": str(record.local_path or ""),
+                    "referenced_markdown": referenced_markdown,
+                    "winner_markdown": winner_markdown,
+                }
+            )
+
+        media_sidecar_rebind_evidence: Dict[str, Dict[str, int]] = {}
+        if preserve_duplicate_source_media:
+            media_sidecar_rebind_evidence = _rebind_media_sidecars(
+                ctx.previous_outputs,
+                loser_to_winner_path,
+            )
+
         removed_artifact_ids = sorted(set(removed_artifact_ids))
         manifest_payload.update(
             {
@@ -775,6 +945,11 @@ class DedupFilter(QualityGate):
                     dependent_removals,
                     key=lambda item: (item["artifact_id"], item["local_path"]),
                 ),
+                "media_artifacts_rebound": sorted(
+                    media_artifact_rebindings,
+                    key=lambda item: (item["artifact_id"], item["local_path"]),
+                ),
+                "media_sidecar_rebind_evidence": media_sidecar_rebind_evidence,
             }
         )
         atomic_write_json(manifest_path, manifest_payload)
@@ -805,6 +980,7 @@ class DedupFilter(QualityGate):
             "filtered_count": len(duplicates),
             "filtered_items": duplicates,
             "dedup_manifest_file": str(manifest_path),
+            "duplicate_source_aliases_file": str(alias_path),
         }
         artifacts = [
             ctx.make_artifact(
@@ -817,7 +993,14 @@ class DedupFilter(QualityGate):
                     "removed_count": len(duplicates),
                     "threshold": threshold,
                 },
-            )
+            ),
+            ctx.make_artifact(
+                alias_path,
+                artifact_type="duplicate_source_aliases",
+                role="dedup_lineage",
+                metadata={"alias_count": len(alias_records)},
+            ),
+            *rebound_artifacts,
         ]
         if final_mapping:
             final_mapping = dict(sorted(final_mapping.items()))
@@ -840,21 +1023,39 @@ class DedupFilter(QualityGate):
             root_mapping = ctx.work_dir / "url_to_md_mapping.json"
             atomic_write_json(root_mapping, final_mapping)
 
-            valid_urls = set(final_mapping)
-            for output_key in ("page_media_file", "page_images_file", "page_videos_file"):
-                path_str = ctx.previous_outputs.get(output_key)
-                if not path_str:
-                    continue
-                payload = load_json_safe(path_str, {}) or {}
-                if not isinstance(payload, dict):
-                    continue
-                pruned = {
-                    str(url): items
-                    for url, items in sorted(payload.items(), key=lambda item: str(item[0]))
-                    if str(url) in valid_urls
-                }
-                atomic_write_json(Path(path_str), pruned)
-                outputs[output_key] = str(path_str)
+            if not preserve_duplicate_source_media:
+                valid_urls = set(final_mapping)
+                for output_key in (
+                    "page_media_file",
+                    "page_images_file",
+                    "page_videos_file",
+                ):
+                    path_str = ctx.previous_outputs.get(output_key)
+                    if not path_str:
+                        continue
+                    payload = load_json_safe(path_str, {}) or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    pruned = {
+                        str(url): items
+                        for url, items in sorted(
+                            payload.items(), key=lambda item: str(item[0])
+                        )
+                        if str(url) in valid_urls
+                    }
+                    atomic_write_json(Path(path_str), pruned)
+                    outputs[output_key] = str(path_str)
+            else:
+                for output_key in (
+                    "page_media_file",
+                    "page_images_file",
+                    "page_videos_file",
+                    "extracted_images_index_file",
+                    "media_manifest_file",
+                ):
+                    path_str = ctx.previous_outputs.get(output_key)
+                    if path_str:
+                        outputs[output_key] = str(path_str)
 
         logger.info("Dedup filter: kept=%d removed=%d", kept, len(duplicates))
 
@@ -864,6 +1065,7 @@ class DedupFilter(QualityGate):
                 "kept": kept,
                 "duplicates_removed": len(duplicates),
                 "dependent_artifacts_removed": dependent_removed,
+                "media_artifacts_rebound": len(media_artifact_rebindings),
                 "lsh_candidate_pairs": len(candidate_pairs),
                 "exact_pairs_verified": exact_pairs_verified,
             },

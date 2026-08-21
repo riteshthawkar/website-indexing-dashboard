@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import shutil
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
@@ -41,6 +42,7 @@ _PATH_METADATA_KEYS = {
     "source_document_path",
     "source_markdown_path",
 }
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _now_iso() -> str:
@@ -75,10 +77,14 @@ def _resolve_run_dir(value: Any) -> Path:
     return path.resolve()
 
 
-def _flatten_completed_outputs(state: PipelineState) -> Dict[str, Any]:
+def _flatten_completed_outputs(
+    state: PipelineState, *, maximum_stage_index: int | None = None
+) -> Dict[str, Any]:
     outputs: Dict[str, Any] = {}
     stage_outputs: Dict[str, Dict[str, Any]] = {}
     for index, stage in enumerate(state.stages):
+        if maximum_stage_index is not None and index > maximum_stage_index:
+            continue
         if stage.status != "completed":
             continue
         outputs.update(stage.outputs or {})
@@ -94,14 +100,23 @@ def _load_source_descriptor(
     required_stage_ids: Sequence[str],
     require_audit_ok: bool,
     allowed_projects: set[str],
+    allow_failed_after_required_stages: bool = False,
+    expected_evidence: Mapping[str, Any] | None = None,
+    source_role: str = "corpus",
 ) -> Dict[str, Any]:
     state = load_state(run_dir)
     if state is None:
         raise ValueError(f"Source run has no pipeline_state.json: {run_dir}")
     if state.status not in {"paused", "completed"}:
-        raise ValueError(
-            f"Source run {state.run_id!r} must be paused or completed, found {state.status!r}"
-        )
+        if state.status != "failed" or not allow_failed_after_required_stages:
+            raise ValueError(
+                f"Source run {state.run_id!r} must be paused or completed, "
+                f"found {state.status!r}"
+            )
+        if not required_stage_ids:
+            raise ValueError(
+                f"Failed source run {state.run_id!r} requires an explicit completed-stage cutoff"
+            )
     if allowed_projects and state.project_name not in allowed_projects:
         raise ValueError(
             f"Source run {state.run_id!r} project {state.project_name!r} is not allowlisted"
@@ -114,6 +129,40 @@ def _load_source_descriptor(
     missing = sorted(set(required_stage_ids) - completed_ids)
     if missing:
         raise ValueError(f"Source run {state.run_id!r} is missing completed stages: {missing}")
+    required_id_set = set(required_stage_ids)
+    required_indices = [
+        index
+        for index, stage in enumerate(state.stages)
+        if str(stage.stage_id or "") in required_id_set
+    ]
+    failed_stages = [
+        {
+            "index": index,
+            "stage_id": str(stage.stage_id or stage.name or index),
+            "error": " ".join(str(stage.error_message or "").split())[:600],
+        }
+        for index, stage in enumerate(state.stages)
+        if stage.status == "failed"
+    ]
+    completed_prefix_cutoff: int | None = None
+    allowed_artifact_producer_stages: List[str] | None = None
+    if state.status == "failed":
+        if not required_indices or any(
+            item["index"] <= max(required_indices) for item in failed_stages
+        ):
+            raise ValueError(
+                f"Source run {state.run_id!r} failed at or before its required-stage cutoff"
+            )
+        completed_prefix_cutoff = max(required_indices)
+        allowed_artifact_producer_stages = sorted(
+            {
+                str(value)
+                for index, stage in enumerate(state.stages)
+                if index <= completed_prefix_cutoff and stage.status == "completed"
+                for value in (stage.stage_id, stage.name)
+                if str(value or "")
+            }
+        )
 
     audit_path = run_dir / "run_audit.json"
     audit = load_json_safe(audit_path, {}) or {}
@@ -122,20 +171,43 @@ def _load_source_descriptor(
 
     catalog_path = run_dir / "artifact_catalog.json"
     snapshot_path = run_dir / "resolved_config.json"
+    evidence = {
+        "pipeline_state_sha256": sha256_file(run_dir / "pipeline_state.json"),
+        "artifact_catalog_sha256": sha256_file(catalog_path),
+        "run_audit_sha256": sha256_file(audit_path) if audit_path.is_file() else "",
+        "resolved_config_sha256": sha256_file(snapshot_path) if snapshot_path.is_file() else "",
+    }
+    for key, expected in (expected_evidence or {}).items():
+        expected_digest = str(expected or "").strip().lower()
+        if key not in evidence:
+            raise ValueError(f"Unknown source evidence key for {state.run_id!r}: {key}")
+        if not _SHA256_RE.fullmatch(expected_digest):
+            raise ValueError(f"Invalid expected source evidence digest for {state.run_id!r}: {key}")
+        if evidence[key] != expected_digest:
+            raise ValueError(
+                f"Source evidence mismatch for {state.run_id!r} {key}: "
+                f"expected {expected_digest}, got {evidence[key]}"
+            )
     return {
         "run_dir": run_dir,
         "run_id": state.run_id,
         "project_name": state.project_name,
         "state": state,
-        "outputs": _flatten_completed_outputs(state),
+        "outputs": _flatten_completed_outputs(
+            state, maximum_stage_index=completed_prefix_cutoff
+        ),
         "catalog": load_artifact_catalog(run_dir),
         "audit": audit,
-        "evidence": {
-            "pipeline_state_sha256": sha256_file(run_dir / "pipeline_state.json"),
-            "artifact_catalog_sha256": sha256_file(catalog_path),
-            "run_audit_sha256": sha256_file(audit_path) if audit_path.is_file() else "",
-            "resolved_config_sha256": sha256_file(snapshot_path) if snapshot_path.is_file() else "",
-        },
+        "evidence": evidence,
+        "source_role": str(source_role or "corpus"),
+        "source_status": state.status,
+        "required_stage_ids": list(required_stage_ids),
+        "failed_stages": failed_stages,
+        "failed_source_explicitly_allowed": bool(
+            state.status == "failed" and allow_failed_after_required_stages
+        ),
+        "completed_prefix_cutoff": completed_prefix_cutoff,
+        "allowed_artifact_producer_stages": allowed_artifact_producer_stages,
     }
 
 
@@ -553,12 +625,59 @@ class CorpusMergeFormatter(FormatterStage):
         if not isinstance(merge_config, dict):
             return ["formatter.corpus_merge must be a mapping"]
         source_dirs = merge_config.get("source_run_dirs") or []
-        if not bool(merge_config.get("use_current_artifacts", True)) and not source_dirs:
+        source_specs = merge_config.get("source_runs")
+        if source_specs is not None and not isinstance(source_specs, list):
+            return ["formatter.corpus_merge.source_runs must be a list"]
+        if source_specs and source_dirs:
             return [
-                "formatter.corpus_merge.source_run_dirs is required when use_current_artifacts is false"
+                "formatter.corpus_merge must use source_runs or source_run_dirs, not both"
+            ]
+        if not bool(merge_config.get("use_current_artifacts", True)) and not (
+            source_dirs or source_specs
+        ):
+            return [
+                "formatter.corpus_merge.source_runs or source_run_dirs is required when "
+                "use_current_artifacts is false"
             ]
         if not isinstance(source_dirs, list):
             return ["formatter.corpus_merge.source_run_dirs must be a list"]
+        errors: List[str] = []
+        for index, raw in enumerate(source_specs or []):
+            if not isinstance(raw, dict):
+                errors.append(f"formatter.corpus_merge.source_runs[{index}] must be a mapping")
+                continue
+            if not str(raw.get("run_dir") or "").strip():
+                errors.append(
+                    f"formatter.corpus_merge.source_runs[{index}].run_dir is required"
+                )
+            stage_ids = raw.get("required_stage_ids")
+            if not isinstance(stage_ids, list) or not all(
+                str(value).strip() for value in stage_ids
+            ):
+                errors.append(
+                    f"formatter.corpus_merge.source_runs[{index}].required_stage_ids "
+                    "must be a non-empty list"
+                )
+            evidence = raw.get("evidence")
+            if evidence is not None:
+                if not isinstance(evidence, dict):
+                    errors.append(
+                        f"formatter.corpus_merge.source_runs[{index}].evidence must be a mapping"
+                    )
+                else:
+                    for key, value in evidence.items():
+                        if key not in {
+                            "pipeline_state_sha256",
+                            "artifact_catalog_sha256",
+                            "run_audit_sha256",
+                            "resolved_config_sha256",
+                        } or not _SHA256_RE.fullmatch(str(value or "").lower()):
+                            errors.append(
+                                f"formatter.corpus_merge.source_runs[{index}].evidence.{key} "
+                                "must be a supported SHA-256 digest"
+                            )
+        if errors:
+            return errors
         return []
 
     async def execute(self, ctx: StageContext) -> StageResult:
@@ -575,17 +694,47 @@ class CorpusMergeFormatter(FormatterStage):
         seen_dirs: set[Path] = set()
 
         try:
-            for raw_path in config.get("source_run_dirs") or []:
-                run_dir = _resolve_run_dir(raw_path)
+            source_specs = config.get("source_runs")
+            if source_specs is None:
+                source_specs = [
+                    {
+                        "run_dir": raw_path,
+                        "required_stage_ids": required_stage_ids,
+                        "allowed_projects": sorted(allowed_projects),
+                    }
+                    for raw_path in config.get("source_run_dirs") or []
+                ]
+            for raw_spec in source_specs:
+                if not isinstance(raw_spec, Mapping):
+                    raise ValueError("Every corpus source specification must be a mapping")
+                run_dir = _resolve_run_dir(raw_spec.get("run_dir"))
                 if run_dir in seen_dirs:
                     continue
                 seen_dirs.add(run_dir)
+                spec_projects = {
+                    str(value)
+                    for value in raw_spec.get("allowed_projects") or []
+                    if str(value)
+                }
+                expected_project = str(raw_spec.get("project_name") or "").strip()
+                if expected_project:
+                    spec_projects.add(expected_project)
                 sources.append(
                     _load_source_descriptor(
                         run_dir,
-                        required_stage_ids=required_stage_ids,
+                        required_stage_ids=[
+                            str(value) for value in raw_spec.get("required_stage_ids") or []
+                        ]
+                        or required_stage_ids,
                         require_audit_ok=require_audit_ok,
-                        allowed_projects=allowed_projects,
+                        allowed_projects=spec_projects or allowed_projects,
+                        allow_failed_after_required_stages=bool(
+                            raw_spec.get("allow_failed_after_required_stages", False)
+                        ),
+                        expected_evidence=raw_spec.get("evidence")
+                        if isinstance(raw_spec.get("evidence"), Mapping)
+                        else None,
+                        source_role=str(raw_spec.get("role") or "corpus"),
                     )
                 )
 
@@ -611,10 +760,23 @@ class CorpusMergeFormatter(FormatterStage):
             selected_records: List[Tuple[Dict[str, Any], ArtifactRecord]] = []
             for source in sources:
                 catalog = source.get("catalog")
+                raw_allowed_producers = source.get(
+                    "allowed_artifact_producer_stages"
+                )
+                allowed_producers = (
+                    set(raw_allowed_producers)
+                    if raw_allowed_producers is not None
+                    else None
+                )
                 for record in sorted(
                     list(getattr(catalog, "records", []) or []),
                     key=lambda item: (item.artifact_type, item.artifact_id),
                 ):
+                    if (
+                        allowed_producers is not None
+                        and record.producer_stage not in allowed_producers
+                    ):
+                        continue
                     if record.artifact_type not in _MATERIALIZED_ARTIFACT_TYPES or not record.local_path:
                         continue
                     source_path = Path(record.local_path).resolve()
@@ -772,6 +934,19 @@ class CorpusMergeFormatter(FormatterStage):
                         "project_name": source["project_name"],
                         "run_dir": str(source["run_dir"]),
                         "audit_ok": bool((source.get("audit") or {}).get("ok", False)),
+                        "source_role": source.get("source_role") or "corpus",
+                        "source_status": source.get("source_status") or "",
+                        "required_stage_ids": source.get("required_stage_ids") or [],
+                        "failed_source_explicitly_allowed": bool(
+                            source.get("failed_source_explicitly_allowed", False)
+                        ),
+                        "excluded_failed_stages": source.get("failed_stages") or [],
+                        "completed_prefix_cutoff": source.get(
+                            "completed_prefix_cutoff"
+                        ),
+                        "allowed_artifact_producer_stages": source.get(
+                            "allowed_artifact_producer_stages"
+                        ),
                         "evidence": source.get("evidence") or {},
                     }
                     for source in sources
