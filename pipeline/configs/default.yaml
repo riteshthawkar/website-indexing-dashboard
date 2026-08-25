@@ -418,6 +418,8 @@ formatter:
 graph:
   store_backend: "local_json"
   require_neo4j_upload: false
+  community_detection_seed: 1729
+  community_detection_iterations: 2
   community_summary_model: "gemini-2.5-flash"
   community_summary_min_coverage_ratio: 0.90
   community_summary_min_characters: 40

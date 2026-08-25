@@ -38,6 +38,9 @@ crawler:
   minimum_sitemap_seed_count: 2100
 
 graph:
+  # Leiden must produce stable memberships and graph hashes across clean runs.
+  community_detection_seed: 1729
+  community_detection_iterations: 2
   # The final graph is uploaded only when every detected community has a
   # substantive summary and no provider request failed.
   community_summary_min_coverage_ratio: 1.0

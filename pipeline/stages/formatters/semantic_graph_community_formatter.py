@@ -29,6 +29,31 @@ class SemanticGraphCommunityFormatter(FormatterStage):
     name = "semantic_graph_community"
     description = "Clusters entities into communities using the Leiden algorithm."
 
+    async def validate_config(self, config: Dict[str, Any]) -> List[str]:
+        graph_config = config.get("graph", {})
+        if not isinstance(graph_config, dict):
+            return ["graph must be a mapping"]
+        errors: List[str] = []
+        try:
+            seed = int(graph_config.get("community_detection_seed", 1729))
+            if not 0 <= seed <= 2**31 - 1:
+                errors.append(
+                    "graph.community_detection_seed must be between 0 and 2147483647"
+                )
+        except (TypeError, ValueError):
+            errors.append("graph.community_detection_seed must be an integer")
+        try:
+            iterations = int(
+                graph_config.get("community_detection_iterations", 2)
+            )
+            if not 1 <= iterations <= 100:
+                errors.append(
+                    "graph.community_detection_iterations must be between 1 and 100"
+                )
+        except (TypeError, ValueError):
+            errors.append("graph.community_detection_iterations must be an integer")
+        return errors
+
     async def execute(self, ctx: StageContext) -> StageResult:
         graph_file = ctx.previous_outputs.get("knowledge_graph_file")
         if not graph_file:
@@ -82,10 +107,19 @@ class SemanticGraphCommunityFormatter(FormatterStage):
 
         g.add_edges(ig_edges)
 
-        # Community Detection (Leiden)
-        # Using ModularityVertexPartition for simplicity; CPMVertexPartition could be used for resolution control
+        graph_config = ctx.graph_config
+        seed = int(graph_config.get("community_detection_seed", 1729))
+        iterations = int(graph_config.get("community_detection_iterations", 2))
+
+        # Seeded Leiden clustering is required for reproducible graph bytes,
+        # request budgets, and release hashes.
         try:
-            partition = la.find_partition(g, la.ModularityVertexPartition)
+            partition = la.find_partition(
+                g,
+                la.ModularityVertexPartition,
+                n_iterations=iterations,
+                seed=seed,
+            )
         except Exception as e:
             logger.error(f"Leiden community detection failed: {e}")
             return StageResult.failure(f"Community detection failed: {e}")
@@ -186,6 +220,9 @@ class SemanticGraphCommunityFormatter(FormatterStage):
             },
             metrics={
                 "detected_communities": valid_communities,
+                "community_entities": len(entity_ids),
+                "community_detection_seed": seed,
+                "community_detection_iterations": iterations,
             },
             artifacts=artifacts
         )
