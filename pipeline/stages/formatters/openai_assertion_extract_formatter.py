@@ -14,6 +14,7 @@ from pipeline.core.assertions import (
     unique_strings,
 )
 from pipeline.core.base import FormatterStage, StageContext, StageResult
+from pipeline.core.incremental_json_cache import IncrementalJsonObjectCache
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.openai_client import json_completion, make_openai_client
 from pipeline.core.registry import register_stage
@@ -380,9 +381,8 @@ class OpenAIAssertionExtractFormatter(FormatterStage):
         use_cache = bool(cfg.get("extract_use_cache", True))
 
         cache_file = ctx.stage_work_dir / "openai_assertion_extract_cache.json"
-        cache_payload = load_json_safe(cache_file, {}) or {}
-        if not isinstance(cache_payload, dict):
-            cache_payload = {}
+        incremental_cache = IncrementalJsonObjectCache(cache_file)
+        cache_payload = incremental_cache.payload
 
         results: List[Dict[str, Any]] = []
         pending: List[Dict[str, Any]] = []
@@ -398,7 +398,9 @@ class OpenAIAssertionExtractFormatter(FormatterStage):
                 pending.append(slice_record)
 
         if pending:
-            with ThreadPoolExecutor(max_workers=concurrency) as pool:
+            pool = ThreadPoolExecutor(max_workers=concurrency)
+            futures = {}
+            try:
                 futures = {
                     pool.submit(
                         _extract_one,
@@ -418,9 +420,15 @@ class OpenAIAssertionExtractFormatter(FormatterStage):
                     slice_record = futures[future]
                     result = future.result()
                     slice_id = clean_text(slice_record.get("id"))
-                    cache_payload[slice_id] = result
-                    atomic_write_json(cache_file, cache_payload)
+                    incremental_cache.put(slice_id, result)
                     results.append(result)
+            except BaseException:
+                for future in futures:
+                    future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                pool.shutdown(wait=True)
 
         results.sort(key=lambda item: clean_text(item.get("slice_id")))
         candidate_entities: List[Dict[str, Any]] = []
@@ -436,7 +444,7 @@ class OpenAIAssertionExtractFormatter(FormatterStage):
         entities_file = ctx.stage_work_dir / "candidate_entities.json"
         assertions_file = ctx.stage_work_dir / "candidate_assertions.json"
         flags_file = ctx.stage_work_dir / "assertion_extract_quality_flags.json"
-        atomic_write_json(cache_file, cache_payload)
+        incremental_cache.compact()
         atomic_write_json(results_file, results)
         atomic_write_json(entities_file, candidate_entities)
         atomic_write_json(assertions_file, candidate_assertions)
