@@ -430,6 +430,7 @@ graph:
   community_summary_max_provider_requests: 1000
   community_summary_max_context_characters: 16000
   community_summary_max_output_tokens: 320
+  community_summary_thinking_budget: 0
   community_summary_retry_attempts: 3
   community_summary_retry_base_delay_sec: 2
   community_summary_retry_max_delay_sec: 30

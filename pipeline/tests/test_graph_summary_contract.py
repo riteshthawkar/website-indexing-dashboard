@@ -143,9 +143,11 @@ class _FakeModels:
     def __init__(self, responses: list[object]) -> None:
         self.responses = list(responses)
         self.calls = 0
+        self.configs = []
 
-    def generate_content(self, **_kwargs):
+    def generate_content(self, **kwargs):
         self.calls += 1
+        self.configs.append(kwargs.get("config"))
         response = self.responses.pop(0)
         if isinstance(response, Exception):
             raise response
@@ -182,6 +184,11 @@ def test_production_summary_stage_rebuilds_bound_index(monkeypatch, tmp_path: Pa
     quality = load_json_safe(result.outputs["community_summary_quality_file"], {})
     assert quality["passed"] is True
     assert quality["provider_failures"] == 0
+    assert fake_client.models.configs
+    assert all(
+        config.thinking_config.thinking_budget == 0
+        for config in fake_client.models.configs
+    )
 
 
 def test_production_summary_stage_fails_closed_without_placeholder(
@@ -352,6 +359,43 @@ def test_provider_cache_resumes_only_missing_communities(monkeypatch, tmp_path: 
     assert second_models.calls == 1
     assert second_result.metrics["cached_provider_community_summaries"] == 1
     assert second_result.metrics["community_summary_provider_requests"] == 1
+
+
+def test_retry_requests_never_exceed_global_provider_budget(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    graph_file, index_file = _community_graph(tmp_path, community_count=3)
+    fake_models = _FakeModels(
+        [RuntimeError("provider unavailable") for _ in range(4)]
+    )
+    monkeypatch.setattr(
+        "pipeline.stages.formatters.semantic_graph_summarize_formatter._make_gemini_client",
+        lambda: SimpleNamespace(models=fake_models),
+    )
+
+    result = asyncio.run(
+        SemanticGraphSummarizeFormatter().execute(
+            _context(
+                tmp_path,
+                graph_file,
+                index_file,
+                graph_overrides={
+                    "community_summary_concurrency": 1,
+                    "community_summary_retry_attempts": 4,
+                    "community_summary_retry_base_delay_sec": 0,
+                    "community_summary_max_provider_requests": 4,
+                },
+            )
+        )
+    )
+
+    assert result.status is StageStatus.FAILED
+    assert fake_models.calls == 4
+    quality = load_json_safe(result.outputs["community_summary_quality_file"], {})
+    assert quality["provider_requests"] == 4
+    assert quality["provider_communities_submitted"] == 3
+    assert quality["provider_retries"] == 1
 
 
 def test_provider_context_budget_retains_entities_and_facts() -> None:

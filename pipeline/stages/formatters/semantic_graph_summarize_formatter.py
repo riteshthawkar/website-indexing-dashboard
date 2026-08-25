@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, Iterable, List, Sequence, Tuple
@@ -188,6 +189,32 @@ class _SummaryQualityError(ValueError):
     pass
 
 
+class _ProviderRequestBudgetExceeded(RuntimeError):
+    pass
+
+
+class _ProviderRetryBudget:
+    """Reserve one request per community and bound all additional retries."""
+
+    def __init__(self, maximum_retries: int) -> None:
+        self.maximum_retries = max(0, int(maximum_retries))
+        self._used = 0
+        self._lock = threading.Lock()
+
+    @property
+    def used(self) -> int:
+        with self._lock:
+            return self._used
+
+    def acquire(self) -> None:
+        with self._lock:
+            if self._used >= self.maximum_retries:
+                raise _ProviderRequestBudgetExceeded(
+                    "Community summary provider retry budget was exhausted"
+                )
+            self._used += 1
+
+
 def _is_retryable_provider_error(exc: Exception) -> bool:
     if isinstance(exc, _SummaryQualityError):
         return True
@@ -205,6 +232,7 @@ def _generate_provider_summary(
     retry_attempts: int,
     retry_base_delay_sec: float,
     retry_max_delay_sec: float,
+    retry_budget: _ProviderRetryBudget,
 ) -> Tuple[str, int]:
     last_error: Exception | None = None
     for attempt in range(1, retry_attempts + 1):
@@ -224,6 +252,7 @@ def _generate_provider_summary(
             last_error = exc
             if attempt >= retry_attempts or not _is_retryable_provider_error(exc):
                 break
+            retry_budget.acquire()
             delay = min(
                 retry_max_delay_sec,
                 retry_base_delay_sec * (2 ** (attempt - 1)),
@@ -266,6 +295,7 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
             ("community_summary_max_provider_requests", 1, None),
             ("community_summary_max_context_characters", 1000, None),
             ("community_summary_max_output_tokens", 64, 2048),
+            ("community_summary_thinking_budget", 0, 1024),
             ("community_summary_retry_attempts", 1, 10),
         )
         for key, minimum, maximum in checks:
@@ -349,6 +379,13 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                 320,
                 minimum=64,
                 maximum=2048,
+            )
+            thinking_budget = _int_config(
+                graph_config,
+                "community_summary_thinking_budget",
+                0,
+                minimum=0,
+                maximum=1024,
             )
             retry_attempts = _int_config(
                 graph_config,
@@ -609,6 +646,7 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
         provider_generated_count = 0
         provider_failures = 0
         provider_retry_count = 0
+        provider_initial_request_count = 0
         if provider_pending:
             try:
                 client = _make_gemini_client()
@@ -616,6 +654,10 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                 generation_config = types.GenerateContentConfig(
                     temperature=0.0,
                     max_output_tokens=max_output_tokens,
+                    thinking_config=types.ThinkingConfig(
+                        thinking_budget=thinking_budget,
+                        include_thoughts=False,
+                    ),
                 )
             except Exception as exc:
                 client = None
@@ -631,6 +673,10 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                 )
 
             if client is not None:
+                provider_initial_request_count = len(provider_pending)
+                retry_budget = _ProviderRetryBudget(
+                    max_provider_requests - len(provider_pending)
+                )
                 pool = ThreadPoolExecutor(max_workers=concurrency)
                 futures = {}
                 try:
@@ -645,6 +691,7 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                             retry_attempts=retry_attempts,
                             retry_base_delay_sec=retry_base_delay_sec,
                             retry_max_delay_sec=retry_max_delay_sec,
+                            retry_budget=retry_budget,
                         ): item
                         for item in provider_pending
                     }
@@ -653,7 +700,7 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                         community_id = str(item["community_id"])
                         node = item["node"]
                         try:
-                            summary, attempts = future.result()
+                            summary, _attempts = future.result()
                         except Exception as exc:
                             provider_failures += 1
                             failures.append(
@@ -674,7 +721,6 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                             properties["title"] = "Community Topic"
                             properties["summary_method"] = "gemini"
                             provider_generated_count += 1
-                            provider_retry_count += max(0, attempts - 1)
                             incremental_cache.put(
                                 str(item["cache_key"]),
                                 {
@@ -697,6 +743,7 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
                     raise
                 else:
                     pool.shutdown(wait=True)
+                provider_retry_count = retry_budget.used
 
         incremental_cache.compact()
 
@@ -728,7 +775,10 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
             "deterministic_summaries": deterministic_count,
             "reused_summaries": reused_count,
             "cached_provider_summaries": cached_count,
-            "provider_requests": len(provider_pending),
+            "provider_requests": (
+                provider_initial_request_count + provider_retry_count
+            ),
+            "provider_communities_submitted": len(provider_pending),
             "provider_retries": provider_retry_count,
             "provider_failures": provider_failures,
             "maximum_provider_requests": max_provider_requests,
@@ -791,7 +841,10 @@ class SemanticGraphSummarizeFormatter(FormatterStage):
             "cached_provider_community_summaries": cached_count,
             "valid_community_summaries": valid_summary_count,
             "community_summary_coverage_ratio": coverage_ratio,
-            "community_summary_provider_requests": len(provider_pending),
+            "community_summary_provider_requests": (
+                provider_initial_request_count + provider_retry_count
+            ),
+            "community_summary_provider_communities": len(provider_pending),
             "community_summary_provider_retries": provider_retry_count,
             "community_summary_provider_failures": provider_failures,
         }
