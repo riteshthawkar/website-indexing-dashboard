@@ -61,6 +61,11 @@ def _write_graph_pair(root: Path, kind: str, marker: str) -> tuple[Path, Path]:
         "formatted": ("format_graph", "knowledge_graph.json", "knowledge_graph_index.json"),
         "promoted": ("promote_graph", "promoted_knowledge_graph.json", "promoted_knowledge_graph_index.json"),
         "community": ("community_graph", "community_knowledge_graph.json", "community_knowledge_graph_index.json"),
+        "summarized": (
+            "summarize_community_graph",
+            "summarized_community_graph.json",
+            "summarized_community_graph_index.json",
+        ),
     }
     stage_id, graph_name, index_name = locations[kind]
     directory = root / "stage_outputs" / stage_id
@@ -403,6 +408,27 @@ def test_canonical_graph_selection_prefers_community_and_rejects_partial_latest(
     with pytest.raises(GraphArtifactContractError, match="without its matching index"):
         resolve_canonical_graph_artifacts(tmp_path)
     assert promoted_graph.is_file()
+
+
+def test_canonical_graph_selection_prefers_stage_owned_summarized_graph(
+    tmp_path: Path,
+) -> None:
+    community_graph, _ = _write_graph_pair(tmp_path, "community", "community")
+    summarized_graph, summarized_index = _write_graph_pair(
+        tmp_path,
+        "summarized",
+        "summarized",
+    )
+
+    selected = resolve_canonical_graph_artifacts(tmp_path)
+
+    assert selected is not None
+    assert selected.graph_file == summarized_graph
+    assert selected.kind == "summarized_community_local_graph"
+    summarized_index.unlink()
+    with pytest.raises(GraphArtifactContractError, match="without its matching index"):
+        resolve_canonical_graph_artifacts(tmp_path)
+    assert community_graph.is_file()
 
 
 def test_canonical_graph_selection_rejects_index_from_a_different_graph(tmp_path: Path) -> None:

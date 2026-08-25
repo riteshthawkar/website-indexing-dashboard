@@ -4746,6 +4746,23 @@ class TestFormatterImages:
 # ─────────────────────────────────────────────────────────────
 
 class TestOrchestrator:
+    def test_metric_logging_bounds_large_nested_collections(self):
+        from pipeline.core.orchestrator import _metrics_for_log
+
+        metrics = {
+            "assertion_count": 42,
+            "assertions_by_type": {f"type-{index}": index for index in range(100)},
+            "small": {"supported": 40, "rejected": 2},
+        }
+
+        logged = _metrics_for_log(metrics)
+
+        assert logged["assertion_count"] == 42
+        assert logged["small"] == {"supported": 40, "rejected": 2}
+        assert logged["assertions_by_type"]["_entry_count"] == 100
+        assert len(logged["assertions_by_type"]["_sample"]) == 5
+        assert len(metrics["assertions_by_type"]) == 100
+
     def _make_mock_stages(self):
         """Create mock stages for testing. Returns cleanup function."""
         from pipeline.core.base import PipelineStage, StageContext, StageResult

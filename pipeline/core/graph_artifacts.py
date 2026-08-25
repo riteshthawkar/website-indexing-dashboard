@@ -43,9 +43,14 @@ class CanonicalGraphArtifacts:
         return sha256_file(self.index_file) if self.index_file is not None else ""
 
 
-# The community stage is downstream of promotion and its summarizer updates the
-# same file in place.  Therefore it is the final graph whenever it exists.
+# Summarization owns a separate immutable graph/index pair so a failed or
+# interrupted provider run cannot corrupt the completed community checkpoint.
 GRAPH_ARTIFACT_CANDIDATES: Tuple[GraphArtifactCandidate, ...] = (
+    GraphArtifactCandidate(
+        kind="summarized_community_local_graph",
+        graph_relative_path="stage_outputs/summarize_community_graph/summarized_community_graph.json",
+        index_relative_path="stage_outputs/summarize_community_graph/summarized_community_graph_index.json",
+    ),
     GraphArtifactCandidate(
         kind="community_local_graph",
         graph_relative_path="stage_outputs/community_graph/community_knowledge_graph.json",

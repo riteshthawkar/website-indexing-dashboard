@@ -44,6 +44,16 @@ graph:
   community_summary_min_characters: 40
   community_summary_max_provider_failures: 0
   community_summary_reuse_existing: true
+  # Small communities receive grounded extractive summaries. Gemini is reserved
+  # for genuinely multi-entity themes and protected by a hard per-run budget.
+  community_summary_llm_min_size: 10
+  community_summary_max_provider_requests: 500
+  community_summary_concurrency: 8
+  community_summary_max_context_characters: 16000
+  community_summary_max_output_tokens: 320
+  community_summary_retry_attempts: 4
+  community_summary_retry_base_delay_sec: 2
+  community_summary_retry_max_delay_sec: 30
 
 assertions:
   extract_model: "gpt-5-mini-2025-08-07"

@@ -423,6 +423,14 @@ graph:
   community_summary_min_characters: 40
   community_summary_max_provider_failures: 5
   community_summary_reuse_existing: true
+  community_summary_concurrency: 4
+  community_summary_llm_min_size: 10
+  community_summary_max_provider_requests: 1000
+  community_summary_max_context_characters: 16000
+  community_summary_max_output_tokens: 320
+  community_summary_retry_attempts: 3
+  community_summary_retry_base_delay_sec: 2
+  community_summary_retry_max_delay_sec: 30
   extraction_provider: "gemini"
   extraction_model: "gemini-2.5-flash"
   extraction_temperature: 0.0

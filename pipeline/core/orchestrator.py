@@ -38,9 +38,40 @@ from .state import (
 
 logger = logging.getLogger(__name__)
 
+_MAX_LOG_MAPPING_ITEMS = 20
+_MAX_LOG_SEQUENCE_ITEMS = 20
+_LOG_VALUE_SAMPLE_SIZE = 5
+
 # Callback type aliases
 StageCallback = Callable[[str, str, Optional[Dict]], None]  # (stage_type, name, info)
 LogCallback = Callable[[str, str], None]  # (level, message)
+
+
+def _metrics_for_log(value: Any) -> Any:
+    """Bound verbose metric collections without changing persisted metrics."""
+
+    if isinstance(value, dict):
+        if len(value) > _MAX_LOG_MAPPING_ITEMS:
+            sample = list(value.items())[:_LOG_VALUE_SAMPLE_SIZE]
+            return {
+                "_entry_count": len(value),
+                "_sample": {
+                    key: _metrics_for_log(item_value)
+                    for key, item_value in sample
+                },
+            }
+        return {key: _metrics_for_log(item_value) for key, item_value in value.items()}
+    if isinstance(value, (list, tuple)):
+        if len(value) > _MAX_LOG_SEQUENCE_ITEMS:
+            return {
+                "_entry_count": len(value),
+                "_sample": [
+                    _metrics_for_log(item)
+                    for item in value[:_LOG_VALUE_SAMPLE_SIZE]
+                ],
+            }
+        return [_metrics_for_log(item) for item in value]
+    return value
 
 
 class RunLockError(RuntimeError):
@@ -715,7 +746,12 @@ class PipelineOrchestrator:
                     previous_outputs.update(result.outputs)
                     previous_outputs.setdefault("stage_outputs", {})[stage_id] = result.outputs
 
-                self._log("info", "Stage %s completed: %s", stage_key, result.metrics)
+                self._log(
+                    "info",
+                    "Stage %s completed: %s",
+                    stage_key,
+                    _metrics_for_log(result.metrics),
+                )
 
             if stop_after_index is not None:
                 _stage_type, _plugin_name, stop_stage_id, _stage_def, _instance = self._stages[
