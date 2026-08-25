@@ -48,6 +48,10 @@ graph:
 assertions:
   extract_model: "gpt-5-mini-2025-08-07"
   validate_model: "gpt-5-nano-2025-08-07"
+  # Live MBZUAI slice requests average roughly 30 seconds. Sixteen workers keep
+  # this offline build practical while remaining below the enforced safety cap.
+  extract_concurrency: 16
+  validate_concurrency: 16
 
 embedder:
   # Query embeddings may be retried once by the retriever. Keep two provider

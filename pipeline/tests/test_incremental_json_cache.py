@@ -12,6 +12,9 @@ from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.stages.formatters.openai_assertion_extract_formatter import (
     OpenAIAssertionExtractFormatter,
 )
+from pipeline.stages.formatters.openai_assertion_validate_formatter import (
+    OpenAIAssertionValidateFormatter,
+)
 
 
 def test_incremental_cache_replays_and_compacts(tmp_path):
@@ -176,3 +179,36 @@ def test_assertion_extraction_resumes_from_journal_after_failure(
             ctx.stage_work_dir / "openai_assertion_extract_cache.json"
         )
     ) == {"slice-1", "slice-2"}
+
+
+@pytest.mark.parametrize(
+    ("formatter", "config_key", "module_name"),
+    [
+        (
+            OpenAIAssertionExtractFormatter,
+            "extract_concurrency",
+            "pipeline.stages.formatters.openai_assertion_extract_formatter",
+        ),
+        (
+            OpenAIAssertionValidateFormatter,
+            "validate_concurrency",
+            "pipeline.stages.formatters.openai_assertion_validate_formatter",
+        ),
+    ],
+)
+def test_assertion_stage_concurrency_is_bounded(
+    formatter,
+    config_key,
+    module_name,
+    monkeypatch,
+):
+    module = __import__(module_name, fromlist=["make_openai_client"])
+    monkeypatch.setattr(module, "make_openai_client", lambda: object())
+
+    errors = asyncio.run(
+        formatter().validate_config(
+            {"assertions": {config_key: 33}}
+        )
+    )
+
+    assert errors == [f"assertions.{config_key} must be between 1 and 32"]

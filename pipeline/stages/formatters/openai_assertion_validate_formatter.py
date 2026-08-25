@@ -13,6 +13,8 @@ from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
 
+_MAX_CONCURRENCY = 32
+
 _VALIDATION_JSON_SCHEMA = {
     "name": "assertion_validation",
     "strict": True,
@@ -191,6 +193,18 @@ class OpenAIAssertionValidateFormatter(FormatterStage):
 
     async def validate_config(self, config: Dict[str, Any]) -> List[str]:
         errors: List[str] = []
+        assertions_cfg = config.get("assertions", {})
+        if not isinstance(assertions_cfg, dict):
+            assertions_cfg = {}
+        try:
+            concurrency = int(assertions_cfg.get("validate_concurrency", 4))
+        except (TypeError, ValueError):
+            errors.append("assertions.validate_concurrency must be an integer")
+        else:
+            if not 1 <= concurrency <= _MAX_CONCURRENCY:
+                errors.append(
+                    f"assertions.validate_concurrency must be between 1 and {_MAX_CONCURRENCY}"
+                )
         try:
             make_openai_client()
         except RuntimeError as exc:
@@ -238,7 +252,10 @@ class OpenAIAssertionValidateFormatter(FormatterStage):
         reasoning_effort = str(cfg.get("validate_reasoning_effort") or "minimal")
         temperature = float(cfg.get("validate_temperature") or 0.0)
         max_completion_tokens = int(cfg.get("validate_max_completion_tokens") or 3000)
-        concurrency = max(1, int(cfg.get("validate_concurrency") or 4))
+        concurrency = max(
+            1,
+            min(_MAX_CONCURRENCY, int(cfg.get("validate_concurrency", 4))),
+        )
         retries = max(1, int(cfg.get("validate_retries") or 3))
         retry_delay_sec = float(cfg.get("validate_retry_delay_sec") or 2.0)
         per_request_delay_sec = float(cfg.get("validate_per_request_delay_sec") or 0.0)
