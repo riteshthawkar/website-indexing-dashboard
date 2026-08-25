@@ -1,0 +1,106 @@
+# Resumable Gemini semantic-captioning candidate for the completed v7 merged
+# MBZUAI corpus. The source run remains immutable: corpus_merge materializes a
+# new hard-linked working corpus, then this run pauses after annotate_media so
+# later indexing stages can be reviewed and resumed independently.
+_inherit: mbzuai_combined_multimodal_processing.yaml
+
+project_name: "mbzuai_semantic_captioning"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    source_run_dirs:
+      - "runs/mbzuai_crawl_processing/mbzuai-crawl-processing-20260820-v7"
+    allowed_source_projects:
+      - "mbzuai_crawl_processing"
+    required_source_stage_ids:
+      - "merge_corpora"
+    require_source_audit_ok: true
+    minimum_source_count: 1
+  media_semantics:
+    mode: "gemini"
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    enable_escalation: true
+    escalation_confidence_threshold: 0.72
+    escalation_image_kinds:
+      - "diagram"
+      - "chart"
+      - "infographic"
+      - "map"
+      - "document_fragment"
+    prompt_revision: "mbzuai-media-semantics-v2-section-context"
+    context_before_blocks: 1
+    context_after_blocks: 2
+    context_max_chars: 1200
+    context_following_heading_max_distance: 4
+    context_html_fallback: true
+    max_reference_contexts_per_annotation: 12
+    concurrency: 4
+    request_timeout_sec: 90
+    retry_attempts: 3
+    retry_backoff_sec: 1.0
+    retry_max_delay_sec: 12.0
+    cache_flush_every: 10
+    max_output_tokens: 1200
+    image_max_side: 1600
+    image_max_pixels: 1800000
+    max_images: 0
+    require_complete: true
+    minimum_completion_ratio: 1.0
+
+# Start from the immutable merged corpus. Keeping the downstream stages in the
+# snapshot makes this same run resumable when each later stage is approved.
+stages:
+  - id: merge_corpora
+    type: formatter
+    plugin: corpus_merge
+  - id: annotate_media
+    type: formatter
+    plugin: media_semantics
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: format_assertion_slices
+    type: formatter
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone

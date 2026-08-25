@@ -10,6 +10,23 @@ pipeline:
   require_assertion_first: true
   require_query_planner: true
 
+# The production release is assembled from the exact controlled A/B winner.
+# Crawling, conversion, media annotation, corpus preparation, chunking, and the
+# Page Graph bridge are audited upstream checkpoints; changing any pinned input
+# requires a new controlled evaluation before this profile can upload it.
+selected_profile:
+  variant_id: "c650__gemini2_1536__dense_graph"
+  decision_file: "runs/evaluation/mbzuai-multilingual-controlled-ab-v1/results/final_selection.json"
+  decision_sha256: "52826eda7fd57ff0d0042f9850d900cd0c932396fd68366c8cd550f38fc458b2"
+  pre_embedding_only: false
+  record_kinds:
+    - "chunk"
+    - "parent"
+    - "parent_section"
+    - "media"
+    - "page_card"
+    - "action"
+
 crawler:
   # Corpus integrity depends on authenticated HTTPS. Any exceptional local
   # debugging override must use a non-production profile.
@@ -36,6 +53,59 @@ embedder:
   # Query embeddings may be retried once by the retriever. Keep two provider
   # attempts plus backoff comfortably inside the 110-second request budget.
   gemini_request_timeout_ms: 30000
+  enable_sparse: false
+  enable_sparse_evidence_spans: false
+  use_sparse_embeddings: false
+  # The controlled A/B winner contains exactly six record kinds. Parent and
+  # parent_section share one physical lane; all unevaluated dense lanes stay
+  # empty for this release profile.
+  enable_dense_facts: false
+  enable_dense_evidence_spans: false
+  enable_dense_assertions: false
+  enable_dense_summaries: false
+  enable_dense_entities: false
+  enable_dense_communities: false
+  namespace_page_cards: "page_cards"
+  namespace_actions: "actions"
+
+vector_store:
+  provider: "pgvector"
+  schema: "mbzuai_retrieval"
+  records_table: "embedding_records"
+  releases_table: "releases"
+  dimensions: 1536
+  schema_version: 2
+  dsn_env: "PGVECTOR_DSN"
+  ingest_dsn_env: "PGVECTOR_INGEST_DSN"
+  reader_role: "mbzuai_retriever"
+  writer_role: "mbzuai_indexer"
+  allow_shared_dsn_for_ingest: false
+  require_ssl: true
+  # The immutable release pointer is the serving authority. Allow ready/retired
+  # rows during blue-green cutovers so activating a new DB release cannot break
+  # an old process that is still draining requests.
+  require_active_release: false
+  pool_min_size: 2
+  pool_max_size: 12
+  pool_timeout_seconds: 5
+  connect_timeout_seconds: 5
+  max_lifetime_seconds: 1800
+  max_idle_seconds: 300
+  statement_timeout_ms: 10000
+  idle_transaction_timeout_ms: 5000
+  hnsw_ef_search: 100
+
+# Controlled multilingual A/B winner (c650 / Gemini 1536 / dense graph).
+chunker:
+  strategy: "hybrid"
+  use_docling_native: true
+  include_section_headings: true
+  always_emit_headings: false
+  target_tokens: 650
+  max_tokens: 900
+  overlap_tokens: 100
+  min_chunk_tokens: 160
+  max_chunks_per_document: 0
 
 # Raw crawl evidence stays immutable. These stages materialize accepted content
 # in stage-owned directories and fail closed on unexplained yield loss.
@@ -71,6 +141,22 @@ formatter:
     enable_escalation: true
     require_complete: true
     minimum_completion_ratio: 1.0
+  page_graph_bridge:
+    derive_document_sections: true
+  selected_release_assembly:
+    checkpoint_run_dir: "runs/mbzuai_selected_index_prep/mbzuai-selected-index-prep-20260824-v3"
+    candidate_manifest_file: "runs/evaluation/mbzuai-multilingual-controlled-ab-v1/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "7ffb5d97597926a5a571d08092ac178b02cbbec7dab3cb554d423905a622b4fe"
+    candidate_records_file: "runs/evaluation/mbzuai-multilingual-controlled-ab-v1/candidates/c650/records.jsonl"
+    candidate_records_sha256: "cf52cef82bc3afa0c6a362199be9b3376b1f92eba78507e486aea71cca6eb395"
+    checkpoint_evidence:
+      pipeline_state_sha256: "1fdb164a84b758728588954bfa1d3794fc73d85a6e76c249b1cbbb736257f7eb"
+      artifact_catalog_sha256: "77e64d29c6cbb4550196fb2ba7af541a89c38e72b61a9b403d1f5e9dd613ec12"
+      run_audit_sha256: "395f8e6763dc9089f9a173fae3199088fba9a672149643edd3f8df933e608689"
+      resolved_config_sha256: "e9ec6d1503aee2084accf2f1c66b6e2ba88ed88d69834576fcc37d54a3d51b7a"
+      chunk_index_sha256: "ea1a371eefdb7eb3b41dc1983d70d5bc9ed0578e1f0c2f3359302101be6f27f9"
+      page_graph_bridge_sha256: "b1988f59e7653ff4545cd5e4673c808fb354fc057039de1155dbb803779b237a"
+      navigation_catalog_sha256: "164f379fcda6e503d918342f6cefc7eb175b600d86fa556317e1271c744a5c57"
   # The researched 2026-08-20 multi-origin sitemap inventory contains roughly
   # 2.75k raw URLs before the main site's verified-empty CMS cohorts.
   # Defective CMS members are excluded only after fresh, run-scoped HTTP proof;
@@ -99,39 +185,15 @@ formatter:
     - "/study/graduate-admission-process/?$"
     - "/study/(?:undergraduate|ug)-admission-process/?$"
 
-# The production sequence is explicit so inherited development profiles cannot
-# move upload ahead of coverage validation or the final knowledge graph.
+# The production sequence starts from the frozen, hash-pinned assembly. Upload
+# remains last, after assertion validation and final graph construction.
 stages:
-  - id: crawl_web
-    type: crawler
-    plugin: crawl4ai
-  - id: prepare_mbzuai_index
+  - id: verify_selected_profile
     type: formatter
-    plugin: mbzuai_index_readiness
-  - id: score_raw_content
-    type: quality_gate
-    plugin: quality_scorer
-  - id: clean_html
-    type: cleaner
-    plugin: trafilatura
-  - id: convert_documents
-    type: converter
-    plugin: docling
-  - id: convert_html
-    type: converter
-    plugin: markitdown
-  - id: enrich_media
+    plugin: selected_profile_guard
+  - id: assemble_selected_release
     type: formatter
-    plugin: media_enrichment
-  - id: annotate_media
-    type: formatter
-    plugin: media_semantics
-  - id: deduplicate_markdown
-    type: quality_gate
-    plugin: dedup_filter
-  - id: chunk_content
-    type: chunker
-    plugin: hybrid
+    plugin: selected_release_assembly
   - id: format_assertion_slices
     type: formatter
     plugin: extraction_slices
@@ -164,19 +226,24 @@ stages:
     plugin: semantic_graph_summarize
   - id: upload_retrieval
     type: embedder
-    plugin: gemini_pinecone
+    plugin: gemini_pgvector
 
 retrieval:
+  index_mode: "dense_graph"
   serving_contract_revision: "mbzuai-routed-hybrid-v1"
   retriever_backend: "routed_hybrid"
   routed_graph_required: true
   query_planner_enabled: true
+  navigation_plan_enabled: true
+  navigation_plan_required: true
   query_planner_model: "gpt-5-nano-2025-08-07"
   evidence_adjudicator_enabled: true
   evidence_adjudicator_model: "gpt-5-nano-2025-08-07"
   evidence_adjudicator_timeout_sec: 12
   evidence_adjudicator_provider_timeout_sec: 10
   evidence_adjudicator_max_workers: 2
+  enable_sparse: false
+  enable_rerank: false
 
 # These values document the backend behavior exercised by answer-readiness
 # evaluation. Bump answer_pipeline_revision whenever the grounded prompt or

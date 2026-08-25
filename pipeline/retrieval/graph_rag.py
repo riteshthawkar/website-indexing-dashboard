@@ -204,6 +204,7 @@ class GraphRAGRetriever:
 
         self.config = config
         self.work_dir = Path(work_dir).resolve()
+        self._owns_base_retriever = base_retriever is None
         self.base = base_retriever or AdaptiveHybridRetriever(config=config, work_dir=self.work_dir)
         self.model = self.base.model
         self.output_dimensionality = self.base.output_dimensionality
@@ -237,8 +238,12 @@ class GraphRAGRetriever:
         self.graph_relation_fact_seed_bonus = float(retrieval_cfg.get("graph_relation_fact_seed_bonus") or 2.5)
         graph_cfg = dict(config.get("graph") or {})
         self.neo4j_timeout_sec = int(graph_cfg.get("neo4j_http_timeout_sec") or 60)
-        self.supports_shared_parallel_retrieval = True
+        self.supports_shared_parallel_retrieval = bool(
+            getattr(self.base, "supports_shared_parallel_retrieval", False)
+        )
+
         self._thread_state = threading.local()
+        self._local_graph_load_lock = threading.Lock()
 
         manifest_file = self.work_dir / "stage_outputs" / "upload_graph" / "neo4j_upload_manifest.json"
         self.neo4j_manifest = load_json_safe(manifest_file, {}) if manifest_file.is_file() else {}
@@ -298,6 +303,13 @@ class GraphRAGRetriever:
         if should_eager_load_local:
             self._ensure_local_graph_loaded()
 
+    def close(self) -> None:
+        if not getattr(self, "_owns_base_retriever", False):
+            return
+        close_base = getattr(getattr(self, "base", None), "close", None)
+        if callable(close_base):
+            close_base()
+
     def embed_query(self, query: str) -> List[float]:
         return self.base.embed_query(query)
 
@@ -345,51 +357,65 @@ class GraphRAGRetriever:
     def _ensure_local_graph_loaded(self) -> None:
         if self._local_graph_loaded or not self.local_graph_available:
             return
-        graph_file = self._graph_file
-        graph_index_file = self._graph_index_file
-        if graph_file is None or graph_index_file is None:
-            raise ValueError("Local graph artifacts are not configured")
-        self.graph_bundle = load_graph_bundle(graph_file)
-        issues = validate_graph_bundle(self.graph_bundle)
-        if issues:
-            raise ValueError(f"Knowledge graph bundle is invalid: {issues[0].get('message')}")
-        self.graph_index = load_json_safe(graph_index_file, {}) or {}
-        self.node_map = {
-            str(node.get("id") or ""): node
-            for node in (self.graph_bundle.get("nodes") or [])
-            if isinstance(node, dict) and str(node.get("id") or "")
-        }
-        self.edge_map = {
-            str(edge.get("id") or ""): edge
-            for edge in (self.graph_bundle.get("edges") or [])
-            if isinstance(edge, dict) and str(edge.get("id") or "")
-        }
-        self.entity_map = {
-            str(node.get("id") or ""): node
-            for node in (self.graph_bundle.get("nodes") or [])
-            if isinstance(node, dict) and str(node.get("node_type") or "") == "entity"
-        }
-        self.assertion_map = {
-            str(node.get("id") or ""): node
-            for node in (self.graph_bundle.get("nodes") or [])
-            if (
-                isinstance(node, dict)
-                and str(node.get("node_type") or "") == "relation_assertion"
-                and self._is_active_assertion_node(node)
-            )
-        }
-        self.community_map = {
-            str(node.get("id") or ""): node
-            for node in (self.graph_bundle.get("nodes") or [])
-            if isinstance(node, dict) and str(node.get("node_type") or "") == "community"
-        }
-        outgoing = self.graph_index.get("outgoing_edge_ids") or {}
-        self.outgoing_edge_ids = {
-            str(node_id): [str(edge_id) for edge_id in edge_ids if str(edge_id)]
-            for node_id, edge_ids in outgoing.items()
-            if isinstance(edge_ids, list)
-        }
-        self._local_graph_loaded = True
+        with self._local_graph_load_lock:
+            if self._local_graph_loaded or not self.local_graph_available:
+                return
+            graph_file = self._graph_file
+            graph_index_file = self._graph_index_file
+            if graph_file is None or graph_index_file is None:
+                raise ValueError("Local graph artifacts are not configured")
+            graph_bundle = load_graph_bundle(graph_file)
+            issues = validate_graph_bundle(graph_bundle)
+            if issues:
+                raise ValueError(f"Knowledge graph bundle is invalid: {issues[0].get('message')}")
+            graph_index = load_json_safe(graph_index_file, {}) or {}
+            node_map = {
+                str(node.get("id") or ""): node
+                for node in (graph_bundle.get("nodes") or [])
+                if isinstance(node, dict) and str(node.get("id") or "")
+            }
+            edge_map = {
+                str(edge.get("id") or ""): edge
+                for edge in (graph_bundle.get("edges") or [])
+                if isinstance(edge, dict) and str(edge.get("id") or "")
+            }
+            entity_map = {
+                str(node.get("id") or ""): node
+                for node in (graph_bundle.get("nodes") or [])
+                if isinstance(node, dict) and str(node.get("node_type") or "") == "entity"
+            }
+            assertion_map = {
+                str(node.get("id") or ""): node
+                for node in (graph_bundle.get("nodes") or [])
+                if (
+                    isinstance(node, dict)
+                    and str(node.get("node_type") or "") == "relation_assertion"
+                    and self._is_active_assertion_node(node)
+                )
+            }
+            community_map = {
+                str(node.get("id") or ""): node
+                for node in (graph_bundle.get("nodes") or [])
+                if isinstance(node, dict) and str(node.get("node_type") or "") == "community"
+            }
+            outgoing = graph_index.get("outgoing_edge_ids") or {}
+            outgoing_edge_ids = {
+                str(node_id): [str(edge_id) for edge_id in edge_ids if str(edge_id)]
+                for node_id, edge_ids in outgoing.items()
+                if isinstance(edge_ids, list)
+            }
+            # Publish the complete immutable graph snapshot only after every
+            # structure has validated, so concurrent readers never see a
+            # partially initialized graph.
+            self.graph_bundle = graph_bundle
+            self.graph_index = graph_index
+            self.node_map = node_map
+            self.edge_map = edge_map
+            self.entity_map = entity_map
+            self.assertion_map = assertion_map
+            self.community_map = community_map
+            self.outgoing_edge_ids = outgoing_edge_ids
+            self._local_graph_loaded = True
 
     def _build_relation_query_plan(self, query: str, *, mode: QueryMode, media_query: bool) -> RelationQueryPlan | None:
         if not self.graph_relation_router_enabled or media_query:

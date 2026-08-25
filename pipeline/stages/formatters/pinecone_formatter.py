@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from pipeline.core.base import FormatterStage, StageContext, StageResult
-from pipeline.core.chunking import load_chunk_index
+from pipeline.core.chunking import ChunkLimitExceededError, load_chunk_index
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.media import (
     build_media_embedding_text,
@@ -112,7 +112,7 @@ def _split_text_into_chunks(
 
     chunk_size_chars = max(500, int(chunk_size_chars))
     chunk_overlap_chars = max(0, min(int(chunk_overlap_chars), chunk_size_chars // 2))
-    max_chunks = max(1, int(max_chunks))
+    max_chunks = int(max_chunks)
 
     if len(content) <= chunk_size_chars:
         return [content]
@@ -121,7 +121,7 @@ def _split_text_into_chunks(
     start = 0
     content_len = len(content)
 
-    while start < content_len and len(chunks) < max_chunks:
+    while start < content_len:
         end = min(content_len, start + chunk_size_chars)
         if end < content_len:
             candidate = content.rfind("\n\n", start, end)
@@ -139,6 +139,14 @@ def _split_text_into_chunks(
             break
 
         chunks.append(chunk)
+        if max_chunks > 0 and len(chunks) > max_chunks:
+            raise ChunkLimitExceededError(
+                f"Formatter chunk safety limit exceeded: generated at least "
+                f"{len(chunks)} chunks, configured maximum is {max_chunks}. "
+                "No partial chunks were returned. Set max_chunks_per_document "
+                "to 0 for lossless unlimited chunking or raise the explicit "
+                "safety limit."
+            )
         if end >= content_len:
             break
 
@@ -272,7 +280,7 @@ class PineconeFormatter(FormatterStage):
         chunk_documents = bool(ctx.formatter_config.get("chunk_documents", True))
         chunk_size_chars = int(ctx.formatter_config.get("chunk_size_chars", 4000))
         chunk_overlap_chars = int(ctx.formatter_config.get("chunk_overlap_chars", 400))
-        max_chunks_per_document = int(ctx.formatter_config.get("max_chunks_per_document", 64))
+        max_chunks_per_document = int(ctx.formatter_config.get("max_chunks_per_document", 0))
 
         formatted_docs = []
         source_documents = 0

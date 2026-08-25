@@ -10,6 +10,8 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pipeline.core.base import StageContext
 from pipeline.core.chunking import (
+    TOKENIZER_ENCODING,
+    ChunkLimitExceededError,
     build_chunk_index,
     estimate_token_count,
     stable_document_id,
@@ -20,7 +22,36 @@ from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.*\S)\s*$")
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+\.)\s+")
 TABLE_SEPARATOR_RE = re.compile(r"^\s*\|?(?:\s*:?-+:?\s*\|)+\s*$")
-SENTENCE_RE = re.compile(r"(?<=[.!?])\s+")
+SENTENCE_RE = re.compile(r"(?<=[.!?\u061f\u06d4\u3002\uff01\uff1f])\s+")
+
+
+def _enforce_chunk_safety_limit(
+    chunk_count: int,
+    *,
+    max_chunks_per_document: int,
+    source_info: Dict[str, Any],
+) -> None:
+    """Fail loudly instead of returning a partial document.
+
+    A non-positive limit means unlimited. Positive values are safety guards,
+    not truncation instructions.
+    """
+
+    if max_chunks_per_document <= 0 or chunk_count <= max_chunks_per_document:
+        return
+    source = (
+        source_info.get("source_url")
+        or source_info.get("path")
+        or source_info.get("source_file")
+        or source_info.get("document_title")
+        or "unknown document"
+    )
+    raise ChunkLimitExceededError(
+        f"Chunk safety limit exceeded for {source}: generated at least "
+        f"{chunk_count} chunks, configured maximum is {max_chunks_per_document}. "
+        "No partial chunks were returned. Set max_chunks_per_document to 0 for "
+        "lossless unlimited chunking or raise the explicit safety limit."
+    )
 
 
 def _clean_text(value: Any) -> str:
@@ -44,6 +75,19 @@ def _document_stem_key(value: Any) -> str:
     stem = Path(text).stem
     stem = re.sub(r"\.pages_\d+_\d+$", "", stem)
     return stem.casefold()
+
+
+def _source_markdown_path(source_info: Dict[str, Any]) -> str:
+    """Return the immutable Markdown identity, not a stage working-copy path.
+
+    Corpus merge stages materialize files below the current run so downstream
+    stages can work without mutating their audited source run.  The merge keeps
+    the original artifact path in ``corpus_source_local_path``.  Publishing the
+    materialized path as chunk provenance breaks joins to Representation V2,
+    especially for file-only PDF documents that have no URL fallback.
+    """
+
+    return str(source_info.get("source_markdown_path") or source_info.get("path") or "")
 
 
 def _load_download_source_lookup(ctx: StageContext) -> Dict[str, str]:
@@ -103,6 +147,9 @@ def collect_markdown_sources(ctx: StageContext) -> List[Dict[str, Any]]:
                 continue
             metadata = dict(record.metadata or {})
             path = Path(record.local_path).resolve()
+            source_markdown_path = str(
+                metadata.get("corpus_source_local_path") or path
+            )
             source_file = str(metadata.get("source_file") or "")
             source_url = _resolve_source_url(
                 metadata.get("source_url"),
@@ -114,6 +161,7 @@ def collect_markdown_sources(ctx: StageContext) -> List[Dict[str, Any]]:
             sources.append(
                 {
                     "path": path,
+                    "source_markdown_path": source_markdown_path,
                     "artifact_id": record.artifact_id,
                     "metadata": metadata,
                     "source_url": source_url,
@@ -144,6 +192,7 @@ def collect_markdown_sources(ctx: StageContext) -> List[Dict[str, Any]]:
         sources.append(
             {
                 "path": resolved,
+                "source_markdown_path": str(resolved),
                 "artifact_id": None,
                 "metadata": {},
                 "source_url": source_url,
@@ -215,6 +264,7 @@ def extract_markdown_blocks(text: str) -> List[Dict[str, Any]]:
     current_lines: List[str] = []
     in_code = False
     section_path: List[str] = []
+    section_headings: Dict[int, str] = {}
 
     def flush_current() -> None:
         nonlocal current_lines
@@ -252,13 +302,26 @@ def extract_markdown_blocks(text: str) -> List[Dict[str, Any]]:
             flush_current()
             level = len(match.group(1))
             heading = match.group(2).strip()
-            section_path = section_path[: level - 1] + [heading]
+            # Track actual Markdown levels rather than indexing into a compact
+            # path. This keeps consecutive H2/H3 headings as siblings even
+            # when the source omits an H1 or skips a heading level.
+            section_headings = {
+                existing_level: existing_heading
+                for existing_level, existing_heading in section_headings.items()
+                if existing_level < level
+            }
+            section_headings[level] = heading
+            section_path = [
+                section_headings[heading_level]
+                for heading_level in sorted(section_headings)
+            ]
             blocks.append(
                 {
                     "text": line.strip(),
                     "element_type": "heading",
                     "section_path": list(section_path),
                     "heading": heading,
+                    "heading_level": level,
                 }
             )
             continue
@@ -290,7 +353,7 @@ def group_blocks_by_section(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]
         current["element_types"].append(block.get("element_type") or "paragraph")
 
     normalized: List[Dict[str, Any]] = []
-    pending_heading_blocks: List[Dict[str, Any]] = []
+    pending_heading_sections: List[Dict[str, Any]] = []
 
     for section in sections:
         has_non_heading_content = any(
@@ -298,33 +361,40 @@ def group_blocks_by_section(blocks: List[Dict[str, Any]]) -> List[Dict[str, Any]
             for block in section["blocks"]
         )
         if not has_non_heading_content:
-            pending_heading_blocks.extend(section["blocks"])
+            pending_heading_sections.append(section)
             continue
 
-        if pending_heading_blocks:
-            section["blocks"] = [*pending_heading_blocks, *section["blocks"]]
+        if pending_heading_sections:
+            section_path = list(section.get("section_path") or [])
+            ancestor_heading_blocks: List[Dict[str, Any]] = []
+            for pending in pending_heading_sections:
+                pending_path = list(pending.get("section_path") or [])
+                is_ancestor = (
+                    bool(pending_path)
+                    and len(pending_path) < len(section_path)
+                    and section_path[: len(pending_path)] == pending_path
+                )
+                if is_ancestor:
+                    ancestor_heading_blocks.extend(pending["blocks"])
+                else:
+                    # A heading-only sibling/top-level section is real source
+                    # content. Preserve it separately instead of relabeling it
+                    # as part of the following section.
+                    normalized.append(pending)
+            section["blocks"] = [*ancestor_heading_blocks, *section["blocks"]]
             section["element_types"] = [
-                *(block.get("element_type") or "paragraph" for block in pending_heading_blocks),
+                *(
+                    block.get("element_type") or "paragraph"
+                    for block in ancestor_heading_blocks
+                ),
                 *section["element_types"],
             ]
-            pending_heading_blocks = []
+            pending_heading_sections = []
         normalized.append(section)
 
-    if pending_heading_blocks:
-        if normalized:
-            normalized[-1]["blocks"].extend(pending_heading_blocks)
-            normalized[-1]["element_types"].extend(
-                block.get("element_type") or "paragraph"
-                for block in pending_heading_blocks
-            )
-        else:
-            normalized.append(
-                {
-                    "section_path": list(pending_heading_blocks[-1].get("section_path") or []),
-                    "blocks": pending_heading_blocks,
-                    "element_types": [block.get("element_type") or "paragraph" for block in pending_heading_blocks],
-                }
-            )
+    # Preserve trailing headings as their own sections; attaching them to the
+    # previous section would corrupt both the text and section metadata.
+    normalized.extend(pending_heading_sections)
 
     return normalized
 
@@ -345,12 +415,95 @@ def build_section_text(section: Dict[str, Any], *, include_section_headings: boo
     return f"{prefix}\n\n{block_text}".strip() if prefix else block_text.strip()
 
 
+def _split_single_lexeme_by_budget(value: str, *, max_tokens: int) -> List[str]:
+    """Split a URL or other no-whitespace value without exceeding the budget."""
+
+    pieces: List[str] = []
+    start = 0
+    while start < len(value):
+        low = start + 1
+        high = len(value)
+        best_end = start
+        while low <= high:
+            midpoint = (low + high) // 2
+            if estimate_token_count(value[start:midpoint]) <= max_tokens:
+                best_end = midpoint
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+        if best_end <= start:
+            raise ValueError(
+                f"Token budget {max_tokens} is too small to encode one source character"
+            )
+        pieces.append(value[start:best_end])
+        start = best_end
+    return pieces
+
+
+def _split_words_by_budget(
+    text: str,
+    *,
+    max_tokens: int,
+    overlap_tokens: int,
+) -> List[str]:
+    """Token-aware fallback for prose with no usable paragraph boundaries."""
+
+    words = re.findall(r"\S+", text)
+    chunks: List[str] = []
+    start = 0
+    while start < len(words):
+        low = start + 1
+        high = len(words)
+        best_end = start
+        while low <= high:
+            midpoint = (low + high) // 2
+            candidate = " ".join(words[start:midpoint])
+            if estimate_token_count(candidate) <= max_tokens:
+                best_end = midpoint
+                low = midpoint + 1
+            else:
+                high = midpoint - 1
+
+        if best_end == start:
+            chunks.extend(
+                _split_single_lexeme_by_budget(
+                    words[start],
+                    max_tokens=max_tokens,
+                )
+            )
+            start += 1
+            continue
+
+        chunks.append(" ".join(words[start:best_end]))
+        if best_end >= len(words):
+            break
+
+        next_start = best_end
+        if overlap_tokens > 0:
+            low = start + 1  # Always make forward progress.
+            high = best_end
+            best_overlap_start = best_end
+            while low <= high:
+                midpoint = (low + high) // 2
+                overlap_text = " ".join(words[midpoint:best_end])
+                if estimate_token_count(overlap_text) <= overlap_tokens:
+                    best_overlap_start = midpoint
+                    high = midpoint - 1
+                else:
+                    low = midpoint + 1
+            next_start = best_overlap_start
+        start = max(start + 1, next_start)
+    return chunks
+
+
 def split_text_by_budget(
     text: str,
     *,
     max_tokens: int,
     overlap_tokens: int = 0,
 ) -> List[str]:
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be greater than zero")
     cleaned = (text or "").strip()
     if not cleaned:
         return []
@@ -361,20 +514,11 @@ def split_text_by_budget(
     if len(units) <= 1:
         units = [unit.strip() for unit in SENTENCE_RE.split(cleaned) if unit.strip()]
     if len(units) <= 1:
-        words = cleaned.split()
-        approx_words = max(50, int(max_tokens / 1.33))
-        overlap_words = max(0, int(overlap_tokens / 1.33))
-        chunks = []
-        start = 0
-        while start < len(words):
-            end = min(len(words), start + approx_words)
-            chunk = " ".join(words[start:end]).strip()
-            if chunk:
-                chunks.append(chunk)
-            if end >= len(words):
-                break
-            start = max(start + 1, end - overlap_words)
-        return chunks
+        return _split_words_by_budget(
+            cleaned,
+            max_tokens=max_tokens,
+            overlap_tokens=max(0, min(overlap_tokens, max_tokens - 1)),
+        )
 
     chunks: List[str] = []
     current_units: List[str] = []
@@ -438,13 +582,13 @@ def fixed_window_chunks(
 ) -> List[Dict[str, Any]]:
     pieces = split_text_by_budget(text, max_tokens=target_tokens, overlap_tokens=overlap_tokens)
     document_id = stable_document_id(
-        source_info.get("path"),
+        _source_markdown_path(source_info),
         source_info.get("source_url"),
         source_info.get("source_file"),
         source_info.get("document_title"),
     )
     chunks = []
-    for idx, piece in enumerate(pieces[:max_chunks_per_document]):
+    for idx, piece in enumerate(pieces):
         chunks.append(
             {
                 "document_id": document_id,
@@ -457,9 +601,14 @@ def fixed_window_chunks(
                 "document_type": source_info.get("document_type") or "",
                 "source_backend": source_info.get("source_backend") or "",
                 "source_file": source_info.get("source_file") or "",
-                "source_markdown_path": str(source_info["path"]),
+                "source_markdown_path": _source_markdown_path(source_info),
                 "source_url": source_info.get("source_url") or "",
             }
+        )
+        _enforce_chunk_safety_limit(
+            len(chunks),
+            max_chunks_per_document=max_chunks_per_document,
+            source_info=source_info,
         )
     return chunks
 
@@ -475,7 +624,7 @@ def hierarchical_markdown_chunks(
     blocks = extract_markdown_blocks(text)
     sections = group_blocks_by_section(blocks)
     document_id = stable_document_id(
-        source_info.get("path"),
+        _source_markdown_path(source_info),
         source_info.get("source_url"),
         source_info.get("source_file"),
         source_info.get("document_title"),
@@ -499,12 +648,15 @@ def hierarchical_markdown_chunks(
                     "document_type": source_info.get("document_type") or "",
                     "source_backend": source_info.get("source_backend") or "",
                     "source_file": source_info.get("source_file") or "",
-                    "source_markdown_path": str(source_info["path"]),
+                    "source_markdown_path": _source_markdown_path(source_info),
                     "source_url": source_info.get("source_url") or "",
                 }
             )
-            if len(chunks) >= max_chunks_per_document:
-                return chunks
+            _enforce_chunk_safety_limit(
+                len(chunks),
+                max_chunks_per_document=max_chunks_per_document,
+                source_info=source_info,
+            )
     return chunks
 
 
@@ -522,7 +674,7 @@ def hybrid_markdown_chunks(
     blocks = extract_markdown_blocks(text)
     sections = group_blocks_by_section(blocks)
     document_id = stable_document_id(
-        source_info.get("path"),
+        _source_markdown_path(source_info),
         source_info.get("source_url"),
         source_info.get("source_file"),
         source_info.get("document_title"),
@@ -541,7 +693,7 @@ def hybrid_markdown_chunks(
             current_units = []
             current_tokens = 0
             return
-        section_path = list(current_units[-1].get("section_path") or [])
+        section_path = list(current_units[0].get("section_path") or [])
         element_types = sorted({etype for unit in current_units for etype in unit.get("element_types") or []})
         pieces = split_text_by_budget(piece, max_tokens=max_tokens, overlap_tokens=overlap_tokens)
         for emitted_piece in pieces:
@@ -558,19 +710,20 @@ def hybrid_markdown_chunks(
                     "document_type": source_info.get("document_type") or "",
                     "source_backend": source_info.get("source_backend") or "",
                     "source_file": source_info.get("source_file") or "",
-                    "source_markdown_path": str(source_info["path"]),
+                    "source_markdown_path": _source_markdown_path(source_info),
                     "source_url": source_info.get("source_url") or "",
                 }
             )
-            if len(chunks) >= max_chunks_per_document:
-                break
+            _enforce_chunk_safety_limit(
+                len(chunks),
+                max_chunks_per_document=max_chunks_per_document,
+                source_info=source_info,
+            )
         current_units = []
         current_tokens = 0
 
     def can_merge(current_section: List[str], next_section: List[str]) -> bool:
-        if not current_section or not next_section:
-            return True
-        return current_section[:1] == next_section[:1]
+        return current_section == next_section
 
     for section in sections:
         section_text = build_section_text(section, include_section_headings=include_section_headings)
@@ -593,30 +746,40 @@ def hybrid_markdown_chunks(
                         "document_type": source_info.get("document_type") or "",
                         "source_backend": source_info.get("source_backend") or "",
                         "source_file": source_info.get("source_file") or "",
-                        "source_markdown_path": str(source_info["path"]),
+                        "source_markdown_path": _source_markdown_path(source_info),
                         "source_url": source_info.get("source_url") or "",
                     }
                 )
-                if len(chunks) >= max_chunks_per_document:
-                    return chunks
+                _enforce_chunk_safety_limit(
+                    len(chunks),
+                    max_chunks_per_document=max_chunks_per_document,
+                    source_info=source_info,
+                )
             continue
 
         next_section_path = list(section.get("section_path") or [])
         current_section_path = list(current_units[-1].get("section_path") or []) if current_units else []
-        if current_units and (
-            current_tokens + section_tokens > target_tokens
-            or not can_merge(current_section_path, next_section_path)
-        ):
-            if current_tokens >= min_chunk_tokens or current_tokens + section_tokens > max_tokens:
+        if current_units:
+            crosses_semantic_section = not can_merge(
+                current_section_path,
+                next_section_path,
+            )
+            exceeds_target = current_tokens + section_tokens > target_tokens
+            if crosses_semantic_section:
+                # Every heading-defined section is a hard boundary, even when
+                # the preceding section is smaller than min_chunk_tokens.
+                emit_current()
+            elif exceeds_target and (
+                current_tokens >= min_chunk_tokens
+                or current_tokens + section_tokens > max_tokens
+            ):
                 emit_current()
 
         current_units.append(section)
         current_tokens += section_tokens
-        if len(chunks) >= max_chunks_per_document:
-            return chunks
 
     emit_current()
-    return chunks[:max_chunks_per_document]
+    return chunks
 
 
 def _walk_nested_values(value: Any):
@@ -688,7 +851,7 @@ def _build_docling_hybrid_chunker(max_tokens: int, *, always_emit_headings: bool
                 return self.tokenizer
 
         tokenizer = TiktokenBudgetTokenizer(
-            tokenizer=tiktoken.get_encoding("cl100k_base"),
+            tokenizer=tiktoken.get_encoding(TOKENIZER_ENCODING),
             max_tokens=max_tokens,
         )
         return HybridChunker(tokenizer=tokenizer, always_emit_headings=always_emit_headings)
@@ -718,16 +881,15 @@ def docling_chunks_from_json(
                 part_path = (json_path.parent / part_path).resolve()
             if not part_path.is_file():
                 continue
-            remaining = max_chunks_per_document - len(chunks)
-            if remaining <= 0:
-                return chunks
             part_chunks = docling_chunks_from_json(
                 part_path,
                 strategy=strategy,
                 source_info=source_info,
                 max_tokens=max_tokens,
                 overlap_tokens=overlap_tokens,
-                max_chunks_per_document=remaining,
+                # Enforce the limit over the complete source document below,
+                # not independently inside each page-window part.
+                max_chunks_per_document=0,
                 always_emit_headings=always_emit_headings,
             )
             page_range = part.get("page_range") or []
@@ -740,8 +902,11 @@ def docling_chunks_from_json(
                     except Exception:
                         pass
                 chunks.append(chunk)
-                if len(chunks) >= max_chunks_per_document:
-                    return chunks
+                _enforce_chunk_safety_limit(
+                    len(chunks),
+                    max_chunks_per_document=max_chunks_per_document,
+                    source_info=source_info,
+                )
         return chunks
 
     from docling.chunking import HierarchicalChunker, HybridChunker
@@ -754,7 +919,7 @@ def docling_chunks_from_json(
         chunker = HierarchicalChunker(always_emit_headings=always_emit_headings)
 
     document_id = stable_document_id(
-        source_info.get("path"),
+        _source_markdown_path(source_info),
         source_info.get("source_url"),
         source_info.get("source_file"),
         source_info.get("document_title"),
@@ -788,11 +953,14 @@ def docling_chunks_from_json(
                     "document_type": source_info.get("document_type") or "",
                     "source_backend": source_info.get("source_backend") or "docling",
                     "source_file": source_info.get("source_file") or "",
-                    "source_markdown_path": str(source_info["path"]),
+                    "source_markdown_path": _source_markdown_path(source_info),
                     "source_url": source_info.get("source_url") or "",
                 }
             )
-            if len(chunks) >= max_chunks_per_document:
-                return chunks
+            _enforce_chunk_safety_limit(
+                len(chunks),
+                max_chunks_per_document=max_chunks_per_document,
+                source_info=source_info,
+            )
 
     return chunks

@@ -42,11 +42,11 @@ def test_production_evaluation_policy_rejects_arbitrary_inputs(tmp_path) -> None
 def test_production_evaluation_manifest_requires_policy_hashes_and_minimum_counts() -> None:
     retrieval = {
         **production_eval_manifest_metadata(answer=False),
-        "query_count": 50,
+        "query_count": 65,
     }
     answer = {
         **production_eval_manifest_metadata(answer=True),
-        "query_count": 50,
+        "query_count": 65,
         "llm_judge": production_answer_judge_manifest_metadata(),
     }
     assert validate_production_eval_manifest(retrieval, answer) == []
@@ -55,22 +55,22 @@ def test_production_evaluation_manifest_requires_policy_hashes_and_minimum_count
     answer["query_count"] = 1
     errors = validate_production_eval_manifest(retrieval, answer)
     assert any(PRODUCTION_EVAL_POLICY_ID in error for error in errors)
-    assert any("at least 50" in error for error in errors)
+    assert any("at least 65" in error for error in errors)
 
 
 def test_production_evaluation_manifest_rejects_judge_provider_fallback() -> None:
     retrieval = {
         **production_eval_manifest_metadata(answer=False),
-        "query_count": 50,
+        "query_count": 65,
     }
     answer = {
         **production_eval_manifest_metadata(answer=True),
-        "query_count": 50,
+        "query_count": 65,
         "llm_judge": {
             **production_answer_judge_manifest_metadata(),
             "providers": ["openai"],
             "models": ["gpt-4.1"],
-            "identity_mismatch_count": 50,
+            "identity_mismatch_count": 65,
             "openai_fallback_allowed": True,
         },
     }

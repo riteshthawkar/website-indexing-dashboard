@@ -71,7 +71,8 @@ def main() -> int:
         "EXPECTED_RETRIEVAL_BUNDLE_SHA256", "EMBEDDING_PROVIDER", "EMBEDDING_MODEL_NAME",
         "EMBEDDING_OUTPUT_DIMENSIONALITY", "GENERATION_MODEL", "QUERY_REWRITE_MODEL",
         "RERANKER_MODEL", "GROUNDED_FINALIZER_MODEL", "FOLLOWUP_SUGGESTION_MODEL",
-        "PRESENTATION_BLOCK_MODEL", "JWT_SECRET", "DATABASE_URL", "RATE_LIMIT_BACKEND",
+        "PRESENTATION_BLOCK_MODEL", "ENABLE_LLM_FOLLOWUP_SUGGESTIONS",
+        "ENABLE_LLM_PRESENTATION_BLOCKS", "JWT_SECRET", "DATABASE_URL", "RATE_LIMIT_BACKEND",
         "RATE_LIMIT_REDIS_URL", "RATE_LIMIT_FAIL_OPEN", "RATE_LIMIT_ALLOW_MEMORY_IN_PRODUCTION",
         "ALLOWED_ORIGINS", "CORS_ALLOW_ORIGINS", "ALLOW_CREDENTIALS", "ALLOW_MISSING_WS_ORIGIN",
         "REQUIRE_WIDGET_KEY", "WIDGET_PUBLIC_KEYS", "OPERATIONS_API_TOKEN",
@@ -97,6 +98,8 @@ def main() -> int:
         "GROUNDED_FINALIZER_MODEL": "gpt-5.4-mini-2026-03-17",
         "FOLLOWUP_SUGGESTION_MODEL": "gpt-5.4-mini-2026-03-17",
         "PRESENTATION_BLOCK_MODEL": "gpt-5.4-mini-2026-03-17",
+        "ENABLE_LLM_FOLLOWUP_SUGGESTIONS": "false",
+        "ENABLE_LLM_PRESENTATION_BLOCKS": "false",
         "RATE_LIMIT_BACKEND": "redis",
         "RATE_LIMIT_FAIL_OPEN": "false",
     }.items():
@@ -141,7 +144,7 @@ def main() -> int:
     assert retriever.get("instance_size_slug") == "apps-d-4vcpu-16gb"
     retriever_env = _environment(retriever)
     expected_retriever_keys = {
-        "SERVICE_ENVIRONMENT", "PIPELINE_CONFIG", "GOOGLE_API_KEY", "PINECONE_API_KEY",
+        "SERVICE_ENVIRONMENT", "PIPELINE_CONFIG", "GOOGLE_API_KEY", "PGVECTOR_DSN",
         "RELEASE_COMMIT_SHA", "RELEASE_STORAGE_MODE", "RELEASE_ARCHIVE_TARGET_ROOT",
         "ACTIVE_RELEASE_FILE", "RELEASE_RUNS_ROOT", "RELEASE_STORAGE_MARKER_FILE",
         "RELEASE_ARCHIVE_S3_URI", "RELEASE_ARCHIVE_S3_ENDPOINT_URL",
@@ -162,7 +165,7 @@ def main() -> int:
     assert set(retriever_env) == expected_retriever_keys, "unexpected retriever environment keys"
     for key in (
         "GOOGLE_API_KEY",
-        "PINECONE_API_KEY",
+        "PGVECTOR_DSN",
         "RELEASE_ARCHIVE_S3_ACCESS_KEY_ID",
         "RELEASE_ARCHIVE_S3_SECRET_ACCESS_KEY",
     ):
@@ -187,7 +190,7 @@ def main() -> int:
         "RETRIEVER_REQUIRE_GRAPH": "true",
         "RETRIEVER_EXPECTED_EMBEDDING_MODEL": "gemini-embedding-2",
         "RETRIEVER_EXPECTED_EMBEDDING_DIMENSIONALITY": "1536",
-        "RETRIEVER_MAX_CONCURRENCY": "1",
+        "RETRIEVER_MAX_CONCURRENCY": "2",
         "RETRIEVER_REQUEST_TIMEOUT_SECONDS": "110",
         "RETRIEVER_QUEUE_TIMEOUT_SECONDS": "10",
         "RETRIEVAL_QUERY_EMBEDDING_RETRIES": "1",
@@ -224,6 +227,16 @@ def main() -> int:
     )
     assert provider_budget < retriever_request_timeout, (
         "Gemini query-embedding retry budget must fit inside the retriever timeout"
+    )
+    archive_max_bytes = int(retriever_env["RELEASE_ARCHIVE_MAX_BYTES"]["value"])
+    archive_max_extracted_bytes = int(
+        retriever_env["RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES"]["value"]
+    )
+    assert 0 < archive_max_bytes <= archive_max_extracted_bytes, (
+        "compressed release archive limit must be positive and no larger than the extracted limit"
+    )
+    assert archive_max_extracted_bytes >= 4 * 1024**3, (
+        "selected release bundle, lexical corpus, assembly, and graph require a 4 GiB extraction ceiling"
     )
     assert "RELEASE_ARCHIVE_URL" not in retriever_env, "production must not depend on an expiring URL"
     for key in (

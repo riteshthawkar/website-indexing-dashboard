@@ -17,12 +17,15 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import fastapi  # noqa: F401 - direct runtime dependency smoke
 import openai  # noqa: F401 - direct runtime dependency smoke
+import psycopg  # noqa: F401 - direct runtime dependency smoke
+import psycopg_pool  # noqa: F401 - direct runtime dependency smoke
 import pydantic  # noqa: F401 - direct runtime dependency smoke
 import requests  # noqa: F401 - direct runtime dependency smoke
 import uvicorn  # noqa: F401 - direct runtime dependency smoke
 import yaml  # noqa: F401 - direct runtime dependency smoke
 from google import genai  # noqa: F401 - direct runtime dependency smoke
 from pinecone import Pinecone  # noqa: F401 - direct runtime dependency smoke
+from pgvector.psycopg import register_vector  # noqa: F401 - direct runtime dependency smoke
 from rank_bm25 import BM25Okapi  # noqa: F401 - direct runtime dependency smoke
 
 from pipeline.core.knowledge_graph import (

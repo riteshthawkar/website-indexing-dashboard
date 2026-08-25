@@ -867,7 +867,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-extracted-bytes",
         type=int,
-        default=int(os.getenv("RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES", str(2 * 1024**3))),
+        default=int(os.getenv("RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES", str(4 * 1024**3))),
     )
     parser.add_argument(
         "--max-files",

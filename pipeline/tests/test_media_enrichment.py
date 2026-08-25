@@ -10,6 +10,7 @@ from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record
 from pipeline.core.base import StageContext
 from pipeline.core.io import atomic_write_json
 from pipeline.core.media import normalize_media_item
+from pipeline.core.media_context import build_media_reference_contexts
 from pipeline.core.unlimited_ocr import image_regions, normalized_bbox_to_pixels
 from pipeline.stages.formatters.media_enrichment_formatter import (
     _extract_pdf_figures,
@@ -138,9 +139,9 @@ def test_docling_layout_boxes_materialize_pdf_figure_crops(tmp_path: Path):
             "name": "sample",
             "origin": {"filename": source_pdf.name, "mimetype": "application/pdf"},
             "pages": {"1": {"page_no": 1, "size": {"width": 300, "height": 300}}},
-            "texts": [
-                {
-                    "text": "An informative architecture diagram",
+                "texts": [
+                    {
+                        "text": "An informative architecture diagram",
                     "prov": [
                         {
                             "page_no": 1,
@@ -151,10 +152,25 @@ def test_docling_layout_boxes_materialize_pdf_figure_crops(tmp_path: Path):
                                 "b": 250,
                                 "coord_origin": "BOTTOMLEFT",
                             },
-                        }
-                    ],
-                }
-            ],
+                            }
+                        ],
+                    },
+                    {
+                        "text": "Document context",
+                        "prov": [
+                            {
+                                "page_no": 1,
+                                "bbox": {
+                                    "l": 40,
+                                    "t": 45,
+                                    "r": 260,
+                                    "b": 20,
+                                    "coord_origin": "BOTTOMLEFT",
+                                },
+                            }
+                        ],
+                    },
+                ],
             "pictures": [
                 {
                     "captions": [{"$ref": "#/texts/0"}],
@@ -228,3 +244,18 @@ def test_docling_layout_boxes_materialize_pdf_figure_crops(tmp_path: Path):
     assert items[0]["caption"] == "An informative architecture diagram"
     assert items[0]["page_number"] == 1
     assert items[0]["crop_source"] == "docling_layout"
+
+    records, _lookup, stats = build_media_reference_contexts(
+        items,
+        markdown_mapping={},
+        html_mapping={},
+        page_metadata={
+            "https://mbzuai.ac.ae/sample.pdf": {"title": "Sample architecture"}
+        },
+        config={"context_before_blocks": 1, "context_after_blocks": 2},
+    )
+    assert len(records) == 1
+    assert records[0]["context_source"] == "docling_layout+markdown"
+    assert records[0]["section_path"] == ["Sample"]
+    assert records[0]["nearby_text"] == "Document context"
+    assert stats["with_surrounding_text"] == 1

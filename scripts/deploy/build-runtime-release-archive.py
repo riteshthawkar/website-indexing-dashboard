@@ -109,6 +109,30 @@ def _archive_entries(
         "knowledge graph": Path(str(payload["knowledge_graph"])).resolve(),
         "knowledge graph index": Path(str(payload["knowledge_graph_index"])).resolve(),
     }
+    if str(payload.get("selected_release_assembly") or "").strip():
+        assembly_path = Path(
+            str(payload["selected_release_assembly"])
+        ).resolve()
+        files["selected release assembly"] = assembly_path
+        try:
+            assembly_payload = json.loads(assembly_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ArchiveError("validated selected release assembly could not be re-read") from exc
+        declared_files = (
+            assembly_payload.get("files")
+            if isinstance(assembly_payload, dict)
+            and isinstance(assembly_payload.get("files"), dict)
+            else {}
+        )
+        for key, entry in declared_files.items():
+            if not isinstance(entry, dict):
+                raise ArchiveError(f"selected release assembly file entry is invalid: {key}")
+            relative = Path(str(entry.get("file") or ""))
+            if not str(relative) or relative.is_absolute() or ".." in relative.parts:
+                raise ArchiveError(f"selected release assembly file entry is unsafe: {key}")
+            files[f"selected release assembly {key}"] = (
+                assembly_path.parent / relative
+            ).resolve()
     entries: list[tuple[Path, str]] = []
     for label, source in files.items():
         if not source.is_file() or source.is_symlink():
@@ -318,7 +342,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-uncompressed-bytes",
         type=int,
-        default=int(os.getenv("RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES", str(2 * 1024**3))),
+        default=int(os.getenv("RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES", str(4 * 1024**3))),
     )
     parser.add_argument("--allow-waived-release", action="store_true")
     parser.add_argument(

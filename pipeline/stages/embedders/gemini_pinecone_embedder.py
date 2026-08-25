@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from pipeline.core.artifact_contracts import ArtifactContract, resolve_first_artifact_path
 from pipeline.core.base import EmbedderStage, StageContext, StageResult
+from pipeline.core.chunking import estimate_token_count
 from pipeline.core.google_genai import import_genai, import_genai_types
 from pipeline.core.graph_artifacts import resolve_canonical_graph_artifacts
 from pipeline.core.io import (
@@ -35,6 +36,8 @@ _SPARSE_STOPWORDS = {
     "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "in", "into",
     "is", "it", "of", "on", "or", "that", "the", "their", "this", "to", "was", "were", "with",
 }
+_GEMINI_EMBEDDING_LOCAL_TOKEN_BUDGET = 6000
+_GEMINI_IMAGE_TOKEN_ALLOWANCE = 258
 
 
 def _release_namespace_token(run_id: str, *, max_length: int = 48) -> str:
@@ -64,6 +67,8 @@ def _resolve_upload_namespaces(config: Dict[str, Any], *, run_id: str) -> Dict[s
         "chunks": "chunks",
         "parents": "parents",
         "media": "media",
+        "page_cards": "page_cards",
+        "actions": "actions",
         "facts": "facts",
         "evidence_spans": "evidence_spans",
         "summaries": "summaries",
@@ -227,6 +232,24 @@ def _resolve_indexing_input_paths(ctx: StageContext) -> Dict[str, str]:
                 label="media embedding payload",
             ),
         ),
+        "page_cards": _resolve_input_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="formatted_documents",
+                role="embedding_payload_page_cards",
+                legacy_output_key="page_card_embedding_file",
+                label="Page Card embedding payload",
+            ),
+        ),
+        "actions": _resolve_input_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="formatted_documents",
+                role="embedding_payload_actions",
+                legacy_output_key="action_embedding_file",
+                label="action embedding payload",
+            ),
+        ),
         "facts": _resolve_input_path(
             ctx,
             ArtifactContract(
@@ -285,6 +308,24 @@ def _resolve_indexing_input_paths(ctx: StageContext) -> Dict[str, str]:
                 role="embedding_payload_communities",
                 legacy_output_key="community_embedding_file",
                 label="community embedding payload",
+            ),
+        ),
+        "release_assembly": _resolve_input_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="selected_release_assembly",
+                role="production_release_assembly",
+                legacy_output_key="selected_release_assembly_file",
+                label="selected release assembly manifest",
+            ),
+        ),
+        "navigation_catalog": _resolve_input_path(
+            ctx,
+            ArtifactContract(
+                artifact_type="page_graph_navigation_catalog",
+                role="retrieval_navigation_runtime",
+                legacy_output_key="page_graph_navigation_catalog_file",
+                label="Page Graph navigation catalog",
             ),
         ),
         "graph_bundle": graph_bundle,
@@ -363,6 +404,29 @@ def _format_embedding_text(text: Any, *, task_type: str, model: str) -> str:
     return f"title: {title} | text: {body}"
 
 
+def _enforce_gemini_embedding_budget(
+    formatted_texts: Sequence[str],
+    *,
+    model: str,
+    image_count_by_input: Sequence[int] | None = None,
+) -> None:
+    """Fail before the Developer API can silently truncate an input."""
+
+    if not _uses_prompt_task_instruction(model):
+        return
+    image_counts = list(image_count_by_input or [0] * len(formatted_texts))
+    if len(image_counts) != len(formatted_texts):
+        raise ValueError("Embedding input/image-count cardinality mismatch")
+    for index, (text, image_count) in enumerate(zip(formatted_texts, image_counts)):
+        proxy_tokens = estimate_token_count(text) + max(0, int(image_count)) * _GEMINI_IMAGE_TOKEN_ALLOWANCE
+        if proxy_tokens > _GEMINI_EMBEDDING_LOCAL_TOKEN_BUDGET:
+            raise ValueError(
+                "Gemini embedding input exceeds the fail-closed local safety "
+                f"budget at batch position {index}: {proxy_tokens} > "
+                f"{_GEMINI_EMBEDDING_LOCAL_TOKEN_BUDGET} proxy tokens"
+            )
+
+
 def _embed_text_batch(
     client: Any,
     *,
@@ -372,16 +436,23 @@ def _embed_text_batch(
     output_dimensionality: int | None,
 ) -> List[List[float]]:
     types = import_genai_types()
-    config_kwargs = {"output_dimensionality": output_dimensionality}
+    config_kwargs = {
+        "output_dimensionality": output_dimensionality,
+    }
     if not _uses_prompt_task_instruction(model):
         config_kwargs["task_type"] = task_type
     config = types.EmbedContentConfig(**config_kwargs)
+    formatted_texts = [
+        _format_embedding_text(text, task_type=task_type, model=model)
+        for text in texts
+    ]
+    _enforce_gemini_embedding_budget(formatted_texts, model=model)
     contents = [
         types.Content(
             role="user",
-            parts=[types.Part.from_text(text=_format_embedding_text(text, task_type=task_type, model=model))],
+            parts=[types.Part.from_text(text=text)],
         )
-        for text in texts
+        for text in formatted_texts
     ]
     response = client.models.embed_content(
         model=model,
@@ -409,16 +480,29 @@ def _embed_multimodal_batch(
     types = import_genai_types()
 
     contents: List[Any] = []
+    formatted_texts: List[str] = []
+    image_counts: List[int] = []
     for item in items:
         text = _format_embedding_text(item.get("text") or "", task_type=task_type, model=model)
+        formatted_texts.append(text)
         local_path = str(item.get("local_path") or "")
         if local_path and Path(local_path).is_file():
             image = _load_image(local_path)
             contents.append([text, image] if text else [image])
+            image_counts.append(1)
         else:
             contents.append(text)
+            image_counts.append(0)
 
-    config_kwargs = {"output_dimensionality": output_dimensionality}
+    _enforce_gemini_embedding_budget(
+        formatted_texts,
+        model=model,
+        image_count_by_input=image_counts,
+    )
+
+    config_kwargs = {
+        "output_dimensionality": output_dimensionality,
+    }
     if not _uses_prompt_task_instruction(model):
         config_kwargs["task_type"] = task_type
     config = types.EmbedContentConfig(**config_kwargs)
@@ -432,7 +516,21 @@ def _embed_multimodal_batch(
 
 def _record_metadata(record: Dict[str, Any], *, kind: str) -> Dict[str, Any]:
     metadata = {
-        "record_type": kind,
+        "record_type": record.get("kind") or record.get("record_type") or kind,
+        "storage_lane_kind": kind,
+        "document_revision_id": record.get("document_revision_id"),
+        "page_card_ids": record.get("page_card_ids"),
+        "section_ids": record.get("section_ids"),
+        "action_id": record.get("action_id"),
+        "action_type": record.get("action_type")
+        or ((record.get("metadata") or {}).get("action_type") if isinstance(record.get("metadata"), Mapping) else None),
+        "target_url": record.get("target_url")
+        or ((record.get("metadata") or {}).get("target_url") if isinstance(record.get("metadata"), Mapping) else None),
+        "official_target": record.get("official_target")
+        if record.get("official_target") is not None
+        else ((record.get("metadata") or {}).get("official_target") if isinstance(record.get("metadata"), Mapping) else None),
+        "child_chunk_ids": record.get("child_chunk_ids")
+        or ((record.get("metadata") or {}).get("child_chunk_ids") if isinstance(record.get("metadata"), Mapping) else None),
         "document_id": record.get("document_id"),
         "document_title": record.get("document_title"),
         "document_type": record.get("document_type"),

@@ -30,16 +30,23 @@ from pipeline.core.assertions import (
 )
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.chunking import load_chunk_index
-from pipeline.core.io import atomic_write_json, load_json_safe
+from pipeline.core.io import atomic_write_json, load_json_safe, sha256_file
 from pipeline.core.media import (
     build_media_embedding_text,
     compact_media_for_metadata,
     dedupe_media_items,
     load_media_manifest_items,
+    media_chunk_match,
     media_items_by_type,
     normalize_media_item,
 )
 from pipeline.core.registry import register_stage
+from pipeline.core.release_assembly import (
+    SELECTED_DENSE_RECORD_KINDS,
+    SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
+    SelectedReleaseAssemblyError,
+    selected_release_file_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,208 @@ _LOW_SIGNAL_MEDIA_PHRASES = {
     "doesn't contain any text or information",
     "does not contain any text or information",
 }
+
+
+def _selected_release_records(
+    ctx: StageContext,
+) -> Tuple[Mapping[str, Any], Path, Dict[str, List[Dict[str, Any]]]] | None:
+    profile = (
+        ctx.config.get("selected_profile")
+        if isinstance(ctx.config.get("selected_profile"), Mapping)
+        else {}
+    )
+    variant_id = str(profile.get("variant_id") or "").strip()
+    if not variant_id:
+        return None
+    if tuple(profile.get("record_kinds") or []) != SELECTED_DENSE_RECORD_KINDS:
+        raise SelectedReleaseAssemblyError(
+            "selected_profile.record_kinds differs from the evaluated dense-graph contract"
+        )
+    resolution = resolve_artifact_path(
+        ctx,
+        ArtifactContract(
+            artifact_type="selected_release_assembly",
+            role="production_release_assembly",
+            legacy_output_key="selected_release_assembly_file",
+            label="selected release assembly manifest",
+        ),
+    )
+    if resolution is None:
+        raise SelectedReleaseAssemblyError(
+            "selected-profile retrieval formatting requires the release assembly manifest"
+        )
+    manifest_path = Path(resolution.path).resolve()
+    manifest = load_json_safe(manifest_path, None)
+    if not isinstance(manifest, Mapping):
+        raise SelectedReleaseAssemblyError("selected release assembly manifest is invalid")
+    if str(manifest.get("schema_version") or "") != SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION:
+        raise SelectedReleaseAssemblyError("selected release assembly schema is unsupported")
+    if str(manifest.get("status") or "") != "ready_for_embedding":
+        raise SelectedReleaseAssemblyError("selected release assembly is not ready for embedding")
+    if str(manifest.get("variant_id") or "") != variant_id:
+        raise SelectedReleaseAssemblyError("selected release assembly variant drifted")
+    files = {
+        lane: load_json_safe(selected_release_file_path(manifest, manifest_path, lane), [])
+        for lane in ("chunks", "parents", "media", "page_cards", "actions")
+    }
+    if not all(isinstance(records, list) for records in files.values()):
+        raise SelectedReleaseAssemblyError("selected release record arrays are invalid")
+    expected = (
+        manifest.get("dense_lane_counts")
+        if isinstance(manifest.get("dense_lane_counts"), Mapping)
+        else {}
+    )
+    for lane, records in files.items():
+        if len(records) != int(expected.get(lane) or 0):
+            raise SelectedReleaseAssemblyError(
+                f"selected release lane count drifted for {lane}"
+            )
+    return manifest, manifest_path, files
+
+
+def _apply_selected_release_records(
+    *,
+    generated_chunks: List[Dict[str, Any]],
+    generated_media: List[Dict[str, Any]],
+    selected: Mapping[str, List[Dict[str, Any]]],
+) -> Tuple[
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
+    """Overlay runtime links while preserving frozen IDs and embedding text."""
+
+    generated_chunk_by_id = {
+        str(record.get("id") or ""): record for record in generated_chunks
+    }
+    selected_chunk_ids = {str(record.get("id") or "") for record in selected["chunks"]}
+    if set(generated_chunk_by_id) != selected_chunk_ids:
+        raise SelectedReleaseAssemblyError(
+            "formatted chunk IDs do not exactly match the selected release assembly"
+        )
+
+    chunks_by_page: Dict[str, List[str]] = defaultdict(list)
+    chunks_by_media: Dict[str, List[str]] = defaultdict(list)
+    chunk_records: List[Dict[str, Any]] = []
+    for frozen in selected["chunks"]:
+        chunk_id = str(frozen["id"])
+        generated = generated_chunk_by_id[chunk_id]
+        metadata = frozen.get("metadata") if isinstance(frozen.get("metadata"), Mapping) else {}
+        page_card_ids = [str(value) for value in frozen.get("page_card_ids") or [] if value]
+        media_ids = [str(value) for value in metadata.get("media_ids") or [] if value]
+        for page_card_id in page_card_ids:
+            chunks_by_page[page_card_id].append(chunk_id)
+        for media_id in media_ids:
+            chunks_by_media[media_id].append(chunk_id)
+        record = {
+            **generated,
+            **frozen,
+            "record_type": "chunk",
+            "evaluated_record_kind": "chunk",
+            "dense_text": str(frozen.get("text") or ""),
+            "lexical_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+            "sparse_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+            "media_ids": media_ids,
+        }
+        chunk_records.append(record)
+
+    parent_records: List[Dict[str, Any]] = []
+    for frozen in selected["parents"]:
+        metadata = frozen.get("metadata") if isinstance(frozen.get("metadata"), Mapping) else {}
+        child_ids = [str(value) for value in metadata.get("child_chunk_ids") or [] if value]
+        if any(chunk_id not in selected_chunk_ids for chunk_id in child_ids):
+            raise SelectedReleaseAssemblyError(
+                f"selected parent references an unknown chunk: {frozen.get('id')}"
+            )
+        kind = str(frozen.get("kind") or "")
+        parent_records.append(
+            {
+                **frozen,
+                "record_type": "parent",
+                "evaluated_record_kind": kind,
+                "parent_type": "section" if kind == "parent_section" else "page",
+                "child_chunk_ids": child_ids,
+                "linked_chunk_ids": child_ids,
+                "dense_text": str(frozen.get("text") or ""),
+                "lexical_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+                "sparse_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+            }
+        )
+
+    generated_media_by_id = {
+        str(record.get("id") or ""): record for record in generated_media
+    }
+    media_records: List[Dict[str, Any]] = []
+    for frozen in selected["media"]:
+        media_id = str(frozen.get("media_id") or frozen.get("id") or "")
+        generated = generated_media_by_id.get(str(frozen.get("id") or ""), {})
+        metadata = frozen.get("metadata") if isinstance(frozen.get("metadata"), Mapping) else {}
+        local_path = str(frozen.get("local_path") or generated.get("local_path") or "")
+        media_records.append(
+            {
+                **generated,
+                **frozen,
+                "record_type": "media",
+                "evaluated_record_kind": "media",
+                "media_type": "image",
+                "linked_chunk_ids": list(dict.fromkeys(chunks_by_media.get(media_id, []))),
+                "dense_text": str(frozen.get("text") or ""),
+                "lexical_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+                "sparse_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+                "local_path": local_path,
+                "asset_uri": str(frozen.get("asset_uri") or generated.get("asset_uri") or local_path),
+                "can_embed_multimodal": bool(
+                    metadata.get("can_embed_multimodal")
+                    and local_path
+                    and Path(local_path).is_file()
+                ),
+            }
+        )
+
+    page_card_records: List[Dict[str, Any]] = []
+    for frozen in selected["page_cards"]:
+        page_card_id = str(frozen.get("id") or "")
+        page_card_records.append(
+            {
+                **frozen,
+                "record_type": "page_card",
+                "evaluated_record_kind": "page_card",
+                "linked_chunk_ids": list(dict.fromkeys(chunks_by_page.get(page_card_id, []))),
+                "dense_text": str(frozen.get("text") or ""),
+                "lexical_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+                "sparse_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+            }
+        )
+
+    action_records: List[Dict[str, Any]] = []
+    for frozen in selected["actions"]:
+        metadata = frozen.get("metadata") if isinstance(frozen.get("metadata"), Mapping) else {}
+        linked: List[str] = []
+        for page_card_id in frozen.get("page_card_ids") or []:
+            linked.extend(chunks_by_page.get(str(page_card_id), []))
+        action_records.append(
+            {
+                **frozen,
+                "record_type": "action",
+                "evaluated_record_kind": "action",
+                "linked_chunk_ids": list(dict.fromkeys(linked)),
+                "action_type": metadata.get("action_type"),
+                "target_url": metadata.get("target_url"),
+                "official_target": metadata.get("official_target"),
+                "dense_text": str(frozen.get("text") or ""),
+                "lexical_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+                "sparse_text": str(frozen.get("sparse_text") or frozen.get("raw_text") or ""),
+            }
+        )
+    return (
+        chunk_records,
+        parent_records,
+        media_records,
+        page_card_records,
+        action_records,
+    )
 
 
 def _stable_id(*parts: Any) -> str:
@@ -212,17 +421,47 @@ def _language_normalized_url(value: Any) -> str:
         return canonical
 
 
-def _sentence_spans(text: Any, *, max_sentences: int, max_chars: int) -> List[str]:
-    normalized = _clean_text(text)
-    if not normalized:
+_SENTENCE_BOUNDARY_RE = re.compile(
+    r'''(?<=[.!?\u061f\u06d4\u3002\uff01\uff1f])\s+'''
+    r'''(?=["'“‘«(\[]*[A-Z0-9\u0600-\u06ff])|[\r\n]+'''
+)
+_ARABIC_DIACRITICS_RE = re.compile(r"[\u064b-\u065f\u0670\u06d6-\u06ed]")
+_ARABIC_MATCH_TRANSLATION = str.maketrans(
+    {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ى": "ي",
+        "ؤ": "و",
+        "ئ": "ي",
+        "ـ": "",
+    }
+)
+
+
+def _normalize_for_matching(value: Any) -> str:
+    normalized = _clean_text(value).casefold().translate(_ARABIC_MATCH_TRANSLATION)
+    return _ARABIC_DIACRITICS_RE.sub("", normalized)
+
+
+def _split_sentences(text: str) -> List[str]:
+    """Split Latin and Arabic prose while retaining extractive text."""
+
+    raw = str(text or "").strip()
+    if not raw:
         return []
-    sentences = [
-        _clean_text(sentence)
-        for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9(])", normalized)
-        if _clean_text(sentence)
-    ]
+    output: List[str] = []
+    for part in _SENTENCE_BOUNDARY_RE.split(raw):
+        candidate = _clean_text(part)
+        if candidate:
+            output.append(candidate)
+    return output
+
+
+def _sentence_spans(text: Any, *, max_sentences: int, max_chars: int) -> List[str]:
+    sentences = _split_sentences(str(text or ""))
     if not sentences:
-        sentences = [normalized]
+        return []
     spans: List[str] = []
     i = 0
     while i < len(sentences):
@@ -243,46 +482,213 @@ def _sentence_spans(text: Any, *, max_sentences: int, max_chars: int) -> List[st
     return spans
 
 
+_DEADLINE_TERMS = (
+    "deadline",
+    "apply by",
+    "applications close",
+    "الموعد النهايي",
+    "اخر موعد",
+    "موعد التقديم",
+    "يغلق باب التقديم",
+    "تغلق الطلبات",
+    "تاريخ الاغلاق",
+)
+_APPLICATION_TERMS = (
+    "apply",
+    "application",
+    "requirement",
+    "eligibility",
+    "tuition",
+    "scholarship",
+    "fee",
+    "cost",
+    "التقديم",
+    "طلب الالتحاق",
+    "الطلبات",
+    "المتطلبات",
+    "الاهليه",
+    "الرسوم",
+    "التكلفه",
+    "منحه",
+)
+_PROGRAM_TERMS = (
+    "ph.d",
+    "phd",
+    "master",
+    "msc",
+    "program",
+    "degree",
+    "bachelor",
+    "undergraduate",
+    "برنامج",
+    "برامج",
+    "درجه",
+    "ماجستير",
+    "دكتوراه",
+    "بكالوريوس",
+)
+_FACULTY_TERMS = (
+    "faculty",
+    "professor",
+    "research interest",
+    "award",
+    "recognition",
+    "publication",
+    "هييه التدريس",
+    "استاذ",
+    "الاهتمامات البحثيه",
+    "البحوث",
+    "منشورات",
+    "جايزه",
+)
+_CONTACT_TERMS = (
+    "email",
+    "phone",
+    "contact",
+    "location",
+    "address",
+    "campus",
+    "masdar",
+    "البريد الالكتروني",
+    "هاتف",
+    "الهاتف",
+    "اتصل",
+    "التواصل",
+    "العنوان",
+    "الموقع",
+    "الحرم الجامعي",
+    "مصدر",
+)
+_POLICY_TERMS = (
+    "policy",
+    "procedure",
+    "guideline",
+    "visa",
+    "housing",
+    "accommodation",
+    "سياسه",
+    "اجراء",
+    "ارشادات",
+    "تاشيره",
+    "سكن",
+    "اقامه",
+)
+_POLICY_TYPE_TERMS = (
+    "policy",
+    "procedure",
+    "guideline",
+    "سياسه",
+    "اجراء",
+    "ارشادات",
+)
+
+
 def _span_signal_score(text: str, *, document_title: str, section_path: Iterable[Any], heading: str) -> float:
-    lower = text.lower()
+    lower = _normalize_for_matching(text)
     score = 0.0
-    if re.search(r"\b\d{4}\b|\b\d{1,2}\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)", lower):
+    if re.search(
+        r"\b\d{4}\b|\b\d{1,2}\s+"
+        r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|"
+        r"يناير|فبراير|مارس|ابريل|مايو|يونيو|يوليو|اغسطس|سبتمبر|اكتوبر|نوفمبر|ديسمبر)",
+        lower,
+    ):
         score += 1.0
     if re.search(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,4}\b", text):
         score += 0.8
-    if any(token in lower for token in ("deadline", "apply", "application", "requirement", "eligibility", "tuition", "scholarship", "fee", "cost")):
+    if any(token in lower for token in (*_DEADLINE_TERMS, *_APPLICATION_TERMS)):
         score += 1.0
-    if any(token in lower for token in ("ph.d", "phd", "master", "msc", "program", "degree", "bachelor", "undergraduate")):
+    if any(token in lower for token in _PROGRAM_TERMS):
         score += 0.9
-    if any(token in lower for token in ("faculty", "professor", "research interest", "award", "recognition", "publication")):
+    if any(token in lower for token in _FACULTY_TERMS):
         score += 0.9
-    if any(token in lower for token in ("email", "phone", "contact", "location", "address", "campus", "masdar")):
+    if any(token in lower for token in _CONTACT_TERMS):
         score += 0.9
-    if any(token in lower for token in ("policy", "procedure", "guideline", "visa", "housing", "accommodation")):
+    if any(token in lower for token in _POLICY_TERMS):
         score += 0.7
-    heading_text = " ".join([document_title, heading, " ".join(str(value) for value in section_path or [])]).lower()
-    if heading_text and any(token in heading_text for token in ("admission", "program", "faculty", "research", "scholarship", "deadline")):
+    heading_text = _normalize_for_matching(
+        " ".join(
+            [document_title, heading, " ".join(str(value) for value in section_path or [])]
+        )
+    )
+    if heading_text and any(
+        token in heading_text
+        for token in (
+            "admission",
+            "program",
+            "faculty",
+            "research",
+            "scholarship",
+            "deadline",
+            "القبول",
+            "برنامج",
+            "هييه التدريس",
+            "البحث",
+            "منحه",
+            "الموعد النهايي",
+        )
+    ):
         score += 0.4
     return score
 
 
 def _classify_span_type(text: str, *, document_title: str, section_path: Iterable[Any], heading: str) -> str:
-    lower = " ".join([text, document_title, heading, " ".join(str(value) for value in section_path or [])]).lower()
-    if any(token in lower for token in ("deadline", "date", "apply by", "applications close")):
+    lower = _normalize_for_matching(
+        " ".join(
+            [text, document_title, heading, " ".join(str(value) for value in section_path or [])]
+        )
+    )
+    if any(token in lower for token in (*_DEADLINE_TERMS, "date", "تاريخ")):
         return "deadline"
-    if any(token in lower for token in ("email", "phone", "contact", "address")):
+    if any(token in lower for token in _CONTACT_TERMS):
         return "contact"
-    if any(token in lower for token in ("requirement", "eligibility", "required", "admission criteria")):
+    if any(
+        token in lower
+        for token in (
+            "requirement",
+            "eligibility",
+            "required",
+            "admission criteria",
+            "المتطلبات",
+            "الاهليه",
+            "مطلوب",
+            "شروط القبول",
+        )
+    ):
         return "requirement"
-    if any(token in lower for token in ("ph.d", "phd", "master", "msc", "bachelor", "program", "degree")):
+    if any(token in lower for token in _PROGRAM_TERMS):
         return "program"
-    if any(token in lower for token in ("professor", "faculty", "research interests", "biography")):
+    if any(
+        token in lower
+        for token in (
+            "professor",
+            "faculty",
+            "research interests",
+            "biography",
+            "هييه التدريس",
+            "استاذ",
+            "الاهتمامات البحثيه",
+            "السيره الذاتيه",
+        )
+    ):
         return "faculty_profile"
-    if any(token in lower for token in ("award", "recognition", "prize", "honor")):
+    if any(token in lower for token in ("award", "recognition", "prize", "honor", "جايزه", "تكريم")):
         return "award"
-    if any(token in lower for token in ("policy", "procedure", "guideline")):
+    if any(token in lower for token in _POLICY_TYPE_TERMS):
         return "policy"
-    if any(token in lower for token in ("fact", "founded", "established", "located", "offers")):
+    if any(
+        token in lower
+        for token in (
+            "fact",
+            "founded",
+            "established",
+            "located",
+            "offers",
+            "تاسست",
+            "يقع",
+            "تقدم",
+            "يوفر",
+        )
+    ):
         return "fact"
     return "general"
 
@@ -576,12 +982,18 @@ def _build_media_embedding_input(item: Dict[str, Any], *, document_title: str = 
     lines.append(f"{media_type.upper()}: {title}")
     if document_title:
         lines.append(f"DOCUMENT: {document_title}")
-    if section_path:
-        lines.append(f"SECTION: {' > '.join(section_path)}")
+    contextual_section_path = list(item.get("section_path") or section_path or [])
+    if contextual_section_path:
+        lines.append(f"SECTION: {' > '.join(contextual_section_path)}")
+    if item.get("page_title") and _clean_text(item.get("page_title")) != _clean_text(document_title):
+        lines.append(f"PAGE_TITLE: {_clean_text(item.get('page_title'))}")
     for key in (
         "caption",
         "description",
         "context",
+        "surrounding_text_before",
+        "surrounding_text_after",
+        "nearby_text",
         "semantic_caption",
         "contextual_caption",
         "visual_description",
@@ -612,19 +1024,6 @@ def _build_media_sparse_text(item: Dict[str, Any], *, max_chars: int) -> str:
 
 def _tokenize_for_bm25(text: str) -> List[str]:
     return [token for token in _clean_text(text).lower().split() if token]
-
-
-def _split_sentences(text: str) -> List[str]:
-    normalized = _clean_text(text)
-    if not normalized:
-        return []
-    parts = re.split(r"(?<=[.!?])\s+|[\r\n]+", normalized)
-    output: List[str] = []
-    for part in parts:
-        candidate = _clean_text(part)
-        if candidate:
-            output.append(candidate)
-    return output
 
 
 def _build_extractive_summary(parent: Dict[str, Any], child_chunks: List[Dict[str, Any]], *, max_chars: int) -> str:
@@ -830,6 +1229,10 @@ class GeminiRetrievalFormatter(FormatterStage):
     description = "Builds chunk, parent, and media corpora for Gemini multimodal retrieval."
 
     async def execute(self, ctx: StageContext) -> StageResult:
+        try:
+            selected_release = _selected_release_records(ctx)
+        except (OSError, TypeError, ValueError, SelectedReleaseAssemblyError) as exc:
+            return StageResult.failure(f"Selected release contract failed: {exc}")
         chunk_index_resolution = resolve_artifact_path(
             ctx,
             ArtifactContract(
@@ -1001,6 +1404,7 @@ class GeminiRetrievalFormatter(FormatterStage):
 
         media_records: List[Dict[str, Any]] = []
         fact_records: List[Dict[str, Any]] = []
+        media_matches_by_chunk: Dict[str, List[Tuple[float, str]]] = defaultdict(list)
         media_counter = 0
 
         def _append_media(item: Dict[str, Any], *, source_url: str = "", source_markdown_path: str = "", page_number: int | None = None) -> None:
@@ -1011,18 +1415,41 @@ class GeminiRetrievalFormatter(FormatterStage):
             normalized["source_url"] = source_url or normalized.get("source_url", "")
             normalized["source_document_path"] = source_markdown_path or normalized.get("source_document_path", "")
             normalized["md_path"] = source_markdown_path or normalized.get("md_path", "")
-            linked_chunk_ids: List[str] = []
-            if source_markdown_path and page_number is not None:
-                linked_chunk_ids.extend(chunk_ids_by_doc_page.get((source_markdown_path, int(page_number)), []))
-            if not linked_chunk_ids and source_markdown_path:
-                linked_chunk_ids.extend(chunk_ids_by_markdown_path.get(source_markdown_path, []))
-            if not linked_chunk_ids and source_url:
-                linked_chunk_ids.extend(chunk_ids_by_url.get(source_url, []))
-            linked_chunk_ids = list(dict.fromkeys(linked_chunk_ids))
-            if not linked_chunk_ids:
+            candidate_chunk_ids: List[str] = []
+            if source_markdown_path:
+                candidate_chunk_ids.extend(
+                    chunk_ids_by_markdown_path.get(source_markdown_path, [])
+                )
+            if source_url:
+                candidate_chunk_ids.extend(chunk_ids_by_url.get(source_url, []))
+            candidate_chunk_ids = list(dict.fromkeys(candidate_chunk_ids))
+            if not candidate_chunk_ids:
                 return
 
-            sample_chunk = chunk_map[linked_chunk_ids[0]]
+            ranked_chunk_matches: List[Tuple[float, str, str]] = []
+            for chunk_id in candidate_chunk_ids:
+                chunk = chunk_map[chunk_id]
+                match = media_chunk_match(
+                    normalized,
+                    chunk_page_numbers=chunk.get("page_numbers") or [],
+                    chunk_section_path=chunk.get("section_path") or [],
+                    chunk_text=str(chunk.get("text") or ""),
+                )
+                if match["matched"]:
+                    ranked_chunk_matches.append(
+                        (
+                            float(match["score"]),
+                            chunk_id,
+                            str(match["method"]),
+                        )
+                    )
+            ranked_chunk_matches.sort(key=lambda row: (-row[0], row[1]))
+            linked_chunk_ids = [row[1] for row in ranked_chunk_matches]
+
+            contextual_section_path = list(normalized.get("section_path") or [])
+            sample_chunk = chunk_map[
+                linked_chunk_ids[0] if linked_chunk_ids else candidate_chunk_ids[0]
+            ]
             page_key = sample_chunk["page_key"]
             section_keys = list(dict.fromkeys(chunk_map[chunk_id]["section_key"] for chunk_id in linked_chunk_ids))
             media_id = normalized.get("id") or _stable_id(
@@ -1038,7 +1465,9 @@ class GeminiRetrievalFormatter(FormatterStage):
             media_text = _build_media_embedding_input(
                 normalized,
                 document_title=document_title,
-                section_path=sample_chunk.get("section_path") or [],
+                section_path=contextual_section_path
+                or sample_chunk.get("section_path")
+                or [],
             )
             local_path = normalized.get("local_path") or ""
             record = {
@@ -1062,6 +1491,22 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "caption": normalized.get("caption", ""),
                 "description": normalized.get("description", ""),
                 "context": normalized.get("context", ""),
+                "context_reference_id": normalized.get("context_reference_id", ""),
+                "context_source": normalized.get("context_source", ""),
+                "context_association": normalized.get("context_association", ""),
+                "context_confidence": normalized.get("context_confidence"),
+                "context_sha256": normalized.get("context_sha256", ""),
+                "section_id": normalized.get("section_id", ""),
+                "section_path": contextual_section_path,
+                "section_heading": normalized.get("section_heading", ""),
+                "surrounding_text_before": normalized.get(
+                    "surrounding_text_before", ""
+                ),
+                "surrounding_text_after": normalized.get(
+                    "surrounding_text_after", ""
+                ),
+                "nearby_text": normalized.get("nearby_text", ""),
+                "page_title": normalized.get("page_title", ""),
                 "transcript": normalized.get("transcript", ""),
                 "provider": normalized.get("provider", ""),
                 "content_hash": normalized.get("content_hash", ""),
@@ -1095,8 +1540,9 @@ class GeminiRetrievalFormatter(FormatterStage):
                 ),
             }
             media_records.append(record)
-            for chunk_id in linked_chunk_ids:
+            for score, chunk_id, _method in ranked_chunk_matches:
                 chunk_map[chunk_id]["media_ids"].append(media_id)
+                media_matches_by_chunk[chunk_id].append((score, media_id))
             page_record_map[page_key]["media_ids"].append(media_id)
             for section_key in section_keys:
                 section_record_map[section_key]["media_ids"].append(media_id)
@@ -1122,78 +1568,82 @@ class GeminiRetrievalFormatter(FormatterStage):
                 if isinstance(item, dict):
                     _append_media(item, source_url=source_url, source_markdown_path=source_markdown_path)
 
-        page_visual_dir = ctx.output_dir("page_visuals")
-        visual_page_keys = set()
-        for record in chunk_map.values():
-            source_file = str(record.get("source_file") or "")
-            if not source_file.lower().endswith(".pdf"):
-                continue
-            for page_number in record.get("page_numbers") or []:
-                key = (source_file, int(page_number))
-                if key in visual_page_keys:
+        # A selected release already contains the exact evaluated media lane.
+        # Re-rendering PDF pages here would perform expensive, unevaluated media
+        # generation before those records are replaced by the frozen lane.
+        if selected_release is None:
+            page_visual_dir = ctx.output_dir("page_visuals")
+            visual_page_keys = set()
+            for record in chunk_map.values():
+                source_file = str(record.get("source_file") or "")
+                if not source_file.lower().endswith(".pdf"):
                     continue
-                visual_page_keys.add(key)
-                local_path = _render_pdf_page_visual(
-                    source_file,
-                    page_number=int(page_number),
-                    output_dir=page_visual_dir,
-                )
-                if not local_path:
-                    continue
-                chunk_ids = list(chunk_ids_by_doc_page.get((_relative_or_absolute(record.get("source_markdown_path") or ""), int(page_number)), []))
-                if not chunk_ids:
-                    chunk_ids = list(chunk_ids_by_page.get(record["page_key"], []))
-                if not chunk_ids:
-                    continue
-                sample_chunk = chunk_map[chunk_ids[0]]
-                section_keys = list(dict.fromkeys(chunk_map[chunk_id]["section_key"] for chunk_id in chunk_ids))
-                visual_id = _stable_id("page_visual", sample_chunk.get("source_markdown_path"), page_number)
-                page_text = " ".join(
-                    _clean_text(chunk_map[chunk_id].get("text"))
-                    for chunk_id in chunk_ids[:3]
-                    if chunk_map.get(chunk_id)
-                ).strip()
-                visual_record = {
-                    "id": visual_id,
-                    "record_type": "media",
-                    "media_type": "page_visual",
-                    "text": _build_media_embedding_input(
-                        {
-                            "type": "page_visual",
-                            "title": f"{sample_chunk.get('document_title') or 'Document'} page {page_number}",
-                            "description": page_text,
-                            "context": page_text,
-                            "source_url": sample_chunk.get("source_url", ""),
-                        },
-                        document_title=sample_chunk.get("document_title", ""),
-                        section_path=sample_chunk.get("section_path") or [],
-                    ),
-                    "document_id": sample_chunk.get("document_id", ""),
-                    "document_title": sample_chunk.get("document_title", ""),
-                    "source_markdown_path": sample_chunk.get("source_markdown_path", ""),
-                    "source_url": sample_chunk.get("source_url", ""),
-                    "page_key": sample_chunk.get("page_key", ""),
-                    "section_keys": section_keys,
-                    "page_number": int(page_number),
-                    "linked_chunk_ids": chunk_ids,
-                    "linked_parent_ids": list(dict.fromkeys([sample_chunk.get("page_key", ""), *section_keys])),
-                    "url": "",
-                    "asset_uri": local_path,
-                    "local_path": local_path,
-                    "title": f"{sample_chunk.get('document_title') or 'Document'} page {page_number}",
-                    "caption": "",
-                    "description": page_text,
-                    "context": page_text,
-                    "transcript": "",
-                    "provider": "rendered_pdf_page",
-                    "can_embed_multimodal": True,
-                }
-                media_records.append(visual_record)
-                for chunk_id in chunk_ids:
-                    chunk_map[chunk_id]["media_ids"].append(visual_id)
-                page_record_map[sample_chunk["page_key"]]["media_ids"].append(visual_id)
-                for section_key in section_keys:
-                    section_record_map[section_key]["media_ids"].append(visual_id)
+                for page_number in record.get("page_numbers") or []:
+                    key = (source_file, int(page_number))
+                    if key in visual_page_keys:
+                        continue
+                    visual_page_keys.add(key)
+                    local_path = _render_pdf_page_visual(
+                        source_file,
+                        page_number=int(page_number),
+                        output_dir=page_visual_dir,
+                    )
+                    if not local_path:
+                        continue
+                    chunk_ids = list(chunk_ids_by_doc_page.get((_relative_or_absolute(record.get("source_markdown_path") or ""), int(page_number)), []))
+                    if not chunk_ids:
+                        chunk_ids = list(chunk_ids_by_page.get(record["page_key"], []))
+                    if not chunk_ids:
+                        continue
+                    sample_chunk = chunk_map[chunk_ids[0]]
+                    section_keys = list(dict.fromkeys(chunk_map[chunk_id]["section_key"] for chunk_id in chunk_ids))
+                    visual_id = _stable_id("page_visual", sample_chunk.get("source_markdown_path"), page_number)
+                    page_text = " ".join(
+                        _clean_text(chunk_map[chunk_id].get("text"))
+                        for chunk_id in chunk_ids[:3]
+                        if chunk_map.get(chunk_id)
+                    ).strip()
+                    visual_record = {
+                        "id": visual_id,
+                        "record_type": "media",
+                        "media_type": "page_visual",
+                        "text": _build_media_embedding_input(
+                            {
+                                "type": "page_visual",
+                                "title": f"{sample_chunk.get('document_title') or 'Document'} page {page_number}",
+                                "description": page_text,
+                                "context": page_text,
+                                "source_url": sample_chunk.get("source_url", ""),
+                            },
+                            document_title=sample_chunk.get("document_title", ""),
+                            section_path=sample_chunk.get("section_path") or [],
+                        ),
+                        "document_id": sample_chunk.get("document_id", ""),
+                        "document_title": sample_chunk.get("document_title", ""),
+                        "source_markdown_path": sample_chunk.get("source_markdown_path", ""),
+                        "source_url": sample_chunk.get("source_url", ""),
+                        "page_key": sample_chunk.get("page_key", ""),
+                        "section_keys": section_keys,
+                        "page_number": int(page_number),
+                        "linked_chunk_ids": chunk_ids,
+                        "linked_parent_ids": list(dict.fromkeys([sample_chunk.get("page_key", ""), *section_keys])),
+                        "url": "",
+                        "asset_uri": local_path,
+                        "local_path": local_path,
+                        "title": f"{sample_chunk.get('document_title') or 'Document'} page {page_number}",
+                        "caption": "",
+                        "description": page_text,
+                        "context": page_text,
+                        "transcript": "",
+                        "provider": "rendered_pdf_page",
+                        "can_embed_multimodal": True,
+                    }
+                    media_records.append(visual_record)
+                    for chunk_id in chunk_ids:
+                        chunk_map[chunk_id]["media_ids"].append(visual_id)
+                    page_record_map[sample_chunk["page_key"]]["media_ids"].append(visual_id)
+                    for section_key in section_keys:
+                        section_record_map[section_key]["media_ids"].append(visual_id)
 
         media_by_id = {record["id"]: record for record in media_records}
         sparse_chunk_max_chars = int(ctx.formatter_config.get("sparse_chunk_max_chars") or 6000)
@@ -1215,7 +1665,16 @@ class GeminiRetrievalFormatter(FormatterStage):
         evidence_span_duplicate_count = 0
         lexical_records: List[Dict[str, Any]] = []
         for record in chunk_map.values():
-            media_items = [media_by_id[mid] for mid in record["media_ids"][:3] if mid in media_by_id]
+            selected_media_ids = [
+                media_id
+                for _score, media_id in sorted(
+                    media_matches_by_chunk.get(record["id"], []),
+                    key=lambda row: (-row[0], row[1]),
+                )[:3]
+            ]
+            media_items = [
+                media_by_id[mid] for mid in selected_media_ids if mid in media_by_id
+            ]
             dense_text = _build_chunk_embedding_text(record, media_items)
             sparse_text = _build_chunk_sparse_text(record, max_chars=sparse_chunk_max_chars)
             chunk_dense_records.append(
@@ -1416,6 +1875,55 @@ class GeminiRetrievalFormatter(FormatterStage):
                 }
             )
 
+        page_card_records: List[Dict[str, Any]] = []
+        action_records: List[Dict[str, Any]] = []
+        if selected_release is not None:
+            _assembly_manifest, _assembly_path, selected_records = selected_release
+            try:
+                (
+                    chunk_dense_records,
+                    parent_records,
+                    media_records,
+                    page_card_records,
+                    action_records,
+                ) = _apply_selected_release_records(
+                    generated_chunks=chunk_dense_records,
+                    generated_media=media_records,
+                    selected=selected_records,
+                )
+            except (TypeError, ValueError, SelectedReleaseAssemblyError) as exc:
+                return StageResult.failure(f"Selected release record overlay failed: {exc}")
+
+            selected_lexical_types = {"chunk", "parent", "media", "page_card", "action"}
+            lexical_records = [
+                record
+                for record in lexical_records
+                if str(record.get("record_type") or "") not in selected_lexical_types
+            ]
+            for record in (
+                *chunk_dense_records,
+                *parent_records,
+                *media_records,
+                *page_card_records,
+                *action_records,
+            ):
+                lexical_text = str(
+                    record.get("sparse_text")
+                    or record.get("lexical_text")
+                    or record.get("raw_text")
+                    or record.get("text")
+                    or ""
+                )
+                lexical_records.append(
+                    {
+                        "id": record["id"],
+                        "record_type": str(record.get("record_type") or ""),
+                        "evaluated_record_kind": str(record.get("kind") or ""),
+                        "text": lexical_text,
+                        "tokens": _tokenize_for_bm25(lexical_text),
+                    }
+                )
+
         summary_records: List[Dict[str, Any]] = []
         for parent in parent_records:
             child_chunks = [chunk_map[chunk_id] for chunk_id in parent.get("child_chunk_ids", []) if chunk_id in chunk_map]
@@ -1586,22 +2094,46 @@ class GeminiRetrievalFormatter(FormatterStage):
                     },
                 )
 
+        selected_release_contract = {}
+        if selected_release is not None:
+            assembly_manifest, assembly_path, _selected_records = selected_release
+            files = assembly_manifest.get("files") if isinstance(assembly_manifest.get("files"), Mapping) else {}
+            navigation_entry = files.get("navigation_catalog") if isinstance(files.get("navigation_catalog"), Mapping) else {}
+            selected_release_contract = {
+                "schema_version": str(assembly_manifest.get("schema_version") or ""),
+                "variant_id": str(assembly_manifest.get("variant_id") or ""),
+                "manifest_sha256": sha256_file(assembly_path),
+                "assembly_sha256": str(assembly_manifest.get("assembly_sha256") or ""),
+                "candidate_records_sha256": str(
+                    (assembly_manifest.get("source") or {}).get("candidate_records_sha256")
+                    if isinstance(assembly_manifest.get("source"), Mapping)
+                    else ""
+                ),
+                "navigation_catalog_sha256": str(navigation_entry.get("sha256") or ""),
+            }
+
         bundle = {
-            "version": 5,
+            "version": 6,
+            "schema_version": "mbzuai.retrieval_bundle.v6",
             "generated_at": ctx.run_id,
             "chunk_records": chunk_dense_records,
             "parent_records": parent_records,
             "media_records": media_records,
+            "page_card_records": page_card_records,
+            "action_records": action_records,
             "fact_records": fact_records,
             "evidence_span_records": evidence_span_records,
             "summary_records": summary_records,
             "entity_records": entity_records,
             "assertion_records": assertion_records,
             "answer_records": answer_records,
+            "selected_release_contract": selected_release_contract,
             "stats": {
                 "chunk_count": len(chunk_dense_records),
                 "parent_count": len(parent_records),
                 "media_count": len(media_records),
+                "page_card_count": len(page_card_records),
+                "action_count": len(action_records),
                 "image_media_count": len(image_media_records),
                 "multimodal_media_count": len(multimodal_media_records),
                 "text_only_image_count": text_only_image_records,
@@ -1621,6 +2153,8 @@ class GeminiRetrievalFormatter(FormatterStage):
         chunk_file = ctx.stage_work_dir / "chunk_dense_records.json"
         parent_file = ctx.stage_work_dir / "parent_dense_records.json"
         media_file = ctx.stage_work_dir / "media_dense_records.json"
+        page_card_file = ctx.stage_work_dir / "page_card_dense_records.json"
+        action_file = ctx.stage_work_dir / "action_dense_records.json"
         fact_file = ctx.stage_work_dir / "fact_dense_records.json"
         evidence_span_file = ctx.stage_work_dir / "evidence_span_dense_records.json"
         summary_file = ctx.stage_work_dir / "summary_dense_records.json"
@@ -1633,6 +2167,8 @@ class GeminiRetrievalFormatter(FormatterStage):
         atomic_write_json(chunk_file, chunk_dense_records)
         atomic_write_json(parent_file, parent_records)
         atomic_write_json(media_file, media_records)
+        atomic_write_json(page_card_file, page_card_records)
+        atomic_write_json(action_file, action_records)
         atomic_write_json(fact_file, fact_records)
         atomic_write_json(evidence_span_file, evidence_span_records)
         atomic_write_json(summary_file, summary_records)
@@ -1679,6 +2215,18 @@ class GeminiRetrievalFormatter(FormatterStage):
                 artifact_type="formatted_documents",
                 role="embedding_payload_media",
                 metadata={"records": len(media_records), "kind": "media"},
+            ),
+            ctx.make_artifact(
+                page_card_file,
+                artifact_type="formatted_documents",
+                role="embedding_payload_page_cards",
+                metadata={"records": len(page_card_records), "kind": "page_cards"},
+            ),
+            ctx.make_artifact(
+                action_file,
+                artifact_type="formatted_documents",
+                role="embedding_payload_actions",
+                metadata={"records": len(action_records), "kind": "actions"},
             ),
             ctx.make_artifact(
                 fact_file,
@@ -1730,6 +2278,8 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "chunk_embedding_file": str(chunk_file),
                 "parent_embedding_file": str(parent_file),
                 "media_embedding_file": str(media_file),
+                "page_card_embedding_file": str(page_card_file),
+                "action_embedding_file": str(action_file),
                 "fact_embedding_file": str(fact_file),
                 "evidence_span_embedding_file": str(evidence_span_file),
                 "summary_embedding_file": str(summary_file),
@@ -1743,6 +2293,8 @@ class GeminiRetrievalFormatter(FormatterStage):
                 "chunk_records": len(chunk_dense_records),
                 "parent_records": len(parent_records),
                 "media_records": len(media_records),
+                "page_card_records": len(page_card_records),
+                "action_records": len(action_records),
                 "image_media_records": len(image_media_records),
                 "multimodal_media_records": len(multimodal_media_records),
                 "text_only_image_records": text_only_image_records,

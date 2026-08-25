@@ -1,0 +1,230 @@
+{
+  "overall": {
+    "no_answer_query_count": {
+      "min": 5
+    },
+    "chunk_hit_at_5": {
+      "min": 0.75
+    },
+    "chunk_hit_at_10": {
+      "min": 0.85
+    },
+    "chunk_mrr_at_10": {
+      "min": 0.65
+    },
+    "chunk_exact_hit_at_5": {
+      "min": 0.55
+    },
+    "chunk_exact_hit_at_10": {
+      "min": 0.70
+    },
+    "chunk_exact_mrr_at_10": {
+      "min": 0.35
+    },
+    "chunk_ndcg_at_10": {
+      "min": 0.65
+    },
+    "chunk_exact_ndcg_at_10": {
+      "min": 0.55
+    },
+    "chunk_source_ndcg_at_10": {
+      "min": 0.74
+    },
+    "chunk_recall_at_10": {
+      "min": 0.70
+    },
+    "parent_hit_at_5": {
+      "min": 0.80
+    },
+    "no_answer_violation_rate": {
+      "max": 0.0
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "chunk_mrr_at_10": {
+        "min": 0.65
+      },
+      "chunk_exact_mrr_at_10": {
+        "min": 0.40
+      },
+      "chunk_exact_ndcg_at_10": {
+        "min": 0.55
+      },
+      "parent_hit_at_5": {
+        "min": 0.75
+      }
+    },
+    "scoped": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "chunk_hit_at_10": {
+        "min": 0.85
+      },
+      "chunk_exact_hit_at_10": {
+        "min": 0.70
+      },
+      "chunk_exact_ndcg_at_10": {
+        "min": 0.55
+      },
+      "parent_hit_at_5": {
+        "min": 0.85
+      }
+    },
+    "synthesis": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "chunk_hit_at_10": {
+        "min": 0.85
+      },
+      "chunk_recall_at_10": {
+        "min": 0.70
+      },
+      "chunk_exact_ndcg_at_10": {
+        "min": 0.55
+      },
+      "chunk_source_ndcg_at_10": {
+        "min": 0.74
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      }
+    }
+  },
+  "by_source_type": {
+    "webpage": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "chunk_hit_at_10": {
+        "min": 0.85
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      }
+    },
+    "none": {
+      "query_count": {
+        "min": 5
+      },
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    },
+    "mixed": {
+      "chunk_hit_at_5": {
+        "min": 0.80
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      }
+    }
+  },
+  "by_benchmark_tag": {
+    "llm_generated_v1": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "chunk_hit_at_10": {
+        "min": 0.85
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      }
+    },
+    "deep_answer": {
+      "chunk_hit_at_10": {
+        "min": 0.85
+      },
+      "chunk_recall_at_10": {
+        "min": 0.70
+      },
+      "chunk_exact_ndcg_at_10": {
+        "min": 0.55
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      }
+    },
+    "hard": {
+      "chunk_hit_at_10": {
+        "min": 0.70
+      },
+      "chunk_exact_ndcg_at_10": {
+        "min": 0.45
+      },
+      "parent_hit_at_5": {
+        "min": 0.70
+      }
+    },
+    "citation_quality": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "chunk_mrr_at_10": {
+        "min": 0.65
+      }
+    },
+    "followup_quality": {
+      "chunk_hit_at_5": {
+        "min": 0.75
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      }
+    },
+    "abstention": {
+      "query_count": {
+        "min": 5
+      },
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    }
+  },
+  "per_query": {
+    "answerable_with_gold_chunks": {
+      "where": {
+        "no_answer": false,
+        "has_gold_chunks": true
+      },
+      "min_queries": 40,
+      "metrics": {
+        "chunk_hit_at_10": {
+          "min": 1.0,
+          "max_failures": 0
+        }
+      }
+    },
+    "answerable_with_gold_parents": {
+      "where": {
+        "no_answer": false,
+        "has_gold_parents": true
+      },
+      "min_queries": 40,
+      "metrics": {
+        "parent_hit_at_5": {
+          "min": 1.0,
+          "max_failures": 0
+        }
+      }
+    },
+    "no_answer_queries": {
+      "where": {
+        "no_answer": true
+      },
+      "min_queries": 5,
+      "metrics": {
+        "no_answer_violation": {
+          "max": 0.0,
+          "max_failures": 0
+        }
+      }
+    }
+  }
+}

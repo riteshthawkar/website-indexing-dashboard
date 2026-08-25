@@ -10,9 +10,11 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 
 DIRECT_VIDEO_EXTENSIONS = {
@@ -23,6 +25,8 @@ DIRECT_VIDEO_EXTENSIONS = {
     ".m4v",
     ".m3u8",
 }
+
+_MATCH_TOKEN_RE = re.compile(r"[^\W_]+", flags=re.UNICODE)
 
 
 def _clean_text(value: Any) -> str:
@@ -246,6 +250,139 @@ def normalize_media_item(item: Dict[str, Any]) -> Dict[str, Any]:
             pass
 
     return normalized
+
+
+def _normalized_match_text(value: Any) -> str:
+    return " ".join(
+        unicodedata.normalize("NFKC", str(value or "")).casefold().split()
+    )
+
+
+def _match_tokens(value: Any) -> set[str]:
+    return {
+        token
+        for token in _MATCH_TOKEN_RE.findall(_normalized_match_text(value))
+        if len(token) >= 2
+    }
+
+
+def media_chunk_match(
+    item: Mapping[str, Any],
+    *,
+    chunk_page_numbers: Sequence[int] = (),
+    chunk_section_path: Sequence[str] = (),
+    chunk_text: str = "",
+) -> Dict[str, Any]:
+    """Return a fail-closed, provenance-aware media-to-chunk match.
+
+    PDF page identity is authoritative: a media item with a page number can
+    only attach to a chunk carrying that exact page. For webpage media, a
+    section-path relationship or a strong occurrence-context match is
+    required. Unscoped document-level images stay independently retrievable
+    as media records instead of being copied into every chunk embedding.
+    """
+
+    normalized = normalize_media_item(dict(item))
+    media_page = normalized.get("page_number")
+    pages = {
+        int(value)
+        for value in chunk_page_numbers
+        if value not in (None, "")
+    }
+    if media_page is not None:
+        if not pages:
+            return {
+                "matched": False,
+                "score": 0.0,
+                "method": "page_unavailable",
+            }
+        if int(media_page) not in pages:
+            return {
+                "matched": False,
+                "score": 0.0,
+                "method": "page_mismatch",
+            }
+        return {
+            "matched": True,
+            "score": 100.0,
+            "method": "exact_page",
+        }
+
+    media_path = tuple(
+        value
+        for value in (
+            _normalized_match_text(part)
+            for part in normalized.get("section_path") or []
+        )
+        if value
+    )
+    chunk_path = tuple(
+        value
+        for value in (
+            _normalized_match_text(part) for part in chunk_section_path
+        )
+        if value
+    )
+    if media_path and chunk_path:
+        if media_path == chunk_path:
+            return {
+                "matched": True,
+                "score": 95.0,
+                "method": "exact_section",
+            }
+        if (
+            media_path[: len(chunk_path)] == chunk_path
+            or chunk_path[: len(media_path)] == media_path
+        ):
+            return {
+                "matched": True,
+                "score": 90.0,
+                "method": "section_ancestor",
+            }
+        if media_path[-1] in chunk_path:
+            return {
+                "matched": True,
+                "score": 85.0,
+                "method": "section_heading",
+            }
+
+    normalized_chunk = _normalized_match_text(chunk_text)
+    chunk_tokens = _match_tokens(normalized_chunk)
+    if not normalized_chunk or not chunk_tokens:
+        return {"matched": False, "score": 0.0, "method": "unscoped"}
+
+    context_fields = (
+        "surrounding_text_before",
+        "surrounding_text_after",
+        "nearby_text",
+        "context",
+    )
+    best_score = 0.0
+    best_method = "unscoped"
+    for field in context_fields:
+        anchor = _normalized_match_text(normalized.get(field))
+        if len(anchor) < 12:
+            continue
+        if len(anchor) >= 24 and anchor in normalized_chunk:
+            score = 82.0 if field.startswith("surrounding_text") else 78.0
+            if score > best_score:
+                best_score = score
+                best_method = f"{field}_substring"
+            continue
+        anchor_tokens = _match_tokens(anchor)
+        overlap_count = len(anchor_tokens & chunk_tokens)
+        coverage = overlap_count / float(len(anchor_tokens)) if anchor_tokens else 0.0
+        if overlap_count >= 4 and coverage >= 0.55:
+            score = 60.0 + min(15.0, coverage * 15.0)
+            if score > best_score:
+                best_score = score
+                best_method = f"{field}_token_overlap"
+
+    return {
+        "matched": best_score > 0.0,
+        "score": best_score,
+        "method": best_method,
+    }
 
 
 def dedupe_media_items(items: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:

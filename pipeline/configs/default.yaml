@@ -263,7 +263,9 @@ chunker:
   max_tokens: 650
   overlap_tokens: 80
   min_chunk_tokens: 140
-  max_chunks_per_document: 64
+  # Lossless by default. A positive value is a fail-fast safety guard and
+  # never authorizes truncating a document.
+  max_chunks_per_document: 0
 
 # ─── Quality ────────────────────────────────────────────────
 quality:
@@ -347,7 +349,16 @@ formatter:
       - "infographic"
       - "map"
       - "document_fragment"
-    prompt_revision: "mbzuai-media-semantics-v1"
+    prompt_revision: "mbzuai-media-semantics-v2-section-context"
+    # Capture a small, same-section window for every image occurrence. The
+    # visual annotation remains content-hash deduplicated; contextual captions
+    # are keyed to the individual page/document reference.
+    context_before_blocks: 1
+    context_after_blocks: 2
+    context_max_chars: 1200
+    context_following_heading_max_distance: 4
+    context_html_fallback: true
+    max_reference_contexts_per_annotation: 12
     concurrency: 4
     request_timeout_sec: 90
     retry_attempts: 3
@@ -363,7 +374,9 @@ formatter:
   chunk_documents: false
   chunk_size_chars: 4000
   chunk_overlap_chars: 400
-  max_chunks_per_document: 64
+  # Disabled legacy formatter fallback is lossless if enabled. Positive values
+  # are fail-fast guards and never truncate output.
+  max_chunks_per_document: 0
   max_media_per_doc: 8
   max_images_per_doc: 5           # max images attached per document in metadata
   max_videos_per_doc: 3
@@ -522,6 +535,11 @@ retrieval:
   query_planner_model: "gemini-2.5-flash"
   query_planner_reasoning_effort: "minimal"
   query_planner_min_confidence: 0.55
+  navigation_plan_enabled: true
+  # Enable only after the same run contains a validated, chunk-complete Page
+  # Graph catalog. Missing optional catalogs produce an unavailable plan.
+  navigation_plan_required: false
+  page_graph_navigation_catalog_file: null
   hyde_enabled: false
   hyde_query_modes: ["synthesis"]
   hyde_model: "gpt-5-nano"
@@ -648,6 +666,11 @@ storage:
   public_base_url: null           # set when assets are exposed over HTTP
   copy_on_register: false
 
+# Pinecone remains an explicit compatibility provider for older run manifests.
+# The canonical MBZUAI production profile overrides this with pgvector.
+vector_store:
+  provider: "pinecone"
+
 # ─── Embedder ───────────────────────────────────────────────
 embedder:
   # Release-scoped namespaces make candidate uploads immutable and keep the
@@ -666,6 +689,8 @@ embedder:
   namespace_chunks: "chunks"
   namespace_parents: "parents"
   namespace_media: "media"
+  namespace_page_cards: "page_cards"
+  namespace_actions: "actions"
   namespace_facts: "facts"
   namespace_evidence_spans: "evidence_spans"
   namespace_summaries: "summaries"

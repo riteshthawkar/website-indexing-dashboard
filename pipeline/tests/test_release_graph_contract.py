@@ -32,6 +32,12 @@ from pipeline.core.release_policy import (
     production_answer_judge_manifest_metadata,
     production_eval_manifest_metadata,
 )
+from pipeline.core.release_assembly import (
+    SELECTED_DENSE_RECORD_KINDS,
+    SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
+    SELECTED_RELEASE_BINDING_ORDER,
+    SELECTED_RELEASE_SOURCE_HASH_KEYS,
+)
 from pipeline.stages.embedders.gemini_pinecone_embedder import (
     _resolve_indexing_input_paths,
     _resolve_upload_namespaces,
@@ -115,6 +121,21 @@ def _production_config(run_id: str) -> dict:
     }
 
 
+def _selected_production_config(run_id: str) -> dict:
+    config = _production_config(run_id)
+    config["selected_profile"] = {
+        "variant_id": "c650__gemini2_1536__dense_graph",
+        "record_kinds": list(SELECTED_DENSE_RECORD_KINDS),
+    }
+    config["vector_store"] = {
+        "provider": "pgvector",
+        "schema": "mbzuai_retrieval",
+        "records_table": "embedding_records",
+    }
+    config["embedder"]["enable_sparse"] = False
+    return config
+
+
 def _write_current_runtime_artifacts(work_dir: Path, config: dict) -> dict:
     atomic_write_json(
         work_dir / "resolved_config.json",
@@ -171,6 +192,202 @@ def _write_current_runtime_artifacts(work_dir: Path, config: dict) -> dict:
         manifest,
     )
     return manifest
+
+
+def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
+    atomic_write_json(
+        work_dir / "resolved_config.json",
+        {
+            "config": config,
+            "production_indexing_contract_fingerprint": production_indexing_contract_fingerprint(
+                config
+            ),
+            "indexing_build": INDEXING_BUILD,
+        },
+    )
+    assembly_dir = work_dir / "stage_outputs" / "assemble_selected_release"
+    file_payloads = {
+        "selected_dense_records": (
+            "selected_dense_records.jsonl",
+            [{"id": f"record-{index}"} for index in range(6)],
+            6,
+        ),
+        "chunks": ("chunk_dense_records.json", [{"id": "chunk-1"}], 1),
+        "parents": (
+            "parent_dense_records.json",
+            [{"id": "parent-1"}, {"id": "parent-section-1"}],
+            2,
+        ),
+        "media": ("media_dense_records.json", [{"id": "media-1"}], 1),
+        "page_cards": ("page_card_dense_records.json", [{"id": "page-1"}], 1),
+        "actions": ("action_dense_records.json", [{"id": "action-1"}], 1),
+        "chunk_index": (
+            "selected_chunk_index.json",
+            {"chunk_count": 1, "chunks": [{"chunk_id": "chunk-1"}]},
+            1,
+        ),
+        "navigation_catalog": (
+            "page_graph_navigation_catalog.json",
+            {
+                "pages": [{"page_id": "page-1"}],
+                "chunks": [{"chunk_id": "chunk-1"}],
+            },
+            1,
+        ),
+        "chunk_id_bridge": (
+            "chunk_id_bridge.json",
+            {"mapping_count": 1, "old_to_evaluated_chunk_id": {"old-1": "chunk-1"}},
+            1,
+        ),
+    }
+    files = {}
+    for key in SELECTED_RELEASE_BINDING_ORDER:
+        filename, payload, count = file_payloads[key]
+        path = assembly_dir / filename
+        atomic_write_json(path, payload)
+        files[key] = {
+            "file": filename,
+            "sha256": sha256_file(path),
+            "record_count": count,
+        }
+    source = {key: "c" * 64 for key in SELECTED_RELEASE_SOURCE_HASH_KEYS}
+    assembly_binding = combine_sha256_digests(
+        *[source[key] for key in SELECTED_RELEASE_SOURCE_HASH_KEYS],
+        *[files[key]["sha256"] for key in SELECTED_RELEASE_BINDING_ORDER],
+    )
+    assembly = {
+        "schema_version": SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
+        "status": "ready_for_embedding",
+        "variant_id": config["selected_profile"]["variant_id"],
+        "record_kinds": list(SELECTED_DENSE_RECORD_KINDS),
+        "record_kind_counts": {
+            "chunk": 1,
+            "parent": 1,
+            "parent_section": 1,
+            "media": 1,
+            "page_card": 1,
+            "action": 1,
+        },
+        "dense_lane_counts": {
+            "chunks": 1,
+            "parents": 2,
+            "media": 1,
+            "page_cards": 1,
+            "actions": 1,
+        },
+        "source": source,
+        "coverage": {
+            "checkpoint_chunk_count": 1,
+            "candidate_chunk_count": 1,
+            "mapped_chunk_count": 1,
+            "text_exact_match_count": 1,
+            "navigation_chunk_count": 1,
+            "all_candidate_chunks_mapped": True,
+            "all_navigation_chunks_remapped": True,
+        },
+        "files": files,
+        "binding_order": list(SELECTED_RELEASE_BINDING_ORDER),
+        "assembly_sha256": assembly_binding,
+        "embedding_performed": False,
+        "upload_performed": False,
+    }
+    assembly_file = assembly_dir / "selected_release_assembly.json"
+    atomic_write_json(assembly_file, assembly)
+    assembly_manifest_sha = sha256_file(assembly_file)
+    navigation_sha = files["navigation_catalog"]["sha256"]
+
+    bundle_file = work_dir / "stage_outputs" / "format_retrieval" / "retrieval_bundle.json"
+    atomic_write_json(
+        bundle_file,
+        {
+            "version": 6,
+            "schema_version": "mbzuai.retrieval_bundle.v6",
+            "selected_release_contract": {
+                "schema_version": SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
+                "variant_id": config["selected_profile"]["variant_id"],
+                "manifest_sha256": assembly_manifest_sha,
+                "assembly_sha256": assembly_binding,
+                "candidate_records_sha256": source["candidate_records_sha256"],
+                "navigation_catalog_sha256": navigation_sha,
+            },
+            "stats": {
+                "chunk_count": 1,
+                "parent_count": 2,
+                "media_count": 1,
+                "page_card_count": 1,
+                "action_count": 1,
+            },
+        },
+    )
+    lexical_file = bundle_file.with_name("lexical_corpus.json")
+    promoted_assertions_file = (
+        work_dir / "stage_outputs" / "promote_assertions" / "promoted_assertions.json"
+    )
+    atomic_write_json(lexical_file, [{"id": "lexical-1", "text": "MBZUAI"}])
+    atomic_write_json(
+        promoted_assertions_file,
+        [{"id": "assertion-1", "text": "MBZUAI is an AI university."}],
+    )
+    graph_file, graph_index_file = _write_graph_pair(work_dir, "community", "community")
+    bundle_sha = sha256_file(bundle_file)
+    lexical_sha = sha256_file(lexical_file)
+    promoted_assertions_sha = sha256_file(promoted_assertions_file)
+    graph_sha = sha256_file(graph_file)
+    graph_index_sha = sha256_file(graph_index_file)
+    uploaded = {
+        "chunks": 1,
+        "parents": 2,
+        "media": 1,
+        "page_cards": 1,
+        "actions": 1,
+        "facts": 0,
+        "evidence_spans": 0,
+        "summaries": 0,
+        "assertions": 0,
+        "entities": 0,
+        "communities": 0,
+    }
+    manifest = {
+        "schema_version": 6,
+        "provider": "pgvector",
+        "production_indexing_contract_fingerprint": production_indexing_contract_fingerprint(
+            config
+        ),
+        "index_name": "mbzuai_retrieval.embedding_records",
+        "sparse_index_name": "",
+        "model": "gemini-embedding-2",
+        "output_dimensionality": 1536,
+        "namespace_strategy": "release",
+        "namespace_release_id": work_dir.name,
+        "namespaces": _resolve_upload_namespaces(config["embedder"], run_id=work_dir.name),
+        "uploaded": uploaded,
+        "bundle_version": 6,
+        "retrieval_bundle_sha256": bundle_sha,
+        "lexical_corpus_sha256": lexical_sha,
+        "promoted_assertions_sha256": promoted_assertions_sha,
+        "knowledge_graph_kind": "community_local_graph",
+        "knowledge_graph_sha256": graph_sha,
+        "knowledge_graph_index_sha256": graph_index_sha,
+        "selected_release_assembly_file": str(assembly_file),
+        "selected_release_assembly_sha256": assembly_manifest_sha,
+        "selected_release_binding_sha256": assembly_binding,
+        "page_graph_navigation_catalog_sha256": navigation_sha,
+        "upload_input_sha256": combine_sha256_digests(
+            bundle_sha,
+            lexical_sha,
+            promoted_assertions_sha,
+            graph_sha,
+            graph_index_sha,
+            assembly_manifest_sha,
+            assembly_binding,
+            navigation_sha,
+        ),
+    }
+    atomic_write_json(
+        work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json",
+        manifest,
+    )
+    return {"manifest": manifest, "assembly_file": assembly_file, "files": files}
 
 
 def test_canonical_graph_selection_prefers_community_and_rejects_partial_latest(tmp_path: Path) -> None:
@@ -258,6 +475,32 @@ def test_current_production_runtime_validates_release_namespaces_bundle_and_grap
     assert report["knowledge_graph_kind"] == "community_local_graph"
 
 
+def test_selected_runtime_validates_full_assembly_and_rejects_lane_tampering(
+    tmp_path: Path,
+) -> None:
+    work_dir = tmp_path / "selected-candidate-v1"
+    config = _selected_production_config(work_dir.name)
+    artifacts = _write_selected_runtime_artifacts(work_dir, config)
+
+    report = validate_runtime_artifact_contract(config, work_dir)
+
+    assert report["validated"] is True
+    assert report["vector_store_provider"] == "pgvector"
+    assert report["selected_release_assembly_sha256"] == artifacts["manifest"][
+        "selected_release_assembly_sha256"
+    ]
+    assert report["selected_release_binding_sha256"] == artifacts["manifest"][
+        "selected_release_binding_sha256"
+    ]
+
+    page_cards_file = artifacts["assembly_file"].parent / artifacts["files"]["page_cards"][
+        "file"
+    ]
+    atomic_write_json(page_cards_file, [{"id": "tampered-page"}])
+    with pytest.raises(RuntimeArtifactContractError, match="assembly file page_cards digest mismatch"):
+        validate_runtime_artifact_contract(config, work_dir)
+
+
 def test_current_production_runtime_rejects_static_namespaces_and_graph_drift(tmp_path: Path) -> None:
     work_dir = tmp_path / "candidate-v3"
     config = _production_config(work_dir.name)
@@ -322,12 +565,12 @@ def test_current_release_promotion_revalidates_snapshot_vector_bundle_and_graph(
         "audit": {"ok": True},
         "evaluation": {
             **production_eval_manifest_metadata(answer=False),
-            "query_count": 50,
+            "query_count": 65,
             "gates": {"passed": True},
         },
         "answer_evaluation": {
             **production_eval_manifest_metadata(answer=True),
-            "query_count": 50,
+            "query_count": 65,
             "llm_judge": production_answer_judge_manifest_metadata(),
             "gates": {"passed": True},
             "skipped": False,
@@ -448,7 +691,18 @@ def test_canonical_production_stage_order_covers_before_processing_and_uploads_l
     config = load_config("mbzuai_production")
     stage_ids = [stage["id"] for stage in config["stages"]]
 
-    assert stage_ids[:2] == ["crawl_web", "prepare_mbzuai_index"]
+    assert stage_ids[:2] == ["verify_selected_profile", "assemble_selected_release"]
+    assert "crawl_web" not in stage_ids
+    assert "chunk_content" not in stage_ids
+    assert config["selected_profile"]["pre_embedding_only"] is False
+    assert config["selected_profile"]["record_kinds"] == [
+        "chunk",
+        "parent",
+        "parent_section",
+        "media",
+        "page_card",
+        "action",
+    ]
     assert stage_ids.index("format_graph") < stage_ids.index("promote_graph")
     assert stage_ids.index("promote_graph") < stage_ids.index("community_graph")
     assert stage_ids.index("summarize_community_graph") < stage_ids.index("upload_retrieval")

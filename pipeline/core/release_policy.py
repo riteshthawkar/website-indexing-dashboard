@@ -10,7 +10,7 @@ from pipeline.core.io import sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v1"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v2"
 PRODUCTION_RETRIEVAL_DATASET = (
     PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_llm_generated_v1.jsonl"
 )
@@ -22,17 +22,17 @@ PRODUCTION_ANSWER_GATES = (
     PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.llm_generated_v1.json"
 )
 PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
-    "c1c032f12c298d7c67fc7de7bed6dec46b303ffcfa843f3eab9fcea548599314"
+    "cd9c4d7835f244347a174f2321399d77bb020593b64654173de8f7d0d0bcf42e"
 )
 PRODUCTION_RETRIEVAL_GATES_SHA256 = (
-    "ff5db91a3efe04719c69db892f129a23003960b98597965366a8c9c6421c708b"
+    "7361ce23bf3cf4e4de807925791dc9b4021c7c0f058cef426a9431f3103c1c80"
 )
 PRODUCTION_ANSWER_DATASET_SHA256 = PRODUCTION_RETRIEVAL_DATASET_SHA256
 PRODUCTION_ANSWER_GATES_SHA256 = (
-    "785113d699e3d96c75bdee6686d432ec2ec08f9c6351b070e4a129fb45f66dd6"
+    "1e66930369c7d009672b683c08f2cdc50aa10fcc9d2ea7b48dbe04920cc7e64e"
 )
-PRODUCTION_MIN_RETRIEVAL_QUERIES = 50
-PRODUCTION_MIN_ANSWER_QUERIES = 50
+PRODUCTION_MIN_RETRIEVAL_QUERIES = 65
+PRODUCTION_MIN_ANSWER_QUERIES = 65
 PRODUCTION_ANSWER_JUDGE_PROVIDER = "gemini"
 PRODUCTION_ANSWER_JUDGE_MODEL = "gemini-2.5-flash"
 
@@ -73,7 +73,14 @@ def _validate_file(
             payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             payload = None
-        recognized = {"overall", "by_query_type", "by_source_type", "by_benchmark_tag", "per_query"}
+        recognized = {
+            "overall",
+            "by_query_type",
+            "by_source_type",
+            "by_language",
+            "by_benchmark_tag",
+            "per_query",
+        }
         if not isinstance(payload, dict) or not any(
             key in recognized and isinstance(value, dict) and bool(value)
             for key, value in payload.items()

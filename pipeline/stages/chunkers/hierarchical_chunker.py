@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from pipeline.core.base import ChunkerStage, StageContext, StageResult
+from pipeline.core.chunking import ChunkLimitExceededError, token_counting_method
 from pipeline.core.registry import register_stage
 from pipeline.stages.chunkers.common import (
     collect_markdown_sources,
@@ -38,7 +39,7 @@ class HierarchicalChunker(ChunkerStage):
 
         structured_docs = collect_structured_documents(ctx)
         max_tokens = int(config.get("max_tokens", 650))
-        max_chunks_per_document = int(config.get("max_chunks_per_document", 64))
+        max_chunks_per_document = int(config.get("max_chunks_per_document", 0))
         include_section_headings = bool(config.get("include_section_headings", True))
         always_emit_headings = bool(config.get("always_emit_headings", False))
         use_docling_native = bool(config.get("use_docling_native", True))
@@ -62,6 +63,8 @@ class HierarchicalChunker(ChunkerStage):
                         max_chunks_per_document=max_chunks_per_document,
                         always_emit_headings=always_emit_headings,
                     )
+                except ChunkLimitExceededError:
+                    raise
                 except Exception as exc:
                     logger.warning("Docling hierarchical chunking failed for %s: %s", path.name, exc)
 
@@ -88,6 +91,9 @@ class HierarchicalChunker(ChunkerStage):
             source_artifact_ids=source_artifact_ids,
             metadata={
                 "max_tokens": max_tokens,
+                "max_chunks_per_document": max_chunks_per_document,
+                "chunk_limit_mode": "unlimited" if max_chunks_per_document <= 0 else "fail",
+                "token_counting_method": token_counting_method(),
                 "include_section_headings": include_section_headings,
                 "use_docling_native": use_docling_native,
             },

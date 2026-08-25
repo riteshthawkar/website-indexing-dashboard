@@ -1,0 +1,29 @@
+# Representation selection stage over the frozen, prepared MBZUAI corpus.
+# This run creates document revisions, Page Cards, and typed actions only.
+# It deliberately performs no chunking, embedding, upload, or indexing.
+
+project_name: "mbzuai_representation_v2"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  representation_v2:
+    source_corpus_run_dir: "runs/mbzuai_corpus_preparation/mbzuai-corpus-preparation-20260821-v4"
+    expected_document_count: 2352
+    expected_page_count: 2350
+    expected_web_document_count: 2299
+    maximum_workers: 4
+    maximum_topics_per_page: 24
+    template_minimum_page_count: 20
+    template_minimum_page_ratio: 0.03
+
+stages:
+  - id: extract_page_cards_and_actions
+    type: formatter
+    plugin: representation_v2

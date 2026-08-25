@@ -1,0 +1,21 @@
+_inherit: mbzuai_selected_release_assembly.yaml
+
+# Offline contract test for the hand-off from immutable assembly to the
+# retrieval bundle. It performs no embeddings, database writes, or promotion.
+project_name: "mbzuai_selected_release_contract"
+
+formatter:
+  require_multimodal_media: true
+  minimum_multimodal_media_records: 100
+  maximum_image_text_only_ratio: 0.0
+
+stages:
+  - id: verify_selected_profile
+    type: formatter
+    plugin: selected_profile_guard
+  - id: assemble_selected_release
+    type: formatter
+    plugin: selected_release_assembly
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2

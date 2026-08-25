@@ -29,20 +29,49 @@ LANES = (
     "entities",
     "communities",
 )
+SELECTED_RELEASE_LANES = (
+    "chunks",
+    "parents",
+    "media",
+    "page_cards",
+    "actions",
+    "facts",
+    "evidence_spans",
+    "summaries",
+    "assertions",
+    "entities",
+    "communities",
+)
+SELECTED_EVALUATED_DENSE_LANES = {
+    "chunks",
+    "parents",
+    "media",
+    "page_cards",
+    "actions",
+}
+SELECTED_RECORD_KINDS = (
+    "chunk",
+    "parent",
+    "parent_section",
+    "media",
+    "page_card",
+    "action",
+)
+SELECTED_ASSEMBLY_SCHEMA = "mbzuai.selected_release_assembly.v1"
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v1"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v2"
 PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
-    "c1c032f12c298d7c67fc7de7bed6dec46b303ffcfa843f3eab9fcea548599314"
+    "cd9c4d7835f244347a174f2321399d77bb020593b64654173de8f7d0d0bcf42e"
 )
 PRODUCTION_RETRIEVAL_GATES_SHA256 = (
-    "ff5db91a3efe04719c69db892f129a23003960b98597965366a8c9c6421c708b"
+    "7361ce23bf3cf4e4de807925791dc9b4021c7c0f058cef426a9431f3103c1c80"
 )
 PRODUCTION_ANSWER_DATASET_SHA256 = PRODUCTION_RETRIEVAL_DATASET_SHA256
 PRODUCTION_ANSWER_GATES_SHA256 = (
-    "785113d699e3d96c75bdee6686d432ec2ec08f9c6351b070e4a129fb45f66dd6"
+    "1e66930369c7d009672b683c08f2cdc50aa10fcc9d2ea7b48dbe04920cc7e64e"
 )
-PRODUCTION_MIN_RETRIEVAL_QUERIES = 50
-PRODUCTION_MIN_ANSWER_QUERIES = 50
+PRODUCTION_MIN_RETRIEVAL_QUERIES = 65
+PRODUCTION_MIN_ANSWER_QUERIES = 65
 PRODUCTION_ANSWER_JUDGE_PROVIDER = "gemini"
 PRODUCTION_ANSWER_JUDGE_MODEL = "gemini-2.5-flash"
 _SECRET_CONFIG_KEYS = {
@@ -347,16 +376,220 @@ def _select_runtime_graph(work_dir: Path) -> tuple[Path, Path, str]:
     raise ValidationError("missing runtime graph and graph index pair; checked " + ", ".join(checked))
 
 
+def _combine_sha256_digests(*digests: str) -> str:
+    combined = hashlib.sha256()
+    for value in digests:
+        normalized = str(value or "").strip().lower()
+        if normalized:
+            combined.update(normalized.encode("ascii"))
+    return combined.hexdigest()
+
+
+def _validate_selected_release_assembly(
+    *,
+    work_dir: Path,
+    selected_profile: dict[str, Any],
+    upload: dict[str, Any],
+) -> tuple[Path, Path, str, str, str, dict[str, int]]:
+    assembly_path = (
+        work_dir
+        / "stage_outputs"
+        / "assemble_selected_release"
+        / "selected_release_assembly.json"
+    )
+    assembly = _json_object(assembly_path, "selected release assembly")
+    errors: list[str] = []
+    if str(assembly.get("schema_version") or "") != SELECTED_ASSEMBLY_SCHEMA:
+        errors.append("selected release assembly schema is unsupported")
+    if str(assembly.get("status") or "") != "ready_for_embedding":
+        errors.append("selected release assembly is not ready for embedding")
+    if str(assembly.get("variant_id") or "") != str(selected_profile.get("variant_id") or ""):
+        errors.append("selected release assembly variant does not match resolved config")
+    if tuple(assembly.get("record_kinds") or ()) != SELECTED_RECORD_KINDS:
+        errors.append("selected release assembly record kinds do not match the evaluated contract")
+    if assembly.get("embedding_performed") is not False or assembly.get("upload_performed") is not False:
+        errors.append("selected release assembly must remain a pre-embedding immutable artifact")
+
+    files = assembly.get("files") if isinstance(assembly.get("files"), dict) else {}
+    binding_order = tuple(assembly.get("binding_order") or ())
+    expected_binding_order = (
+        "selected_dense_records",
+        "chunks",
+        "parents",
+        "media",
+        "page_cards",
+        "actions",
+        "chunk_index",
+        "navigation_catalog",
+        "chunk_id_bridge",
+    )
+    if binding_order != expected_binding_order:
+        errors.append("selected release assembly binding order is invalid")
+    if set(files) != set(expected_binding_order):
+        errors.append(
+            "selected release assembly file set must exactly match its binding order"
+        )
+
+    file_hashes: list[str] = []
+    resolved_files: dict[str, Path] = {}
+    for key in expected_binding_order:
+        entry = files.get(key) if isinstance(files.get(key), dict) else {}
+        relative = str(entry.get("file") or "").strip()
+        expected_sha = str(entry.get("sha256") or "").strip().lower()
+        relative_path = Path(relative)
+        if (
+            not relative
+            or relative_path.is_absolute()
+            or ".." in relative_path.parts
+            or not re.fullmatch(r"[0-9a-f]{64}", expected_sha)
+        ):
+            errors.append(f"selected release assembly file entry is invalid: {key}")
+            continue
+        unresolved_path = assembly_path.parent / relative_path
+        path = unresolved_path.resolve()
+        if not _is_within(path, assembly_path.parent):
+            errors.append(f"selected release assembly file escapes its stage directory: {key}")
+            continue
+        if not path.is_file() or unresolved_path.is_symlink():
+            errors.append(f"selected release assembly file is missing or unsafe: {key}")
+            continue
+        actual_sha = _sha256(path)
+        if actual_sha != expected_sha:
+            errors.append(f"selected release assembly file SHA256 drifted: {key}")
+        file_hashes.append(actual_sha)
+        resolved_files[key] = path
+    if len(set(resolved_files.values())) != len(resolved_files):
+        errors.append("selected release assembly file entries must resolve uniquely")
+
+    source = assembly.get("source") if isinstance(assembly.get("source"), dict) else {}
+    source_hash_keys = (
+        "decision_sha256",
+        "candidate_manifest_sha256",
+        "candidate_records_sha256",
+        "pipeline_state_sha256",
+        "artifact_catalog_sha256",
+        "run_audit_sha256",
+        "resolved_config_sha256",
+        "chunk_index_sha256",
+        "page_graph_bridge_sha256",
+        "navigation_catalog_sha256",
+    )
+    source_hashes = [str(source.get(key) or "").strip().lower() for key in source_hash_keys]
+    if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in source_hashes):
+        errors.append("selected release assembly source hash set is incomplete")
+    binding_sha = str(assembly.get("assembly_sha256") or "").strip().lower()
+    if len(file_hashes) == len(expected_binding_order):
+        actual_binding_sha = _combine_sha256_digests(*source_hashes, *file_hashes)
+        if binding_sha != actual_binding_sha:
+            errors.append("selected release assembly binding digest is invalid")
+
+    dense_counts = (
+        assembly.get("dense_lane_counts")
+        if isinstance(assembly.get("dense_lane_counts"), dict)
+        else {}
+    )
+    normalized_counts = {
+        lane: _positive_int(dense_counts.get(lane))
+        for lane in SELECTED_EVALUATED_DENSE_LANES
+    }
+    if any(count <= 0 for count in normalized_counts.values()):
+        errors.append("selected release assembly contains an empty evaluated dense lane")
+    kind_counts = (
+        assembly.get("record_kind_counts")
+        if isinstance(assembly.get("record_kind_counts"), dict)
+        else {}
+    )
+    normalized_kind_counts = {
+        kind: _positive_int(kind_counts.get(kind)) for kind in SELECTED_RECORD_KINDS
+    }
+    expected_dense_counts = {
+        "chunks": normalized_kind_counts["chunk"],
+        "parents": normalized_kind_counts["parent"]
+        + normalized_kind_counts["parent_section"],
+        "media": normalized_kind_counts["media"],
+        "page_cards": normalized_kind_counts["page_card"],
+        "actions": normalized_kind_counts["action"],
+    }
+    if normalized_counts != expected_dense_counts:
+        errors.append("selected release dense lane counts do not match record-kind counts")
+    file_count_keys = {
+        "chunks": "chunks",
+        "parents": "parents",
+        "media": "media",
+        "page_cards": "page_cards",
+        "actions": "actions",
+    }
+    for lane, file_key in file_count_keys.items():
+        entry = files.get(file_key) if isinstance(files.get(file_key), dict) else {}
+        if _positive_int(entry.get("record_count")) != normalized_counts[lane]:
+            errors.append(f"selected release assembly file count differs for {lane}")
+    exact_entry = (
+        files.get("selected_dense_records")
+        if isinstance(files.get("selected_dense_records"), dict)
+        else {}
+    )
+    if _positive_int(exact_entry.get("record_count")) != sum(normalized_kind_counts.values()):
+        errors.append("selected release exact record count differs from record-kind counts")
+    uploaded = upload.get("uploaded") if isinstance(upload.get("uploaded"), dict) else {}
+    for lane, expected in normalized_counts.items():
+        if _positive_int(uploaded.get(lane)) != expected:
+            errors.append(
+                f"selected release upload count differs from assembly for {lane}"
+            )
+    coverage = assembly.get("coverage") if isinstance(assembly.get("coverage"), dict) else {}
+    if coverage.get("all_candidate_chunks_mapped") is not True or coverage.get(
+        "all_navigation_chunks_remapped"
+    ) is not True:
+        errors.append("selected release assembly chunk/navigation coverage is incomplete")
+
+    manifest_sha = _sha256(assembly_path)
+    navigation_path = resolved_files.get("navigation_catalog")
+    navigation_sha = _sha256(navigation_path) if navigation_path else ""
+    expected_hashes = {
+        "selected_release_assembly_sha256": manifest_sha,
+        "selected_release_binding_sha256": binding_sha,
+        "page_graph_navigation_catalog_sha256": navigation_sha,
+    }
+    for key, actual in expected_hashes.items():
+        if str(upload.get(key) or "").strip().lower() != actual:
+            errors.append(f"vector upload manifest {key} does not match the selected assembly")
+
+    if errors:
+        raise ValidationError("selected release assembly validation failed: " + "; ".join(errors))
+    assert navigation_path is not None
+    return (
+        assembly_path,
+        navigation_path,
+        manifest_sha,
+        binding_sha,
+        navigation_sha,
+        normalized_counts,
+    )
+
+
 def _validate_upload_manifest(
     *,
     upload: dict[str, Any],
     run_id: str,
     expected_model: str,
     expected_dimension: int,
+    selected_profile: bool = False,
 ) -> list[str]:
     errors: list[str] = []
+    provider = str(upload.get("provider") or "pinecone").strip().lower()
+    if provider not in {"pinecone", "pgvector"}:
+        errors.append(f"unsupported vector provider: {provider}")
     if _positive_int(upload.get("schema_version")) < 4:
         errors.append("vector upload manifest schema_version must be at least 4")
+    if provider == "pgvector" and _positive_int(upload.get("schema_version")) < 5:
+        errors.append("pgvector upload manifest schema_version must be at least 5")
+    if selected_profile and _positive_int(upload.get("schema_version")) < 6:
+        errors.append("selected-profile vector upload manifest schema_version must be at least 6")
+    if provider == "pgvector" and not re.fullmatch(
+        r"[0-9a-f]{64}",
+        str(upload.get("production_indexing_contract_fingerprint") or "").strip().lower(),
+    ):
+        errors.append("pgvector upload manifest indexing contract fingerprint is missing or invalid")
     if str(upload.get("model") or "").strip() != expected_model:
         errors.append(
             f"embedding model must be {expected_model!r}; got {str(upload.get('model') or '<missing>')!r}"
@@ -367,47 +600,63 @@ def _validate_upload_manifest(
             f"got {_positive_int(upload.get('output_dimensionality'))}"
         )
     if not str(upload.get("index_name") or "").strip():
-        errors.append("dense Pinecone index name is missing")
-    if not str(upload.get("sparse_index_name") or "").strip():
+        errors.append("vector index target is missing")
+    sparse_enabled = bool(str(upload.get("sparse_index_name") or "").strip())
+    if provider == "pinecone" and not sparse_enabled:
         errors.append("sparse Pinecone index name is missing")
+    if provider == "pgvector" and sparse_enabled:
+        errors.append("selected pgvector dense-graph release must not declare a sparse index")
     if str(upload.get("namespace_strategy") or "").strip().lower() != "release":
         errors.append("vector namespaces must use namespace_strategy=release")
     if str(upload.get("namespace_release_id") or "").strip() != run_id:
         errors.append("namespace_release_id must match the release run_id")
 
+    lanes = SELECTED_RELEASE_LANES if selected_profile else LANES
     namespaces = upload.get("namespaces") if isinstance(upload.get("namespaces"), dict) else {}
-    namespace_values = [str(namespaces.get(lane) or "").strip() for lane in LANES]
-    missing = [lane for lane, value in zip(LANES, namespace_values) if not value]
+    namespace_values = [str(namespaces.get(lane) or "").strip() for lane in lanes]
+    missing = [lane for lane, value in zip(lanes, namespace_values) if not value]
     if missing:
         errors.append(f"vector namespace mappings are missing lanes: {missing}")
     if len(set(value for value in namespace_values if value)) != len([v for v in namespace_values if v]):
         errors.append("dense/sparse retrieval lanes must use distinct namespaces")
-    static_lanes = [lane for lane, value in zip(LANES, namespace_values) if value == lane]
+    static_lanes = [lane for lane, value in zip(lanes, namespace_values) if value == lane]
     if static_lanes:
         errors.append(f"release uses unsafe static namespace names: {static_lanes}")
 
     planned = upload.get("planned") if isinstance(upload.get("planned"), dict) else {}
     uploaded = upload.get("uploaded") if isinstance(upload.get("uploaded"), dict) else {}
-    for lane in LANES:
-        for key in (lane, f"sparse_{lane}"):
+    for lane in lanes:
+        keys = [lane]
+        if sparse_enabled:
+            keys.append(f"sparse_{lane}")
+        for key in keys:
             expected = _positive_int(planned.get(key))
             actual = _positive_int(uploaded.get(key))
             if expected != actual:
                 errors.append(f"upload count mismatch for {key}: planned={expected}, uploaded={actual}")
-        if _positive_int(uploaded.get(lane)) <= 0:
+        dense_count = _positive_int(uploaded.get(lane))
+        if selected_profile and lane not in SELECTED_EVALUATED_DENSE_LANES:
+            if dense_count != 0:
+                errors.append(f"selected release unevaluated dense lane must be zero for {lane}")
+        elif dense_count <= 0:
             errors.append(f"dense upload count must be greater than zero for {lane}")
-        if _positive_int(uploaded.get(f"sparse_{lane}")) <= 0:
+        if sparse_enabled and _positive_int(uploaded.get(f"sparse_{lane}")) <= 0:
             errors.append(f"sparse upload count must be greater than zero for {lane}")
 
     verification = upload.get("verification") if isinstance(upload.get("verification"), dict) else {}
-    for family in ("dense", "sparse"):
+    families = ["dense"]
+    if sparse_enabled:
+        families.append("sparse")
+    for family in families:
         report = verification.get(family) if isinstance(verification.get(family), dict) else {}
         expected_counts = report.get("expected") if isinstance(report.get("expected"), dict) else {}
         actual_counts = report.get("actual") if isinstance(report.get("actual"), dict) else {}
         if report.get("failures") != []:
             errors.append(f"{family} namespace verification contains failures or is missing")
-        for lane, namespace in zip(LANES, namespace_values):
+        for lane, namespace in zip(lanes, namespace_values):
             if not namespace:
+                continue
+            if _positive_int(planned.get(f"{'sparse_' if family == 'sparse' else ''}{lane}")) == 0:
                 continue
             expected = _positive_int(expected_counts.get(namespace))
             actual = _positive_int(actual_counts.get(namespace))
@@ -481,6 +730,13 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         raise ValidationError("resolved_config.json run_id does not match the runtime work directory")
     if not isinstance(resolved_config.get("config"), dict):
         raise ValidationError("resolved_config.json is missing its config object")
+    resolved_pipeline_config = resolved_config["config"]
+    selected_profile = (
+        resolved_pipeline_config.get("selected_profile")
+        if isinstance(resolved_pipeline_config.get("selected_profile"), dict)
+        else {}
+    )
+    selected_release = bool(str(selected_profile.get("variant_id") or "").strip())
     secret_paths = _secret_config_paths(resolved_config.get("config"))
     if secret_paths:
         raise ValidationError(
@@ -573,16 +829,38 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         run_id=run_id,
         expected_model=args.expected_model,
         expected_dimension=args.expected_dimension,
+        selected_profile=selected_release,
     )
     if upload.get("indexing_build") != indexing_build:
         upload_errors.append("Pinecone upload manifest indexing build does not match resolved config")
     if str(upload.get("indexing_build_sha256") or "").strip().lower() != indexing_build_sha256:
         upload_errors.append("Pinecone upload manifest indexing build digest does not match resolved config")
 
+    selected_assembly_path: Path | None = None
+    selected_navigation_path: Path | None = None
+    selected_assembly_sha = ""
+    selected_binding_sha = ""
+    selected_navigation_sha = ""
+    if selected_release:
+        (
+            selected_assembly_path,
+            selected_navigation_path,
+            selected_assembly_sha,
+            selected_binding_sha,
+            selected_navigation_sha,
+            _selected_lane_counts,
+        ) = _validate_selected_release_assembly(
+            work_dir=work_dir,
+            selected_profile=selected_profile,
+            upload=upload,
+        )
+
     bundle_path = _select_runtime_bundle(work_dir)
     _validate_nonempty_json_container(bundle_path, "retrieval bundle", opening_byte=b"{")
     if _positive_int(upload.get("bundle_version")) < 5:
         upload_errors.append("retrieval bundle version must be at least 5")
+    if selected_release and _positive_int(upload.get("bundle_version")) < 6:
+        upload_errors.append("selected-profile retrieval bundle version must be at least 6")
     expected_bundle_sha = str(upload.get("retrieval_bundle_sha256") or "").strip().lower()
     actual_bundle_sha = _sha256(bundle_path)
     if not re.fullmatch(r"[0-9a-f]{64}", expected_bundle_sha) or expected_bundle_sha != actual_bundle_sha:
@@ -643,19 +921,32 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             )
         upload_input_sha = str(upload.get("upload_input_sha256") or "").strip().lower()
         upload_input_digest = hashlib.sha256()
-        for artifact_sha in (
+        upload_artifact_hashes = [
             expected_bundle_sha,
             actual_lexical_sha,
             actual_promoted_assertions_sha,
             expected_graph_sha,
             expected_graph_index_sha,
-        ):
+        ]
+        if selected_release:
+            upload_artifact_hashes.extend(
+                (
+                    selected_assembly_sha,
+                    selected_binding_sha,
+                    selected_navigation_sha,
+                )
+            )
+        for artifact_sha in upload_artifact_hashes:
             upload_input_digest.update(artifact_sha.encode("utf-8"))
         if upload_input_sha != upload_input_digest.hexdigest():
             upload_errors.append("upload_input_sha256 does not bind all runtime retrieval artifacts")
 
     if release_manifest is not None:
         vector = release_manifest.get("vector_index") if isinstance(release_manifest.get("vector_index"), dict) else {}
+        if str(vector.get("provider") or "pinecone").strip().lower() != str(
+            upload.get("provider") or "pinecone"
+        ).strip().lower():
+            upload_errors.append("release manifest vector provider does not match upload manifest")
         if _positive_int(vector.get("manifest_schema_version")) < 4:
             upload_errors.append("release vector manifest_schema_version must be at least 4")
         if str(vector.get("index_name") or "").strip() != str(upload.get("index_name") or "").strip():
@@ -678,6 +969,9 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             "upload_input_sha256",
             "lexical_corpus_sha256",
             "promoted_assertions_sha256",
+            "selected_release_assembly_sha256",
+            "selected_release_binding_sha256",
+            "page_graph_navigation_catalog_sha256",
         ):
             if str(vector.get(key) or "") != str(upload.get(key) or ""):
                 upload_errors.append(f"release vector metadata {key} does not match upload manifest")
@@ -713,6 +1007,16 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
             != actual_promoted_assertions_sha
         ):
             upload_errors.append("release manifest promoted assertions SHA256 does not match runtime")
+        if selected_release:
+            for key, expected in (
+                ("selected_release_assembly_sha256", selected_assembly_sha),
+                ("selected_release_binding_sha256", selected_binding_sha),
+                ("page_graph_navigation_catalog_sha256", selected_navigation_sha),
+            ):
+                if str(release_bundle.get(key) or "").strip().lower() != expected:
+                    upload_errors.append(
+                        f"release retrieval bundle contract {key} does not match runtime"
+                    )
 
     if upload_errors:
         raise ValidationError("release artifact validation failed: " + "; ".join(upload_errors))
@@ -736,6 +1040,11 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         "lexical_corpus_sha256": actual_lexical_sha,
         "promoted_assertions": str(promoted_assertions_path),
         "promoted_assertions_sha256": actual_promoted_assertions_sha,
+        "selected_release_assembly": str(selected_assembly_path or ""),
+        "selected_release_assembly_sha256": selected_assembly_sha,
+        "selected_release_binding_sha256": selected_binding_sha,
+        "page_graph_navigation_catalog": str(selected_navigation_path or ""),
+        "page_graph_navigation_catalog_sha256": selected_navigation_sha,
         "knowledge_graph": str(graph_path or ""),
         "knowledge_graph_index": str(graph_index_path or ""),
         "graph_type": graph_type,

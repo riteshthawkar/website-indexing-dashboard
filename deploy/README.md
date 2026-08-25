@@ -19,6 +19,12 @@ the full crawler/indexer must run on a Droplet or build worker. Use the
 lightweight `Dockerfile.retriever` for the App Platform service and keep runtime
 archives below the configured compressed and extracted size limits.
 
+The selected v1 release carries the evaluated assembly as well as the runtime
+bundle, lexical corpus, and graph. Keep the compressed download ceiling at
+2 GiB and the extracted ceiling at 4 GiB; the latter is enforced by the
+committed App Platform validation because the release payload is expected to
+exceed 2 GiB once the production graph is included.
+
 The committed [`.do/app.yaml`](../.do/app.yaml) is the production structure for
 one public backend plus one private retriever. It pins `Dockerfile.retriever`,
 port 8060 as internal-only, 16 GB retriever memory, long hydration health-check
@@ -71,13 +77,18 @@ must first pass the backend and indexing pre-deploy workflows. Then build and
 promote against the exact commits, publish the immutable runtime archive, set
 its S3 URI/endpoint/region/SHA/host and the expected run/bundle identity in DigitalOcean, and
 initiate the production deployment from the protected release process. A
-mismatched old archive is rejected by the serving fingerprint. After rotating
-Pinecone credentials, update the private retriever component's encrypted
-`PINECONE_API_KEY` (not the public backend component); the mandatory startup
-query must reach the live provider before `/readyz` succeeds.
+mismatched old archive is rejected by the serving fingerprint. The pgvector
+Droplet setup, TLS, role separation, backup policy, and release lifecycle are
+documented in [`deploy/pgvector/README.md`](pgvector/README.md). The private
+retriever receives only its encrypted read-only `PGVECTOR_DSN`; the indexing
+worker holds the separate `PGVECTOR_INGEST_DSN`. The mandatory startup query
+must verify exact database counts and execute a live nearest-neighbor query
+before `/readyz` succeeds.
 
-Each retriever process deliberately serves one retrieval at a time because the
-current routed retriever is not declared safe for shared parallel calls. The
-10-second bounded queue absorbs short bursts. Add capacity with horizontally
-isolated retriever replicas only after the multi-replica soak gate passes; do
-not increase `RETRIEVER_MAX_CONCURRENCY` within one process.
+The routed retriever uses thread-local provider clients, request-local
+diagnostics, immutable local indexes, and an atomic lazy graph loader. Each
+process therefore starts with two concurrent retrieval slots. The 10-second
+bounded queue provides backpressure beyond that limit. Raise
+`RETRIEVER_MAX_CONCURRENCY` only after the release load gate passes at the new
+value and peak RSS, provider errors, p95/p99 latency, and queue rejections stay
+within the production limits.

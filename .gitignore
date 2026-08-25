@@ -30,6 +30,7 @@ build/
 !**/components.json
 !eval/gates/*.json
 !eval/benchmarks/*.json
+!eval/mbzuai_gold/mbzuai_llm_generated_v1.manifest.json
 
 # OS files
 .DS_Store

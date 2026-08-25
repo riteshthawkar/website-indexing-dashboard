@@ -30,10 +30,10 @@ LANES = (
 )
 CONTRACT_FINGERPRINT = "a" * 64
 SERVING_CONTRACT_FINGERPRINT = "b" * 64
-EVAL_POLICY_ID = "mbzuai-production-eval-v1"
-RETRIEVAL_DATASET_SHA256 = "c1c032f12c298d7c67fc7de7bed6dec46b303ffcfa843f3eab9fcea548599314"
-RETRIEVAL_GATES_SHA256 = "ff5db91a3efe04719c69db892f129a23003960b98597965366a8c9c6421c708b"
-ANSWER_GATES_SHA256 = "785113d699e3d96c75bdee6686d432ec2ec08f9c6351b070e4a129fb45f66dd6"
+EVAL_POLICY_ID = "mbzuai-production-eval-v2"
+RETRIEVAL_DATASET_SHA256 = "cd9c4d7835f244347a174f2321399d77bb020593b64654173de8f7d0d0bcf42e"
+RETRIEVAL_GATES_SHA256 = "7361ce23bf3cf4e4de807925791dc9b4021c7c0f058cef426a9431f3103c1c80"
+ANSWER_GATES_SHA256 = "1e66930369c7d009672b683c08f2cdc50aa10fcc9d2ea7b48dbe04920cc7e64e"
 ANSWER_RUNTIME_COMMIT_SHA = "e" * 40
 INDEXING_BUILD = {
     "commit_sha": "f" * 40,
@@ -189,6 +189,217 @@ def _make_required_artifacts(work_dir: Path) -> None:
     )
 
 
+def _combine_hashes(*values: str) -> str:
+    digest = hashlib.sha256()
+    for value in values:
+        digest.update(str(value).strip().lower().encode("ascii"))
+    return digest.hexdigest()
+
+
+def _make_selected_required_artifacts(work_dir: Path) -> None:
+    _make_required_artifacts(work_dir)
+    run_id = work_dir.name
+    resolved_path = work_dir / "resolved_config.json"
+    resolved = json.loads(resolved_path.read_text(encoding="utf-8"))
+    resolved["config"]["selected_profile"] = {
+        "variant_id": "c650__gemini2_1536__dense_graph",
+        "record_kinds": [
+            "chunk",
+            "parent",
+            "parent_section",
+            "media",
+            "page_card",
+            "action",
+        ],
+    }
+    _write_json(resolved_path, resolved)
+
+    bundle_path = (
+        work_dir / "stage_outputs" / "finalize_retrieval_bundle" / "retrieval_bundle.json"
+    )
+    bundle = json.loads(bundle_path.read_text(encoding="utf-8"))
+    bundle["version"] = 6
+    bundle["schema_version"] = "mbzuai.retrieval_bundle.v6"
+    bundle["page_card_records"] = [{"id": "page-card-1", "text": "Admissions page"}]
+    bundle["action_records"] = [{"id": "action-1", "text": "Apply now"}]
+
+    assembly_dir = work_dir / "stage_outputs" / "assemble_selected_release"
+    record_files = {
+        "selected_dense_records": (
+            "selected_dense_records.jsonl",
+            b'{"id":"chunk-1"}\n'
+            b'{"id":"parent-1"}\n'
+            b'{"id":"section-1"}\n'
+            b'{"id":"media-1"}\n'
+            b'{"id":"page-card-1"}\n'
+            b'{"id":"action-1"}\n',
+            6,
+        ),
+        "chunks": ("chunk_dense_records.json", b'[{"id":"chunk-1","text":"chunk"}]', 1),
+        "parents": (
+            "parent_dense_records.json",
+            b'[{"id":"parent-1","text":"parent"},{"id":"section-1","text":"section"}]',
+            2,
+        ),
+        "media": ("media_dense_records.json", b'[{"id":"media-1","text":"media"}]', 1),
+        "page_cards": (
+            "page_card_dense_records.json",
+            b'[{"id":"page-card-1","text":"page"}]',
+            1,
+        ),
+        "actions": ("action_dense_records.json", b'[{"id":"action-1","text":"action"}]', 1),
+        "chunk_index": ("selected_chunk_index.json", b'{"chunk_count":1,"chunks":[{"chunk_id":"chunk-1"}]}', 1),
+        "navigation_catalog": (
+            "page_graph_navigation_catalog.json",
+            b'{"stats":{"pages":1,"chunks":1,"actions":1},"pages":[{"page_card_id":"page-card-1"}]}',
+            1,
+        ),
+        "chunk_id_bridge": (
+            "chunk_id_bridge.json",
+            b'{"mapping_count":1,"old_to_evaluated_chunk_id":{"old":"chunk-1"}}',
+            1,
+        ),
+    }
+    files: dict[str, dict] = {}
+    for key, (filename, content, count) in record_files.items():
+        path = assembly_dir / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        files[key] = {"file": filename, "sha256": _sha256(path), "record_count": count}
+    binding_order = tuple(record_files)
+    source_hash_keys = (
+        "decision_sha256",
+        "candidate_manifest_sha256",
+        "candidate_records_sha256",
+        "pipeline_state_sha256",
+        "artifact_catalog_sha256",
+        "run_audit_sha256",
+        "resolved_config_sha256",
+        "chunk_index_sha256",
+        "page_graph_bridge_sha256",
+        "navigation_catalog_sha256",
+    )
+    source = {key: hashlib.sha256(key.encode("utf-8")).hexdigest() for key in source_hash_keys}
+    assembly_binding = _combine_hashes(
+        *(source[key] for key in source_hash_keys),
+        *(files[key]["sha256"] for key in binding_order),
+    )
+    assembly_path = assembly_dir / "selected_release_assembly.json"
+    _write_json(
+        assembly_path,
+        {
+            "schema_version": "mbzuai.selected_release_assembly.v1",
+            "status": "ready_for_embedding",
+            "variant_id": "c650__gemini2_1536__dense_graph",
+            "record_kinds": [
+                "chunk",
+                "parent",
+                "parent_section",
+                "media",
+                "page_card",
+                "action",
+            ],
+            "record_kind_counts": {
+                "chunk": 1,
+                "parent": 1,
+                "parent_section": 1,
+                "media": 1,
+                "page_card": 1,
+                "action": 1,
+            },
+            "dense_lane_counts": {
+                "chunks": 1,
+                "parents": 2,
+                "media": 1,
+                "page_cards": 1,
+                "actions": 1,
+            },
+            "source": source,
+            "coverage": {
+                "all_candidate_chunks_mapped": True,
+                "all_navigation_chunks_remapped": True,
+            },
+            "files": files,
+            "binding_order": list(binding_order),
+            "assembly_sha256": assembly_binding,
+            "embedding_performed": False,
+            "upload_performed": False,
+        },
+    )
+    assembly_sha = _sha256(assembly_path)
+    navigation_sha = files["navigation_catalog"]["sha256"]
+    bundle["selected_release_contract"] = {
+        "schema_version": "mbzuai.selected_release_assembly.v1",
+        "variant_id": "c650__gemini2_1536__dense_graph",
+        "manifest_sha256": assembly_sha,
+        "assembly_sha256": assembly_binding,
+        "navigation_catalog_sha256": navigation_sha,
+    }
+    _write_json(bundle_path, bundle)
+
+    upload_path = work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json"
+    upload = json.loads(upload_path.read_text(encoding="utf-8"))
+    selected_lanes = (
+        "chunks",
+        "parents",
+        "media",
+        "page_cards",
+        "actions",
+        "facts",
+        "evidence_spans",
+        "summaries",
+        "assertions",
+        "entities",
+        "communities",
+    )
+    namespaces = {lane: f"{lane}--{run_id}" for lane in selected_lanes}
+    counts = {lane: 0 for lane in selected_lanes}
+    counts.update({"chunks": 1, "parents": 2, "media": 1, "page_cards": 1, "actions": 1})
+    upload.update(
+        {
+            "schema_version": 6,
+            "provider": "pgvector",
+            "production_indexing_contract_fingerprint": CONTRACT_FINGERPRINT,
+            "index_name": "mbzuai_retrieval.embedding_records",
+            "sparse_index_name": "",
+            "namespaces": namespaces,
+            "planned": counts,
+            "uploaded": counts,
+            "bundle_version": 6,
+            "retrieval_bundle_sha256": _sha256(bundle_path),
+            "selected_release_assembly_sha256": assembly_sha,
+            "selected_release_binding_sha256": assembly_binding,
+            "page_graph_navigation_catalog_sha256": navigation_sha,
+            "selected_profile": {
+                "variant_id": "c650__gemini2_1536__dense_graph",
+                "record_kinds": list(resolved["config"]["selected_profile"]["record_kinds"]),
+            },
+            "verification": {
+                "dense": {
+                    "expected": {
+                        namespaces[lane]: count for lane, count in counts.items() if count
+                    },
+                    "actual": {
+                        namespaces[lane]: count for lane, count in counts.items() if count
+                    },
+                    "failures": [],
+                }
+            },
+        }
+    )
+    upload["upload_input_sha256"] = _combine_hashes(
+        upload["retrieval_bundle_sha256"],
+        upload["lexical_corpus_sha256"],
+        upload["promoted_assertions_sha256"],
+        upload["knowledge_graph_sha256"],
+        upload["knowledge_graph_index_sha256"],
+        assembly_sha,
+        assembly_binding,
+        navigation_sha,
+    )
+    _write_json(upload_path, upload)
+
+
 def _manifest_payload(
     *,
     status: str,
@@ -231,16 +442,16 @@ def _manifest_payload(
             "policy_id": EVAL_POLICY_ID,
             "dataset_sha256": RETRIEVAL_DATASET_SHA256,
             "gates_sha256": RETRIEVAL_GATES_SHA256,
-            "minimum_query_count": 50,
-            "query_count": 50,
+            "minimum_query_count": 65,
+            "query_count": 65,
             "gates": {"passed": True},
         },
         "answer_evaluation": {
             "policy_id": EVAL_POLICY_ID,
             "dataset_sha256": RETRIEVAL_DATASET_SHA256,
             "gates_sha256": ANSWER_GATES_SHA256,
-            "minimum_query_count": 50,
-            "query_count": 0 if waived else 50,
+            "minimum_query_count": 65,
+            "query_count": 0 if waived else 65,
             "llm_judge": {
                 "enabled": True,
                 "providers": ["gemini"],
@@ -250,7 +461,7 @@ def _manifest_payload(
                 "openai_fallback_allowed": False,
                 "identity_mismatch_count": 0,
                 "error_count": 0,
-                "judged_count": 50,
+                "judged_count": 65,
             },
             "gates": {"passed": not waived},
             "skipped": waived,
@@ -258,6 +469,7 @@ def _manifest_payload(
             "waiver_reason": "approved incident waiver" if waived else "",
         },
         "vector_index": {
+            "provider": upload.get("provider", "pinecone"),
             "manifest_schema_version": upload["schema_version"],
             "indexing_build": INDEXING_BUILD,
             "indexing_build_sha256": INDEXING_BUILD_SHA256,
@@ -272,6 +484,15 @@ def _manifest_payload(
             "knowledge_graph_kind": upload["knowledge_graph_kind"],
             "knowledge_graph_sha256": upload["knowledge_graph_sha256"],
             "knowledge_graph_index_sha256": upload["knowledge_graph_index_sha256"],
+            "selected_release_assembly_sha256": upload.get(
+                "selected_release_assembly_sha256", ""
+            ),
+            "selected_release_binding_sha256": upload.get(
+                "selected_release_binding_sha256", ""
+            ),
+            "page_graph_navigation_catalog_sha256": upload.get(
+                "page_graph_navigation_catalog_sha256", ""
+            ),
             "upload_input_sha256": upload["upload_input_sha256"],
         },
         "knowledge_graph": {
@@ -284,6 +505,15 @@ def _manifest_payload(
             "retrieval_bundle_sha256": _sha256(bundle_path),
             "lexical_corpus_sha256": upload["lexical_corpus_sha256"],
             "promoted_assertions_sha256": upload["promoted_assertions_sha256"],
+            "selected_release_assembly_sha256": upload.get(
+                "selected_release_assembly_sha256", ""
+            ),
+            "selected_release_binding_sha256": upload.get(
+                "selected_release_binding_sha256", ""
+            ),
+            "page_graph_navigation_catalog_sha256": upload.get(
+                "page_graph_navigation_catalog_sha256", ""
+            ),
         },
     }
 
@@ -509,6 +739,92 @@ def test_explicit_candidate_work_dir_does_not_require_promoted_pointer(tmp_path:
     assert result.stdout.strip() == str(work_dir)
 
 
+def test_selected_candidate_accepts_complete_release_assembly(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    work_dir = runs_root / "selected-candidate"
+    _make_selected_required_artifacts(work_dir)
+
+    result = _resolve(
+        tmp_path / "missing-active-release.json",
+        runs_root,
+        RETRIEVAL_WORK_DIR=str(work_dir),
+        RETRIEVER_VALIDATE_JSON="true",
+    )
+
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(result.stdout)
+    assert payload["selected_release_assembly_sha256"]
+    assert payload["selected_release_binding_sha256"]
+    assert payload["page_graph_navigation_catalog_sha256"]
+
+
+def test_selected_candidate_rejects_navigation_catalog_drift(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    work_dir = runs_root / "selected-candidate"
+    _make_selected_required_artifacts(work_dir)
+    navigation_path = (
+        work_dir
+        / "stage_outputs"
+        / "assemble_selected_release"
+        / "page_graph_navigation_catalog.json"
+    )
+    navigation_path.write_text('{"tampered":true}\n', encoding="utf-8")
+
+    result = _resolve(
+        tmp_path / "missing-active-release.json",
+        runs_root,
+        RETRIEVAL_WORK_DIR=str(work_dir),
+    )
+
+    assert result.returncode != 0
+    assert "navigation_catalog" in result.stderr
+    assert "SHA256 drifted" in result.stderr
+
+
+def test_selected_candidate_rejects_unbound_assembly_file(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    work_dir = runs_root / "selected-candidate"
+    _make_selected_required_artifacts(work_dir)
+    assembly_path = (
+        work_dir
+        / "stage_outputs"
+        / "assemble_selected_release"
+        / "selected_release_assembly.json"
+    )
+    assembly = json.loads(assembly_path.read_text(encoding="utf-8"))
+    assembly["files"]["unbound_extra"] = dict(assembly["files"]["chunks"])
+    _write_json(assembly_path, assembly)
+
+    result = _resolve(
+        tmp_path / "missing-active-release.json",
+        runs_root,
+        RETRIEVAL_WORK_DIR=str(work_dir),
+    )
+
+    assert result.returncode != 0
+    assert "file set must exactly match its binding order" in result.stderr
+
+
+def test_selected_candidate_rejects_unevaluated_dense_lane(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    work_dir = runs_root / "selected-candidate"
+    _make_selected_required_artifacts(work_dir)
+    upload_path = work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json"
+    upload = json.loads(upload_path.read_text(encoding="utf-8"))
+    upload["planned"]["facts"] = 1
+    upload["uploaded"]["facts"] = 1
+    _write_json(upload_path, upload)
+
+    result = _resolve(
+        tmp_path / "missing-active-release.json",
+        runs_root,
+        RETRIEVAL_WORK_DIR=str(work_dir),
+    )
+
+    assert result.returncode != 0
+    assert "unevaluated dense lane must be zero for facts" in result.stderr
+
+
 def test_retriever_start_rejects_placeholder_service_token(tmp_path: Path) -> None:
     runs_root = tmp_path / "runs"
     work_dir = runs_root / "candidate"
@@ -551,7 +867,7 @@ def test_active_release_rejects_zero_answer_queries(tmp_path: Path) -> None:
     result = _resolve(pointer_path, runs_root)
 
     assert result.returncode != 0
-    assert "answer evaluation query_count must be at least 50" in result.stderr
+    assert "answer evaluation query_count must be at least 65" in result.stderr
 
 
 def test_active_release_rejects_unpinned_evaluation_policy(tmp_path: Path) -> None:
@@ -578,7 +894,7 @@ def test_active_release_rejects_unpinned_evaluation_policy(tmp_path: Path) -> No
     result = _resolve(pointer_path, runs_root)
 
     assert result.returncode != 0
-    assert "retrieval evaluation dataset_sha256 does not match mbzuai-production-eval-v1" in result.stderr
+    assert "retrieval evaluation dataset_sha256 does not match mbzuai-production-eval-v2" in result.stderr
 
 
 def test_candidate_rejects_static_namespaces(tmp_path: Path) -> None:

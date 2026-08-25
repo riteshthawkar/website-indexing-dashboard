@@ -166,7 +166,7 @@ class PipelineOrchestrator:
 
     def _upload_stage_index(self) -> Optional[int]:
         for index, (_stage_type, plugin_name, stage_id, _stage_def, _instance) in enumerate(self._stages):
-            if str(plugin_name) == "gemini_pinecone" or str(stage_id) == "upload_retrieval":
+            if str(plugin_name) in {"gemini_pinecone", "gemini_pgvector"} or str(stage_id) == "upload_retrieval":
                 return index
         return None
 

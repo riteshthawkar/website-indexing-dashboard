@@ -33,6 +33,7 @@ _KNOWN_CONFIG_SECTIONS = {
     "quality_gate",
     "formatter",
     "embedder",
+    "vector_store",
     "storage",
 }
 
@@ -120,6 +121,10 @@ class StageContext:
     @property
     def embedder_config(self) -> Dict[str, Any]:
         return self._config_for_section("embedder")
+
+    @property
+    def vector_store_config(self) -> Dict[str, Any]:
+        return self._config_for_section("vector_store")
 
     @property
     def storage_config(self) -> Dict[str, Any]:
@@ -321,6 +326,7 @@ class ChunkerStage(PipelineStage):
     stage_type = "chunker"
     # Expected outputs:
     #   chunks_file: Path
+    #   chunk_index_file: Path — canonical alias for graph/index stages
     #   chunk_count: int
 
 

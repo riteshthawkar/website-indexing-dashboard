@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
@@ -24,7 +24,7 @@ from pipeline.evaluation.answer_generation import generate_answer_predictions
 from pipeline.evaluation.dataset import EvalExample, load_eval_examples
 from pipeline.evaluation.retrieval_eval import check_metric_gates, load_eval_gates
 
-_ANSWER_READINESS_REPORT_VERSION = 3
+_ANSWER_READINESS_REPORT_VERSION = 4
 _PREDICTION_METADATA_VERSION = 1
 _JUDGE_PROMPT_VERSION = "mbzuai-answer-readiness-judge-v2"
 AnswerProgressCallback = Callable[[str, Mapping[str, Any]], None]
@@ -55,6 +55,19 @@ _NO_ANSWER_MARKERS = (
     "no grounded answer",
     "available sources do not",
     "official sources do not",
+    "لا أستطيع العثور",
+    "لا يمكنني العثور",
+    "لم أتمكن من العثور",
+    "لا أستطيع تقديم",
+    "لا يمكنني تقديم",
+    "لا تتوفر معلومات",
+    "لا توجد معلومات",
+    "لا توجد أدلة",
+    "المصادر المتاحة لا",
+    "المصادر الرسمية لا",
+    "غير متوفر في المصادر",
+    "تعذر التحقق",
+    "لا يمكن التحقق",
 )
 
 
@@ -63,6 +76,20 @@ def _mean(values: Iterable[float]) -> float:
     if not values:
         return 0.0
     return float(sum(values) / len(values))
+
+
+def _percentile(values: Iterable[float], percentile: float) -> float:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    bounded = min(100.0, max(0.0, float(percentile)))
+    rank = (len(ordered) - 1) * (bounded / 100.0)
+    lower = int(rank)
+    upper = min(len(ordered) - 1, lower + 1)
+    fraction = rank - lower
+    return ordered[lower] + ((ordered[upper] - ordered[lower]) * fraction)
 
 
 def _text(value: Any) -> str:
@@ -135,6 +162,25 @@ _TERM_STOPWORDS = {
     "the",
     "to",
     "with",
+    "إلى",
+    "الى",
+    "الي",
+    "أو",
+    "او",
+    "أن",
+    "ان",
+    "في",
+    "من",
+    "على",
+    "عن",
+    "مع",
+    "ما",
+    "هو",
+    "هي",
+    "هذا",
+    "هذه",
+    "التي",
+    "الذي",
 }
 _ACRONYM_SYNONYMS = {
     "ai": ("artificial intelligence",),
@@ -145,18 +191,74 @@ _ACRONYM_SYNONYMS = {
     "nlp": ("natural language processing",),
 }
 
+_ARABIC_DIACRITICS_RE = re.compile(
+    r"[\u0610-\u061a\u064b-\u065f\u0670\u06d6-\u06ed]"
+)
+_ARABIC_MATCH_TRANSLATION = str.maketrans(
+    {
+        "أ": "ا",
+        "إ": "ا",
+        "آ": "ا",
+        "ٱ": "ا",
+        "ى": "ي",
+        "٠": "0",
+        "١": "1",
+        "٢": "2",
+        "٣": "3",
+        "٤": "4",
+        "٥": "5",
+        "٦": "6",
+        "٧": "7",
+        "٨": "8",
+        "٩": "9",
+        "۰": "0",
+        "۱": "1",
+        "۲": "2",
+        "۳": "3",
+        "۴": "4",
+        "۵": "5",
+        "۶": "6",
+        "۷": "7",
+        "۸": "8",
+        "۹": "9",
+    }
+)
+
+
+def _normalize_arabic_for_match(value: str) -> str:
+    value = value.translate(_ARABIC_MATCH_TRANSLATION).replace("ـ", "")
+    return _ARABIC_DIACRITICS_RE.sub("", value)
+
 
 def _normalize_for_term_match(value: Any) -> str:
     text = unicodedata.normalize("NFKC", _text(value)).casefold()
+    text = _normalize_arabic_for_match(text)
     text = text.replace("&", " and ")
     text = _normalize_temporal_tokens(text)
     text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\b)", "", text)
-    text = re.sub(r"[^a-z0-9@._%+\-/]+", " ", text)
+    text = re.sub(r"[^a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff@._%+\-/]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
 def _normalize_temporal_tokens(text: str) -> str:
+    def _arabic_minute_time(match: re.Match[str]) -> str:
+        hour = str(int(match.group(1)))
+        minute = str(int(match.group(2))).zfill(2)
+        suffix = "am" if match.group(3).startswith("صباح") else "pm"
+        return f"{hour}{'' if minute == '00' else minute}{suffix}"
+
+    text = re.sub(
+        r"\b(\d{1,2})\s*[:.]\s*(\d{2})\s*(صباحا?|مساءا?|ظهرا?)\b",
+        _arabic_minute_time,
+        text,
+    )
+    text = re.sub(
+        r"\b(\d{1,2})\s*(صباحا?|مساءا?|ظهرا?)\b",
+        lambda match: f"{int(match.group(1))}{'am' if match.group(2).startswith('صباح') else 'pm'}",
+        text,
+    )
+
     def _minute_time(match: re.Match[str]) -> str:
         hour = str(int(match.group(1)))
         minute = match.group(2)
@@ -179,27 +281,27 @@ def _normalize_temporal_tokens(text: str) -> str:
 
 
 _CLOCK_EXPRESSION_RE = re.compile(
-    r"\b(\d{1,2})\s*[:.]\s*(\d{2})(?:\s*(a\.?m\.?|p\.?m\.?))?\b",
+    r"\b(\d{1,2})\s*[:.]\s*(\d{2})(?:\s*(a\.?m\.?|p\.?m\.?|صباحا?|مساءا?|ظهرا?))?\b",
     re.IGNORECASE,
 )
 
 
 def _clock_alias_groups(value: Any) -> List[set[str]]:
-    text = unicodedata.normalize("NFKC", _text(value)).casefold()
+    text = _normalize_arabic_for_match(unicodedata.normalize("NFKC", _text(value)).casefold())
     groups: List[set[str]] = []
     for match in _CLOCK_EXPRESSION_RE.finditer(text):
         try:
             hour = int(match.group(1))
         except ValueError:
             continue
-        minute = match.group(2)
+        minute = str(int(match.group(2))).zfill(2)
         meridiem = match.group(3)
         if hour <= 0 or hour > 24:
             continue
         display_hour = hour if 1 <= hour <= 12 else ((hour - 1) % 12) + 1
         compact_time = f"{display_hour}{'' if minute == '00' else minute}"
         if meridiem:
-            suffix = "am" if meridiem.startswith("a") else "pm"
+            suffix = "am" if meridiem.startswith(("a", "صباح")) else "pm"
             groups.append({f"{compact_time}{suffix}"})
         else:
             groups.append({f"{compact_time}am", f"{compact_time}pm"})
@@ -207,7 +309,8 @@ def _clock_alias_groups(value: Any) -> List[set[str]]:
 
 
 def _remove_clock_expressions(value: Any) -> str:
-    return _CLOCK_EXPRESSION_RE.sub(" ", _text(value))
+    normalized = _normalize_arabic_for_match(unicodedata.normalize("NFKC", _text(value)).casefold())
+    return _CLOCK_EXPRESSION_RE.sub(" ", normalized)
 
 
 def _all_clock_aliases_supported(response_tokens: set[str], response_blob: str, groups: Sequence[set[str]]) -> bool:
@@ -216,13 +319,21 @@ def _all_clock_aliases_supported(response_tokens: set[str], response_blob: str, 
 
 def _term_tokens(value: Any) -> List[str]:
     normalized = _normalize_for_term_match(value)
-    tokens = re.findall(r"[a-z0-9@._%+\-/]+", normalized)
+    tokens = re.findall(
+        r"[a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff@._%+\-/]+",
+        normalized,
+    )
     output: List[str] = []
     for token in tokens:
         if token in _TERM_STOPWORDS:
             continue
         if "@" not in token:
             token = token.strip("._-/")
+        if re.fullmatch(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]+", token):
+            if token.startswith("وال") and len(token) > 5:
+                token = token[3:]
+            elif token.startswith("ال") and len(token) > 4:
+                token = token[2:]
         if len(token) > 4 and token.endswith("s") and "@" not in token:
             token = token[:-1]
         if token:
@@ -303,14 +414,14 @@ def _metadata_list(metadata: Mapping[str, Any], key: str) -> List[str]:
 
 
 def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
-    normalized = _text(response).casefold()
+    normalized = _normalize_for_term_match(response)
     kind = _text(response_kind).casefold()
     if "no_answer" in kind:
         return True
     if not normalized:
         return False
     no_answer_starter = any(
-        normalized.startswith(marker)
+        normalized.startswith(_normalize_for_term_match(marker))
         for marker in (
             "i couldn’t confirm",
             "i couldn't confirm",
@@ -340,7 +451,9 @@ def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
     has_inline_citation = bool(re.search(r"\[(?:\d+|source\s+\d+)(?:\s*,\s*\d+)*\]", response or "", re.IGNORECASE))
     if has_inline_citation:
         return False
-    return len(normalized) < 420 and any(marker in normalized for marker in _NO_ANSWER_MARKERS)
+    return len(normalized) < 420 and any(
+        _normalize_for_term_match(marker) in normalized for marker in _NO_ANSWER_MARKERS
+    )
 
 
 def _inline_citation_present(response: str) -> bool:
@@ -1046,6 +1159,7 @@ class AnswerReadinessScore:
     query: str
     query_type: str
     source_type: str
+    language: str
     benchmark_tags: List[str]
     no_answer: bool
     response_non_empty: float
@@ -1073,6 +1187,7 @@ class AnswerReadinessScore:
     llm_reasons: List[str]
     pass_score: float
     latency_ms: float
+    first_content_latency_ms: float
     error: str
     response_preview: str
     missing_required_terms: List[str]
@@ -1189,11 +1304,20 @@ def _score_answer_row(
         latency_ms = float(row.get("latency_ms") or (row.get("metadata") or {}).get("latency_ms") or 0.0)
     except (TypeError, ValueError):
         latency_ms = 0.0
+    try:
+        first_content_latency_ms = float(
+            row.get("first_content_latency_ms")
+            or (row.get("metadata") or {}).get("first_content_latency_ms")
+            or latency_ms
+        )
+    except (TypeError, ValueError):
+        first_content_latency_ms = latency_ms
     return AnswerReadinessScore(
         id=example.id,
         query=example.query,
         query_type=example.query_type,
         source_type=example.source_type,
+        language=example.language,
         benchmark_tags=benchmark_tags,
         no_answer=example.no_answer,
         response_non_empty=response_non_empty,
@@ -1221,6 +1345,7 @@ def _score_answer_row(
         llm_reasons=llm_reasons,
         pass_score=1.0 if passed else 0.0,
         latency_ms=latency_ms,
+        first_content_latency_ms=first_content_latency_ms,
         error=error,
         response_preview=response[:240],
         missing_required_terms=missing_required,
@@ -1232,6 +1357,8 @@ def _score_answer_row(
 def _aggregate_scores(scores: Sequence[AnswerReadinessScore]) -> Dict[str, float]:
     answerable = [score for score in scores if not score.no_answer]
     no_answer = [score for score in scores if score.no_answer]
+    latencies = [score.latency_ms for score in scores]
+    first_content_latencies = [score.first_content_latency_ms for score in scores]
     return {
         "query_count": float(len(scores)),
         "answerable_query_count": float(len(answerable)),
@@ -1257,7 +1384,16 @@ def _aggregate_scores(scores: Sequence[AnswerReadinessScore]) -> Dict[str, float
         "llm_safety_mean": _mean(score.llm_safety for score in scores),
         "llm_judge_error_rate": _mean(score.llm_judge_error for score in scores),
         "error_rate": _mean(1.0 if score.error else 0.0 for score in scores),
-        "mean_latency_ms": _mean(score.latency_ms for score in scores),
+        "mean_latency_ms": _mean(latencies),
+        "p50_latency_ms": _percentile(latencies, 50),
+        "p95_latency_ms": _percentile(latencies, 95),
+        "p99_latency_ms": _percentile(latencies, 99),
+        "max_latency_ms": max(latencies, default=0.0),
+        "mean_first_content_latency_ms": _mean(first_content_latencies),
+        "p50_first_content_latency_ms": _percentile(first_content_latencies, 50),
+        "p95_first_content_latency_ms": _percentile(first_content_latencies, 95),
+        "p99_first_content_latency_ms": _percentile(first_content_latencies, 99),
+        "max_first_content_latency_ms": max(first_content_latencies, default=0.0),
     }
 
 
@@ -1386,6 +1522,7 @@ def _chat_prediction_row_from_payload(
     status_code: int = 0,
     transport_error: str = "",
     terminal_event: str = "",
+    first_content_latency_ms: float | None = None,
 ) -> Dict[str, Any]:
     response_text = str(payload.get("response") or payload.get("message") or "")
     error = str(payload.get("error") or transport_error or "")
@@ -1401,6 +1538,11 @@ def _chat_prediction_row_from_payload(
         "endpoint": endpoint,
         "eval_request_mode": bool(eval_request_mode),
         "latency_ms": latency_ms,
+        "first_content_latency_ms": (
+            float(first_content_latency_ms)
+            if first_content_latency_ms is not None
+            else float(latency_ms)
+        ),
         "citation_mode": payload.get("citation_mode"),
         "partial": payload.get("partial"),
         "finish_reason": payload.get("finish_reason"),
@@ -1414,6 +1556,7 @@ def _chat_prediction_row_from_payload(
         "id": example.id,
         "query_type": example.query_type,
         "source_type": example.source_type,
+        "language": example.language,
         "user_input": example.query,
         "response": response_text,
         "reference": example.reference_answer,
@@ -1441,6 +1584,7 @@ def _chat_prediction_row_from_payload(
         "status": payload.get("status"),
         "metadata": metadata,
         "latency_ms": latency_ms,
+        "first_content_latency_ms": metadata["first_content_latency_ms"],
         "error": metadata["error"],
     }
 
@@ -1457,7 +1601,8 @@ def _post_chat_request(
 ) -> Dict[str, Any]:
     payload = {
         "question": example.query,
-        "language": "English",
+        "language": example.language,
+        "protocol_version": "1.0",
         "previous_chats": [],
         "session_id": _eval_session_id(example),
         "request_id": f"release-readiness-{example.id}",
@@ -1545,7 +1690,8 @@ async def _websocket_chat_request_async(
     websocket_endpoint = _normalize_websocket_endpoint(endpoint)
     payload = {
         "question": example.query,
-        "language": "English",
+        "language": example.language,
+        "protocol_version": "1.0",
         "previous_chats": [],
         "session_id": _eval_session_id(example),
         "request_id": f"release-readiness-{example.id}",
@@ -1575,6 +1721,7 @@ async def _websocket_chat_request_async(
     timeout = max(1.0, float(timeout_seconds))
     terminal_payload: Dict[str, Any] = {}
     terminal_event = ""
+    first_content_latency_ms: float | None = None
     try:
         try:
             connection = websockets.connect(
@@ -1638,7 +1785,28 @@ async def _websocket_chat_request_async(
                     if not isinstance(message, dict):
                         continue
                     event = str(message.get("event") or "")
+                    if first_content_latency_ms is None and (
+                        event in {"chunk", "delta"}
+                        and str(
+                            message.get("delta")
+                            or message.get("response")
+                            or message.get("content")
+                            or message.get("text")
+                            or ""
+                        ).strip()
+                    ):
+                        first_content_latency_ms = round(
+                            (time.perf_counter() - started) * 1000.0,
+                            3,
+                        )
                     if event == "final" or bool(message.get("terminal")) or message.get("status") == "done":
+                        if first_content_latency_ms is None and str(
+                            message.get("response") or message.get("message") or ""
+                        ).strip():
+                            first_content_latency_ms = round(
+                                (time.perf_counter() - started) * 1000.0,
+                                3,
+                            )
                         terminal_payload = message
                         terminal_event = event
                         break
@@ -1660,6 +1828,7 @@ async def _websocket_chat_request_async(
             latency_ms=round((time.perf_counter() - started) * 1000.0, 3),
             eval_request_mode=eval_request_mode,
             transport_error=error_text,
+            first_content_latency_ms=first_content_latency_ms,
         )
 
     return _chat_prediction_row_from_payload(
@@ -1670,6 +1839,7 @@ async def _websocket_chat_request_async(
         latency_ms=round((time.perf_counter() - started) * 1000.0, 3),
         eval_request_mode=eval_request_mode,
         terminal_event=terminal_event,
+        first_content_latency_ms=first_content_latency_ms,
     )
 
 
@@ -1711,6 +1881,7 @@ def _run_http_answer_predictions(
     probe_mode: bool = False,
     eval_request_mode: bool = True,
     resume_predictions: bool = False,
+    parallelism: int = 1,
     progress_callback: AnswerProgressCallback | None = None,
 ) -> List[Dict[str, Any]]:
     predictions_file = Path(predictions_path)
@@ -1745,9 +1916,11 @@ def _run_http_answer_predictions(
         query_count=len(examples),
         resume_kept_count=resume_state["kept_count"],
     )
-    for example in examples:
-        if example.id in rows_by_id:
-            continue
+    pending_examples = [example for example in examples if example.id not in rows_by_id]
+    requested_parallelism = max(1, int(parallelism or 1))
+    effective_parallelism = min(requested_parallelism, max(1, len(pending_examples)))
+
+    def evaluate_one(example: EvalExample) -> tuple[EvalExample, Dict[str, Any], float]:
         started = time.perf_counter()
         row = _post_chat_request(
             endpoint=endpoint,
@@ -1758,6 +1931,9 @@ def _run_http_answer_predictions(
             probe_mode=probe_mode,
             eval_request_mode=eval_request_mode,
         )
+        return example, row, round((time.perf_counter() - started) * 1000.0, 3)
+
+    def record_result(example: EvalExample, row: Dict[str, Any], elapsed_ms: float) -> None:
         rows_by_id[example.id] = _stamp_prediction_row(
             row,
             example=example,
@@ -1778,9 +1954,21 @@ def _run_http_answer_predictions(
             id=example.id,
             completed=len(rows_by_id),
             query_count=len(examples),
-            elapsed_ms=round((time.perf_counter() - started) * 1000.0, 3),
+            elapsed_ms=elapsed_ms,
             error=_text(row.get("error") or (row.get("metadata") or {}).get("error")),
         )
+
+    if effective_parallelism <= 1:
+        for example in pending_examples:
+            record_result(*evaluate_one(example))
+    else:
+        with ThreadPoolExecutor(
+            max_workers=effective_parallelism,
+            thread_name_prefix="answer-readiness-http",
+        ) as executor:
+            futures = [executor.submit(evaluate_one, example) for example in pending_examples]
+            for future in as_completed(futures):
+                record_result(*future.result())
     rows = ordered_rows()
     for row in rows:
         metadata = dict(row.get("metadata") or {})
@@ -1793,6 +1981,8 @@ def _run_http_answer_predictions(
         "answer_predictions_done",
         mode="http",
         query_count=len(rows),
+        parallelism_requested=requested_parallelism,
+        parallelism_effective=effective_parallelism,
     )
     return rows
 
@@ -1812,6 +2002,7 @@ def _run_websocket_answer_predictions(
     probe_mode: bool = False,
     eval_request_mode: bool = True,
     resume_predictions: bool = False,
+    parallelism: int = 1,
     progress_callback: AnswerProgressCallback | None = None,
 ) -> List[Dict[str, Any]]:
     predictions_file = Path(predictions_path)
@@ -1848,9 +2039,11 @@ def _run_websocket_answer_predictions(
         resume_kept_count=resume_state["kept_count"],
         endpoint=normalized_endpoint,
     )
-    for example in examples:
-        if example.id in rows_by_id:
-            continue
+    pending_examples = [example for example in examples if example.id not in rows_by_id]
+    requested_parallelism = max(1, int(parallelism or 1))
+    effective_parallelism = min(requested_parallelism, max(1, len(pending_examples)))
+
+    def evaluate_one(example: EvalExample) -> tuple[EvalExample, Dict[str, Any], float]:
         started = time.perf_counter()
         row = _websocket_chat_request(
             endpoint=normalized_endpoint,
@@ -1861,6 +2054,9 @@ def _run_websocket_answer_predictions(
             probe_mode=probe_mode,
             eval_request_mode=eval_request_mode,
         )
+        return example, row, round((time.perf_counter() - started) * 1000.0, 3)
+
+    def record_result(example: EvalExample, row: Dict[str, Any], elapsed_ms: float) -> None:
         rows_by_id[example.id] = _stamp_prediction_row(
             row,
             example=example,
@@ -1881,9 +2077,21 @@ def _run_websocket_answer_predictions(
             id=example.id,
             completed=len(rows_by_id),
             query_count=len(examples),
-            elapsed_ms=round((time.perf_counter() - started) * 1000.0, 3),
+            elapsed_ms=elapsed_ms,
             error=_text(row.get("error") or (row.get("metadata") or {}).get("error")),
         )
+
+    if effective_parallelism <= 1:
+        for example in pending_examples:
+            record_result(*evaluate_one(example))
+    else:
+        with ThreadPoolExecutor(
+            max_workers=effective_parallelism,
+            thread_name_prefix="answer-readiness-websocket",
+        ) as executor:
+            futures = [executor.submit(evaluate_one, example) for example in pending_examples]
+            for future in as_completed(futures):
+                record_result(*future.result())
     rows = ordered_rows()
     for row in rows:
         metadata = dict(row.get("metadata") or {})
@@ -1896,6 +2104,8 @@ def _run_websocket_answer_predictions(
         "answer_predictions_done",
         mode="websocket",
         query_count=len(rows),
+        parallelism_requested=requested_parallelism,
+        parallelism_effective=effective_parallelism,
     )
     return rows
 
@@ -2013,6 +2223,7 @@ def evaluate_answer_readiness(
     probe_mode: bool = False,
     eval_request_mode: bool = True,
     resume_predictions: bool = False,
+    parallelism: int = 1,
     progress_callback: AnswerProgressCallback | None = None,
 ) -> Dict[str, Any]:
     resolved_dataset = Path(dataset_path).expanduser().resolve()
@@ -2050,6 +2261,7 @@ def evaluate_answer_readiness(
             probe_mode=probe_mode,
             eval_request_mode=eval_request_mode,
             resume_predictions=resume_predictions,
+            parallelism=parallelism,
             progress_callback=progress_callback,
         )
         backend = "production_chat_http"
@@ -2068,6 +2280,7 @@ def evaluate_answer_readiness(
             probe_mode=probe_mode,
             eval_request_mode=eval_request_mode,
             resume_predictions=resume_predictions,
+            parallelism=parallelism,
             progress_callback=progress_callback,
         )
         backend = "production_chat_websocket"
@@ -2171,6 +2384,14 @@ def evaluate_answer_readiness(
         "eval_request_mode": bool(eval_request_mode) if mode in {"http", "websocket"} else False,
         "predictions_path": str(resolved_predictions),
         "query_count": len(scores),
+        "execution": {
+            "parallelism_requested": max(1, int(parallelism or 1)),
+            "parallelism_effective": (
+                min(max(1, int(parallelism or 1)), max(1, len(examples)))
+                if mode in {"http", "websocket"}
+                else 1
+            ),
+        },
         "prediction_integrity": prediction_integrity,
         "llm_judge": {
             "enabled": bool(judge_enabled),
@@ -2193,6 +2414,7 @@ def evaluate_answer_readiness(
         "overall": overall,
         "by_query_type": _slice_scores(scores, "query_type"),
         "by_source_type": _slice_scores(scores, "source_type"),
+        "by_language": _slice_scores(scores, "language"),
         "by_benchmark_tag": _slice_scores_by_benchmark_tag(scores),
         "queries": [score.to_dict() for score in scores],
     }

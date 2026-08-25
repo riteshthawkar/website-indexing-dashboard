@@ -8,6 +8,14 @@ from typing import Any, Dict, Iterable, List
 
 ALLOWED_QUERY_TYPES = {"fact", "scoped", "synthesis", "multimodal"}
 ALLOWED_SOURCE_TYPES = {"webpage", "pdf", "mixed", "image", "video", "none"}
+ALLOWED_LANGUAGES = {"English", "Arabic"}
+_LANGUAGE_ALIASES = {
+    "en": "English",
+    "english": "English",
+    "ar": "Arabic",
+    "arabic": "Arabic",
+    "العربية": "Arabic",
+}
 
 
 @dataclass
@@ -15,6 +23,7 @@ class EvalExample:
     id: str
     query: str
     query_type: str
+    language: str = "English"
     source_type: str = "mixed"
     no_answer: bool = False
     reference_answer: str = ""
@@ -22,16 +31,24 @@ class EvalExample:
     gold_span_ids: List[str] = field(default_factory=list)
     gold_parent_ids: List[str] = field(default_factory=list)
     gold_media_ids: List[str] = field(default_factory=list)
+    gold_document_revision_ids: List[str] = field(default_factory=list)
+    gold_page_card_ids: List[str] = field(default_factory=list)
+    gold_section_ids: List[str] = field(default_factory=list)
+    gold_action_ids: List[str] = field(default_factory=list)
     notes: str = ""
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def normalized(self) -> "EvalExample":
         query_type = str(self.query_type or "").strip().lower()
         source_type = str(self.source_type or "").strip().lower()
+        raw_language = str(self.language or "English").strip()
+        language = _LANGUAGE_ALIASES.get(raw_language.casefold(), raw_language)
         if query_type not in ALLOWED_QUERY_TYPES:
             raise ValueError(f"Unsupported query_type {self.query_type!r} for eval example {self.id}")
         if source_type not in ALLOWED_SOURCE_TYPES:
             raise ValueError(f"Unsupported source_type {self.source_type!r} for eval example {self.id}")
+        if language not in ALLOWED_LANGUAGES:
+            raise ValueError(f"Unsupported language {self.language!r} for eval example {self.id}")
         if not str(self.id or "").strip():
             raise ValueError("Eval example id is required")
         if not str(self.query or "").strip():
@@ -40,6 +57,7 @@ class EvalExample:
             id=str(self.id).strip(),
             query=str(self.query).strip(),
             query_type=query_type,
+            language=language,
             source_type=source_type,
             no_answer=bool(self.no_answer),
             reference_answer=str(self.reference_answer or "").strip(),
@@ -47,6 +65,12 @@ class EvalExample:
             gold_span_ids=[str(item).strip() for item in self.gold_span_ids if str(item).strip()],
             gold_parent_ids=[str(item).strip() for item in self.gold_parent_ids if str(item).strip()],
             gold_media_ids=[str(item).strip() for item in self.gold_media_ids if str(item).strip()],
+            gold_document_revision_ids=[
+                str(item).strip() for item in self.gold_document_revision_ids if str(item).strip()
+            ],
+            gold_page_card_ids=[str(item).strip() for item in self.gold_page_card_ids if str(item).strip()],
+            gold_section_ids=[str(item).strip() for item in self.gold_section_ids if str(item).strip()],
+            gold_action_ids=[str(item).strip() for item in self.gold_action_ids if str(item).strip()],
             notes=str(self.notes or "").strip(),
             metadata=dict(self.metadata or {}),
         )

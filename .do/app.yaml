@@ -121,6 +121,14 @@ services:
         value: gpt-5.4-mini-2026-03-17
         scope: RUN_TIME
         type: GENERAL
+      - key: ENABLE_LLM_FOLLOWUP_SUGGESTIONS
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
+      - key: ENABLE_LLM_PRESENTATION_BLOCKS
+        value: "false"
+        scope: RUN_TIME
+        type: GENERAL
       - key: JWT_SECRET
         value: CHANGE_ME_WITH_AT_LEAST_32_RANDOM_CHARACTERS
         scope: RUN_TIME
@@ -229,8 +237,8 @@ services:
         value: CHANGE_ME_IN_DIGITALOCEAN
         scope: RUN_TIME
         type: SECRET
-      - key: PINECONE_API_KEY
-        value: CHANGE_ME_IN_DIGITALOCEAN
+      - key: PGVECTOR_DSN
+        value: CHANGE_ME_TO_READ_ONLY_PRIVATE_PGVECTOR_DSN_WITH_SSLMODE
         scope: RUN_TIME
         type: SECRET
       - key: RELEASE_COMMIT_SHA
@@ -298,7 +306,7 @@ services:
         scope: RUN_TIME
         type: GENERAL
       - key: RELEASE_ARCHIVE_MAX_EXTRACTED_BYTES
-        value: "2147483648"
+        value: "4294967296"
         scope: RUN_TIME
         type: GENERAL
       - key: RELEASE_ARCHIVE_MAX_FILES
@@ -342,7 +350,7 @@ services:
         scope: RUN_TIME
         type: GENERAL
       - key: RETRIEVER_MAX_CONCURRENCY
-        value: "1"
+        value: "2"
         scope: RUN_TIME
         type: GENERAL
       - key: RETRIEVER_REQUEST_TIMEOUT_SECONDS

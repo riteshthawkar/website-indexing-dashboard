@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from pipeline.core.base import ChunkerStage, StageContext, StageResult
+from pipeline.core.chunking import token_counting_method
 from pipeline.core.registry import register_stage
 from pipeline.stages.chunkers.common import (
     collect_markdown_sources,
@@ -34,7 +35,7 @@ class FixedWindowChunker(ChunkerStage):
 
         target_tokens = int(config.get("target_tokens", 450))
         overlap_tokens = int(config.get("overlap_tokens", 80))
-        max_chunks_per_document = int(config.get("max_chunks_per_document", 64))
+        max_chunks_per_document = int(config.get("max_chunks_per_document", 0))
 
         chunks: List[Dict[str, Any]] = []
         source_artifact_ids: List[str] = []
@@ -59,7 +60,13 @@ class FixedWindowChunker(ChunkerStage):
             strategy=self.name,
             chunks=chunks,
             source_artifact_ids=source_artifact_ids,
-            metadata={"target_tokens": target_tokens, "overlap_tokens": overlap_tokens},
+            metadata={
+                "target_tokens": target_tokens,
+                "overlap_tokens": overlap_tokens,
+                "max_chunks_per_document": max_chunks_per_document,
+                "chunk_limit_mode": "unlimited" if max_chunks_per_document <= 0 else "fail",
+                "token_counting_method": token_counting_method(),
+            },
         )
         logger.info("Fixed chunker: %d documents -> %d chunks", chunk_index["document_count"], chunk_index["chunk_count"])
         return StageResult.success(

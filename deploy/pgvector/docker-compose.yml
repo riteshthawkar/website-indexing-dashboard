@@ -1,0 +1,108 @@
+name: mbzuai-pgvector
+
+services:
+  postgres:
+    image: pgvector/pgvector:0.8.6-pg17-bookworm@sha256:cf134a767f474095eeba57e0117be8e568e011a63f33fbf252f14c9b760f8e6f
+    restart: unless-stopped
+    init: true
+    shm_size: "${PGVECTOR_SHM_SIZE:-1gb}"
+    mem_limit: "${PGVECTOR_MEMORY_LIMIT:-4g}"
+    cpus: "${PGVECTOR_CPU_LIMIT:-2.0}"
+    security_opt:
+      - no-new-privileges:true
+    environment:
+      POSTGRES_DB: "${PGVECTOR_DATABASE:-mbzuai_vectors}"
+      POSTGRES_USER: "${PGVECTOR_ADMIN_USER:-mbzuai_pgadmin}"
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=peer --data-checksums"
+      PGDATA: /var/lib/postgresql/data/pgdata
+      PGVECTOR_READER_USER: "${PGVECTOR_READER_USER:-mbzuai_retriever}"
+      PGVECTOR_READER_PASSWORD_FILE: /run/secrets/reader_password
+      PGVECTOR_READER_CONNECTION_LIMIT: "${PGVECTOR_READER_CONNECTION_LIMIT:-24}"
+      PGVECTOR_WRITER_USER: "${PGVECTOR_WRITER_USER:-mbzuai_indexer}"
+      PGVECTOR_WRITER_PASSWORD_FILE: /run/secrets/writer_password
+      PGVECTOR_WRITER_CONNECTION_LIMIT: "${PGVECTOR_WRITER_CONNECTION_LIMIT:-8}"
+      PGVECTOR_ALLOWED_CIDRS: "${PGVECTOR_ALLOWED_CIDRS:?Set PGVECTOR_ALLOWED_CIDRS to private app/worker CIDRs}"
+    secrets:
+      - postgres_password
+      - reader_password
+      - writer_password
+    ports:
+      - "${PGVECTOR_BIND_IP:?Set PGVECTOR_BIND_IP to the Droplet private VPC address}:5432:5432"
+    volumes:
+      - "${PGVECTOR_DATA_DIR:?Set PGVECTOR_DATA_DIR to a mounted persistent path}:/var/lib/postgresql/data"
+      - "${PGVECTOR_TLS_DIR:?Set PGVECTOR_TLS_DIR to the TLS certificate directory}:/etc/postgresql/tls:ro"
+      - ./sql/001_schema.sql:/docker-entrypoint-initdb.d/001_schema.sql:ro
+      - ./sql/002_create_login_roles.sh:/docker-entrypoint-initdb.d/002_create_login_roles.sh:ro
+      - ./sql/003_configure_hba.sh:/docker-entrypoint-initdb.d/003_configure_hba.sh:ro
+      - ./sql/004_selected_release_lanes.sql:/docker-entrypoint-initdb.d/004_selected_release_lanes.sql:ro
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - listen_addresses=*
+      - -c
+      - ssl=on
+      - -c
+      - ssl_min_protocol_version=TLSv1.2
+      - -c
+      - ssl_cert_file=/etc/postgresql/tls/server.crt
+      - -c
+      - ssl_key_file=/etc/postgresql/tls/server.key
+      - -c
+      - ssl_ca_file=/etc/postgresql/tls/ca.crt
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - max_connections=${PGVECTOR_MAX_CONNECTIONS:-100}
+      - -c
+      - shared_buffers=${PGVECTOR_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${PGVECTOR_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - maintenance_work_mem=${PGVECTOR_MAINTENANCE_WORK_MEM:-512MB}
+      - -c
+      - work_mem=${PGVECTOR_WORK_MEM:-16MB}
+      - -c
+      - wal_compression=on
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - effective_io_concurrency=200
+      - -c
+      - idle_in_transaction_session_timeout=15s
+      - -c
+      - statement_timeout=120s
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_lock_waits=on
+      - -c
+      - track_io_timing=on
+      - -c
+      - pg_stat_statements.track=all
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    stop_grace_period: 60s
+    logging:
+      driver: json-file
+      options:
+        max-size: 20m
+        max-file: "5"
+
+secrets:
+  postgres_password:
+    file: "${PGVECTOR_POSTGRES_PASSWORD_FILE:?Set PGVECTOR_POSTGRES_PASSWORD_FILE}"
+  reader_password:
+    file: "${PGVECTOR_READER_PASSWORD_FILE:?Set PGVECTOR_READER_PASSWORD_FILE}"
+  writer_password:
+    file: "${PGVECTOR_WRITER_PASSWORD_FILE:?Set PGVECTOR_WRITER_PASSWORD_FILE}"

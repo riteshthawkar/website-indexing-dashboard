@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
@@ -216,6 +218,172 @@ def test_retrieval_service_authenticates_requests_and_caps_unsafe_concurrency(tm
     assert unauthorized.status_code == 401
     assert authorized.status_code == 200
     assert invalid_request_id.status_code == 422
+
+
+def test_retrieval_service_runs_two_safe_requests_concurrently(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    class SafeRetriever:
+        supports_shared_parallel_retrieval = True
+
+        def __init__(self):
+            self.barrier = threading.Barrier(2)
+            self.lock = threading.Lock()
+            self.active = 0
+            self.max_active = 0
+
+        def retrieve(self, query):
+            with self.lock:
+                self.active += 1
+                self.max_active = max(self.max_active, self.active)
+            try:
+                self.barrier.wait(timeout=2.0)
+                time.sleep(0.02)
+                return {"query": query, "abstained": True, "retrieval_documents": []}
+            finally:
+                with self.lock:
+                    self.active -= 1
+
+    retriever = SafeRetriever()
+    token = "Rtrv-2026-StrongToken_A9z8Y7x6W5v4"
+    headers = {"X-Retrieval-Service-Token": token}
+    monkeypatch.setenv("RETRIEVAL_SERVICE_TOKEN", token)
+    monkeypatch.setattr(
+        "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+        lambda **_kwargs: retriever,
+    )
+    app = create_retrieval_service_app(config_name="cfg", work_dir=tmp_path, max_concurrency=2)
+
+    with TestClient(app) as client:
+        attestation = client.get("/attestationz", headers=headers)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(
+                    client.post,
+                    "/retrieve",
+                    headers=headers,
+                    json={"query": f"distinct query {index}", "request_id": f"parallel-{index}"},
+                )
+                for index in range(2)
+            ]
+            responses = [future.result(timeout=3.0) for future in futures]
+
+    assert attestation.status_code == 200
+    assert attestation.json()["max_concurrency"] == 2
+    assert [response.status_code for response in responses] == [200, 200]
+    assert retriever.max_active == 2
+
+
+def test_retrieval_service_cache_separates_planner_handoff_mode(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    class PlannerAwareRetriever:
+        supports_shared_parallel_retrieval = True
+
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, query, *, skip_query_planner=False):
+            self.calls.append((query, skip_query_planner))
+            return {
+                "query": query,
+                "abstained": True,
+                "retrieval_documents": [],
+                "planner_skipped": skip_query_planner,
+            }
+
+    retriever = PlannerAwareRetriever()
+    monkeypatch.setattr(
+        "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+        lambda **_kwargs: retriever,
+    )
+    app = create_retrieval_service_app(config_name="cfg", work_dir=tmp_path)
+
+    with TestClient(app) as client:
+        planned_first = client.post("/retrieve", json={"query": "same query"})
+        planned_cached = client.post("/retrieve", json={"query": "same query"})
+        handoff_first = client.post(
+            "/retrieve",
+            json={"query": "same query", "skip_query_planner": True},
+        )
+        handoff_cached = client.post(
+            "/retrieve",
+            json={"query": "same query", "skip_query_planner": True},
+        )
+
+    assert retriever.calls == [("same query", False), ("same query", True)]
+    assert planned_first.json()["service_cache_hit"] is False
+    assert planned_cached.json()["service_cache_hit"] is True
+    assert handoff_first.json()["service_cache_hit"] is False
+    assert handoff_first.json()["service_query_planner_skipped"] is True
+    assert handoff_cached.json()["service_cache_hit"] is True
+
+
+def test_retrieval_service_forwards_navigation_context_and_separates_cache(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    class NavigationAwareRetriever:
+        supports_shared_parallel_retrieval = True
+
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, query, *, navigation_context=None):
+            self.calls.append((query, navigation_context))
+            return {
+                "query": query,
+                "abstained": True,
+                "retrieval_documents": [],
+            }
+
+    retriever = NavigationAwareRetriever()
+    monkeypatch.setattr(
+        "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+        lambda **_kwargs: retriever,
+    )
+    app = create_retrieval_service_app(config_name="cfg", work_dir=tmp_path)
+    apply_context = {
+        "intent": "apply",
+        "goal": "Apply to MBZUAI",
+        "confidence": 0.94,
+        "source": "backend_query_analysis",
+    }
+    contact_context = {
+        "intent": "contact",
+        "goal": "Contact MBZUAI",
+        "confidence": 0.94,
+        "source": "backend_query_analysis",
+    }
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/retrieve",
+            json={"query": "same query", "navigation_context": apply_context},
+        )
+        cached = client.post(
+            "/retrieve",
+            json={"query": "same query", "navigation_context": apply_context},
+        )
+        different_context = client.post(
+            "/retrieve",
+            json={"query": "same query", "navigation_context": contact_context},
+        )
+
+    assert retriever.calls == [
+        ("same query", apply_context),
+        ("same query", contact_context),
+    ]
+    assert first.status_code == 200
+    assert first.json()["service_navigation_context_forwarded"] is True
+    assert first.json()["service_cache_hit"] is False
+    assert cached.json()["service_cache_hit"] is True
+    assert different_context.json()["service_cache_hit"] is False
 
 
 @pytest.mark.parametrize(

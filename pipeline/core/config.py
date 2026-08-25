@@ -40,6 +40,7 @@ class ProductionConfigMismatchError(ValueError):
 
 _INDEXING_CONTRACT_SECTIONS = (
     "pipeline",
+    "selected_profile",
     "crawler",
     "cleaner",
     "converter",
@@ -49,6 +50,7 @@ _INDEXING_CONTRACT_SECTIONS = (
     "assertions",
     "formatter",
     "embedder",
+    "vector_store",
     "graph",
 )
 _PIPELINE_RUNTIME_ONLY_KEYS = {"active_release_file"}
@@ -59,14 +61,37 @@ _GRAPH_RUNTIME_ONLY_KEYS = {
     "neo4j_database",
     "neo4j_http_timeout_sec",
 }
+_VECTOR_STORE_RUNTIME_ONLY_KEYS = {
+    "dsn_env",
+    "ingest_dsn_env",
+    "reader_role",
+    "writer_role",
+    "allow_shared_dsn_for_ingest",
+    "require_ssl",
+    "require_active_release",
+    "pool_min_size",
+    "pool_max_size",
+    "pool_timeout_seconds",
+    "connect_timeout_seconds",
+    "max_lifetime_seconds",
+    "max_idle_seconds",
+    "statement_timeout_ms",
+    "idle_transaction_timeout_ms",
+    "hnsw_ef_search",
+    "application_name",
+    "ingest_application_name",
+}
 _SERVING_IMPLEMENTATION_FILES = (
     "core/evidence_adjudicator.py",
+    "core/navigation_intent.py",
     "core/query_expansion.py",
     "core/query_planner.py",
     "retrieval/adaptive_hybrid.py",
     "retrieval/evidence_packer.py",
     "retrieval/graph_rag.py",
+    "retrieval/navigation_planner.py",
     "retrieval/routed_hybrid.py",
+    "vectorstores/pgvector_store.py",
 )
 _INDEXING_CORE_IMPLEMENTATION_FILES = (
     "core/answer_records.py",
@@ -75,6 +100,8 @@ _INDEXING_CORE_IMPLEMENTATION_FILES = (
     "core/graph_artifacts.py",
     "core/knowledge_graph.py",
     "core/mbzuai_indexing.py",
+    "core/page_graph_bridge.py",
+    "core/release_assembly.py",
 )
 _SECRET_CONFIG_KEYS = {
     "api_key",
@@ -87,6 +114,9 @@ _SECRET_CONFIG_KEYS = {
     "cookies",
     "credential",
     "credentials",
+    "connection_string",
+    "database_url",
+    "dsn",
     "neo4j_password",
     "password",
     "private_key",
@@ -239,6 +269,9 @@ def production_indexing_contract_payload(config: Dict[str, Any]) -> Dict[str, An
         elif section == "graph":
             for key in _GRAPH_RUNTIME_ONLY_KEYS:
                 section_payload.pop(key, None)
+        elif section == "vector_store":
+            for key in _VECTOR_STORE_RUNTIME_ONLY_KEYS:
+                section_payload.pop(key, None)
         payload[section] = section_payload
     return payload
 
@@ -272,6 +305,7 @@ def production_serving_contract_payload(config: Dict[str, Any]) -> Dict[str, Any
     safe_config = sanitized_config_snapshot(config)
     embedder = safe_config.get("embedder") if isinstance(safe_config.get("embedder"), dict) else {}
     graph = safe_config.get("graph") if isinstance(safe_config.get("graph"), dict) else {}
+    vector_store = safe_config.get("vector_store") if isinstance(safe_config.get("vector_store"), dict) else {}
     pipeline = safe_config.get("pipeline") if isinstance(safe_config.get("pipeline"), dict) else {}
     return {
         "project_name": safe_config.get("project_name"),
@@ -297,12 +331,38 @@ def production_serving_contract_payload(config: Dict[str, Any]) -> Dict[str, Any
                 "namespace_chunks",
                 "namespace_parents",
                 "namespace_media",
+                "namespace_page_cards",
+                "namespace_actions",
                 "namespace_facts",
                 "namespace_evidence_spans",
                 "namespace_summaries",
                 "namespace_assertions",
                 "namespace_entities",
                 "namespace_communities",
+            )
+        },
+        "vector_store_runtime": {
+            key: vector_store.get(key)
+            for key in (
+                "provider",
+                "schema",
+                "records_table",
+                "releases_table",
+                "dimensions",
+                "schema_version",
+                "dsn_env",
+                "reader_role",
+                "require_ssl",
+                "require_active_release",
+                "pool_min_size",
+                "pool_max_size",
+                "pool_timeout_seconds",
+                "connect_timeout_seconds",
+                "max_lifetime_seconds",
+                "max_idle_seconds",
+                "statement_timeout_ms",
+                "idle_transaction_timeout_ms",
+                "hnsw_ef_search",
             )
         },
         "graph_runtime": {
@@ -315,6 +375,12 @@ def production_serving_contract_payload(config: Dict[str, Any]) -> Dict[str, Any
                 "community_summary_min_characters",
             )
         },
+        "selected_profile": {
+            key: (safe_config.get("selected_profile") or {}).get(key)
+            for key in ("variant_id", "record_kinds")
+        }
+        if isinstance(safe_config.get("selected_profile"), dict)
+        else {},
         "implementation_sha256": implementation_hashes,
     }
 

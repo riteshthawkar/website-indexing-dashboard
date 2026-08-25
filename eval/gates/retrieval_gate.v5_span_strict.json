@@ -1,5 +1,8 @@
 {
   "overall": {
+    "query_count": {
+      "min": 65
+    },
     "no_answer_query_count": {
       "min": 5
     },
@@ -101,6 +104,60 @@
     "none": {
       "query_count": {
         "min": 5
+      },
+      "unsupported_abstention_rate": {
+        "min": 1.0
+      },
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    }
+  },
+  "by_language": {
+    "English": {
+      "query_count": {
+        "min": 57
+      },
+      "span_hit_at_10": {
+        "min": 0.85
+      },
+      "chunk_source_hit_at_10": {
+        "min": 0.85
+      },
+      "parent_hit_at_5": {
+        "min": 0.80
+      },
+      "unsupported_abstention_rate": {
+        "min": 1.0
+      },
+      "no_answer_violation_rate": {
+        "max": 0.0
+      }
+    },
+    "Arabic": {
+      "query_count": {
+        "min": 8
+      },
+      "answerable_query_count": {
+        "min": 6
+      },
+      "no_answer_query_count": {
+        "min": 2
+      },
+      "span_hit_at_10": {
+        "min": 0.70
+      },
+      "chunk_source_hit_at_10": {
+        "min": 0.75
+      },
+      "parent_hit_at_5": {
+        "min": 0.70
+      },
+      "required_entity_coverage": {
+        "min": 0.75
+      },
+      "citation_support_rate": {
+        "min": 0.75
       },
       "unsupported_abstention_rate": {
         "min": 1.0

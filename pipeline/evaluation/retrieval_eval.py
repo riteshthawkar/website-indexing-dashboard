@@ -550,6 +550,7 @@ class QueryRetrievalScore:
     selected_media_ids: List[str]
     dense_parent_ids: List[str]
     dense_media_ids: List[str]
+    language: str = "English"
     chunk_exact_hit_at_5: float = 0.0
     chunk_exact_hit_at_10: float = 0.0
     chunk_exact_mrr_at_10: float = 0.0
@@ -668,6 +669,7 @@ def _score_query(
         query=example.query,
         query_type=example.query_type,
         source_type=example.source_type,
+        language=example.language,
         benchmark_tags=[
             str(tag)
             for tag in (dict(example.metadata or {}).get("benchmark_tags") or [])
@@ -1019,6 +1021,7 @@ def check_metric_gates(report: Dict[str, Any], gates: Dict[str, Any]) -> List[Di
         "overall": report.get("overall", {}),
         "by_query_type": report.get("by_query_type", {}),
         "by_source_type": report.get("by_source_type", {}),
+        "by_language": report.get("by_language", {}),
         "by_benchmark_tag": report.get("by_benchmark_tag", {}),
     }
     for section_name, section_gates in gates.items():
@@ -1438,6 +1441,11 @@ def evaluate_retrieval_dataset(
                 embedded_vectors = retriever.embed_queries(miss_queries)
             else:
                 embedded_vectors = [retriever.embed_query(query) for query in miss_queries]
+            if len(embedded_vectors) != len(missing_examples):
+                raise RuntimeError(
+                    "Strict evaluation requires one query embedding per missing example: "
+                    f"requested={len(missing_examples)} returned={len(embedded_vectors)}"
+                )
             for (_example, cache_key), vector in zip(missing_examples, embedded_vectors):
                 query_cache[cache_key] = [float(value) for value in vector]
                 cache_misses += 1
@@ -1651,6 +1659,7 @@ def evaluate_retrieval_dataset(
         "overall": _aggregate_scores(scores),
         "by_query_type": _slice_scores(scores, "query_type"),
         "by_source_type": _slice_scores(scores, "source_type"),
+        "by_language": _slice_scores(scores, "language"),
         "by_benchmark_tag": _slice_scores_by_benchmark_tag(scores),
         "dataset_validation": dataset_validation,
         "retrieval_errors": retrieval_errors,

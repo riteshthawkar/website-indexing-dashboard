@@ -79,6 +79,7 @@ from .retrieval import AdaptiveHybridRetriever
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 _NOISY_SDK_LOGGERS = (
+    "google_genai.models",
     "httpx",
     "pinecone",
     "pinecone.index",
@@ -828,6 +829,7 @@ def cmd_eval_answer_readiness(args: argparse.Namespace) -> int:
         judge_timeout_seconds=args.judge_timeout_seconds,
         eval_request_mode=not args.disable_eval_request_mode,
         resume_predictions=args.resume_predictions,
+        parallelism=args.parallelism,
         progress_callback=progress_callback,
     )
     if args.json:
@@ -1142,13 +1144,13 @@ def main() -> int:
         default=None,
         help="Git commit of the candidate backend exercised by answer readiness (required for production)",
     )
-    p_release.add_argument("--answer-auth-token", default=None, help="Optional operations/telegram token for HTTP answer readiness")
+    p_release.add_argument("--answer-auth-token", default=None, help="Optional operations/telegram token for network answer readiness")
     p_release.add_argument("--answer-widget-key", default=None, help="Optional widget public key for WebSocket answer readiness")
-    p_release.add_argument("--answer-probe-mode", action="store_true", help="Send X-Health-Probe during HTTP answer readiness. Off by default so grading sees normal user-facing responses.")
-    p_release.add_argument("--disable-answer-eval-request-mode", action="store_true", help="Do not send X-Eval-Request during HTTP answer readiness. By default eval mode exercises the normal route while skipping chat persistence.")
+    p_release.add_argument("--answer-probe-mode", action="store_true", help="Send X-Health-Probe during network answer readiness. Off by default so grading sees normal user-facing responses.")
+    p_release.add_argument("--disable-answer-eval-request-mode", action="store_true", help="Do not send X-Eval-Request during network answer readiness. By default eval mode exercises the normal route while skipping chat persistence.")
     p_release.add_argument("--resume-answer-predictions", action="store_true", help="Reuse successful existing answer prediction rows and retry only missing/failed rows")
     p_release.add_argument("--answer-model", default="gemini-2.5-flash", help="Local answer-readiness generation model")
-    p_release.add_argument("--answer-timeout-seconds", type=float, default=120.0, help="Per-query HTTP answer-readiness timeout")
+    p_release.add_argument("--answer-timeout-seconds", type=float, default=120.0, help="Per-query answer-readiness timeout")
     p_release.add_argument("--judge-model", default="gemini-2.5-flash", help="LLM judge model for answer readiness")
     p_release.add_argument("--judge-timeout-seconds", type=float, default=120.0, help="Per-query LLM judge timeout")
     p_release.add_argument("--skip-llm-judge", action="store_true", help="Skip LLM-as-judge scoring; default production answer gates will fail without judge metrics")
@@ -1165,7 +1167,7 @@ def main() -> int:
     )
     p_release.add_argument("--query-cache", default=None, help="Optional persistent query-embedding cache JSON path")
     p_release.add_argument("--retrieval-cache", default=None, help="Optional persistent retrieval-result cache JSON path")
-    p_release.add_argument("--parallelism", type=int, default=1, help="Number of retrieval eval worker threads")
+    p_release.add_argument("--parallelism", type=int, default=1, help="Number of retrieval and network answer-eval workers")
     p_release.add_argument(
         "--promote",
         action="store_true",
@@ -1291,6 +1293,7 @@ def main() -> int:
     p_eval_answer.add_argument("--probe-mode", action="store_true", help="Send X-Health-Probe in HTTP mode. Off by default so grading sees normal user-facing responses.")
     p_eval_answer.add_argument("--disable-eval-request-mode", action="store_true", help="Do not send X-Eval-Request in HTTP mode. By default eval mode exercises the normal route while skipping chat persistence.")
     p_eval_answer.add_argument("--resume-predictions", action="store_true", help="Reuse successful existing prediction rows and retry only missing/failed rows")
+    p_eval_answer.add_argument("--parallelism", type=int, default=1, help="Number of concurrent production chat requests")
     p_eval_answer.add_argument("--model", default="gemini-2.5-flash", help="Local answer-generation model")
     p_eval_answer.add_argument("--timeout-seconds", type=float, default=120.0, help="Per-query HTTP timeout")
     p_eval_answer.add_argument("--judge-model", default="gemini-2.5-flash", help="LLM judge model")

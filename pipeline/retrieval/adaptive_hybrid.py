@@ -56,6 +56,7 @@ from pipeline.core.assertions import build_answer_records_from_assertions
 from pipeline.core.google_genai import import_genai, import_genai_types
 from pipeline.core.io import load_json_safe
 from pipeline.core.media import build_retrieval_documents, response_agent_media_instructions
+from pipeline.core.navigation_intent import infer_navigation_context
 
 logger = logging.getLogger(__name__)
 _GEMINI_CLIENT_STATE = threading.local()
@@ -126,21 +127,35 @@ def _apply_modern_vector_manifest_config(payload: Dict[str, Any], manifest: Dict
 
     embed_cfg = dict(payload.get("embedder") or {})
     retrieval_cfg = dict(payload.get("retrieval") or {})
+    vector_store_cfg = dict(payload.get("vector_store") or {})
+    provider = str(manifest.get("provider") or vector_store_cfg.get("provider") or "pinecone").strip().lower()
+    if provider not in {"pinecone", "pgvector"}:
+        raise ValueError(f"Unsupported vector upload manifest provider: {provider}")
     sparse_index_name = str(manifest.get("sparse_index_name") or "").strip()
 
-    embed_cfg["pinecone_index"] = index_name
-    embed_cfg["pinecone_sparse_index"] = sparse_index_name
+    vector_store_cfg["provider"] = provider
+    vector_store_cfg["release_id"] = str(manifest.get("namespace_release_id") or "").strip()
+    if provider == "pinecone":
+        embed_cfg["pinecone_index"] = index_name
+        embed_cfg["pinecone_sparse_index"] = sparse_index_name
+        retrieval_cfg["pinecone_index"] = index_name
+        retrieval_cfg["pinecone_sparse_index"] = sparse_index_name
+    else:
+        embed_cfg.pop("pinecone_index", None)
+        embed_cfg.pop("pinecone_sparse_index", None)
+        retrieval_cfg.pop("pinecone_index", None)
+        retrieval_cfg.pop("pinecone_sparse_index", None)
     embed_cfg.pop("pinecone_text_index", None)
     embed_cfg.pop("pinecone_summary_index", None)
     embed_cfg.pop("namespace", None)
-    retrieval_cfg["pinecone_index"] = index_name
-    retrieval_cfg["pinecone_sparse_index"] = sparse_index_name
 
     namespaces = manifest.get("namespaces") if isinstance(manifest.get("namespaces"), dict) else {}
     for key in (
         "chunks",
         "parents",
         "media",
+        "page_cards",
+        "actions",
         "facts",
         "evidence_spans",
         "summaries",
@@ -165,14 +180,18 @@ def _apply_modern_vector_manifest_config(payload: Dict[str, Any], manifest: Dict
             isinstance(stage, dict)
             and (
                 str(stage.get("id") or "") == "upload_retrieval"
-                or str(stage.get("plugin") or "") == "gemini_pinecone"
+                or str(stage.get("plugin") or "") in {"gemini_pinecone", "gemini_pgvector"}
             )
             for stage in stages
         )
         if not has_modern_upload_stage:
             payload["stages"] = [
                 *stages,
-                {"id": "upload_retrieval", "type": "embedder", "plugin": "gemini_pinecone"},
+                {
+                    "id": "upload_retrieval",
+                    "type": "embedder",
+                    "plugin": "gemini_pgvector" if provider == "pgvector" else "gemini_pinecone",
+                },
             ]
 
     retrieval_cfg["enable_sparse"] = bool(sparse_index_name)
@@ -188,6 +207,7 @@ def _apply_modern_vector_manifest_config(payload: Dict[str, Any], manifest: Dict
 
     payload["embedder"] = embed_cfg
     payload["retrieval"] = retrieval_cfg
+    payload["vector_store"] = vector_store_cfg
     return payload
 
 
@@ -267,6 +287,8 @@ _NAMESPACE_RECORD_TYPES = {
     "chunks": {"chunk"},
     "parents": {"parent"},
     "media": {"media"},
+    "page_cards": {"page_card"},
+    "actions": {"action"},
     "facts": {"fact"},
     "evidence_spans": {"evidence_span"},
     "summaries": {"summary"},
@@ -455,33 +477,33 @@ _SUBORDINATE_LOCATION_SUBJECT_TOKENS = {
 
 _LOOKUP_ATTRIBUTE_RULES = {
     "location": {
-        "tokens": {"address", "metro", "station"},
-        "phrases": {"campus address", "metro station", "train station"},
+        "tokens": {"address", "metro", "station", "عنوان", "محطة"},
+        "phrases": {"campus address", "metro station", "train station", "عنوان الحرم الجامعي"},
         "strict": False,
     },
     "email": {
-        "tokens": {"email", "mail"},
-        "phrases": {"email address", "contact email", "email id"},
+        "tokens": {"email", "mail", "بريد", "البريد", "إيميل"},
+        "phrases": {"email address", "contact email", "email id", "البريد الإلكتروني", "عنوان البريد"},
         "strict": True,
     },
     "phone": {
-        "tokens": {"phone", "telephone", "mobile", "hotline", "extension", "ext"},
-        "phrases": {"phone number", "telephone number", "extension number", "contact number"},
+        "tokens": {"phone", "telephone", "mobile", "hotline", "extension", "ext", "هاتف", "الهاتف"},
+        "phrases": {"phone number", "telephone number", "extension number", "contact number", "رقم الهاتف", "رقم التواصل"},
         "strict": True,
     },
     "website": {
-        "tokens": {"website", "url", "web", "webpage", "link"},
-        "phrases": {"website address", "web address", "official website"},
+        "tokens": {"website", "url", "web", "webpage", "link", "رابط"},
+        "phrases": {"website address", "web address", "official website", "الموقع الإلكتروني", "الموقع الرسمي"},
         "strict": True,
     },
     "hours": {
-        "tokens": {"hours", "hour", "time", "times", "opening", "working", "operating"},
-        "phrases": {"working hours", "operating hours", "opening hours"},
+        "tokens": {"hours", "hour", "time", "times", "opening", "working", "operating", "ساعات", "الدوام", "مواعيد"},
+        "phrases": {"working hours", "operating hours", "opening hours", "ساعات العمل", "ساعات الدوام", "مواعيد العمل"},
         "strict": False,
     },
     "date": {
-        "tokens": {"deadline", "date", "dates", "due", "start", "starts", "begin", "begins"},
-        "phrases": {"application deadline", "start date", "semester start"},
+        "tokens": {"deadline", "date", "dates", "due", "start", "starts", "begin", "begins", "موعد", "الموعد", "تاريخ"},
+        "phrases": {"application deadline", "start date", "semester start", "الموعد النهائي", "تاريخ البدء"},
         "strict": False,
     },
 }
@@ -677,6 +699,12 @@ _SCOPED_QUERY_TOKENS = {
     "specialization",
     "specializations",
     "student-facing",
+    "البرامج",
+    "التخصصات",
+    "الخدمات",
+    "المرافق",
+    "متطلبات",
+    "القبول",
 }
 
 _SCOPED_QUERY_PHRASES = {
@@ -693,6 +721,10 @@ _SCOPED_QUERY_PHRASES = {
     "established under law",
     "student-facing campus services",
     "student facing campus services",
+    "متطلبات القبول",
+    "برامج الدراسات العليا",
+    "مرافق الحرم الجامعي",
+    "خدمات الطلاب",
 }
 
 _VISUAL_INTENT_TOKENS = {
@@ -2663,6 +2695,15 @@ def classify_query_mode(query: str) -> QueryMode:
         "guide",
         "policy",
         "process",
+        "اشرح",
+        "لخص",
+        "ملخص",
+        "نظرة عامة",
+        "نظرة شاملة",
+        "قارن",
+        "حلل",
+        "صف",
+        "بالتفصيل",
     }
     synthesis_topic_terms = {
         "location",
@@ -2697,6 +2738,15 @@ def classify_query_mode(query: str) -> QueryMode:
         "what is ",
         "what are ",
         "what was ",
+        "من ",
+        "متى ",
+        "أين ",
+        "اين ",
+        "ما ",
+        "ما هو ",
+        "ما هي ",
+        "كم ",
+        "هل ",
     )
     narrow_fact_terms = {
         "address",
@@ -2977,18 +3027,22 @@ def _embed_queries(
         f"task: search result | query: {query}"
         for query in queries
     ] if use_prompt_instruction else list(queries)
-    try:
-        types = import_genai_types()
-        config_kwargs = {"output_dimensionality": output_dimensionality}
-        if not use_prompt_instruction:
-            config_kwargs["task_type"] = task_type
-        config = types.EmbedContentConfig(**config_kwargs)
-    except Exception:
-        from types import SimpleNamespace
-        config_kwargs = {"output_dimensionality": output_dimensionality}
-        if not use_prompt_instruction:
-            config_kwargs["task_type"] = task_type
-        config = SimpleNamespace(**config_kwargs)
+    types = import_genai_types()
+    config_kwargs = {"output_dimensionality": output_dimensionality}
+    if not use_prompt_instruction:
+        config_kwargs["task_type"] = task_type
+    config = types.EmbedContentConfig(**config_kwargs)
+    # The Google Gen AI SDK treats a plain list[str] as consecutive parts of a
+    # single Content object. Gemini Embedding 2 then returns one aggregate
+    # vector, not one vector per query. Keep each query in its own Content so
+    # batched evaluation has a strict one-to-one query/vector contract.
+    contents = [
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=query)],
+        )
+        for query in embed_queries
+    ]
 
     client = (
         _make_gemini_client(request_timeout_ms=request_timeout_ms)
@@ -2997,10 +3051,16 @@ def _embed_queries(
     )
     response = client.models.embed_content(
         model=model,
-        contents=embed_queries,
+        contents=contents,
         config=config,
     )
-    return [list(embedding.values) for embedding in response.embeddings]
+    vectors = [list(embedding.values) for embedding in response.embeddings]
+    if len(vectors) != len(embed_queries):
+        raise RuntimeError(
+            "Gemini query embedding cardinality mismatch: "
+            f"requested={len(embed_queries)} returned={len(vectors)}"
+        )
+    return vectors
 
 
 @dataclass
@@ -3020,10 +3080,29 @@ class AdaptiveHybridRetriever:
         )
         retrieval_cfg = self.config.get("retrieval", {}) or {}
         embed_cfg = self.config.get("embedder", {}) or {}
+        vector_store_cfg = self.config.get("vector_store", {}) or {}
+
+        self.vector_store_provider = str(
+            vector_store_cfg.get("provider") or "pinecone"
+        ).strip().lower()
+        if self.vector_store_provider not in {"pinecone", "pgvector"}:
+            raise ValueError(
+                f"Unsupported vector_store.provider: {self.vector_store_provider}"
+            )
 
         self.index_name = str(embed_cfg.get("pinecone_index") or "").strip()
-        if not self.index_name:
+        if self.vector_store_provider == "pinecone" and not self.index_name:
             raise ValueError("embedder.pinecone_index is required for retrieval")
+        if self.vector_store_provider == "pgvector":
+            self.index_name = (
+                f"{str(vector_store_cfg.get('schema') or 'mbzuai_retrieval')}."
+                f"{str(vector_store_cfg.get('records_table') or 'embedding_records')}"
+            )
+        self.vector_release_id = str(
+            vector_store_cfg.get("release_id")
+            or self.runtime_artifact_contract.get("namespace_release_id")
+            or self.work_dir.name
+        ).strip()
 
         self.model = str(embed_cfg.get("model") or "gemini-embedding-2")
         self.output_dimensionality = int(embed_cfg.get("output_dimensionality") or 1536)
@@ -3037,6 +3116,8 @@ class AdaptiveHybridRetriever:
         self.namespace_chunks = str(embed_cfg.get("namespace_chunks") or "chunks")
         self.namespace_parents = str(embed_cfg.get("namespace_parents") or "parents")
         self.namespace_media = str(embed_cfg.get("namespace_media") or "media")
+        self.namespace_page_cards = str(embed_cfg.get("namespace_page_cards") or "page_cards")
+        self.namespace_actions = str(embed_cfg.get("namespace_actions") or "actions")
         self.namespace_facts = str(embed_cfg.get("namespace_facts") or "facts")
         self.namespace_evidence_spans = str(
             embed_cfg.get("namespace_evidence_spans")
@@ -3050,6 +3131,8 @@ class AdaptiveHybridRetriever:
         self.dense_chunk_top_k = int(retrieval_cfg.get("dense_chunk_top_k", 12))
         self.dense_parent_top_k = int(retrieval_cfg.get("dense_parent_top_k", 6))
         self.dense_media_top_k = int(retrieval_cfg.get("dense_media_top_k", 6))
+        self.dense_page_card_top_k = int(retrieval_cfg.get("dense_page_card_top_k", 6))
+        self.dense_action_top_k = int(retrieval_cfg.get("dense_action_top_k", 6))
         self.dense_fact_top_k = int(retrieval_cfg.get("dense_fact_top_k", 8))
         self.dense_evidence_span_top_k = int(retrieval_cfg.get("dense_evidence_span_top_k", max(8, self.dense_fact_top_k)))
         self.dense_summary_top_k = int(retrieval_cfg.get("dense_summary_top_k", max(4, self.dense_parent_top_k)))
@@ -3123,6 +3206,8 @@ class AdaptiveHybridRetriever:
             "local_parents": float(retrieval_cfg.get("weight_local_parents", 1.4)),
             "graph_relation_parents": float(retrieval_cfg.get("weight_graph_relation_parents", 1.6)),
             "dense_media": float(retrieval_cfg.get("weight_dense_media", 0.8)),
+            "dense_page_cards": float(retrieval_cfg.get("weight_dense_page_cards", 1.0)),
+            "dense_actions": float(retrieval_cfg.get("weight_dense_actions", 1.2)),
             "sparse_media": float(retrieval_cfg.get("weight_sparse_media", 0.8)),
             "local_media": float(retrieval_cfg.get("weight_local_media", 1.4)),
             "dense_facts": float(retrieval_cfg.get("weight_dense_facts", 1.3)),
@@ -3143,7 +3228,32 @@ class AdaptiveHybridRetriever:
         self._sparse_index = None
         self._pinecone_client = None
         self._legacy_bm25_encoder = None
+        self._legacy_bm25_encoder_lock = threading.Lock()
         self._thread_state = threading.local()
+        self._pgvector_store = None
+        if self.vector_store_provider == "pgvector":
+            if self.enable_sparse:
+                raise ValueError(
+                    "pgvector runtime is configured for the selected dense-graph profile; "
+                    "retrieval.enable_sparse must be false"
+                )
+            if self.enable_rerank:
+                raise ValueError(
+                    "Pinecone inference reranking is unavailable with pgvector; "
+                    "set retrieval.enable_rerank=false or configure a provider-neutral reranker"
+                )
+            if not self.vector_release_id:
+                raise ValueError("A release_id is required for pgvector retrieval")
+            from pipeline.vectorstores.pgvector_store import PgVectorStore
+
+            self._pgvector_store = PgVectorStore.from_config(
+                self.config,
+                purpose="read",
+            )
+        # Retrieval request diagnostics and provider handles are request-local
+        # or thread-local. Immutable in-memory indexes can therefore be safely
+        # shared by concurrent service requests.
+        self.supports_shared_parallel_retrieval = True
         self.parallel_lane_workers = max(1, int(retrieval_cfg.get("parallel_lane_workers", 6) or 6))
         default_local_lane_workers = max(1, min(4, self.parallel_lane_workers))
         self.persistent_lane_executors = bool(retrieval_cfg.get("persistent_lane_executors", True))
@@ -3210,6 +3320,16 @@ class AdaptiveHybridRetriever:
         self.chunk_map = {record["id"]: record for record in self.bundle.get("chunk_records", []) if isinstance(record, dict)}
         self.parent_map = {record["id"]: record for record in self.bundle.get("parent_records", []) if isinstance(record, dict)}
         self.media_map = {record["id"]: record for record in self.bundle.get("media_records", []) if isinstance(record, dict)}
+        self.page_card_map = {
+            record["id"]: record
+            for record in self.bundle.get("page_card_records", [])
+            if isinstance(record, dict) and str(record.get("id") or "")
+        }
+        self.action_map = {
+            record["id"]: record
+            for record in self.bundle.get("action_records", [])
+            if isinstance(record, dict) and str(record.get("id") or "")
+        }
         self.fact_map = {record["id"]: record for record in self.bundle.get("fact_records", []) if isinstance(record, dict)}
         self.evidence_span_map = {
             record["id"]: record
@@ -3496,15 +3616,19 @@ class AdaptiveHybridRetriever:
             return encoder
         if not self.legacy_bm25_model_file:
             return None
-        try:
-            from pinecone_text.sparse import BM25Encoder
+        with self._legacy_bm25_encoder_lock:
+            encoder = getattr(self, "_legacy_bm25_encoder", None)
+            if encoder is not None:
+                return encoder
+            try:
+                from pinecone_text.sparse import BM25Encoder
 
-            encoder = BM25Encoder().load(self.legacy_bm25_model_file)
-        except Exception as exc:
-            logger.warning("Failed to load legacy BM25 model %s: %s", self.legacy_bm25_model_file, exc)
-            encoder = None
-        self._legacy_bm25_encoder = encoder
-        return encoder
+                encoder = BM25Encoder().load(self.legacy_bm25_model_file)
+            except Exception as exc:
+                logger.warning("Failed to load legacy BM25 model %s: %s", self.legacy_bm25_model_file, exc)
+                encoder = None
+            self._legacy_bm25_encoder = encoder
+            return encoder
 
     def _legacy_hybrid_query_payload(
         self,
@@ -3559,6 +3683,15 @@ class AdaptiveHybridRetriever:
     ) -> List[str]:
         if top_k <= 0:
             return []
+        if self.vector_store_provider == "pgvector":
+            if self._pgvector_store is None:
+                raise RuntimeError("pgvector store is not initialized")
+            return self._pgvector_store.query_ids(
+                release_id=self.vector_release_id,
+                namespace=namespace,
+                vector=query_vector,
+                top_k=top_k,
+            )
         dense_vector, sparse_vector = self._legacy_hybrid_query_payload(query=query, query_vector=query_vector)
         kwargs: Dict[str, Any] = {}
         if sparse_vector:
@@ -3573,6 +3706,12 @@ class AdaptiveHybridRetriever:
             **kwargs,
         ).matches
         return [str(match.id) for match in matches if getattr(match, "id", None)]
+
+    def close(self) -> None:
+        store = getattr(self, "_pgvector_store", None)
+        if store is not None:
+            store.close()
+            self._pgvector_store = None
 
     def _informative_query_tokens(self, query: str) -> List[str]:
         lookup_profile = _lookup_query_profile(query)
@@ -5260,6 +5399,12 @@ class AdaptiveHybridRetriever:
             if record_id in self.media_map:
                 chunk_ids.extend(self.media_map[record_id].get("linked_chunk_ids") or [])
                 continue
+            if record_id in self.page_card_map:
+                chunk_ids.extend(self.page_card_map[record_id].get("linked_chunk_ids") or [])
+                continue
+            if record_id in self.action_map:
+                chunk_ids.extend(self.action_map[record_id].get("linked_chunk_ids") or [])
+                continue
             if record_id in self.fact_map:
                 chunk_ids.extend(self.fact_map[record_id].get("linked_chunk_ids") or [])
         return list(dict.fromkeys(chunk_ids))
@@ -6578,6 +6723,7 @@ class AdaptiveHybridRetriever:
         *,
         query_vector: Optional[List[float]] = None,
         seed_overrides: Optional[Dict[str, Sequence[str]]] = None,
+        skip_query_planner: bool = False,
     ) -> Dict[str, Any]:
         retrieval_started = time.perf_counter()
         stage_started = retrieval_started
@@ -6634,6 +6780,8 @@ class AdaptiveHybridRetriever:
                 "parent_dense",
                 "summary_dense",
                 "media_dense",
+                "page_card_dense",
+                "action_dense",
                 "fact_dense",
                 "evidence_span_dense",
             ):
@@ -6667,6 +6815,8 @@ class AdaptiveHybridRetriever:
         media_dense_ids = lane_results["media_dense_ids"]
         sparse_media_ids = lane_results["sparse_media_ids"]
         local_media_ids = lane_results["local_media_ids"]
+        dense_page_card_ids = lane_results["dense_page_card_ids"]
+        dense_action_ids = lane_results["dense_action_ids"]
         fact_dense_ids = lane_results["fact_dense_ids"]
         sparse_fact_ids = lane_results["sparse_fact_ids"]
         local_fact_ids = lane_results["local_fact_ids"]
@@ -6751,6 +6901,8 @@ class AdaptiveHybridRetriever:
             "dense_media": media_dense_ids,
             "sparse_media": sparse_media_ids,
             "local_media": local_media_ids,
+            "dense_page_cards": dense_page_card_ids,
+            "dense_actions": dense_action_ids,
             "dense_facts": fact_dense_ids,
             "sparse_facts": sparse_fact_ids,
             "local_facts": local_fact_ids,
@@ -6868,6 +7020,8 @@ class AdaptiveHybridRetriever:
                 "dense_media_ids": [],
                 "sparse_media_ids": [],
                 "local_media_ids": [],
+                "dense_page_card_ids": [],
+                "dense_action_ids": [],
                 "dense_fact_ids": [],
                 "sparse_fact_ids": [],
                 "local_fact_ids": [],
@@ -6912,6 +7066,8 @@ class AdaptiveHybridRetriever:
                     "dense_media_ids": media_dense_ids,
                     "sparse_media_ids": sparse_media_ids,
                     "local_media_ids": local_media_ids,
+                    "dense_page_card_ids": dense_page_card_ids,
+                    "dense_action_ids": dense_action_ids,
                     "dense_fact_ids": fact_dense_ids,
                     "sparse_fact_ids": sparse_fact_ids,
                     "local_fact_ids": local_fact_ids,
@@ -7212,6 +7368,8 @@ class AdaptiveHybridRetriever:
             "dense_media_ids": media_dense_ids,
             "sparse_media_ids": sparse_media_ids,
             "local_media_ids": local_media_ids,
+            "dense_page_card_ids": dense_page_card_ids,
+            "dense_action_ids": dense_action_ids,
             "dense_fact_ids": fact_dense_ids,
             "sparse_fact_ids": sparse_fact_ids,
             "local_fact_ids": local_fact_ids,
@@ -7259,6 +7417,9 @@ class AdaptiveHybridRetriever:
             mode != QueryMode.SYNTHESIS or synthesis_structured_lane_enabled
         ) and not legacy_text_only
         evidence_span_lane_enabled = bool(self.evidence_span_map) and not legacy_text_only
+        page_card_lane_enabled = bool(self.page_card_map) and not legacy_text_only
+        navigation_intent = str(infer_navigation_context(query).get("intent") or "none")
+        action_lane_enabled = bool(self.action_map) and not legacy_text_only
         answer_local_top_k = self.local_answer_top_k if answer_lane_enabled else 0
         local_chunk_top_k = self.sparse_chunk_top_k if mode != QueryMode.SYNTHESIS else max(self.sparse_chunk_top_k, self.dense_chunk_top_k)
         if exact_lookup:
@@ -7306,6 +7467,12 @@ class AdaptiveHybridRetriever:
             "media_dense": self.dense_media_top_k if media_lane_enabled else 0,
             "media_sparse": self.sparse_media_top_k if media_lane_enabled else 0,
             "media_local": self.sparse_media_top_k if media_lane_enabled else 0,
+            "page_card_dense": self.dense_page_card_top_k if page_card_lane_enabled else 0,
+            "action_dense": (
+                self.dense_action_top_k
+                if action_lane_enabled and navigation_intent != "none"
+                else max(1, self.dense_action_top_k // 3) if action_lane_enabled else 0
+            ),
             "fact_dense": (
                 fact_dense_top_k
                 if fact_lane_enabled and mode == QueryMode.FACT
@@ -7404,6 +7571,26 @@ class AdaptiveHybridRetriever:
                 self._local_media_query_ids,
                 {"query": query, "top_k": lane_top_ks["media_local"]},
             )
+        if getattr(self, "page_card_map", None):
+            tasks["dense_page_card_ids"] = (
+                self._dense_query_ids,
+                {
+                    "query_vector": query_vector,
+                    "namespace": self.namespace_page_cards,
+                    "top_k": lane_top_ks.get("page_card_dense", 0),
+                    "query": query,
+                },
+            )
+        if getattr(self, "action_map", None):
+            tasks["dense_action_ids"] = (
+                self._dense_query_ids,
+                {
+                    "query_vector": query_vector,
+                    "namespace": self.namespace_actions,
+                    "top_k": lane_top_ks.get("action_dense", 0),
+                    "query": query,
+                },
+            )
         if self.fact_map:
             tasks["fact_dense_ids"] = (
                 self._dense_query_ids,
@@ -7446,6 +7633,8 @@ class AdaptiveHybridRetriever:
             "media_dense_ids": [],
             "sparse_media_ids": [],
             "local_media_ids": [],
+            "dense_page_card_ids": [],
+            "dense_action_ids": [],
             "fact_dense_ids": [],
             "sparse_fact_ids": [],
             "local_fact_ids": [],

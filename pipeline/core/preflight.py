@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional
@@ -24,6 +25,22 @@ CORE_PRODUCTION_STAGE_ORDER = [
 
 ASSERTION_FIRST_STAGE_ORDER = [
     *CORE_PRODUCTION_STAGE_ORDER,
+    "format_assertion_slices",
+    "extract_assertions_openai",
+    "validate_assertions_openai",
+    "canonicalize_assertions",
+    "promote_assertions",
+    "format_retrieval",
+    "format_graph",
+    "promote_graph",
+    "community_graph",
+    "summarize_community_graph",
+    "upload_retrieval",
+]
+
+SELECTED_RELEASE_STAGE_ORDER = [
+    "verify_selected_profile",
+    "assemble_selected_release",
     "format_assertion_slices",
     "extract_assertions_openai",
     "validate_assertions_openai",
@@ -178,6 +195,13 @@ def _graph_store_backend(config: Mapping[str, Any], stage_plugins: Iterable[str]
 def _production_stage_profile(config: Mapping[str, Any], stage_plugins: Iterable[str]) -> tuple[str, List[str]]:
     plugins = set(stage_plugins)
     stage_ids = set(_stage_ids(config))
+    selected_profile = (
+        config.get("selected_profile")
+        if isinstance(config.get("selected_profile"), Mapping)
+        else {}
+    )
+    if str(selected_profile.get("variant_id") or "").strip():
+        return "selected-release/v1", list(SELECTED_RELEASE_STAGE_ORDER)
     if {"semantic_graph_extract", "semantic_graph_canonicalize"}.intersection(plugins):
         order = [
             stage_id
@@ -266,6 +290,63 @@ def assess_production_readiness(
     else:
         _add(checks, "stage_order", "ok", f"Production {stage_profile} stage order is complete.")
 
+    selected_profile = (
+        config.get("selected_profile")
+        if isinstance(config.get("selected_profile"), Mapping)
+        else {}
+    )
+    selected_release = bool(str(selected_profile.get("variant_id") or "").strip())
+    if selected_release:
+        assembly_cfg = (
+            (config.get("formatter") or {}).get("selected_release_assembly")
+            if isinstance(config.get("formatter"), Mapping)
+            else None
+        )
+        expected_kinds = [
+            "chunk",
+            "parent",
+            "parent_section",
+            "media",
+            "page_card",
+            "action",
+        ]
+        selected_errors: List[str] = []
+        if bool(selected_profile.get("pre_embedding_only", False)):
+            selected_errors.append("selected_profile.pre_embedding_only must be false")
+        if list(selected_profile.get("record_kinds") or []) != expected_kinds:
+            selected_errors.append("selected_profile.record_kinds must match the evaluated six-kind contract")
+        for key in ("decision_sha256",):
+            if not re.fullmatch(r"[0-9a-f]{64}", str(selected_profile.get(key) or "").strip().lower()):
+                selected_errors.append(f"selected_profile.{key} must be a SHA-256 digest")
+        if not isinstance(assembly_cfg, Mapping):
+            selected_errors.append("formatter.selected_release_assembly must be configured")
+        else:
+            for key in ("candidate_manifest_sha256", "candidate_records_sha256"):
+                if not re.fullmatch(r"[0-9a-f]{64}", str(assembly_cfg.get(key) or "").strip().lower()):
+                    selected_errors.append(
+                        f"formatter.selected_release_assembly.{key} must be a SHA-256 digest"
+                    )
+            checkpoint_evidence = assembly_cfg.get("checkpoint_evidence")
+            if not isinstance(checkpoint_evidence, Mapping) or len(checkpoint_evidence) < 7:
+                selected_errors.append(
+                    "formatter.selected_release_assembly.checkpoint_evidence is incomplete"
+                )
+        if selected_errors:
+            _add(
+                checks,
+                "selected_release_assembly_contract",
+                "error",
+                "The selected production release assembly contract is incomplete.",
+                errors=selected_errors,
+            )
+        else:
+            _add(
+                checks,
+                "selected_release_assembly_contract",
+                "ok",
+                "The production release is bound to the evaluated corpus and audited graph checkpoint.",
+            )
+
     formatter_cfg = config.get("formatter", {}) if isinstance(config.get("formatter"), Mapping) else {}
     media_cfg = (
         formatter_cfg.get("media_enrichment", {})
@@ -279,20 +360,23 @@ def assess_production_readiness(
     )
     multimodal_required = bool(formatter_cfg.get("require_multimodal_media", False))
     if multimodal_required:
-        media_stage_valid = "enrich_media" in stage_ids
-        if media_stage_valid and "convert_html" in stage_ids and "deduplicate_markdown" in stage_ids:
+        media_stage_valid = "assemble_selected_release" in stage_ids if selected_release else "enrich_media" in stage_ids
+        if (
+            not selected_release
+            and media_stage_valid
+            and "convert_html" in stage_ids
+            and "deduplicate_markdown" in stage_ids
+        ):
             media_position = stage_ids.index("enrich_media")
-            media_stage_valid = (
-                stage_ids.index("convert_html") < media_position < stage_ids.index("deduplicate_markdown")
-            )
+            media_stage_valid = stage_ids.index("convert_html") < media_position < stage_ids.index("deduplicate_markdown")
         if not media_stage_valid:
             _add(
                 checks,
                 "multimodal_media_stage",
                 "error",
-                "Multimodal production requires enrich_media between conversion and deduplication.",
+                "Multimodal production requires an audited selected assembly or enrich_media between conversion and deduplication.",
             )
-        elif not media_cfg.get("allowed_media_hosts"):
+        elif not selected_release and not media_cfg.get("allowed_media_hosts"):
             _add(
                 checks,
                 "multimodal_media_stage",
@@ -307,8 +391,13 @@ def assess_production_readiness(
                 "Media acquisition is allowlisted and runs before deduplication.",
             )
 
-        semantics_stage_valid = "annotate_media" in stage_ids
-        if semantics_stage_valid and "enrich_media" in stage_ids and "deduplicate_markdown" in stage_ids:
+        semantics_stage_valid = "assemble_selected_release" in stage_ids if selected_release else "annotate_media" in stage_ids
+        if (
+            not selected_release
+            and semantics_stage_valid
+            and "enrich_media" in stage_ids
+            and "deduplicate_markdown" in stage_ids
+        ):
             semantics_position = stage_ids.index("annotate_media")
             semantics_stage_valid = (
                 stage_ids.index("enrich_media")
@@ -323,9 +412,9 @@ def assess_production_readiness(
                 "error",
                 "Multimodal production requires annotate_media between enrichment and deduplication.",
             )
-        elif semantics_mode != "gemini" or not bool(
+        elif not selected_release and (semantics_mode != "gemini" or not bool(
             media_semantics_cfg.get("require_complete", False)
-        ):
+        )):
             _add(
                 checks,
                 "multimodal_semantics_stage",
@@ -790,6 +879,7 @@ def assess_production_readiness(
             )
 
         retrieval_contract = config.get("retrieval", {}) if isinstance(config.get("retrieval"), Mapping) else {}
+        vector_store_contract = config.get("vector_store", {}) if isinstance(config.get("vector_store"), Mapping) else {}
         if str(retrieval_contract.get("retriever_backend") or "").strip() != "routed_hybrid":
             production_contract_errors.append("retrieval.retriever_backend must be routed_hybrid")
         if not bool(retrieval_contract.get("routed_graph_required", False)):
@@ -798,6 +888,14 @@ def assess_production_readiness(
             production_contract_errors.append("retrieval.evidence_adjudicator_enabled must be true")
         if not str(retrieval_contract.get("evidence_adjudicator_model") or "").strip():
             production_contract_errors.append("retrieval.evidence_adjudicator_model must be configured")
+        if str(vector_store_contract.get("provider") or "").strip().lower() != "pgvector":
+            production_contract_errors.append("vector_store.provider must be pgvector")
+        if bool(retrieval_contract.get("enable_sparse", False)):
+            production_contract_errors.append("selected production profile requires retrieval.enable_sparse=false")
+        if bool(retrieval_contract.get("enable_rerank", False)):
+            production_contract_errors.append(
+                "selected pgvector profile requires retrieval.enable_rerank=false until a provider-neutral reranker is configured"
+            )
         if production_contract_errors:
             _add(
                 checks,
@@ -871,6 +969,82 @@ def assess_production_readiness(
             _add(checks, "openai_credentials", "ok", "OPENAI_API_KEY is available.")
         else:
             _add(checks, "openai_credentials", "error", "OPENAI_API_KEY is required for assertion extraction and validation.")
+
+    if "gemini_pgvector" in stage_plugins:
+        if _has_any_env(("GOOGLE_API_KEY", "GEMINI_API_KEY")):
+            _add(checks, "gemini_credentials", "ok", "GOOGLE_API_KEY or GEMINI_API_KEY is available.")
+        else:
+            _add(checks, "gemini_credentials", "error", "GOOGLE_API_KEY or GEMINI_API_KEY is required for Gemini embeddings.")
+
+        try:
+            from pipeline.vectorstores.pgvector_store import PgVectorSettings
+
+            settings = PgVectorSettings.from_config(config, purpose="write")
+        except (RuntimeError, ValueError) as exc:
+            _add(
+                checks,
+                "pgvector_target",
+                "error",
+                "The pgvector writer target is missing or unsafe.",
+                error=str(exc),
+            )
+        else:
+            _add(
+                checks,
+                "pgvector_target",
+                "ok",
+                "The dedicated TLS pgvector writer target is configured.",
+                schema=settings.schema,
+                records_table=settings.records_table,
+                dimensions=settings.dimensions,
+            )
+
+        namespace_strategy = str(embedder_cfg.get("namespace_strategy") or "static").strip().lower()
+        if namespace_strategy == "release":
+            from pipeline.stages.embedders.gemini_pinecone_embedder import _resolve_upload_namespaces
+
+            try:
+                first = _resolve_upload_namespaces(embedder_cfg, run_id="preflight/candidate")
+                second = _resolve_upload_namespaces(embedder_cfg, run_id="preflight-candidate")
+                if any(first.get(lane) == second.get(lane) for lane in first):
+                    raise ValueError("distinct run IDs resolve to the same namespace")
+            except (KeyError, ValueError) as exc:
+                _add(
+                    checks,
+                    "pgvector_release_isolation",
+                    "error",
+                    "Release-scoped pgvector namespace configuration is not collision-safe.",
+                    error=str(exc),
+                )
+            else:
+                _add(
+                    checks,
+                    "pgvector_release_isolation",
+                    "ok",
+                    "Candidate records use identity-bound release namespaces and immutable release rows.",
+                )
+        else:
+            _add(
+                checks,
+                "pgvector_release_isolation",
+                "error",
+                "Production pgvector uploads must use embedder.namespace_strategy=release.",
+                namespace_strategy=namespace_strategy,
+            )
+        if bool(embedder_cfg.get("enable_sparse", False)):
+            _add(
+                checks,
+                "pgvector_dense_profile",
+                "error",
+                "The selected pgvector profile is dense-graph and must disable sparse embedding upload.",
+            )
+        else:
+            _add(
+                checks,
+                "pgvector_dense_profile",
+                "ok",
+                "The selected dense-graph pgvector profile is configured.",
+            )
 
     if "gemini_pinecone" in stage_plugins:
         if _has_any_env(("GOOGLE_API_KEY", "GEMINI_API_KEY")):

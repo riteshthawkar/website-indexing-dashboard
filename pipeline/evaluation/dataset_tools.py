@@ -32,6 +32,10 @@ def summarize_eval_examples(examples: Sequence[EvalExample]) -> Dict[str, Any]:
         "with_gold_chunks": sum(1 for example in rows if example.gold_chunk_ids),
         "with_gold_parents": sum(1 for example in rows if example.gold_parent_ids),
         "with_gold_media": sum(1 for example in rows if example.gold_media_ids),
+        "with_gold_documents": sum(1 for example in rows if example.gold_document_revision_ids),
+        "with_gold_page_cards": sum(1 for example in rows if example.gold_page_card_ids),
+        "with_gold_sections": sum(1 for example in rows if example.gold_section_ids),
+        "with_gold_actions": sum(1 for example in rows if example.gold_action_ids),
     }
 
 
@@ -86,6 +90,14 @@ def _looks_like_no_answer_reference(value: str) -> bool:
             "cannot find",
             "could not verify",
             "cannot verify",
+            "does not verify",
+            "does not establish",
+            "contains no",
+            "should abstain",
+            "must abstain",
+            "should not",
+            "should not invent",
+            "must not fabricate",
             "not available",
             "not found",
             "not in the provided sources",
@@ -93,6 +105,17 @@ def _looks_like_no_answer_reference(value: str) -> bool:
             "do not contain",
             "lack of information",
             "no answer",
+            "لا تحتوي",
+            "لا تتضمن",
+            "لا تتحقق",
+            "لا تثبت",
+            "لا تقدم",
+            "لا تحدد",
+            "غير متاح",
+            "غير متوفرة",
+            "لا يمكن تقديم",
+            "الامتناع عن",
+            "عدم اختلاق",
         )
     )
 
@@ -113,8 +136,20 @@ def validate_eval_examples(
 
     for example in examples:
         metadata = dict(example.metadata or {})
+        source_grounded_ids = (
+            example.gold_document_revision_ids,
+            example.gold_page_card_ids,
+            example.gold_section_ids,
+            example.gold_action_ids,
+        )
+        retrieval_grounded_ids = (
+            example.gold_chunk_ids,
+            example.gold_span_ids,
+            example.gold_parent_ids,
+            example.gold_media_ids,
+        )
         if example.no_answer:
-            if any((example.gold_chunk_ids, example.gold_parent_ids, example.gold_media_ids)):
+            if any((*retrieval_grounded_ids, *source_grounded_ids)):
                 warnings.append(
                     {
                         "id": example.id,
@@ -150,7 +185,7 @@ def validate_eval_examples(
                 )
             continue
 
-        if not any((example.gold_chunk_ids, example.gold_parent_ids, example.gold_media_ids)):
+        if not any((*retrieval_grounded_ids, *source_grounded_ids)):
             errors.append(
                 {
                     "id": example.id,

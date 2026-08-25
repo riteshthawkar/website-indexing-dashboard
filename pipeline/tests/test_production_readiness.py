@@ -4631,7 +4631,7 @@ class TestFormatterImages:
                     "chunk_documents": True,
                     "chunk_size_chars": 500,
                     "chunk_overlap_chars": 80,
-                    "max_chunks_per_document": 10,
+                    "max_chunks_per_document": 0,
                     "max_images_per_doc": 5,
                     "max_videos_per_doc": 2,
                 }
@@ -4656,6 +4656,7 @@ class TestFormatterImages:
         assert docs[0]["metadata"]["images"][0]["page_number"] == 1
         assert docs[0]["metadata"]["images"][0]["description"] == "Annotated campus map"
         assert "CHUNK 1/" in docs[0]["text"]
+        assert "Paragraph 17:" in "\n".join(doc["text"] for doc in docs)
 
     def test_execute_prefers_chunk_manifest_when_available(self, tmp_dir):
         from pipeline.core.base import StageContext
@@ -6991,6 +6992,9 @@ class TestGeminiRetrievalFormatter:
                         "url": "https://example.com/intro.mp4",
                         "title": "Intro video",
                         "caption": "Welcome to MBZUAI",
+                        "section_path": ["Research"],
+                        "section_heading": "Research",
+                        "surrounding_text_after": "Research programs and laboratory tours.",
                     }
                 ]
             },
@@ -7015,7 +7019,18 @@ class TestGeminiRetrievalFormatter:
         assert result.metrics["fact_records"] >= 2
         assert len(bundle["chunk_records"]) == 2
         assert len(bundle["fact_records"]) >= 2
-        assert bundle["media_records"][0]["linked_chunk_ids"]
+        # Unscoped document-level images remain independently retrievable;
+        # only media with page/section/context provenance attaches to chunks.
+        assert bundle["media_records"][0]["linked_chunk_ids"] == []
+        assert any(record["linked_chunk_ids"] for record in bundle["media_records"])
+        contextual_video = next(
+            record
+            for record in bundle["media_records"]
+            if record.get("url") == "https://example.com/intro.mp4"
+        )
+        assert contextual_video["linked_chunk_ids"] == ["chunk-b"]
+        assert contextual_video["section_path"] == ["Research"]
+        assert "SURROUNDING_TEXT_AFTER" in contextual_video["text"]
         assert bundle["parent_records"][0]["child_chunk_ids"]
 
     def test_execute_skips_low_signal_media_records(self, tmp_dir):

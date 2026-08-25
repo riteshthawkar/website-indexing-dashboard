@@ -1,5 +1,8 @@
 {
   "overall": {
+    "query_count": {
+      "min": 65
+    },
     "answerable_query_count": {
       "min": 45
     },
@@ -77,6 +80,27 @@
     },
     "error_rate": {
       "max": 0.0
+    },
+    "p50_first_content_latency_ms": {
+      "max": 8000
+    },
+    "p95_first_content_latency_ms": {
+      "max": 15000
+    },
+    "p99_first_content_latency_ms": {
+      "max": 25000
+    },
+    "p50_latency_ms": {
+      "max": 30000
+    },
+    "p95_latency_ms": {
+      "max": 60000
+    },
+    "p99_latency_ms": {
+      "max": 90000
+    },
+    "max_latency_ms": {
+      "max": 120000
     }
   },
   "by_query_type": {
@@ -128,6 +152,57 @@
       },
       "must_not_include_pass_rate": {
         "min": 1.0
+      }
+    }
+  },
+  "by_language": {
+    "English": {
+      "query_count": {
+        "min": 57
+      },
+      "pass_rate": {
+        "min": 0.90
+      },
+      "support_present_rate": {
+        "min": 0.92
+      },
+      "no_answer_pass_rate": {
+        "min": 1.0
+      },
+      "error_rate": {
+        "max": 0.0
+      }
+    },
+    "Arabic": {
+      "query_count": {
+        "min": 8
+      },
+      "answerable_query_count": {
+        "min": 6
+      },
+      "no_answer_query_count": {
+        "min": 2
+      },
+      "pass_rate": {
+        "min": 0.80
+      },
+      "support_present_rate": {
+        "min": 0.83
+      },
+      "must_include_pass_rate": {
+        "min": 0.80
+      },
+      "no_answer_pass_rate": {
+        "min": 1.0
+      },
+      "llm_groundedness_mean": {
+        "min": 0.78
+      },
+      "llm_safety_mean": {
+        "min": 0.86
+      },
+      "error_rate": {
+        "max": 0.0
       }
     }
   },

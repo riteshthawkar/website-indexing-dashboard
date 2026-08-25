@@ -77,7 +77,7 @@ Production promotion uses the governed LLM-generated v1 suite and strict gates b
 - `eval/gates/retrieval_gate.v5_span_strict.json`
 - `eval/gates/answer_readiness_gate.llm_generated_v1.json`
 
-The production policy requires at least 50 retrieval queries and 50 judged answers. The release-readiness v2 suite remains available as a supplemental regression set for PDF-derived, multi-document, and multimodal coverage, but it is not the promotion policy.
+Production policy `mbzuai-production-eval-v2` requires all 65 governed retrieval queries and 65 judged answers: 57 English cases and eight Arabic cases. The release-readiness v2 suite remains available as a supplemental regression set for PDF-derived, multi-document, and multimodal coverage, but it is not the promotion policy.
 
 The v2 suite is generated from the internal v4 gold set with:
 
@@ -119,24 +119,26 @@ Run the full release gate against a completed candidate run:
   --promote
 ```
 
-`release-check` now gates both retrieval quality and generated-answer readiness. Production release checks default to the live HTTP chat path, so start the backend against the candidate retrieval configuration and pass `--answer-endpoint` or set `MBZUAI_CHAT_EVAL_ENDPOINT`. Use `--answer-eval-mode local` only for indexing-side dry runs.
+`release-check` gates both retrieval quality and generated-answer readiness. Production promotion requires the live WebSocket chat path, so start the backend against the candidate retrieval configuration and pass `--answer-endpoint` or set `MBZUAI_CHAT_EVAL_ENDPOINT`. Use `--answer-eval-mode local` only for indexing-side dry runs.
 
 Generated-answer readiness uses an LLM-as-judge by default for production release checks. The judge evaluates the final response plus supporting evidence, references/sources, expected reference URLs, citation requirements, response structure, UI payload, injected components, suggested actions, follow-up questions, and response contract fields. Set `GOOGLE_API_KEY` or `GEMINI_API_KEY` before running a production release gate.
 
-To exercise the exact live widget/chatbot HTTP path, start the backend against the candidate retrieval configuration, then run:
+To exercise the exact live widget/chatbot WebSocket path, start the backend against the candidate retrieval configuration, then run:
 
 ```bash
 ./env/bin/python -m pipeline release-check \
   --config pipeline/configs/default.yaml \
   --work-dir runs/mbzuai_indexing/<run_id> \
-  --answer-endpoint http://127.0.0.1:8000/telegram-chat \
+  --answer-eval-mode websocket \
+  --answer-endpoint ws://127.0.0.1:8000/chat \
   --answer-auth-token "$OPERATIONS_API_TOKEN" \
+  --parallelism 2 \
   --promote
 ```
 
-The HTTP evaluator does not send `X-Health-Probe` by default because probe mode can intentionally bypass normal user-facing responses. Use `--answer-probe-mode` only when you explicitly want a health-probe style check instead of production answer grading.
+The evaluator does not send `X-Health-Probe` by default because probe mode can intentionally bypass normal user-facing responses. Use `--answer-probe-mode` only when you explicitly want a health-probe style check instead of production answer grading.
 
-To grade the LLM-generated 50-query suite, use its matching answer gate:
+To grade the governed 65-query multilingual suite, use its matching answer gate:
 
 ```bash
 ./env/bin/python -m pipeline eval-answer-readiness \
@@ -144,8 +146,9 @@ To grade the LLM-generated 50-query suite, use its matching answer gate:
   --work-dir runs/mbzuai_indexing/<run_id> \
   --dataset eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl \
   --gates eval/gates/answer_readiness_gate.llm_generated_v1.json \
-  --mode http \
-  --endpoint http://127.0.0.1:8000/telegram-chat \
+  --mode websocket \
+  --endpoint ws://127.0.0.1:8000/chat \
+  --parallelism 2 \
   --output eval/reports/answer_readiness_llm_generated_v1_report.json
 ```
 
@@ -172,6 +175,57 @@ You can run only the generated-answer readiness check with:
 
 That command also runs the LLM judge by default. Use `--skip-llm-judge` only with non-production gates when checking deterministic include/exclude rules without production promotion confidence.
 
+## MBZUAI Multilingual V2 Controlled Retrieval Study
+
+`eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl` is the candidate-independent
+source-grounded retrieval set for selecting the next chunk, embedding, and
+index layout. It contains 160 queries: 80 English and 80 Arabic, including 24
+multimodal cases, 16 navigation cases, 18 cross-lingual cases, and 24
+adversarial no-answer cases. Gold evidence is attached to immutable document,
+Page Card, section, action, and media identities rather than candidate chunk
+ids.
+
+The split builder preserves exact language/query-type/answerability strata and
+keeps source-connected examples in one split. Selection has 96 cases,
+regression has 26, and the sealed holdout has 38. The current artifact reports
+zero source-group leaks across those splits.
+
+Prepare the isolated candidates and locked embedding inputs with:
+
+```bash
+./env/bin/python scripts/prepare_multilingual_ab.py
+./env/bin/python scripts/build_multilingual_ab_embedding_inputs.py
+```
+
+Run the experiment strictly in this order:
+
+```bash
+./env/bin/python scripts/evaluate_multilingual_ab.py selection
+./env/bin/python scripts/evaluate_multilingual_ab.py regression
+./env/bin/python scripts/evaluate_multilingual_ab.py holdout
+```
+
+The selection phase freezes three finalists and their abstention thresholds.
+The regression command refuses a changed dataset, experiment manifest, scoring
+implementation, or selection result. The holdout command runs only the
+regression-passing finalists. These commands write recommendation artifacts
+under `runs/evaluation/mbzuai-multilingual-controlled-ab-v1`; they never upload,
+promote, or mutate a production index.
+
+The completed August 22, 2026 run selected
+`c650__gemini2_1536__dense_graph`: 650-token target chunks, 900-token maximum,
+100-token overlap, 160-token minimum, Gemini Embedding 2 at 1,536 dimensions,
+grounded caption/OCR/context text for media, and dense retrieval over chunks,
+page/section parents, media, Page Cards, and actions. The selected variant
+scored 0.81348 on the sealed holdout. A 450-token alternative scored 0.82304,
+but was inside the frozen 0.01 quality-equivalence margin; the preregistered
+cost tie-break selected the 14.3%-smaller 650-token index.
+
+See `../../MULTILINGUAL_RETRIEVAL_AB_REPORT.md` for the full matrix, regression and
+holdout results, latency/memory/cost comparison, limitations, and exact artifact
+paths. The machine-readable final decision is
+`runs/evaluation/mbzuai-multilingual-controlled-ab-v1/results/final_selection.json`.
+
 Summarize and validate an eval set:
 
 ```bash
@@ -195,6 +249,10 @@ Each row is JSON or JSONL with these fields:
 - `reference_answer`
 - `gold_chunk_ids`
 - `gold_parent_ids`
+- `gold_document_revision_ids`
+- `gold_page_card_ids`
+- `gold_section_ids`
+- `gold_action_ids`
 - `gold_media_ids`
 - `notes`
 - `metadata`

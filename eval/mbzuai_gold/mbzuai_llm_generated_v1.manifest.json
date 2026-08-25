@@ -1,0 +1,34 @@
+{
+  "schema_version": 2,
+  "provider": "gemini",
+  "model": "gemini-2.5-flash",
+  "search_enabled": true,
+  "work_dir": "/Users/ritesh.thawkar/Ritesh/lawaAI/MBZUAI-APP/website-indexing-dashboard/runs/mbzuai_main/mbzuai-full-production-20260519-000125",
+  "output": "/Users/ritesh.thawkar/Ritesh/lawaAI/MBZUAI-APP/website-indexing-dashboard/eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl",
+  "row_count": 65,
+  "generated_row_count": 50,
+  "release_control_row_count": 15,
+  "language_counts": {
+    "English": 57,
+    "Arabic": 8
+  },
+  "answerability_counts": {
+    "answerable": 55,
+    "no_answer": 10
+  },
+  "suite_name": "llm_generated_v1",
+  "topics": [
+    "admissions and application process",
+    "undergraduate admissions",
+    "graduate programs and specializations",
+    "campus location and visitor logistics",
+    "student accommodation and family visitor policy",
+    "parking and transport",
+    "campus facilities and services",
+    "working hours and support contacts",
+    "institutional identity, legal basis, leadership, and governance",
+    "research, faculty, labs, and academic life",
+    "events, news, scholarships, and public engagement",
+    "no-answer controls for unsupported offices, contacts, campuses, dates, or policies"
+  ]
+}

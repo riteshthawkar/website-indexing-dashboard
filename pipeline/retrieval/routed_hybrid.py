@@ -9,13 +9,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from threading import BoundedSemaphore, Lock
-from typing import Any, Dict, List, Sequence
+from typing import Any, Dict, List, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
 from pipeline.core.evidence_adjudicator import adjudicate_factual_evidence
+from pipeline.core.navigation_intent import normalize_navigation_context
 from pipeline.core.query_expansion import hyde_expansion
 from pipeline.core.query_planner import plan_query
 from pipeline.retrieval.evidence_packer import build_evidence_pack, score_retrieval_confidence
+from pipeline.retrieval.navigation_planner import (
+    GroundedNavigationPlanner,
+)
 
 from .adaptive_hybrid import (
     AdaptiveHybridRetriever,
@@ -93,6 +97,10 @@ class QueryRewriteBundle:
     vector_query: str
     graph_query: str
     labels: tuple[str, ...]
+    navigation_intent: str = "none"
+    navigation_goal: str = ""
+    navigation_confidence: float = 0.0
+    navigation_source: str = "deterministic_query_intent"
 
 
 class RoutedHybridRetriever:
@@ -139,6 +147,25 @@ class RoutedHybridRetriever:
             retrieval_cfg.get("query_planner_reasoning_effort") or "minimal"
         )
         self.query_planner_min_confidence = float(retrieval_cfg.get("query_planner_min_confidence") or 0.55)
+        self.navigation_plan_enabled = bool(
+            retrieval_cfg.get("navigation_plan_enabled", True)
+        )
+        self.navigation_plan_required = bool(
+            retrieval_cfg.get("navigation_plan_required", False)
+        )
+        self.navigation_planner = GroundedNavigationPlanner.from_runtime(
+            work_dir=self.work_dir,
+            configured_path=retrieval_cfg.get("page_graph_navigation_catalog_file"),
+        )
+        if (
+            self.navigation_plan_enabled
+            and self.navigation_plan_required
+            and not self.navigation_planner.available
+        ):
+            raise ValueError(
+                "Required page-graph navigation catalog is unavailable: "
+                f"{self.navigation_planner.load_error or 'not found'}"
+            )
         self.evidence_adjudicator_enabled = bool(retrieval_cfg.get("evidence_adjudicator_enabled", False))
         self.selective_adjudication_enabled = bool(retrieval_cfg.get("selective_adjudication_enabled", True))
         self.evidence_adjudicator_model = str(retrieval_cfg.get("evidence_adjudicator_model") or "gpt-5-nano")
@@ -246,6 +273,13 @@ class RoutedHybridRetriever:
                 self.graph = None
 
         self._initialize_evidence_adjudicator_runtime()
+        self.supports_shared_parallel_retrieval = bool(
+            getattr(self.vector, "supports_shared_parallel_retrieval", False)
+            and (
+                self.graph is None
+                or getattr(self.graph, "supports_shared_parallel_retrieval", False)
+            )
+        )
 
     def _initialize_evidence_adjudicator_runtime(self) -> None:
         """Create one bounded adjudication pool per retriever instance.
@@ -272,6 +306,9 @@ class RoutedHybridRetriever:
         if executor is not None:
             executor.shutdown(wait=False, cancel_futures=True)
             self._evidence_adjudicator_executor = None
+        vector_close = getattr(getattr(self, "vector", None), "close", None)
+        if callable(vector_close):
+            vector_close()
 
     def embed_query(self, query: str) -> List[float]:
         return self.vector.embed_query(query)
@@ -312,18 +349,29 @@ class RoutedHybridRetriever:
         *,
         relation_plan: RelationQueryPlan | None = None,
         query_mode: str = "fact",
+        use_query_planner: bool = True,
     ) -> QueryRewriteBundle:
         labels: List[str] = []
         vector_query = query
         graph_query = query
+        navigation = normalize_navigation_context(query)
         generic_contact_query = _is_generic_contact_query(query)
-        if self.query_planner_enabled:
+        if self.query_planner_enabled and use_query_planner:
             plan = plan_query(
                 query=query,
                 model=self.query_planner_model,
                 fallback_query_type=query_mode,
             )
             planner_confidence = float(plan.get("confidence") or 0.0)
+            navigation = normalize_navigation_context(
+                query,
+                {
+                    "intent": plan.get("navigation_intent"),
+                    "goal": plan.get("navigation_goal"),
+                    "confidence": plan.get("navigation_confidence"),
+                    "source": "retrieval_query_planner",
+                },
+            )
             if planner_confidence >= self.query_planner_min_confidence:
                 planned_vector = str(plan.get("vector_query") or "").strip()
                 planned_graph = str(plan.get("graph_query") or "").strip()
@@ -366,6 +414,12 @@ class RoutedHybridRetriever:
             vector_query=vector_query,
             graph_query=graph_query,
             labels=tuple(dict.fromkeys(labels)),
+            navigation_intent=str(navigation.get("intent") or "none"),
+            navigation_goal=str(navigation.get("goal") or ""),
+            navigation_confidence=float(navigation.get("confidence") or 0.0),
+            navigation_source=str(
+                navigation.get("source") or "deterministic_query_intent"
+            ),
         )
 
     def _empty_graph_context(self, query: str) -> GraphQueryContext:
@@ -406,11 +460,32 @@ class RoutedHybridRetriever:
         ):
             return "unsupported_private_or_user_specific_request"
 
+        if any(
+            marker in text
+            for marker in (
+                "موعد مقابلتي",
+                "جدول مقابلتي",
+                "مقابلتي الشخصية",
+                "غرفتي",
+                "رقم غرفتي",
+                "المخصص لي",
+            )
+        ):
+            return "unsupported_private_or_user_specific_request"
+
         if "exact questions" in text and any(marker in text for marker in ("exam", "screening", "test", "assessment")):
+            return "unsupported_confidential_exam_content"
+        if any(marker in text for marker in ("الأسئلة الدقيقة", "الاسئلة الدقيقة", "أسئلة الاختبار نفسها")) and any(
+            marker in text for marker in ("اختبار", "امتحان", "تقييم")
+        ):
             return "unsupported_confidential_exam_content"
 
         if any(marker in text for marker in ("right now", "live location", "current live", "currently live")) and any(
             marker in text for marker in ("shuttle", "bus", "vehicle", "airport")
+        ):
+            return "unsupported_live_operational_status"
+        if any(marker in text for marker in ("الآن", "الان", "الموقع المباشر", "موقعه الحالي")) and any(
+            marker in text for marker in ("الحافلة", "حافلة", "مركبة", "المطار")
         ):
             return "unsupported_live_operational_status"
 
@@ -428,6 +503,10 @@ class RoutedHybridRetriever:
                     "result",
                     "results",
                     "awardee",
+                    "الفائز",
+                    "فاز",
+                    "الجائزة",
+                    "النتائج",
                 )
             ):
                 return "unsupported_future_event_result"
@@ -1761,7 +1840,14 @@ class RoutedHybridRetriever:
             payload["verification_status"] = "backfilled_required_page_evidence"
         return changed
 
-    def retrieve(self, query: str, *, query_vector: List[float] | None = None) -> Dict[str, Any]:
+    def retrieve(
+        self,
+        query: str,
+        *,
+        query_vector: List[float] | None = None,
+        skip_query_planner: bool = False,
+        navigation_context: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
         routing_started = time.perf_counter()
         mode = classify_query_mode(query)
         media_query = _is_media_query(query)
@@ -1861,7 +1947,32 @@ class RoutedHybridRetriever:
 
         decision = self._route_query(query)
         relation_plan = decision.relation_plan if decision.graph_available else None
-        rewrites = self._build_query_rewrite_bundle(query, relation_plan=relation_plan, query_mode=mode.value)
+        rewrites = self._build_query_rewrite_bundle(
+            query,
+            relation_plan=relation_plan,
+            query_mode=mode.value,
+            use_query_planner=not skip_query_planner,
+        )
+        if skip_query_planner:
+            rewrites = QueryRewriteBundle(
+                vector_query=rewrites.vector_query,
+                graph_query=rewrites.graph_query,
+                labels=tuple(dict.fromkeys(["upstream_query_plan", *rewrites.labels])),
+                navigation_intent=rewrites.navigation_intent,
+                navigation_goal=rewrites.navigation_goal,
+                navigation_confidence=rewrites.navigation_confidence,
+                navigation_source=rewrites.navigation_source,
+            )
+        planned_navigation_context = normalize_navigation_context(
+            query,
+            navigation_context
+            or {
+                "intent": rewrites.navigation_intent,
+                "goal": rewrites.navigation_goal,
+                "confidence": rewrites.navigation_confidence,
+                "source": rewrites.navigation_source,
+            },
+        )
         query_embedding_status = "ok"
         query_embedding_error = ""
         if query_vector is not None and "hyde_expansion" not in rewrites.labels:
@@ -2052,6 +2163,13 @@ class RoutedHybridRetriever:
         payload["missing_required_entities"] = payload["evidence_pack"].get("missing_required_entities") or []
         payload["missing_required_pages"] = payload["evidence_pack"].get("missing_required_pages") or []
         payload["missing_required_sections"] = payload["evidence_pack"].get("missing_required_sections") or []
+        if self.navigation_plan_enabled:
+            payload["navigation_plan"] = self.navigation_planner.plan(
+                query=query,
+                result=payload,
+                navigation_context=planned_navigation_context,
+            )
+            payload["navigation_intent"] = planned_navigation_context["intent"]
         payload["retrieval_trace"] = {
             "backend": decision.backend,
             "reason": decision.reason,
@@ -2094,5 +2212,16 @@ class RoutedHybridRetriever:
             "coverage_plan": coverage_plan,
             "confidence": confidence,
             "verification_status": payload.get("verification_status") or "",
+            "navigation": {
+                "enabled": bool(self.navigation_plan_enabled),
+                "catalog_available": bool(self.navigation_planner.available),
+                "intent": planned_navigation_context["intent"],
+                "status": (
+                    payload.get("navigation_plan") or {}
+                ).get("status"),
+                "step_count": len(
+                    (payload.get("navigation_plan") or {}).get("steps") or []
+                ),
+            },
         }
         return payload

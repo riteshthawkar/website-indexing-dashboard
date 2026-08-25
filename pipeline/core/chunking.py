@@ -7,8 +7,8 @@ changing the formatter or embedder stages.
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timezone
+from functools import lru_cache
 from hashlib import sha1
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -16,11 +16,163 @@ from typing import Any, Dict, Iterable, List, Optional
 from .io import load_json_safe
 
 
+TOKENIZER_ENCODING = "cl100k_base"
+
+
+class ChunkLimitExceededError(RuntimeError):
+    """Raised when an explicit safety limit would otherwise drop content."""
+
+
+@lru_cache(maxsize=1)
+def _budget_tokenizer():
+    """Return the deterministic tokenizer used for local chunk budgets.
+
+    Gemini does not expose an offline tokenizer. The pipeline therefore uses
+    the same multilingual-safe proxy as the Docling chunker and records the
+    method in the chunk manifest. Exact provider counts can be sampled with
+    Gemini's countTokens API without making chunking depend on a network call.
+    """
+
+    try:
+        import tiktoken
+
+        return tiktoken.get_encoding(TOKENIZER_ENCODING)
+    except Exception:
+        return None
+
+
+def token_counting_method() -> str:
+    """Describe the active local token-budget implementation."""
+
+    if _budget_tokenizer() is not None:
+        return f"tiktoken:{TOKENIZER_ENCODING}"
+    return "unicode_conservative_fallback:v1"
+
+
+def _unicode_conservative_token_count(text: str) -> int:
+    """Conservative dependency-free fallback for multilingual content.
+
+    ASCII alphanumeric runs are estimated at four characters per token. Each
+    punctuation mark counts separately, and non-ASCII characters are charged
+    by UTF-8 byte length. This deliberately overestimates Arabic/CJK content
+    rather than recreating the former whitespace-based undercount.
+    """
+
+    count = 0
+    ascii_run_length = 0
+
+    def flush_ascii_run() -> None:
+        nonlocal count, ascii_run_length
+        if ascii_run_length:
+            count += max(1, (ascii_run_length + 3) // 4)
+            ascii_run_length = 0
+
+    for character in text:
+        if character.isspace():
+            flush_ascii_run()
+        elif character.isascii() and character.isalnum():
+            ascii_run_length += 1
+        else:
+            flush_ascii_run()
+            count += len(character.encode("utf-8")) if not character.isascii() else 1
+    flush_ascii_run()
+    return count
+
+
 def estimate_token_count(text: str) -> int:
-    words = re.findall(r"\S+", text or "")
-    if not words:
+    """Count local budget tokens consistently for every language/source type."""
+
+    value = str(text or "")
+    if not value.strip():
         return 0
-    return max(1, int(len(words) * 1.33))
+    tokenizer = _budget_tokenizer()
+    if tokenizer is not None:
+        return max(1, len(tokenizer.encode(value, disallowed_special=())))
+    return max(1, _unicode_conservative_token_count(value))
+
+
+def window_text_to_token_budget(
+    text: str,
+    *,
+    max_tokens: int,
+    omission_marker: str = "\n\n[...content window omitted...]\n\n",
+) -> str:
+    """Return explicit head/middle/tail windows within a multilingual token budget.
+
+    This is intended for synopsis-style retrieval records, not lossless chunking.
+    Callers must retain the complete source separately. The omission marker makes
+    the bounded representation auditable instead of relying on provider-side
+    silent truncation.
+    """
+
+    value = str(text or "").strip()
+    if max_tokens <= 0:
+        raise ValueError("max_tokens must be positive")
+    if not value or estimate_token_count(value) <= max_tokens:
+        return value
+
+    tokenizer = _budget_tokenizer()
+    if tokenizer is not None:
+        token_ids = tokenizer.encode(value, disallowed_special=())
+        marker_ids = tokenizer.encode(omission_marker, disallowed_special=())
+        available = max_tokens - 2 * len(marker_ids)
+        if available <= 2:
+            return tokenizer.decode(token_ids[:max_tokens]).strip()
+        while available > 2:
+            first_count = max(1, int(available * 0.55))
+            middle_count = max(1, int(available * 0.20))
+            last_count = max(1, available - first_count - middle_count)
+            midpoint = max(0, len(token_ids) // 2 - middle_count // 2)
+            bounded_ids = [
+                *token_ids[:first_count],
+                *marker_ids,
+                *token_ids[midpoint : midpoint + middle_count],
+                *marker_ids,
+                *token_ids[-last_count:],
+            ]
+            bounded = tokenizer.decode(bounded_ids).strip()
+            actual_tokens = estimate_token_count(bounded)
+            if actual_tokens <= max_tokens:
+                return bounded
+            # Decoding a token slice at an arbitrary Unicode boundary can
+            # re-encode to a few extra tokens. Leave measured headroom and
+            # rebuild all three windows instead of dropping the tail.
+            available -= max(4, actual_tokens - max_tokens + 2)
+        return tokenizer.decode(token_ids[:max_tokens]).strip()
+
+    def by_character_budget(maximum_chars: int) -> str:
+        first = max(1, int(maximum_chars * 0.55))
+        middle = max(1, int(maximum_chars * 0.20))
+        last = max(1, maximum_chars - first - middle)
+        midpoint = max(0, len(value) // 2 - middle // 2)
+        return (
+            value[:first].rstrip()
+            + omission_marker
+            + value[midpoint : midpoint + middle].strip()
+            + omission_marker
+            + value[-last:].lstrip()
+        ).strip()
+
+    low, high = 1, len(value)
+    best = ""
+    while low <= high:
+        midpoint = (low + high) // 2
+        candidate = by_character_budget(midpoint)
+        if estimate_token_count(candidate) <= max_tokens:
+            best = candidate
+            low = midpoint + 1
+        else:
+            high = midpoint - 1
+    if best:
+        return best
+    # Extremely small budgets can be shorter than two omission markers.
+    prefix = ""
+    for character in value:
+        candidate = prefix + character
+        if estimate_token_count(candidate) > max_tokens:
+            break
+        prefix = candidate
+    return prefix.strip()
 
 
 def stable_document_id(*parts: Any) -> str:

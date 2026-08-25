@@ -14,7 +14,7 @@ CANDIDATE_ATTESTATION_TIMEOUT_SECONDS="${CANDIDATE_ATTESTATION_TIMEOUT_SECONDS:-
 CANDIDATE_ATTESTATION_ALLOWED_HOSTS="${CANDIDATE_ATTESTATION_ALLOWED_HOSTS:-backend-candidate,retriever-candidate}"
 JUDGE_MODEL="${JUDGE_MODEL:-gemini-2.5-flash}"
 ANSWER_MODEL="${ANSWER_MODEL:-gemini-2.5-flash}"
-PARALLELISM="${RELEASE_CHECK_PARALLELISM:-1}"
+PARALLELISM="${RELEASE_CHECK_PARALLELISM:-2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CANONICAL_RELEASE_DATASET="$PROJECT_ROOT/eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl"
@@ -284,6 +284,20 @@ expected_identity = {
     "lexical_corpus_sha256": expected.get("lexical_corpus_sha256"),
     "promoted_assertions_sha256": expected.get("promoted_assertions_sha256"),
 }
+if expected.get("selected_release_assembly_sha256"):
+    expected_identity.update(
+        {
+            "selected_release_assembly_sha256": expected.get(
+                "selected_release_assembly_sha256"
+            ),
+            "selected_release_binding_sha256": expected.get(
+                "selected_release_binding_sha256"
+            ),
+            "page_graph_navigation_catalog_sha256": expected.get(
+                "page_graph_navigation_catalog_sha256"
+            ),
+        }
+    )
 if retriever.get("ready") is not True or retriever.get("config_name") != "mbzuai_production":
     raise SystemExit("retriever-candidate is not ready with mbzuai_production")
 for key, value in expected_identity.items():

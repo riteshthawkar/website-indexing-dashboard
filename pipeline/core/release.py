@@ -85,6 +85,11 @@ _PROMOTION_ATTESTATION_KEYS = {
     "answer_models",
     "signature_sha256",
 }
+_PROMOTION_SELECTED_ATTESTATION_KEYS = {
+    "selected_release_assembly_sha256",
+    "selected_release_binding_sha256",
+    "page_graph_navigation_catalog_sha256",
+}
 
 
 @contextmanager
@@ -217,7 +222,7 @@ def _promotion_release_identity(
         if isinstance(manifest.get("retrieval_bundle"), Mapping)
         else {}
     )
-    return {
+    identity = {
         "run_id": str(manifest.get("run_id") or "").strip(),
         "retriever_commit_sha": str(retriever_commit_sha or "").strip().lower(),
         "indexing_build_commit_sha": str(indexing_build.get("commit_sha") or "").strip().lower(),
@@ -235,6 +240,14 @@ def _promotion_release_identity(
             vector_index.get("promoted_assertions_sha256") or ""
         ).strip().lower(),
     }
+    if str(vector_index.get("selected_release_assembly_sha256") or "").strip():
+        identity.update(
+            {
+                key: str(vector_index.get(key) or "").strip().lower()
+                for key in _PROMOTION_SELECTED_ATTESTATION_KEYS
+            }
+        )
+    return identity
 
 
 def build_promotion_attestation_evidence(
@@ -301,6 +314,9 @@ def build_promotion_attestation_evidence(
         "lexical_corpus_sha256": "lexical_corpus_sha256",
         "promoted_assertions_sha256": "promoted_assertions_sha256",
     }
+    for key in _PROMOTION_SELECTED_ATTESTATION_KEYS:
+        if key in expected_identity:
+            retriever_field_map[key] = key
     for identity_key, candidate_key in retriever_field_map.items():
         if str(retriever_attestation.get(candidate_key) or "").strip().lower() != expected_identity[identity_key]:
             raise ValueError(f"retriever-candidate identity mismatch for {candidate_key}")
@@ -353,7 +369,11 @@ def build_promotion_attestation_evidence(
         raise ValueError("backend-candidate answer model identity is incomplete")
 
     evidence = {
-        "schema_version": PROMOTION_ATTESTATION_SCHEMA_VERSION,
+        "schema_version": (
+            2
+            if _PROMOTION_SELECTED_ATTESTATION_KEYS.intersection(expected_identity)
+            else PROMOTION_ATTESTATION_SCHEMA_VERSION
+        ),
         "attested_at": str(attested_at or _now_iso()),
         "release_manifest_sha256": _stable_json_sha256(manifest),
         "release_id": str(manifest.get("release_id") or ""),
@@ -376,15 +396,27 @@ def _validate_promotion_attestation(
     errors: List[str] = []
     if not isinstance(evidence, Mapping):
         return ["fresh promotion attestation evidence is required"]
+    vector_index = (
+        manifest.get("vector_index")
+        if isinstance(manifest.get("vector_index"), Mapping)
+        else {}
+    )
+    selected_attestation = bool(
+        str(vector_index.get("selected_release_assembly_sha256") or "").strip()
+    )
+    expected_attestation_keys = set(_PROMOTION_ATTESTATION_KEYS)
+    if selected_attestation:
+        expected_attestation_keys.update(_PROMOTION_SELECTED_ATTESTATION_KEYS)
     evidence_keys = set(evidence)
-    if evidence_keys != _PROMOTION_ATTESTATION_KEYS:
-        missing = sorted(_PROMOTION_ATTESTATION_KEYS - evidence_keys)
-        unexpected = sorted(evidence_keys - _PROMOTION_ATTESTATION_KEYS)
+    if evidence_keys != expected_attestation_keys:
+        missing = sorted(expected_attestation_keys - evidence_keys)
+        unexpected = sorted(evidence_keys - expected_attestation_keys)
         if missing:
             errors.append(f"promotion attestation is missing fields: {missing}")
         if unexpected:
             errors.append(f"promotion attestation has unexpected fields: {unexpected}")
-    if _count(evidence.get("schema_version")) != PROMOTION_ATTESTATION_SCHEMA_VERSION:
+    expected_schema_version = 2 if selected_attestation else PROMOTION_ATTESTATION_SCHEMA_VERSION
+    if _count(evidence.get("schema_version")) != expected_schema_version:
         errors.append("promotion attestation schema_version is unsupported")
     signature = str(evidence.get("signature_sha256") or "").strip().lower()
     if not re.fullmatch(r"[0-9a-f]{64}", signature):
@@ -536,6 +568,8 @@ _VECTOR_UPLOAD_COUNT_MAP = {
     "chunks": "chunk_count",
     "parents": "parent_count",
     "media": "media_count",
+    "page_cards": "page_card_count",
+    "actions": "action_count",
     "facts": "fact_count",
     "evidence_spans": "evidence_span_count",
     "summaries": "summary_count",
@@ -545,6 +579,8 @@ _MODERN_VECTOR_NAMESPACE_KEYS = (
     "chunks",
     "parents",
     "media",
+    "page_cards",
+    "actions",
     "facts",
     "evidence_spans",
     "summaries",
@@ -552,7 +588,24 @@ _MODERN_VECTOR_NAMESPACE_KEYS = (
     "entities",
     "communities",
 )
+_PRE_SELECTED_VECTOR_NAMESPACE_KEYS = tuple(
+    key for key in _MODERN_VECTOR_NAMESPACE_KEYS if key not in {"page_cards", "actions"}
+)
 _LEGACY_VECTORSTORE_CONTRACT = "mbzuai_chatbot_legacy_v1"
+
+
+def _is_selected_vector_manifest(manifest: Mapping[str, Any]) -> bool:
+    selected = manifest.get("selected_profile")
+    return bool(
+        (isinstance(selected, Mapping) and str(selected.get("variant_id") or "").strip())
+        or str(manifest.get("selected_release_assembly_sha256") or "").strip()
+    )
+
+
+def _vector_namespace_keys(manifest: Mapping[str, Any]) -> Tuple[str, ...]:
+    if _is_selected_vector_manifest(manifest) or _count(manifest.get("schema_version")) >= 6:
+        return _MODERN_VECTOR_NAMESPACE_KEYS
+    return _PRE_SELECTED_VECTOR_NAMESPACE_KEYS
 
 
 def _stage_plugins(config: Mapping[str, Any]) -> List[str]:
@@ -589,16 +642,36 @@ def _count(value: Any) -> int:
         return 0
 
 
-def _verify_retrieval_bundle_stats(stats: Dict[str, Any]) -> List[str]:
+def _verify_retrieval_bundle_stats(
+    stats: Dict[str, Any],
+    *,
+    selected_profile: bool = False,
+) -> List[str]:
     errors: List[str] = []
     if not stats.get("retrieval_bundle_file"):
         return ["Retrieval bundle is missing"]
-    if _count(stats.get("retrieval_bundle_version")) < 5:
-        errors.append("Retrieval bundle version must be 5 or newer")
-    missing = [key for key in _REQUIRED_RETRIEVAL_BUNDLE_STATS if key not in stats]
+    minimum_version = 6 if selected_profile else 5
+    if _count(stats.get("retrieval_bundle_version")) < minimum_version:
+        errors.append(f"Retrieval bundle version must be {minimum_version} or newer")
+    required_keys = list(_REQUIRED_RETRIEVAL_BUNDLE_STATS)
+    if selected_profile:
+        required_keys.extend(("page_card_count", "action_count"))
+    missing = [key for key in required_keys if key not in stats]
     if missing:
         errors.append(f"Retrieval bundle stats are missing required keys: {missing}")
-    for key in _POSITIVE_RETRIEVAL_BUNDLE_STATS:
+    positive_keys = (
+        (
+            "chunk_count",
+            "parent_count",
+            "media_count",
+            "page_card_count",
+            "action_count",
+            "lexical_count",
+        )
+        if selected_profile
+        else _POSITIVE_RETRIEVAL_BUNDLE_STATS
+    )
+    for key in positive_keys:
         if key in stats and _count(stats.get(key)) <= 0:
             errors.append(f"Retrieval bundle {key} must be greater than zero")
     return errors
@@ -622,6 +695,8 @@ def _sparse_record_skipped_count(manifest: Mapping[str, Any], upload_key: str) -
         "chunks": "chunk",
         "parents": "parent",
         "media": "media",
+        "page_cards": "page_card",
+        "actions": "action",
         "facts": "fact",
         "evidence_spans": "evidence_span",
         "summaries": "summary",
@@ -644,16 +719,24 @@ def _modern_vector_expected_counts_for_manifest(
     expected: Dict[str, int] = {}
     embedder_config = embedder_config if isinstance(embedder_config, Mapping) else None
     sparse_enabled = bool(str(manifest.get("sparse_index_name") or "").strip())
+    selected = _is_selected_vector_manifest(manifest)
+    namespace_keys = set(_vector_namespace_keys(manifest))
     for upload_key, stat_key in _VECTOR_UPLOAD_COUNT_MAP.items():
+        if upload_key not in namespace_keys:
+            continue
         bundle_count = _count(bundle_stats.get(stat_key))
         dense_enabled = True
-        if embedder_config is not None:
+        if selected and upload_key not in {"chunks", "parents", "media", "page_cards", "actions"}:
+            dense_enabled = False
+        elif embedder_config is not None:
             if upload_key == "facts":
                 dense_enabled = bool(embedder_config.get("enable_dense_facts", False))
             elif upload_key == "evidence_spans":
                 dense_enabled = bool(embedder_config.get("enable_dense_evidence_spans", True))
             elif upload_key == "assertions":
                 dense_enabled = bool(embedder_config.get("enable_dense_assertions", True))
+            elif upload_key == "summaries":
+                dense_enabled = bool(embedder_config.get("enable_dense_summaries", True))
         expected[upload_key] = bundle_count if dense_enabled else 0
         if sparse_enabled:
             skipped = _sparse_record_skipped_count(manifest, upload_key)
@@ -770,8 +853,16 @@ def _verify_vector_manifest(
         return _verify_legacy_vector_manifest(manifest, work_dir)
 
     errors: List[str] = []
+    provider = str(manifest.get("provider") or "pinecone").strip().lower()
+    if provider not in {"pinecone", "pgvector"}:
+        errors.append(f"Vector index manifest provider is unsupported: {provider}")
     if _count(manifest.get("schema_version")) < 2:
         errors.append("Vector index manifest schema_version must be 2 or newer")
+    if provider == "pgvector" and _count(manifest.get("schema_version")) < 5:
+        errors.append("pgvector manifest schema_version must be 5 or newer")
+    selected = _is_selected_vector_manifest(manifest)
+    if selected and _count(manifest.get("schema_version")) < 6:
+        errors.append("selected-profile vector manifest schema_version must be 6 or newer")
     if not str(manifest.get("index_name") or "").strip():
         errors.append("Vector index manifest is missing index_name")
 
@@ -785,12 +876,13 @@ def _verify_vector_manifest(
     if not isinstance(namespaces, dict):
         namespaces = {}
         errors.append("Vector index manifest is missing namespace mappings")
+    namespace_keys = _vector_namespace_keys(manifest)
     missing_namespaces = [
-        key for key in _MODERN_VECTOR_NAMESPACE_KEYS if not str(namespaces.get(key) or "").strip()
+        key for key in namespace_keys if not str(namespaces.get(key) or "").strip()
     ]
     if missing_namespaces:
         errors.append(f"Vector index manifest is missing namespaces: {missing_namespaces}")
-    populated_namespaces = [str(namespaces.get(key) or "").strip() for key in _MODERN_VECTOR_NAMESPACE_KEYS]
+    populated_namespaces = [str(namespaces.get(key) or "").strip() for key in namespace_keys]
     populated_namespaces = [namespace for namespace in populated_namespaces if namespace]
     if len(set(populated_namespaces)) != len(populated_namespaces):
         errors.append("Vector index manifest namespaces must be distinct per retrieval lane")
@@ -803,7 +895,12 @@ def _verify_vector_manifest(
     missing_uploaded = [key for key in expected_counts if key not in uploaded]
     if missing_uploaded:
         errors.append(f"Vector index manifest is missing uploaded count keys: {missing_uploaded}")
-    for key in ("chunks", "parents"):
+    positive_lanes = (
+        ("chunks", "parents", "media", "page_cards", "actions")
+        if selected
+        else ("chunks", "parents")
+    )
+    for key in positive_lanes:
         if _count(uploaded.get(key)) <= 0:
             errors.append(f"Vector index uploaded count for {key!r} must be greater than zero")
     for key, expected in expected_counts.items():
@@ -818,9 +915,9 @@ def _verify_vector_manifest(
     if not isinstance(planned, dict):
         planned = {}
         errors.append("Vector index manifest is missing immutable planned counts")
-    required_plan_keys = list(_MODERN_VECTOR_NAMESPACE_KEYS)
+    required_plan_keys = list(namespace_keys)
     if str(manifest.get("sparse_index_name") or "").strip():
-        required_plan_keys.extend(f"sparse_{key}" for key in _MODERN_VECTOR_NAMESPACE_KEYS)
+        required_plan_keys.extend(f"sparse_{key}" for key in namespace_keys)
     missing_plan_keys = [key for key in required_plan_keys if key not in planned]
     if missing_plan_keys:
         errors.append(f"Vector index manifest is missing planned count keys: {missing_plan_keys}")
@@ -846,10 +943,14 @@ def _verify_vector_manifest(
     sparse_payload = manifest.get("sparse") if isinstance(manifest.get("sparse"), Mapping) else {}
     sparse_stats = sparse_payload.get("record_stats") if isinstance(sparse_payload.get("record_stats"), Mapping) else {}
     for upload_key, stat_key in _VECTOR_UPLOAD_COUNT_MAP.items():
+        if upload_key not in namespace_keys:
+            continue
         singular = {
             "chunks": "chunk",
             "parents": "parent",
             "media": "media",
+            "page_cards": "page_card",
+            "actions": "action",
             "facts": "fact",
             "evidence_spans": "evidence_span",
             "summaries": "summary",
@@ -891,7 +992,7 @@ def _verify_vector_manifest(
             errors.append(f"Vector {label} namespace verification has failures: {report.get('failures')}")
 
         prefix = "sparse_" if label == "sparse" else ""
-        for upload_key in _MODERN_VECTOR_NAMESPACE_KEYS:
+        for upload_key in namespace_keys:
             count_key = f"{prefix}{upload_key}"
             expected_count = expected_counts.get(count_key, _count(planned.get(count_key)))
             if expected_count <= 0:
@@ -909,6 +1010,17 @@ def _verify_vector_manifest(
                     f"Vector {label} verification count mismatch for {upload_key!r}: "
                     f"canonical={expected_count}, expected={reported_expected}, actual={reported_actual}"
                 )
+    if selected:
+        for lane in (
+            "facts",
+            "evidence_spans",
+            "summaries",
+            "assertions",
+            "entities",
+            "communities",
+        ):
+            if _count(uploaded.get(lane)) != 0 or _count(planned.get(lane)) != 0:
+                errors.append(f"Selected release contains unevaluated dense lane: {lane}")
     return errors
 
 
@@ -922,6 +1034,7 @@ def _verify_vector_manifest_matches_config(
     errors: List[str] = []
     embedder_cfg = config.get("embedder") if isinstance(config.get("embedder"), dict) else {}
     retrieval_cfg = config.get("retrieval") if isinstance(config.get("retrieval"), dict) else {}
+    vector_store_cfg = config.get("vector_store") if isinstance(config.get("vector_store"), dict) else {}
     if _is_legacy_vector_manifest(manifest):
         expected_summary = str(embedder_cfg.get("pinecone_summary_index") or "").strip()
         expected_text = str(embedder_cfg.get("pinecone_text_index") or embedder_cfg.get("pinecone_index") or "").strip()
@@ -953,12 +1066,32 @@ def _verify_vector_manifest_matches_config(
             )
         return errors
 
-    expected_dense = str(embedder_cfg.get("pinecone_index") or "").strip()
-    expected_sparse = str(embedder_cfg.get("pinecone_sparse_index") or retrieval_cfg.get("pinecone_sparse_index") or "").strip()
+    expected_provider = str(vector_store_cfg.get("provider") or "pinecone").strip().lower()
+    actual_provider = str(manifest.get("provider") or "pinecone").strip().lower()
+    if expected_provider != actual_provider:
+        errors.append(
+            f"Configured vector provider {expected_provider!r} does not match uploaded provider {actual_provider!r}"
+        )
+    if actual_provider == "pgvector":
+        expected_contract = production_indexing_contract_fingerprint(config)
+        actual_contract = str(
+            manifest.get("production_indexing_contract_fingerprint") or ""
+        ).strip()
+        if actual_contract != expected_contract:
+            errors.append("pgvector upload manifest indexing contract does not match configured production contract")
+    if expected_provider == "pgvector":
+        expected_dense = (
+            f"{str(vector_store_cfg.get('schema') or 'mbzuai_retrieval')}."
+            f"{str(vector_store_cfg.get('records_table') or 'embedding_records')}"
+        )
+        expected_sparse = ""
+    else:
+        expected_dense = str(embedder_cfg.get("pinecone_index") or "").strip()
+        expected_sparse = str(embedder_cfg.get("pinecone_sparse_index") or retrieval_cfg.get("pinecone_sparse_index") or "").strip()
     actual_dense = str(manifest.get("index_name") or "").strip()
     actual_sparse = str(manifest.get("sparse_index_name") or "").strip()
     if expected_dense and expected_dense != actual_dense:
-        errors.append(f"Configured dense Pinecone index {expected_dense!r} does not match uploaded index {actual_dense!r}")
+        errors.append(f"Configured vector index {expected_dense!r} does not match uploaded index {actual_dense!r}")
     if expected_sparse and expected_sparse != actual_sparse:
         errors.append(f"Configured sparse Pinecone index {expected_sparse!r} does not match uploaded sparse index {actual_sparse!r}")
 
@@ -992,6 +1125,8 @@ def _verify_vector_manifest_matches_config(
         "chunks": ("namespace_chunks", "namespace_chunks"),
         "parents": ("namespace_parents", "namespace_parents"),
         "media": ("namespace_media", "namespace_media"),
+        "page_cards": ("namespace_page_cards", "namespace_page_cards"),
+        "actions": ("namespace_actions", "namespace_actions"),
         "facts": ("namespace_facts", "namespace_facts"),
         "evidence_spans": ("namespace_evidence_spans", "namespace_evidence_spans"),
         "summaries": ("namespace_summaries", "namespace_summaries"),
@@ -1173,6 +1308,11 @@ def _load_retrieval_bundle_stats(work_dir: Path) -> Dict[str, Any]:
     payload = load_json_safe(bundle_path, {}) or {}
     if isinstance(payload, dict):
         stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
+        selected_contract = (
+            payload.get("selected_release_contract")
+            if isinstance(payload.get("selected_release_contract"), Mapping)
+            else {}
+        )
         lexical_corpus_path = bundle_path.with_name("lexical_corpus.json")
         promoted_assertions_path = (
             work_dir / "stage_outputs" / "promote_assertions" / "promoted_assertions.json"
@@ -1192,6 +1332,15 @@ def _load_retrieval_bundle_stats(work_dir: Path) -> Dict[str, Any]:
             "promoted_assertions_sha256": (
                 sha256_file(promoted_assertions_path) if promoted_assertions_path.exists() else ""
             ),
+            "selected_release_assembly_sha256": str(
+                selected_contract.get("manifest_sha256") or ""
+            ).strip().lower(),
+            "selected_release_binding_sha256": str(
+                selected_contract.get("assembly_sha256") or ""
+            ).strip().lower(),
+            "page_graph_navigation_catalog_sha256": str(
+                selected_contract.get("navigation_catalog_sha256") or ""
+            ).strip().lower(),
         }
     return {}
 
@@ -1244,6 +1393,22 @@ def _verify_upload_artifact_binding(
     ):
         errors.append("Uploaded promoted assertions hash does not match the release sidecar")
 
+    selected = _is_selected_vector_manifest(vector_manifest)
+    selected_hashes: List[str] = []
+    if selected:
+        for key, label in (
+            ("selected_release_assembly_sha256", "selected release assembly"),
+            ("selected_release_binding_sha256", "selected release binding"),
+            ("page_graph_navigation_catalog_sha256", "Page Graph navigation catalog"),
+        ):
+            expected = str(vector_manifest.get(key) or "").strip().lower()
+            actual = str(retrieval_bundle_stats.get(key) or "").strip().lower()
+            if not expected:
+                errors.append(f"Vector manifest is missing {key}")
+            elif expected != actual:
+                errors.append(f"Uploaded {label} hash does not match the retrieval bundle contract")
+            selected_hashes.append(expected)
+
     graph_backend = str(graph_manifest.get("store_backend") or "").strip()
     if graph_backend == "disabled":
         return errors
@@ -1285,13 +1450,16 @@ def _verify_upload_artifact_binding(
 
     expected_upload_input_sha = str(vector_manifest.get("upload_input_sha256") or "").strip()
     if expected_bundle_sha and expected_graph_sha:
-        actual_upload_input_sha = combine_sha256_digests(
+        upload_digests = [
             expected_bundle_sha,
             expected_lexical_sha,
             expected_promoted_assertions_sha,
             expected_graph_sha,
             expected_index_sha,
-        )
+        ]
+        if selected:
+            upload_digests.extend(selected_hashes)
+        actual_upload_input_sha = combine_sha256_digests(*upload_digests)
         if require_current_contract and not expected_upload_input_sha:
             errors.append("Vector manifest is missing upload_input_sha256")
         elif expected_upload_input_sha and expected_upload_input_sha != actual_upload_input_sha:
@@ -1433,7 +1601,15 @@ def build_release_manifest(
         config=retrieval_contract_config,
     )
     retrieval_bundle_stats = _load_retrieval_bundle_stats(work_path)
-    bundle_errors = _verify_retrieval_bundle_stats(retrieval_bundle_stats)
+    selected_profile = (
+        config.get("selected_profile")
+        if isinstance(config.get("selected_profile"), Mapping)
+        else {}
+    )
+    bundle_errors = _verify_retrieval_bundle_stats(
+        retrieval_bundle_stats,
+        selected_profile=bool(str(selected_profile.get("variant_id") or "").strip()),
+    )
     embedder_config = config.get("embedder") if isinstance(config.get("embedder"), Mapping) else {}
     vector_errors.extend(
         _verify_vector_manifest(
@@ -1610,6 +1786,7 @@ def build_release_manifest(
                     judge_model=judge_model,
                     judge_timeout_seconds=judge_timeout_seconds,
                     allow_openai_judge_fallback=not canonical_production,
+                    parallelism=max(1, int(parallelism or 1)),
                     progress_callback=progress_callback,
                 )
                 if not bool((answer_report.get("gates") or {}).get("passed")):
@@ -1711,6 +1888,10 @@ def build_release_manifest(
             "warning_count": len(audit.warnings),
         },
         "vector_index": {
+            "provider": vector_manifest.get("provider", "pinecone"),
+            "production_indexing_contract_fingerprint": vector_manifest.get(
+                "production_indexing_contract_fingerprint", ""
+            ),
             "manifest_file": str(vector_manifest_path),
             "manifest_schema_version": vector_manifest.get("schema_version", 0),
             "indexing_build": vector_manifest.get("indexing_build") or {},
@@ -1730,6 +1911,15 @@ def build_release_manifest(
             "knowledge_graph_kind": vector_manifest.get("knowledge_graph_kind", ""),
             "knowledge_graph_sha256": vector_manifest.get("knowledge_graph_sha256", ""),
             "knowledge_graph_index_sha256": vector_manifest.get("knowledge_graph_index_sha256", ""),
+            "selected_release_assembly_sha256": vector_manifest.get(
+                "selected_release_assembly_sha256", ""
+            ),
+            "selected_release_binding_sha256": vector_manifest.get(
+                "selected_release_binding_sha256", ""
+            ),
+            "page_graph_navigation_catalog_sha256": vector_manifest.get(
+                "page_graph_navigation_catalog_sha256", ""
+            ),
             "upload_input_sha256": vector_manifest.get("upload_input_sha256", ""),
             "expected_uploads": _vector_expected_counts_for_manifest(
                 vector_manifest,
@@ -1988,13 +2178,19 @@ def promote_release_manifest(
             integrity_errors.append("production vector manifest indexing build digest mismatch")
         if _count(vector_payload.get("manifest_schema_version")) < 4:
             integrity_errors.append("production vector manifest schema_version must be 4 or newer")
+        promotion_selected = _is_selected_vector_manifest(vector_payload)
+        if promotion_selected and _count(vector_payload.get("manifest_schema_version")) < 6:
+            integrity_errors.append(
+                "selected production vector manifest schema_version must be 6 or newer"
+            )
         if str(vector_payload.get("namespace_strategy") or "").strip().lower() != "release":
             integrity_errors.append("production vector namespaces are not release-scoped")
         if str(vector_payload.get("namespace_release_id") or "").strip() != run_id:
             integrity_errors.append("production vector namespace release ID does not match run_id")
         namespaces = vector_payload.get("namespaces") if isinstance(vector_payload.get("namespaces"), Mapping) else {}
+        promotion_namespace_keys = _vector_namespace_keys(vector_payload)
         missing_namespaces = [
-            key for key in _MODERN_VECTOR_NAMESPACE_KEYS if not str(namespaces.get(key) or "").strip()
+            key for key in promotion_namespace_keys if not str(namespaces.get(key) or "").strip()
         ]
         if missing_namespaces:
             integrity_errors.append(f"production vector namespaces are incomplete: {missing_namespaces}")
@@ -2005,6 +2201,10 @@ def promote_release_manifest(
             integrity_errors.append("production vector upload manifest file is missing or invalid")
         else:
             vector_field_checks = {
+                "provider": vector_payload.get("provider"),
+                "production_indexing_contract_fingerprint": vector_payload.get(
+                    "production_indexing_contract_fingerprint"
+                ),
                 "index_name": vector_payload.get("index_name"),
                 "sparse_index_name": vector_payload.get("sparse_index_name"),
                 "namespace_strategy": vector_payload.get("namespace_strategy"),
@@ -2015,6 +2215,15 @@ def promote_release_manifest(
                 "knowledge_graph_kind": vector_payload.get("knowledge_graph_kind"),
                 "knowledge_graph_sha256": vector_payload.get("knowledge_graph_sha256"),
                 "knowledge_graph_index_sha256": vector_payload.get("knowledge_graph_index_sha256"),
+                "selected_release_assembly_sha256": vector_payload.get(
+                    "selected_release_assembly_sha256"
+                ),
+                "selected_release_binding_sha256": vector_payload.get(
+                    "selected_release_binding_sha256"
+                ),
+                "page_graph_navigation_catalog_sha256": vector_payload.get(
+                    "page_graph_navigation_catalog_sha256"
+                ),
                 "upload_input_sha256": vector_payload.get("upload_input_sha256"),
             }
             for key, release_value in vector_field_checks.items():
@@ -2024,6 +2233,12 @@ def promote_release_manifest(
                     )
             if dict(vector_manifest.get("namespaces") or {}) != dict(namespaces):
                 integrity_errors.append("release vector namespaces do not match the upload manifest file")
+            if dict(vector_manifest.get("uploaded") or {}) != dict(
+                vector_payload.get("uploaded") or {}
+            ):
+                integrity_errors.append(
+                    "release vector uploaded counts do not match the upload manifest file"
+                )
 
         bundle_payload = payload.get("retrieval_bundle") if isinstance(payload.get("retrieval_bundle"), Mapping) else {}
         bundle_file = Path(str(bundle_payload.get("retrieval_bundle_file") or "")).expanduser()
@@ -2063,9 +2278,181 @@ def promote_release_manifest(
                 "production vector manifest is not bound to the promoted assertions"
             )
 
+        selected_release_hashes: List[str] = []
+        if promotion_selected:
+            assembly_path = (
+                manifest_work_dir
+                / "stage_outputs"
+                / "assemble_selected_release"
+                / "selected_release_assembly.json"
+            )
+            assembly_payload = load_json_safe(assembly_path, None)
+            if not isinstance(assembly_payload, Mapping):
+                integrity_errors.append("production selected release assembly is missing or invalid")
+            else:
+                from pipeline.core.release_assembly import (
+                    SELECTED_DENSE_RECORD_KINDS,
+                    SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
+                    SELECTED_RELEASE_BINDING_ORDER,
+                    SELECTED_RELEASE_SOURCE_HASH_KEYS,
+                    SelectedReleaseAssemblyError,
+                    selected_release_file_path,
+                )
+
+                assembly_manifest_sha = sha256_file(assembly_path)
+                assembly_binding_sha = str(
+                    assembly_payload.get("assembly_sha256") or ""
+                ).strip().lower()
+                if str(assembly_payload.get("schema_version") or "") != SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION:
+                    integrity_errors.append("production selected release assembly schema is unsupported")
+                if str(assembly_payload.get("status") or "") != "ready_for_embedding":
+                    integrity_errors.append("production selected release assembly is not ready")
+                selected_profile = (
+                    current_runtime_config.get("selected_profile")
+                    if isinstance(current_runtime_config.get("selected_profile"), Mapping)
+                    else {}
+                )
+                if str(assembly_payload.get("variant_id") or "") != str(
+                    selected_profile.get("variant_id") or ""
+                ):
+                    integrity_errors.append(
+                        "production selected release assembly variant does not match config"
+                    )
+                if tuple(assembly_payload.get("record_kinds") or ()) != SELECTED_DENSE_RECORD_KINDS:
+                    integrity_errors.append(
+                        "production selected release assembly record kinds drifted"
+                    )
+                if tuple(assembly_payload.get("binding_order") or ()) != SELECTED_RELEASE_BINDING_ORDER:
+                    integrity_errors.append(
+                        "production selected release assembly binding order drifted"
+                    )
+                if assembly_payload.get("embedding_performed") is not False or assembly_payload.get(
+                    "upload_performed"
+                ) is not False:
+                    integrity_errors.append(
+                        "production selected release assembly is not an immutable pre-embedding artifact"
+                    )
+
+                assembly_files = (
+                    assembly_payload.get("files")
+                    if isinstance(assembly_payload.get("files"), Mapping)
+                    else {}
+                )
+                if set(assembly_files) != set(SELECTED_RELEASE_BINDING_ORDER):
+                    integrity_errors.append(
+                        "production selected release assembly file set drifted"
+                    )
+                resolved_assembly_files: Dict[str, Path] = {}
+                assembly_file_hashes: List[str] = []
+                for file_key in SELECTED_RELEASE_BINDING_ORDER:
+                    try:
+                        resolved_file = selected_release_file_path(
+                            assembly_payload,
+                            assembly_path,
+                            file_key,
+                        )
+                    except SelectedReleaseAssemblyError as exc:
+                        integrity_errors.append(str(exc))
+                    else:
+                        resolved_assembly_files[file_key] = resolved_file
+                        assembly_file_hashes.append(sha256_file(resolved_file))
+                if len(set(resolved_assembly_files.values())) != len(
+                    resolved_assembly_files
+                ):
+                    integrity_errors.append(
+                        "production selected release assembly files do not resolve uniquely"
+                    )
+
+                source = (
+                    assembly_payload.get("source")
+                    if isinstance(assembly_payload.get("source"), Mapping)
+                    else {}
+                )
+                source_hashes = [
+                    str(source.get(key) or "").strip().lower()
+                    for key in SELECTED_RELEASE_SOURCE_HASH_KEYS
+                ]
+                if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in source_hashes):
+                    integrity_errors.append(
+                        "production selected release assembly source hashes are incomplete"
+                    )
+                elif len(assembly_file_hashes) == len(SELECTED_RELEASE_BINDING_ORDER):
+                    computed_binding_sha = combine_sha256_digests(
+                        *source_hashes,
+                        *assembly_file_hashes,
+                    )
+                    if computed_binding_sha != assembly_binding_sha:
+                        integrity_errors.append(
+                            "production selected release assembly binding digest is invalid"
+                        )
+
+                navigation_path = resolved_assembly_files.get("navigation_catalog")
+                navigation_sha = sha256_file(navigation_path) if navigation_path else ""
+                dense_counts = (
+                    assembly_payload.get("dense_lane_counts")
+                    if isinstance(assembly_payload.get("dense_lane_counts"), Mapping)
+                    else {}
+                )
+                uploaded_counts = (
+                    vector_payload.get("uploaded")
+                    if isinstance(vector_payload.get("uploaded"), Mapping)
+                    else {}
+                )
+                for lane in ("chunks", "parents", "media", "page_cards", "actions"):
+                    expected_count = _count(dense_counts.get(lane))
+                    if expected_count <= 0 or _count(uploaded_counts.get(lane)) != expected_count:
+                        integrity_errors.append(
+                            f"production selected release count differs for {lane}"
+                        )
+                for lane in (
+                    "facts",
+                    "evidence_spans",
+                    "summaries",
+                    "assertions",
+                    "entities",
+                    "communities",
+                ):
+                    if _count(uploaded_counts.get(lane)) != 0:
+                        integrity_errors.append(
+                            f"production selected release contains unevaluated lane {lane}"
+                        )
+                coverage = (
+                    assembly_payload.get("coverage")
+                    if isinstance(assembly_payload.get("coverage"), Mapping)
+                    else {}
+                )
+                if coverage.get("all_candidate_chunks_mapped") is not True or coverage.get(
+                    "all_navigation_chunks_remapped"
+                ) is not True:
+                    integrity_errors.append(
+                        "production selected release assembly coverage is incomplete"
+                    )
+                selected_release_hashes = [
+                    assembly_manifest_sha,
+                    assembly_binding_sha,
+                    navigation_sha,
+                ]
+                for key, actual in zip(
+                    (
+                        "selected_release_assembly_sha256",
+                        "selected_release_binding_sha256",
+                        "page_graph_navigation_catalog_sha256",
+                    ),
+                    selected_release_hashes,
+                ):
+                    if str(vector_payload.get(key) or "").strip().lower() != actual:
+                        integrity_errors.append(
+                            f"production vector manifest is not bound to runtime {key}"
+                        )
+                    if str(bundle_payload.get(key) or "").strip().lower() != actual:
+                        integrity_errors.append(
+                            f"production retrieval bundle contract is not bound to runtime {key}"
+                        )
+
         graph_payload = payload.get("knowledge_graph") if isinstance(payload.get("knowledge_graph"), Mapping) else {}
         graph_backend = str(graph_payload.get("store_backend") or "").strip()
         graph_sha = str(graph_payload.get("knowledge_graph_sha256") or "").strip()
+        graph_index_sha = ""
         if graph_backend != "disabled":
             graph_file_value = (
                 graph_payload.get("manifest_file")
@@ -2129,6 +2516,22 @@ def promote_release_manifest(
                             f"actual={float(summary_quality['coverage_ratio']):.4f}, "
                             f"required={minimum_summary_coverage:.4f}"
                         )
+
+        upload_digests = [
+            bundle_sha,
+            lexical_sha,
+            promoted_assertions_sha,
+            graph_sha,
+            graph_index_sha,
+        ]
+        if promotion_selected:
+            upload_digests.extend(selected_release_hashes)
+        if all(upload_digests):
+            expected_upload_input_sha = combine_sha256_digests(*upload_digests)
+            if str(vector_payload.get("upload_input_sha256") or "").strip().lower() != expected_upload_input_sha:
+                integrity_errors.append(
+                    "production upload_input_sha256 does not bind the complete release assembly"
+                )
 
         integrity_errors.extend(
             _validate_promotion_attestation(

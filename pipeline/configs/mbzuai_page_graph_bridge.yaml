@@ -1,0 +1,25 @@
+# Clean the broad crawl graph and bridge it to Representation V2 IDs.
+# This pre-chunk run is intentionally allowed to stop at document/section/action
+# coverage. Re-run with chunk_index_file and require_chunk_index=true after the
+# chosen chunk representation is produced.
+
+project_name: "mbzuai_page_graph_bridge"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  page_graph_bridge:
+    source_representation_run_dir: "runs/mbzuai_representation_v2/mbzuai-representation-v2-20260821-v2"
+    source_corpus_run_dir: "runs/mbzuai_corpus_preparation/mbzuai-corpus-preparation-20260821-v4"
+    require_chunk_index: false
+
+stages:
+  - id: bridge_page_graph
+    type: formatter
+    plugin: page_graph_bridge

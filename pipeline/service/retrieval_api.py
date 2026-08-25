@@ -12,12 +12,13 @@ from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from pipeline.core.config import load_config
 from pipeline.retrieval import AdaptiveHybridRetriever
 
 
@@ -47,6 +48,13 @@ _PROVIDER_CREDENTIAL_PLACEHOLDER_MARKERS = (
 )
 
 
+class NavigationContextRequest(BaseModel):
+    intent: str = Field(default="none", min_length=1, max_length=40)
+    goal: str = Field(default="", max_length=500)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    source: str = Field(default="upstream_query_planner", max_length=80)
+
+
 class RetrieveRequest(BaseModel):
     query: str = Field(
         ...,
@@ -60,6 +68,21 @@ class RetrieveRequest(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
         description="Optional caller-supplied request identifier.",
+    )
+    skip_query_planner: bool = Field(
+        default=False,
+        description=(
+            "Skip the retriever LLM planner only when a trusted upstream "
+            "query-analysis stage already rewrote the retrieval query."
+        ),
+    )
+    navigation_context: NavigationContextRequest | None = Field(
+        default=None,
+        description=(
+            "Optional trusted upstream navigation intent. It may influence "
+            "selection, but URLs/actions are always resolved from the frozen "
+            "Page Graph catalog."
+        ),
     )
 
 
@@ -142,7 +165,7 @@ def _run_startup_probe(
     query: str,
     operation_timeout_seconds: float,
 ) -> Dict[str, Any]:
-    """Prove provider credentials and both remote release indexes are usable."""
+    """Prove embedding and vector providers can serve the exact frozen release."""
 
     manifest_path = work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json"
     try:
@@ -153,51 +176,113 @@ def _run_startup_probe(
         raise RuntimeError("startup probe vector upload manifest is invalid")
 
     vector = getattr(retriever, "vector", retriever)
-    dense_handle = vector._pinecone_index()
-    sparse_handle = vector._pinecone_sparse_index()
-    dense_counts = _namespace_counts(
-        dense_handle.describe_index_stats(timeout=operation_timeout_seconds)
-    )
-    sparse_counts = _namespace_counts(
-        sparse_handle.describe_index_stats(timeout=operation_timeout_seconds)
-    )
+    provider = str(
+        manifest.get("provider")
+        or getattr(vector, "vector_store_provider", "pinecone")
+        or "pinecone"
+    ).strip().lower()
     namespaces = manifest.get("namespaces") if isinstance(manifest.get("namespaces"), dict) else {}
     uploaded = manifest.get("uploaded") if isinstance(manifest.get("uploaded"), dict) else {}
     if not namespaces:
         raise RuntimeError("startup probe vector namespaces are missing")
-    for lane, namespace_value in namespaces.items():
-        namespace = str(namespace_value or "").strip()
-        expected_dense = int(uploaded.get(str(lane)) or 0)
-        expected_sparse = int(uploaded.get(f"sparse_{lane}") or 0)
-        if not namespace or expected_dense <= 0 or dense_counts.get(namespace) != expected_dense:
-            raise RuntimeError(f"startup probe dense namespace count mismatch for {lane}")
-        if expected_sparse <= 0 or sparse_counts.get(namespace) != expected_sparse:
-            raise RuntimeError(f"startup probe sparse namespace count mismatch for {lane}")
 
-    query_vector = list(vector.embed_query(query))
-    expected_dimension = int(getattr(vector, "output_dimensionality", 0) or 0)
-    if not query_vector or (expected_dimension and len(query_vector) != expected_dimension):
-        raise RuntimeError("startup probe embedding dimension mismatch")
-    chunk_namespace = str(namespaces.get("chunks") or "").strip()
-    dense_response = dense_handle.query(
-        vector=query_vector,
-        top_k=1,
-        namespace=chunk_namespace,
-        include_metadata=False,
-        include_values=False,
-        timeout=operation_timeout_seconds,
-    )
-    if not _response_items(dense_response):
-        raise RuntimeError("startup probe dense query returned no matches")
-    sparse_response = sparse_handle.search(
-        namespace=chunk_namespace,
-        top_k=1,
-        inputs={"text": query},
-        fields=[],
-        timeout=operation_timeout_seconds,
-    )
-    if not _response_items(sparse_response, nested=True):
-        raise RuntimeError("startup probe sparse query returned no hits")
+    if provider == "pgvector":
+        store = getattr(vector, "_pgvector_store", None)
+        if store is None:
+            raise RuntimeError("startup probe pgvector store is not initialized")
+        release_id = str(
+            manifest.get("namespace_release_id")
+            or getattr(vector, "vector_release_id", "")
+        ).strip()
+        expected_counts = {
+            str(namespace): int(uploaded.get(str(lane)) or 0)
+            for lane, namespace in namespaces.items()
+        }
+        health = store.health_check(
+            release_id=release_id,
+            expected_namespaces=expected_counts,
+            expected_model=str(manifest.get("model") or ""),
+            expected_contract_sha256=str(
+                manifest.get("production_indexing_contract_fingerprint") or ""
+            ),
+            expected_lane_counts={
+                str(lane): int(uploaded.get(str(lane)) or 0)
+                for lane in namespaces
+            },
+            expected_artifact_hashes={
+                key: str(manifest.get(key) or "")
+                for key in (
+                    "retrieval_bundle_sha256",
+                    "lexical_corpus_sha256",
+                    "promoted_assertions_sha256",
+                    "knowledge_graph_sha256",
+                    "knowledge_graph_index_sha256",
+                    "selected_release_assembly_sha256",
+                    "selected_release_binding_sha256",
+                    "page_graph_navigation_catalog_sha256",
+                    "upload_input_sha256",
+                )
+                if str(manifest.get(key) or "")
+            },
+        )
+        query_vector = list(vector.embed_query(query))
+        expected_dimension = int(getattr(vector, "output_dimensionality", 0) or 0)
+        if not query_vector or (expected_dimension and len(query_vector) != expected_dimension):
+            raise RuntimeError("startup probe embedding dimension mismatch")
+        chunk_namespace = str(namespaces.get("chunks") or "").strip()
+        if not store.query_ids(
+            release_id=release_id,
+            namespace=chunk_namespace,
+            vector=query_vector,
+            top_k=1,
+        ):
+            raise RuntimeError("startup probe pgvector query returned no matches")
+        dense_counts = dict(health.get("namespace_counts") or {})
+        sparse_counts: Dict[str, int] = {}
+    elif provider == "pinecone":
+        dense_handle = vector._pinecone_index()
+        sparse_handle = vector._pinecone_sparse_index()
+        dense_counts = _namespace_counts(
+            dense_handle.describe_index_stats(timeout=operation_timeout_seconds)
+        )
+        sparse_counts = _namespace_counts(
+            sparse_handle.describe_index_stats(timeout=operation_timeout_seconds)
+        )
+        for lane, namespace_value in namespaces.items():
+            namespace = str(namespace_value or "").strip()
+            expected_dense = int(uploaded.get(str(lane)) or 0)
+            expected_sparse = int(uploaded.get(f"sparse_{lane}") or 0)
+            if not namespace or expected_dense <= 0 or dense_counts.get(namespace) != expected_dense:
+                raise RuntimeError(f"startup probe dense namespace count mismatch for {lane}")
+            if expected_sparse <= 0 or sparse_counts.get(namespace) != expected_sparse:
+                raise RuntimeError(f"startup probe sparse namespace count mismatch for {lane}")
+
+        query_vector = list(vector.embed_query(query))
+        expected_dimension = int(getattr(vector, "output_dimensionality", 0) or 0)
+        if not query_vector or (expected_dimension and len(query_vector) != expected_dimension):
+            raise RuntimeError("startup probe embedding dimension mismatch")
+        chunk_namespace = str(namespaces.get("chunks") or "").strip()
+        dense_response = dense_handle.query(
+            vector=query_vector,
+            top_k=1,
+            namespace=chunk_namespace,
+            include_metadata=False,
+            include_values=False,
+            timeout=operation_timeout_seconds,
+        )
+        if not _response_items(dense_response):
+            raise RuntimeError("startup probe dense query returned no matches")
+        sparse_response = sparse_handle.search(
+            namespace=chunk_namespace,
+            top_k=1,
+            inputs={"text": query},
+            fields=[],
+            timeout=operation_timeout_seconds,
+        )
+        if not _response_items(sparse_response, nested=True):
+            raise RuntimeError("startup probe sparse query returned no hits")
+    else:
+        raise RuntimeError(f"startup probe vector provider is unsupported: {provider}")
 
     result = retriever.retrieve(query, query_vector=query_vector)
     if not isinstance(result, dict) or result.get("query_embedding_status") not in {None, "ok"}:
@@ -209,11 +294,14 @@ def _run_startup_probe(
     ]
     if result.get("abstained") is True or not evidence:
         raise RuntimeError("startup probe full retrieval returned no usable evidence")
-    return {
+    result_payload = {
         "dense_namespace_count": len(dense_counts),
         "sparse_namespace_count": len(sparse_counts),
         "evidence_count": len(evidence),
     }
+    if provider != "pinecone":
+        result_payload["provider"] = provider
+    return result_payload
 
 
 def _load_env_files() -> None:
@@ -252,6 +340,15 @@ def _health_payload(app: FastAPI) -> Dict[str, Any]:
         "knowledge_graph_index_sha256": getattr(app.state, "knowledge_graph_index_sha256", None),
         "lexical_corpus_sha256": getattr(app.state, "lexical_corpus_sha256", None),
         "promoted_assertions_sha256": getattr(app.state, "promoted_assertions_sha256", None),
+        "selected_release_assembly_sha256": getattr(
+            app.state, "selected_release_assembly_sha256", None
+        ),
+        "selected_release_binding_sha256": getattr(
+            app.state, "selected_release_binding_sha256", None
+        ),
+        "page_graph_navigation_catalog_sha256": getattr(
+            app.state, "page_graph_navigation_catalog_sha256", None
+        ),
         "answer_runtime_commit_sha": getattr(app.state, "answer_runtime_commit_sha", None),
         "indexing_build_commit_sha": getattr(app.state, "indexing_build_commit_sha", None),
         "startup_probe_required": bool(getattr(app.state, "startup_probe_required", False)),
@@ -271,15 +368,39 @@ def _health_payload(app: FastAPI) -> Dict[str, Any]:
     }
 
 
-def _normalize_cache_query(query: str) -> str:
-    return " ".join(str(query or "").strip().split()).casefold()
+def _normalize_cache_query(
+    query: str,
+    *,
+    skip_query_planner: bool = False,
+    navigation_context: Mapping[str, Any] | None = None,
+) -> str:
+    normalized_query = " ".join(str(query or "").strip().split()).casefold()
+    if not normalized_query:
+        return ""
+    navigation_key = json.dumps(
+        dict(navigation_context or {}), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+    )
+    return (
+        f"planner-skip={int(bool(skip_query_planner))}:"
+        f"navigation={navigation_key}:{normalized_query}"
+    )
 
 
-async def _get_cached_result(app: FastAPI, query: str) -> Dict[str, Any] | None:
+async def _get_cached_result(
+    app: FastAPI,
+    query: str,
+    *,
+    skip_query_planner: bool = False,
+    navigation_context: Mapping[str, Any] | None = None,
+) -> Dict[str, Any] | None:
     cache = getattr(app.state, "result_cache", None)
     if not cache:
         return None
-    cache_key = _normalize_cache_query(query)
+    cache_key = _normalize_cache_query(
+        query,
+        skip_query_planner=skip_query_planner,
+        navigation_context=navigation_context,
+    )
     if not cache_key:
         return None
     async with app.state.result_cache_lock:
@@ -295,12 +416,23 @@ async def _get_cached_result(app: FastAPI, query: str) -> Dict[str, Any] | None:
         return copy.deepcopy(payload)
 
 
-async def _cache_result(app: FastAPI, query: str, payload: Dict[str, Any]) -> None:
+async def _cache_result(
+    app: FastAPI,
+    query: str,
+    payload: Dict[str, Any],
+    *,
+    skip_query_planner: bool = False,
+    navigation_context: Mapping[str, Any] | None = None,
+) -> None:
     cache = getattr(app.state, "result_cache", None)
     max_size = int(getattr(app.state, "result_cache_max_size", 0) or 0)
     if cache is None or max_size <= 0:
         return
-    cache_key = _normalize_cache_query(query)
+    cache_key = _normalize_cache_query(
+        query,
+        skip_query_planner=skip_query_planner,
+        navigation_context=navigation_context,
+    )
     if not cache_key:
         return
     async with app.state.result_cache_lock:
@@ -338,14 +470,22 @@ def create_retrieval_service_app(
     if service_token and token_error:
         raise ValueError(f"RETRIEVAL_SERVICE_TOKEN {token_error}")
     if production_config:
-        provider_credentials = (
-            ("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY")),
+        runtime_config = load_config(config_name)
+        vector_store_cfg = (
+            runtime_config.get("vector_store")
+            if isinstance(runtime_config.get("vector_store"), Mapping)
+            else {}
+        )
+        vector_provider = str(vector_store_cfg.get("provider") or "pinecone").strip().lower()
+        provider_credentials = [
             ("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY")),
             (
                 "GOOGLE_API_KEY or GEMINI_API_KEY",
                 os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY"),
             ),
-        )
+        ]
+        if vector_provider == "pinecone":
+            provider_credentials.append(("PINECONE_API_KEY", os.getenv("PINECONE_API_KEY")))
         provider_errors = [
             f"{name} {error}"
             for name, value in provider_credentials
@@ -356,6 +496,10 @@ def create_retrieval_service_app(
                 "Production retriever has invalid provider credentials: "
                 + "; ".join(provider_errors)
             )
+        if vector_provider == "pgvector":
+            from pipeline.vectorstores.pgvector_store import PgVectorSettings
+
+            PgVectorSettings.from_config(runtime_config, purpose="read")
     startup_probe_required = production_config or _env_bool(
         "RETRIEVER_STARTUP_PROBE_REQUIRED",
         default=False,
@@ -416,6 +560,15 @@ def create_retrieval_service_app(
         app.state.knowledge_graph_index_sha256 = os.getenv("RETRIEVAL_KNOWLEDGE_GRAPH_INDEX_SHA256") or None
         app.state.lexical_corpus_sha256 = os.getenv("RETRIEVAL_LEXICAL_CORPUS_SHA256") or None
         app.state.promoted_assertions_sha256 = os.getenv("RETRIEVAL_PROMOTED_ASSERTIONS_SHA256") or None
+        app.state.selected_release_assembly_sha256 = os.getenv(
+            "RETRIEVAL_SELECTED_RELEASE_ASSEMBLY_SHA256"
+        ) or None
+        app.state.selected_release_binding_sha256 = os.getenv(
+            "RETRIEVAL_SELECTED_RELEASE_BINDING_SHA256"
+        ) or None
+        app.state.page_graph_navigation_catalog_sha256 = os.getenv(
+            "RETRIEVAL_PAGE_GRAPH_NAVIGATION_CATALOG_SHA256"
+        ) or None
         app.state.answer_runtime_commit_sha = os.getenv("RETRIEVAL_ANSWER_RUNTIME_COMMIT_SHA") or None
         app.state.indexing_build_commit_sha = os.getenv("RETRIEVAL_INDEXING_BUILD_COMMIT_SHA") or None
         app.state.startup_probe_required = startup_probe_required
@@ -573,7 +726,17 @@ def create_retrieval_service_app(
         semaphore = app.state.semaphore
         executor = app.state.executor
         app.state.request_count += 1
-        cached_result = await _get_cached_result(app, query)
+        navigation_context = (
+            payload.navigation_context.model_dump()
+            if payload.navigation_context is not None
+            else None
+        )
+        cached_result = await _get_cached_result(
+            app,
+            query,
+            skip_query_planner=payload.skip_query_planner,
+            navigation_context=navigation_context,
+        )
         if cached_result is not None:
             output = dict(cached_result or {})
             output["service_request_id"] = request_id
@@ -581,6 +744,10 @@ def create_retrieval_service_app(
             output["service_backend"] = "retrieval_service"
             output["service_config_name"] = app.state.config_name
             output["service_cache_hit"] = True
+            output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
+            output["service_navigation_context_forwarded"] = bool(
+                navigation_context
+            )
             return output
         try:
             await asyncio.wait_for(semaphore.acquire(), timeout=app.state.queue_timeout_seconds)
@@ -606,7 +773,15 @@ def create_retrieval_service_app(
 
         try:
             loop = asyncio.get_running_loop()
-            retrieval_future = loop.run_in_executor(executor, retriever.retrieve, query)
+            retrieval_options: Dict[str, Any] = {}
+            if payload.skip_query_planner:
+                retrieval_options["skip_query_planner"] = True
+            if navigation_context is not None:
+                retrieval_options["navigation_context"] = navigation_context
+            retrieval_future = loop.run_in_executor(
+                executor,
+                lambda: retriever.retrieve(query, **retrieval_options),
+            )
             app.state.inflight_futures.add(retrieval_future)
             retrieval_future.add_done_callback(app.state.inflight_futures.discard)
             result = await asyncio.wait_for(
@@ -638,12 +813,20 @@ def create_retrieval_service_app(
                 semaphore.release()
 
         output = dict(result or {})
-        await _cache_result(app, query, output)
+        await _cache_result(
+            app,
+            query,
+            output,
+            skip_query_planner=payload.skip_query_planner,
+            navigation_context=navigation_context,
+        )
         output["service_request_id"] = request_id
         output["service_latency_ms"] = round((time.perf_counter() - started_at) * 1000.0, 3)
         output["service_backend"] = "retrieval_service"
         output["service_config_name"] = app.state.config_name
         output["service_cache_hit"] = False
+        output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
+        output["service_navigation_context_forwarded"] = bool(navigation_context)
         return output
 
     return app

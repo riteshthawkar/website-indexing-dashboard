@@ -20,6 +20,7 @@ from pipeline.tests.test_deploy_startup_safety import (
     INDEXING_BUILD,
     SERVING_CONTRACT_FINGERPRINT,
     _make_required_artifacts,
+    _make_selected_required_artifacts,
     _manifest_payload,
     _write_json,
 )
@@ -167,6 +168,30 @@ def _make_active_release(root: Path) -> tuple[Path, Path]:
     return active_path, runs_root
 
 
+def _make_selected_active_release(root: Path) -> tuple[Path, Path]:
+    runs_root = root / "runs" / "mbzuai_main"
+    work_dir = runs_root / "run-1"
+    active_path = root / "mbzuai_main" / "active_release.json"
+    manifest_path = work_dir / "release" / "retrieval_release_manifest.json"
+    _make_selected_required_artifacts(work_dir)
+    _write_json(manifest_path, _manifest_payload(status="passed", work_dir=str(work_dir)))
+    _write_json(
+        active_path,
+        {
+            "schema_version": 1,
+            "status": "passed",
+            "run_id": "run-1",
+            "release_id": "release-1",
+            "production_indexing_contract_fingerprint": CONTRACT_FINGERPRINT,
+            "production_serving_contract_fingerprint": SERVING_CONTRACT_FINGERPRINT,
+            "answer_runtime_commit_sha": ANSWER_RUNTIME_COMMIT_SHA,
+            "indexing_build_commit_sha": INDEXING_BUILD["commit_sha"],
+            "active_release_manifest": str(manifest_path),
+        },
+    )
+    return active_path, runs_root
+
+
 def test_runtime_archive_is_deterministic_and_hydrates_safely(tmp_path: Path) -> None:
     source = tmp_path / "source"
     active_path, runs_root = _make_active_release(source)
@@ -286,6 +311,72 @@ def test_runtime_archive_is_deterministic_and_hydrates_safely(tmp_path: Path) ->
         assert "chunk-1" in routed.vector.lexical_map
     finally:
         routed.close()
+
+
+def test_selected_runtime_archive_carries_and_revalidates_full_assembly(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "source"
+    active_path, runs_root = _make_selected_active_release(source)
+    output = tmp_path / "selected-release.tar.gz"
+    build = subprocess.run(
+        [
+            sys.executable,
+            str(BUILDER),
+            "--active-release-file",
+            str(active_path),
+            "--runs-root",
+            str(runs_root),
+            "--output",
+            str(output),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert build.returncode == 0, build.stderr
+
+    stage_prefix = "runs/mbzuai_main/run-1/stage_outputs/assemble_selected_release/"
+    with tarfile.open(output, mode="r:gz") as archive:
+        names = set(archive.getnames())
+    expected_assembly_files = {
+        "selected_release_assembly.json",
+        "selected_dense_records.jsonl",
+        "chunk_dense_records.json",
+        "parent_dense_records.json",
+        "media_dense_records.json",
+        "page_card_dense_records.json",
+        "action_dense_records.json",
+        "selected_chunk_index.json",
+        "page_graph_navigation_catalog.json",
+        "chunk_id_bridge.json",
+    }
+    assert {name.removeprefix(stage_prefix) for name in names if name.startswith(stage_prefix)} == expected_assembly_files
+
+    target = tmp_path / "hydrated"
+    hydrate = _hydrate_from_local_archive(output, target=target)
+    assert hydrate.returncode == 0, hydrate.stderr
+    validate = subprocess.run(
+        [
+            sys.executable,
+            str(VALIDATOR),
+            "--active-release-file",
+            str(target / "mbzuai_main" / "active_release.json"),
+            "--runs-root",
+            str(target / "runs" / "mbzuai_main"),
+            "--storage-marker-file",
+            str(target / ".mbzuai-release-storage"),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert validate.returncode == 0, validate.stderr
+    payload = json.loads(validate.stdout)
+    assert payload["selected_release_binding_sha256"]
+    assert payload["page_graph_navigation_catalog_sha256"]
 
 
 def test_hydrator_rejects_path_traversal_archive(tmp_path: Path) -> None:

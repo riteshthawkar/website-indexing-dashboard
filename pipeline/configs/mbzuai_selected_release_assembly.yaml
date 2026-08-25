@@ -1,0 +1,37 @@
+_inherit: mbzuai_selected_index_prep.yaml
+
+# Offline, pre-embedding assembly of the exact controlled A/B winner.  This
+# profile performs no network calls, embeddings, database writes, or release
+# promotion.  Every input is pinned by SHA-256 and the output is fail-closed.
+project_name: "mbzuai_selected_release_assembly"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  selected_release_assembly:
+    checkpoint_run_dir: "runs/mbzuai_selected_index_prep/mbzuai-selected-index-prep-20260824-v3"
+    candidate_manifest_file: "runs/evaluation/mbzuai-multilingual-controlled-ab-v1/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "7ffb5d97597926a5a571d08092ac178b02cbbec7dab3cb554d423905a622b4fe"
+    candidate_records_file: "runs/evaluation/mbzuai-multilingual-controlled-ab-v1/candidates/c650/records.jsonl"
+    candidate_records_sha256: "cf52cef82bc3afa0c6a362199be9b3376b1f92eba78507e486aea71cca6eb395"
+    checkpoint_evidence:
+      pipeline_state_sha256: "1fdb164a84b758728588954bfa1d3794fc73d85a6e76c249b1cbbb736257f7eb"
+      artifact_catalog_sha256: "77e64d29c6cbb4550196fb2ba7af541a89c38e72b61a9b403d1f5e9dd613ec12"
+      run_audit_sha256: "395f8e6763dc9089f9a173fae3199088fba9a672149643edd3f8df933e608689"
+      resolved_config_sha256: "e9ec6d1503aee2084accf2f1c66b6e2ba88ed88d69834576fcc37d54a3d51b7a"
+      chunk_index_sha256: "ea1a371eefdb7eb3b41dc1983d70d5bc9ed0578e1f0c2f3359302101be6f27f9"
+      page_graph_bridge_sha256: "b1988f59e7653ff4545cd5e4673c808fb354fc057039de1155dbb803779b237a"
+      navigation_catalog_sha256: "164f379fcda6e503d918342f6cefc7eb175b600d86fa556317e1271c744a5c57"
+
+stages:
+  - id: verify_selected_profile
+    type: formatter
+    plugin: selected_profile_guard
+  - id: assemble_selected_release
+    type: formatter
+    plugin: selected_release_assembly
