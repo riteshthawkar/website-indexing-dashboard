@@ -260,6 +260,7 @@ def _normalize_assertions(slice_record: Dict[str, Any], payload: Dict[str, Any])
                 authority_class=authority_class,
                 authority_score_value=authority_value,
                 source_doc_id=slice_record.get("document_id") or "",
+                source_slice_id=slice_record.get("id") or "",
                 source_chunk_ids=slice_record.get("linked_chunk_ids") or [],
                 source_parent_ids=[],
                 source_url=slice_record.get("source_url") or "",
@@ -452,10 +453,21 @@ class OpenAIAssertionExtractFormatter(FormatterStage):
         candidate_assertions: List[Dict[str, Any]] = []
         quality_flags: Dict[str, List[str]] = {}
         for result in results:
+            slice_id = clean_text(result.get("slice_id"))
             candidate_entities.extend(result.get("entities") or [])
-            candidate_assertions.extend(result.get("assertions") or [])
+            normalized_assertions: List[Dict[str, Any]] = []
+            for assertion in result.get("assertions") or []:
+                if not isinstance(assertion, dict):
+                    continue
+                assertion_payload = dict(assertion)
+                assertion_payload["source_slice_id"] = (
+                    clean_text(assertion_payload.get("source_slice_id")) or slice_id
+                )
+                normalized_assertions.append(assertion_payload)
+            result["assertions"] = normalized_assertions
+            candidate_assertions.extend(normalized_assertions)
             if result.get("quality_flags"):
-                quality_flags[clean_text(result.get("slice_id"))] = unique_strings(result.get("quality_flags") or [])
+                quality_flags[slice_id] = unique_strings(result.get("quality_flags") or [])
 
         results_file = ctx.stage_work_dir / "openai_assertion_extract_results.json"
         entities_file = ctx.stage_work_dir / "candidate_entities.json"

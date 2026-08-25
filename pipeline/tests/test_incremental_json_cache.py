@@ -14,6 +14,7 @@ from pipeline.stages.formatters.openai_assertion_extract_formatter import (
 )
 from pipeline.stages.formatters.openai_assertion_validate_formatter import (
     OpenAIAssertionValidateFormatter,
+    _group_assertions_by_slice,
 )
 
 
@@ -212,3 +213,52 @@ def test_assertion_stage_concurrency_is_bounded(
     )
 
     assert errors == [f"assertions.{config_key} must be between 1 and 32"]
+
+
+def test_assertion_grouping_prefers_exact_slice_and_indexes_chunk_fallback():
+    slices = [
+        {
+            "id": "slice-1",
+            "linked_chunk_ids": ["shared-chunk"],
+            "text": "First source text.",
+        },
+        {
+            "id": "slice-2",
+            "linked_chunk_ids": ["shared-chunk", "second-chunk"],
+            "text": "Second source text with the exact support span.",
+        },
+    ]
+    assertions = [
+        {
+            "id": "exact",
+            "source_slice_id": "slice-2",
+            "source_chunk_ids": ["shared-chunk"],
+        },
+        {
+            "id": "fallback",
+            "source_chunk_ids": ["shared-chunk"],
+            "support_span": "exact support span",
+        },
+    ]
+
+    slices_by_id, grouped, unmapped = _group_assertions_by_slice(
+        slices,
+        assertions,
+    )
+
+    assert set(slices_by_id) == {"slice-1", "slice-2"}
+    assert [item["id"] for item in grouped["slice-2"]] == [
+        "exact",
+        "fallback",
+    ]
+    assert unmapped == []
+
+
+def test_assertion_grouping_reports_unmapped_records():
+    _, grouped, unmapped = _group_assertions_by_slice(
+        [{"id": "slice-1", "linked_chunk_ids": ["chunk-1"], "text": "Text"}],
+        [{"id": "missing", "source_chunk_ids": ["unknown"]}],
+    )
+
+    assert grouped == {}
+    assert unmapped == ["missing"]

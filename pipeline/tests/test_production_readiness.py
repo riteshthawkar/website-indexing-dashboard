@@ -17450,6 +17450,10 @@ class TestOpenAIAssertionPipeline:
         )
         extract_result = run_async(OpenAIAssertionExtractFormatter().execute(extract_ctx))
         assert extract_result.status.value == "completed"
+        extracted_assertions = load_json_safe(
+            extract_result.outputs["candidate_assertions_file"]
+        )
+        assert extracted_assertions[0]["source_slice_id"] == "slice-1"
 
         monkeypatch.setattr(validate_mod, "make_openai_client", lambda: object())
         monkeypatch.setattr(

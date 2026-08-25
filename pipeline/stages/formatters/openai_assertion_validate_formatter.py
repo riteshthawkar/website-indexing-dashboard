@@ -186,6 +186,77 @@ def _validate_one(
     }
 
 
+def _group_assertions_by_slice(
+    slices: List[Dict[str, Any]],
+    assertions: List[Dict[str, Any]],
+) -> tuple[
+    Dict[str, Dict[str, Any]],
+    Dict[str, List[Dict[str, Any]]],
+    List[str],
+]:
+    """Map assertions to source slices in linear time.
+
+    New extraction records carry an exact ``source_slice_id``. The chunk index
+    is retained only for backward-compatible cache recovery.
+    """
+
+    slices_by_id: Dict[str, Dict[str, Any]] = {}
+    slice_ids_by_chunk: Dict[str, List[str]] = {}
+    for slice_record in slices:
+        if not isinstance(slice_record, dict):
+            continue
+        slice_id = clean_text(slice_record.get("id"))
+        if not slice_id:
+            continue
+        slices_by_id[slice_id] = slice_record
+        for chunk_id in unique_strings(slice_record.get("linked_chunk_ids") or []):
+            slice_ids_by_chunk.setdefault(chunk_id, []).append(slice_id)
+
+    assertions_by_slice: Dict[str, List[Dict[str, Any]]] = {}
+    unmapped_assertion_ids: List[str] = []
+    for index, assertion in enumerate(assertions):
+        if not isinstance(assertion, dict):
+            unmapped_assertion_ids.append(f"non-object:{index}")
+            continue
+
+        slice_id = clean_text(assertion.get("source_slice_id"))
+        if slice_id not in slices_by_id:
+            slice_id = ""
+
+        if not slice_id:
+            candidate_slice_ids: List[str] = []
+            seen_slice_ids = set()
+            for chunk_id in unique_strings(assertion.get("source_chunk_ids") or []):
+                for candidate_slice_id in slice_ids_by_chunk.get(chunk_id, []):
+                    if candidate_slice_id in seen_slice_ids:
+                        continue
+                    seen_slice_ids.add(candidate_slice_id)
+                    candidate_slice_ids.append(candidate_slice_id)
+
+            support_span = clean_text(
+                assertion.get("support_span") or assertion.get("evidence")
+            ).casefold()
+            if support_span:
+                for candidate_slice_id in candidate_slice_ids:
+                    source_text = clean_text(
+                        slices_by_id[candidate_slice_id].get("text")
+                    ).casefold()
+                    if support_span in source_text:
+                        slice_id = candidate_slice_id
+                        break
+            if not slice_id and candidate_slice_ids:
+                slice_id = candidate_slice_ids[0]
+
+        if not slice_id:
+            unmapped_assertion_ids.append(
+                clean_text(assertion.get("id")) or f"assertion:{index}"
+            )
+            continue
+        assertions_by_slice.setdefault(slice_id, []).append(assertion)
+
+    return slices_by_id, assertions_by_slice, unmapped_assertion_ids
+
+
 @register_stage
 class OpenAIAssertionValidateFormatter(FormatterStage):
     name = "openai_assertion_validate"
@@ -223,30 +294,15 @@ class OpenAIAssertionValidateFormatter(FormatterStage):
         if not isinstance(slices, list) or not isinstance(assertions, list):
             return StageResult.failure("Assertion validation inputs are invalid")
 
-        slices_by_id = {
-            clean_text(item.get("id")): item
-            for item in slices
-            if isinstance(item, dict) and clean_text(item.get("id"))
-        }
-        assertions_by_slice: Dict[str, List[Dict[str, Any]]] = {}
-        for assertion in assertions:
-            if not isinstance(assertion, dict):
-                continue
-            source_chunk_ids = unique_strings(assertion.get("source_chunk_ids") or [])
-            slice_id = ""
-            if source_chunk_ids:
-                for slice_record in slices:
-                    if not isinstance(slice_record, dict):
-                        continue
-                    slice_chunk_ids = set(unique_strings(slice_record.get("linked_chunk_ids") or []))
-                    if slice_chunk_ids & set(source_chunk_ids):
-                        slice_id = clean_text(slice_record.get("id"))
-                        break
-            if not slice_id:
-                slice_id = clean_text(assertion.get("source_slice_id"))
-            if not slice_id:
-                continue
-            assertions_by_slice.setdefault(slice_id, []).append(assertion)
+        slices_by_id, assertions_by_slice, unmapped_assertion_ids = (
+            _group_assertions_by_slice(slices, assertions)
+        )
+        if unmapped_assertion_ids:
+            examples = ", ".join(unmapped_assertion_ids[:5])
+            return StageResult.failure(
+                f"Unable to map {len(unmapped_assertion_ids)} candidate assertions "
+                f"to extraction slices; examples: {examples}"
+            )
 
         model = str(cfg.get("validate_model") or "gpt-5-nano")
         reasoning_effort = str(cfg.get("validate_reasoning_effort") or "minimal")
@@ -349,6 +405,9 @@ class OpenAIAssertionValidateFormatter(FormatterStage):
             metrics={
                 "validated_assertions": len(validated_assertions),
                 "rejected_assertions": len(rejected_assertions),
+                "validation_slices": len(assertions_by_slice),
+                "mapped_candidate_assertions": len(assertions),
+                "unmapped_candidate_assertions": 0,
             },
             artifacts=artifacts,
         )
