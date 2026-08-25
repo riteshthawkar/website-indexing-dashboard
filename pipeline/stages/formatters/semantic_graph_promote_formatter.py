@@ -168,6 +168,36 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                         )
                     )
 
+        active_assertion_ids: Set[str] = set()
+        duplicate_assertion_ids: Set[str] = set()
+        for assertion in canonical_assertions:
+            if not isinstance(assertion, dict) or not _active_validity_status(
+                assertion.get("validity_status")
+            ):
+                continue
+            assertion_id = str(assertion.get("id") or "").strip()
+            if not assertion_id:
+                continue
+            if assertion_id in active_assertion_ids:
+                duplicate_assertion_ids.add(assertion_id)
+            active_assertion_ids.add(assertion_id)
+
+        colliding_assertion_ids = active_assertion_ids & node_ids
+        if duplicate_assertion_ids or colliding_assertion_ids:
+            duplicate_examples = ", ".join(sorted(duplicate_assertion_ids)[:5])
+            collision_examples = ", ".join(sorted(colliding_assertion_ids)[:5])
+            details = [
+                f"duplicate_active_assertion_ids={len(duplicate_assertion_ids)}",
+                f"base_or_entity_id_collisions={len(colliding_assertion_ids)}",
+            ]
+            if duplicate_examples:
+                details.append(f"duplicate_examples={duplicate_examples}")
+            if collision_examples:
+                details.append(f"collision_examples={collision_examples}")
+            return StageResult.failure(
+                "Semantic graph assertion identities are invalid: " + "; ".join(details)
+            )
+
         for assertion in canonical_assertions:
             if not isinstance(assertion, dict):
                 continue
@@ -217,8 +247,12 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                         "source_span_ids": source_span_ids,
                         "source_fact_ids": assertion.get("source_fact_ids") or [],
                         "source_parent_ids": assertion.get("source_parent_ids") or [],
+                        "source_slice_ids": assertion.get("source_slice_ids") or [],
+                        "source_doc_ids": assertion.get("source_doc_ids") or [],
                         "source_url": assertion.get("source_url"),
+                        "source_urls": assertion.get("source_urls") or [],
                         "document_title": assertion.get("document_title"),
+                        "document_titles": assertion.get("document_titles") or [],
                     },
                 )
             )
@@ -317,6 +351,8 @@ class SemanticGraphPromoteFormatter(FormatterStage):
                 "promoted_graph_edges": promoted_bundle["stats"]["edge_count"],
                 "semantic_entity_nodes": promoted_bundle["stats"]["node_type_counts"].get("entity", 0),
                 "semantic_assertion_nodes": promoted_bundle["stats"]["node_type_counts"].get("relation_assertion", 0),
+                "duplicate_semantic_assertion_ids": 0,
+                "semantic_assertion_id_collisions": 0,
             },
             artifacts=artifacts,
         )

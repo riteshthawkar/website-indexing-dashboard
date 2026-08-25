@@ -4,7 +4,17 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List
 
-from pipeline.core.assertions import clean_text, coerce_confidence, normalize_answer_subtype, normalize_predicate, unique_strings
+from pipeline.core.assertions import (
+    assertion_text,
+    clean_text,
+    coerce_confidence,
+    normalize_answer_subtype,
+    normalize_entity_type,
+    normalize_predicate,
+    stable_assertion_id,
+    stable_entity_id,
+    unique_strings,
+)
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.incremental_json_cache import IncrementalJsonObjectCache
 from pipeline.core.io import atomic_write_json, load_json_safe
@@ -106,6 +116,72 @@ def _validation_prompt(slice_record: Dict[str, Any], assertions: List[Dict[str, 
     return "\n".join(lines).strip()
 
 
+def _normalize_validated_assertion(assertion: Dict[str, Any]) -> Dict[str, Any]:
+    """Refresh semantic identity after validator-normalized fields change.
+
+    Validation cache entries can predate identity fixes, so this function is
+    intentionally applied to both fresh and cached results before artifacts are
+    written. The source-bound ID is distinct from the later canonical semantic
+    ID, which merges equivalent assertions across source slices.
+    """
+
+    predicate = normalize_predicate(
+        assertion.get("predicate")
+        or assertion.get("relation_type")
+        or assertion.get("answer_type")
+    )
+    answer_type = normalize_predicate(assertion.get("answer_type") or predicate)
+    subject_name = clean_text(assertion.get("subject_name"))
+    object_value = clean_text(
+        assertion.get("object_value") or assertion.get("object_name")
+    )
+    answer_subtype = normalize_answer_subtype(
+        answer_type,
+        assertion.get("answer_subtype"),
+        object_value,
+    )
+    subject_type = normalize_entity_type(
+        assertion.get("subject_type") or "organization"
+    )
+    object_type = normalize_entity_type(assertion.get("object_type") or "other")
+    subject_entity_id = stable_entity_id(subject_type, subject_name)
+    object_entity_id = stable_entity_id(object_type, object_value)
+
+    return {
+        **assertion,
+        "id": stable_assertion_id(
+            subject_name,
+            predicate,
+            answer_subtype,
+            object_value,
+            clean_text(assertion.get("source_url")),
+            clean_text(assertion.get("source_doc_id")),
+        ),
+        "subject_name": subject_name,
+        "subject_type": subject_type,
+        "subject_entity_id": subject_entity_id,
+        "predicate": predicate,
+        "relation_type": predicate,
+        "answer_type": answer_type,
+        "answer_subtype": answer_subtype,
+        "object_name": object_value,
+        "object_value": object_value,
+        "object_type": object_type,
+        "object_entity_id": object_entity_id,
+        "canonical_subject": subject_entity_id,
+        "canonical_predicate": predicate,
+        "canonical_object": object_value.casefold(),
+        "text": assertion_text(
+            subject_name=subject_name,
+            predicate=predicate,
+            object_value=object_value,
+            answer_type=answer_type,
+            answer_subtype=answer_subtype,
+            qualifiers=assertion.get("qualifiers") or [],
+        ),
+    }
+
+
 def _validate_one(
     *,
     slice_record: Dict[str, Any],
@@ -152,7 +228,7 @@ def _validate_one(
         normalized_object = clean_text(
             decision_payload.get("normalized_object") or assertion.get("object_value") or assertion.get("object_name")
         )
-        assertion_copy = {
+        assertion_copy = _normalize_validated_assertion({
             **assertion,
             "predicate": normalized_predicate,
             "relation_type": normalized_predicate,
@@ -172,7 +248,7 @@ def _validate_one(
             "validator_confidence": coerce_confidence(decision_payload.get("confidence"), default=0.0),
             "validator_decision": decision,
             "validator_reason": clean_text(decision_payload.get("reason")),
-        }
+        })
         if decision == "supported":
             validated.append(assertion_copy)
         else:
@@ -370,8 +446,20 @@ class OpenAIAssertionValidateFormatter(FormatterStage):
         validated_assertions: List[Dict[str, Any]] = []
         rejected_assertions: List[Dict[str, Any]] = []
         for result in results:
-            validated_assertions.extend(result.get("validated_assertions") or [])
-            rejected_assertions.extend(result.get("rejected_assertions") or [])
+            normalized_validated = [
+                _normalize_validated_assertion(assertion)
+                for assertion in (result.get("validated_assertions") or [])
+                if isinstance(assertion, dict)
+            ]
+            normalized_rejected = [
+                _normalize_validated_assertion(assertion)
+                for assertion in (result.get("rejected_assertions") or [])
+                if isinstance(assertion, dict)
+            ]
+            result["validated_assertions"] = normalized_validated
+            result["rejected_assertions"] = normalized_rejected
+            validated_assertions.extend(normalized_validated)
+            rejected_assertions.extend(normalized_rejected)
 
         results_file = ctx.stage_work_dir / "openai_assertion_validate_results.json"
         validated_file = ctx.stage_work_dir / "validated_assertions.json"

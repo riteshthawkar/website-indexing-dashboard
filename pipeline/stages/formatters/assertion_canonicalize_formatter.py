@@ -5,12 +5,15 @@ from typing import Any, Dict, List, Tuple
 
 from pipeline.core.assertions import (
     aggregate_assertion_metrics,
+    assertion_text,
     build_entity_records_from_assertions,
     clean_text,
     coerce_confidence,
     merge_entity_records,
+    normalize_answer_subtype,
     normalize_entity_type,
     normalize_predicate,
+    stable_assertion_id,
     stable_entity_id,
     unique_strings,
 )
@@ -21,6 +24,36 @@ from pipeline.core.registry import register_stage
 
 def _entity_key(entity_type: str, canonical_name: str) -> Tuple[str, str]:
     return (normalize_entity_type(entity_type), clean_text(canonical_name).casefold())
+
+
+def _provenance_values(
+    assertion: Dict[str, Any],
+    plural_field: str,
+    scalar_field: str = "",
+) -> List[str]:
+    raw_values = assertion.get(plural_field) or []
+    if isinstance(raw_values, (str, bytes)):
+        values: List[Any] = [raw_values]
+    elif isinstance(raw_values, (list, tuple, set)):
+        values = list(raw_values)
+    else:
+        values = [raw_values]
+    if scalar_field:
+        values.append(assertion.get(scalar_field))
+    return unique_strings(values)
+
+
+_PROVENANCE_FIELDS = {
+    "source_slice_ids": "source_slice_id",
+    "source_doc_ids": "source_doc_id",
+    "source_chunk_ids": "",
+    "source_parent_ids": "",
+    "source_fact_ids": "",
+    "source_span_ids": "",
+    "source_urls": "source_url",
+    "source_markdown_paths": "source_markdown_path",
+    "document_titles": "document_title",
+}
 
 
 @register_stage
@@ -106,12 +139,21 @@ class AssertionCanonicalizeFormatter(FormatterStage):
         for assertion in validated_assertions:
             if not isinstance(assertion, dict):
                 continue
-            predicate = normalize_predicate(assertion.get("predicate") or assertion.get("answer_type"))
-            subtype = clean_text(assertion.get("answer_subtype")).lower().replace(" ", "_")
+            predicate = normalize_predicate(
+                assertion.get("predicate")
+                or assertion.get("relation_type")
+                or assertion.get("answer_type")
+            )
+            answer_type = normalize_predicate(assertion.get("answer_type") or predicate)
             subject_name = clean_text(assertion.get("subject_name"))
             object_name = clean_text(assertion.get("object_value") or assertion.get("object_name"))
             if not subject_name or not object_name or not predicate:
                 continue
+            subtype = normalize_answer_subtype(
+                answer_type,
+                assertion.get("answer_subtype"),
+                object_name,
+            )
             subject_type = assertion.get("subject_type") or "organization"
             object_type = assertion.get("object_type") or "other"
             subject_entity_id = _canonical_entity_id(
@@ -125,35 +167,47 @@ class AssertionCanonicalizeFormatter(FormatterStage):
                 object_name,
             )
             key = (subject_entity_id, predicate, subtype, object_entity_id)
+            canonical_id = stable_assertion_id(
+                "canonical-v2",
+                subject_entity_id,
+                predicate,
+                subtype,
+                object_entity_id,
+            )
             payload = {
                 **assertion,
+                "id": canonical_id,
                 "predicate": predicate,
                 "relation_type": predicate,
-                "answer_type": normalize_predicate(assertion.get("answer_type") or predicate),
+                "answer_type": answer_type,
                 "answer_subtype": subtype,
                 "subject_name": subject_name,
                 "object_name": object_name,
                 "object_value": object_name,
                 "subject_entity_id": subject_entity_id,
                 "object_entity_id": object_entity_id,
-                "source_chunk_ids": unique_strings(assertion.get("source_chunk_ids") or []),
-                "source_parent_ids": unique_strings(assertion.get("source_parent_ids") or []),
-                "source_fact_ids": unique_strings(assertion.get("source_fact_ids") or []),
+                "canonical_subject": subject_entity_id,
+                "canonical_predicate": predicate,
+                "canonical_object": object_name.casefold(),
                 "qualifiers": unique_strings(assertion.get("qualifiers") or []),
             }
+            for plural_field, scalar_field in _PROVENANCE_FIELDS.items():
+                payload[plural_field] = _provenance_values(
+                    assertion,
+                    plural_field,
+                    scalar_field,
+                )
             current = merged_assertions.get(key)
             if current is None:
                 merged_assertions[key] = payload
                 continue
-            current["source_chunk_ids"] = unique_strings(
-                [*(current.get("source_chunk_ids") or []), *(payload.get("source_chunk_ids") or [])]
-            )
-            current["source_parent_ids"] = unique_strings(
-                [*(current.get("source_parent_ids") or []), *(payload.get("source_parent_ids") or [])]
-            )
-            current["source_fact_ids"] = unique_strings(
-                [*(current.get("source_fact_ids") or []), *(payload.get("source_fact_ids") or [])]
-            )
+            for plural_field in _PROVENANCE_FIELDS:
+                current[plural_field] = unique_strings(
+                    [
+                        *(current.get(plural_field) or []),
+                        *(payload.get(plural_field) or []),
+                    ]
+                )
             current["qualifiers"] = unique_strings([*(current.get("qualifiers") or []), *(payload.get("qualifiers") or [])])
             current["confidence"] = max(
                 coerce_confidence(current.get("confidence"), default=0.0),
@@ -174,6 +228,25 @@ class AssertionCanonicalizeFormatter(FormatterStage):
             if not current.get("support_span") and payload.get("support_span"):
                 current["support_span"] = payload["support_span"]
                 current["evidence"] = payload.get("evidence")
+
+        canonical_ids = [
+            clean_text(assertion.get("id"))
+            for assertion in merged_assertions.values()
+        ]
+        if len(canonical_ids) != len(set(canonical_ids)):
+            return StageResult.failure(
+                "Canonical assertion identity collision detected; semantic graph output is unsafe"
+            )
+
+        for assertion in merged_assertions.values():
+            assertion["text"] = assertion_text(
+                subject_name=assertion.get("subject_name"),
+                predicate=assertion.get("predicate"),
+                object_value=assertion.get("object_value"),
+                answer_type=assertion.get("answer_type"),
+                answer_subtype=assertion.get("answer_subtype"),
+                qualifiers=assertion.get("qualifiers") or [],
+            )
 
         canonical_assertions = sorted(
             merged_assertions.values(),

@@ -11,10 +11,11 @@ from pipeline.core.registry import register_stage
 
 def _canonicalized_assertion(assertion: Dict[str, Any]) -> Dict[str, Any]:
     predicate = normalize_predicate(
-        assertion.get("answer_type")
-        or assertion.get("predicate")
+        assertion.get("predicate")
         or assertion.get("relation_type")
+        or assertion.get("answer_type")
     )
+    answer_type = normalize_predicate(assertion.get("answer_type") or predicate)
     answer_subtype = clean_text(assertion.get("answer_subtype")).lower().replace(" ", "_")
     subject = clean_text(assertion.get("subject_entity_id")) or clean_text(assertion.get("subject_name")).casefold()
     obj = clean_text(assertion.get("object_value") or assertion.get("object_name")).casefold()
@@ -26,12 +27,14 @@ def _canonicalized_assertion(assertion: Dict[str, Any]) -> Dict[str, Any]:
     )
     return {
         **assertion,
-        "canonical_subject": clean_text(assertion.get("canonical_subject") or subject),
-        "canonical_predicate": clean_text(assertion.get("canonical_predicate") or predicate),
-        "canonical_object": clean_text(assertion.get("canonical_object") or obj),
+        "predicate": predicate,
+        "relation_type": predicate,
+        "canonical_subject": subject,
+        "canonical_predicate": predicate,
+        "canonical_object": obj,
         "source_last_seen": source_last_seen,
         "validity_status": clean_text(assertion.get("validity_status") or "active").lower(),
-        "answer_type": clean_text(assertion.get("answer_type") or predicate),
+        "answer_type": answer_type,
         "answer_subtype": answer_subtype,
     }
 
@@ -165,6 +168,26 @@ class AssertionPromoteFormatter(FormatterStage):
         )
         quarantined_assertions.extend(conflict_quarantine)
 
+        promoted_ids: Set[str] = set()
+        duplicate_promoted_ids: Set[str] = set()
+        missing_promoted_ids = 0
+        for assertion in promoted_assertions:
+            assertion_id = clean_text(assertion.get("id"))
+            if not assertion_id:
+                missing_promoted_ids += 1
+                continue
+            if assertion_id in promoted_ids:
+                duplicate_promoted_ids.add(assertion_id)
+            promoted_ids.add(assertion_id)
+        if missing_promoted_ids or duplicate_promoted_ids:
+            examples = ", ".join(sorted(duplicate_promoted_ids)[:5])
+            return StageResult.failure(
+                "Promoted assertion identities are invalid: "
+                f"missing={missing_promoted_ids}, "
+                f"duplicate_ids={len(duplicate_promoted_ids)}"
+                + (f"; examples: {examples}" if examples else "")
+            )
+
         for assertion in promoted_assertions:
             if clean_text(assertion.get("validity_status") or "active").lower() not in {"active", "valid"}:
                 continue
@@ -239,6 +262,7 @@ class AssertionPromoteFormatter(FormatterStage):
                 "assertions_superseded": superseded_count,
                 "assertions_quarantined_by_conflict": len(conflict_quarantine),
                 "quarantined_assertions": len(quarantined_assertions),
+                "duplicate_promoted_assertion_ids": 0,
             },
             artifacts=artifacts,
         )
