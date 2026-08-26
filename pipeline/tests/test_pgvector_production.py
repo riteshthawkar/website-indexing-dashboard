@@ -205,6 +205,62 @@ def test_pgvector_upsert_uses_psycopg_cursor_executemany() -> None:
     assert len(executed_batches[0][1]) == 2
 
 
+def test_pgvector_query_casts_list_parameters_to_vector() -> None:
+    executed_queries = []
+
+    class Result:
+        def __init__(self, rows=None):
+            self.rows = list(rows or [])
+
+        def fetchall(self):
+            return self.rows
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    class Connection:
+        @staticmethod
+        def transaction():
+            return Transaction()
+
+        @staticmethod
+        def execute(query, _parameters=None):
+            executed_queries.append(query)
+            if isinstance(query, str):
+                return Result()
+            return Result([{"record_id": "chunk-1", "score": 0.75}])
+
+    class Pool:
+        @contextmanager
+        def connection(self, **_kwargs):
+            yield Connection()
+
+    store = object.__new__(PgVectorStore)
+    store.settings = PgVectorSettings(
+        dsn="postgresql://unused?sslmode=require",
+        dimensions=3,
+        require_active_release=False,
+    )
+    store._pool = Pool()
+    store._sql = sql
+
+    matches = store.query(
+        release_id="release-1",
+        namespace="chunks--release-1",
+        vector=[1, 2, 3],
+        top_k=5,
+    )
+
+    vector_query = next(query for query in executed_queries if not isinstance(query, str))
+    rendered = vector_query.as_string(None)
+    assert rendered.count("%s::vector") == 2
+    assert [(match.record_id, match.score) for match in matches] == [("chunk-1", 0.75)]
+
+
 def test_adaptive_dense_lane_dispatches_to_pgvector() -> None:
     calls = []
 

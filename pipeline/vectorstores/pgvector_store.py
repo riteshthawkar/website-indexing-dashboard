@@ -509,11 +509,11 @@ class PgVectorStore:
         )
         query = self._sql.SQL(
             """
-            SELECT e.record_id, (1 - (e.embedding <=> %s))::double precision AS score
+            SELECT e.record_id, (1 - (e.embedding <=> %s::vector))::double precision AS score
             FROM {} AS e
             JOIN {} AS r ON r.release_id = e.release_id
             WHERE e.release_id = %s AND e.namespace = %s {}
-            ORDER BY e.embedding <=> %s
+            ORDER BY e.embedding <=> %s::vector
             LIMIT %s
             """
         ).format(
