@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from psycopg import sql
 
 from pipeline.core.config import load_config
 from pipeline.retrieval.adaptive_hybrid import (
@@ -125,6 +127,82 @@ def test_pgvector_vector_validation_is_dimensioned_and_finite() -> None:
         store._normalize_vector([0, 0, 0])
     with pytest.raises(ValueError, match="non-finite"):
         store._normalize_vector([1, float("nan"), 2])
+
+
+def test_pgvector_upsert_uses_psycopg_cursor_executemany() -> None:
+    executed_batches = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return None
+
+        def executemany(self, query, values):
+            executed_batches.append((query, list(values)))
+
+    class Result:
+        @staticmethod
+        def fetchone():
+            return {"status": "building"}
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback):
+            return None
+
+    class Connection:
+        @staticmethod
+        def transaction():
+            return Transaction()
+
+        @staticmethod
+        def execute(_query, _parameters):
+            return Result()
+
+        @staticmethod
+        def cursor():
+            return Cursor()
+
+    class Pool:
+        @contextmanager
+        def connection(self, **_kwargs):
+            yield Connection()
+
+    store = object.__new__(PgVectorStore)
+    store.settings = PgVectorSettings(
+        dsn="postgresql://unused?sslmode=require",
+        purpose="write",
+        dimensions=3,
+    )
+    store._pool = Pool()
+    store._sql = sql
+    store._Jsonb = lambda value: value
+
+    uploaded = store.upsert_records(
+        release_id="release-1",
+        lane="chunks",
+        namespace="chunks--release-1",
+        records=[
+            {
+                "id": "chunk-1",
+                "text": "First chunk",
+                "embedding": [1, 2, 3],
+            },
+            {
+                "id": "chunk-2",
+                "text": "Second chunk",
+                "embedding": [3, 2, 1],
+            },
+        ],
+    )
+
+    assert uploaded == 2
+    assert len(executed_batches) == 1
+    assert len(executed_batches[0][1]) == 2
 
 
 def test_adaptive_dense_lane_dispatches_to_pgvector() -> None:

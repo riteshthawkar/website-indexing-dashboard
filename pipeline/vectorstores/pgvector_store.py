@@ -700,7 +700,11 @@ class PgVectorStore:
                     raise PgVectorReleaseError(
                         f"release {release_id} is immutable in status {release['status']}"
                     )
-                connection.executemany(upsert_query, values)
+                # psycopg 3 exposes batch execution on cursors, not directly
+                # on Connection. Keep the release lock and the whole batch in
+                # the same transaction while using the supported API.
+                with connection.cursor() as cursor:
+                    cursor.executemany(upsert_query, values)
         return len(values)
 
     def verify_counts(
