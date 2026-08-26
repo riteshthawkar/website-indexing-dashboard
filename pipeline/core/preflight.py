@@ -201,7 +201,7 @@ def _production_stage_profile(config: Mapping[str, Any], stage_plugins: Iterable
         else {}
     )
     if str(selected_profile.get("variant_id") or "").strip():
-        return "selected-release/v1", list(SELECTED_RELEASE_STAGE_ORDER)
+        return "selected-release/v2", list(SELECTED_RELEASE_STAGE_ORDER)
     if {"semantic_graph_extract", "semantic_graph_canonicalize"}.intersection(plugins):
         order = [
             stage_id
@@ -315,6 +315,21 @@ def assess_production_readiness(
             selected_errors.append("selected_profile.pre_embedding_only must be false")
         if list(selected_profile.get("record_kinds") or []) != expected_kinds:
             selected_errors.append("selected_profile.record_kinds must match the evaluated six-kind contract")
+        selected_embedder = (
+            config.get("embedder")
+            if isinstance(config.get("embedder"), Mapping)
+            else {}
+        )
+        expected_embedding_contract = {
+            "query_format": "task: search result | query: {query}",
+            "document_format": "title: {title} | text: {text}",
+            "media_input": "caption_text",
+        }
+        for key, expected in expected_embedding_contract.items():
+            if str(selected_embedder.get(key) or "").strip() != expected:
+                selected_errors.append(
+                    f"embedder.{key} must match the evaluated selected-release contract"
+                )
         for key in ("decision_sha256",):
             if not re.fullmatch(r"[0-9a-f]{64}", str(selected_profile.get(key) or "").strip().lower()):
                 selected_errors.append(f"selected_profile.{key} must be a SHA-256 digest")

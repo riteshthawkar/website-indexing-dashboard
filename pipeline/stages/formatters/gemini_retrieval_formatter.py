@@ -46,6 +46,7 @@ from pipeline.core.release_assembly import (
     SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
     SelectedReleaseAssemblyError,
     selected_release_file_path,
+    validate_selected_release_embedding_spec,
 )
 
 logger = logging.getLogger(__name__)
@@ -96,6 +97,7 @@ def _selected_release_records(
         raise SelectedReleaseAssemblyError("selected release assembly is not ready for embedding")
     if str(manifest.get("variant_id") or "") != variant_id:
         raise SelectedReleaseAssemblyError("selected release assembly variant drifted")
+    validate_selected_release_embedding_spec(manifest)
     files = {
         lane: load_json_safe(selected_release_file_path(manifest, manifest_path, lane), [])
         for lane in ("chunks", "parents", "media", "page_cards", "actions")

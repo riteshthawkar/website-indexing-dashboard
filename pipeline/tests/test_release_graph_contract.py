@@ -37,6 +37,7 @@ from pipeline.core.release_assembly import (
     SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
     SELECTED_RELEASE_BINDING_ORDER,
     SELECTED_RELEASE_SOURCE_HASH_KEYS,
+    selected_embedding_spec_sha256,
 )
 from pipeline.stages.embedders.gemini_pinecone_embedder import (
     _resolve_indexing_input_paths,
@@ -54,6 +55,14 @@ INDEXING_BUILD = {
 INDEXING_BUILD_SHA256 = hashlib.sha256(
     json.dumps(INDEXING_BUILD, sort_keys=True, separators=(",", ":")).encode("utf-8")
 ).hexdigest()
+SELECTED_EMBEDDING_SPEC = {
+    "provider": "gemini",
+    "model": "gemini-embedding-2",
+    "dimensions": 1536,
+    "query_format": "task: search result | query: {query}",
+    "document_format": "title: {title} | text: {text}",
+    "media_input": "caption_text",
+}
 
 
 def _write_graph_pair(root: Path, kind: str, marker: str) -> tuple[Path, Path]:
@@ -137,7 +146,15 @@ def _selected_production_config(run_id: str) -> dict:
         "schema": "mbzuai_retrieval",
         "records_table": "embedding_records",
     }
-    config["embedder"]["enable_sparse"] = False
+    config["embedder"].update(
+        {
+            "engine": "gemini",
+            "enable_sparse": False,
+            "query_format": SELECTED_EMBEDDING_SPEC["query_format"],
+            "document_format": SELECTED_EMBEDDING_SPEC["document_format"],
+            "media_input": SELECTED_EMBEDDING_SPEC["media_input"],
+        }
+    )
     return config
 
 
@@ -256,6 +273,9 @@ def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
             "record_count": count,
         }
     source = {key: "c" * 64 for key in SELECTED_RELEASE_SOURCE_HASH_KEYS}
+    source["embedding_spec_sha256"] = selected_embedding_spec_sha256(
+        SELECTED_EMBEDDING_SPEC
+    )
     assembly_binding = combine_sha256_digests(
         *[source[key] for key in SELECTED_RELEASE_SOURCE_HASH_KEYS],
         *[files[key]["sha256"] for key in SELECTED_RELEASE_BINDING_ORDER],
@@ -264,6 +284,7 @@ def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
         "schema_version": SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
         "status": "ready_for_embedding",
         "variant_id": config["selected_profile"]["variant_id"],
+        "embedding_spec": SELECTED_EMBEDDING_SPEC,
         "record_kinds": list(SELECTED_DENSE_RECORD_KINDS),
         "record_kind_counts": {
             "chunk": 1,
@@ -362,6 +383,7 @@ def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
         "sparse_index_name": "",
         "model": "gemini-embedding-2",
         "output_dimensionality": 1536,
+        "media_input": SELECTED_EMBEDDING_SPEC["media_input"],
         "namespace_strategy": "release",
         "namespace_release_id": work_dir.name,
         "namespaces": _resolve_upload_namespaces(config["embedder"], run_id=work_dir.name),
@@ -377,6 +399,13 @@ def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
         "selected_release_assembly_sha256": assembly_manifest_sha,
         "selected_release_binding_sha256": assembly_binding,
         "page_graph_navigation_catalog_sha256": navigation_sha,
+        "selected_profile": {
+            "variant_id": config["selected_profile"]["variant_id"],
+            "record_kinds": list(config["selected_profile"]["record_kinds"]),
+            "assembly_sha256": assembly_binding,
+            "embedding_spec": SELECTED_EMBEDDING_SPEC,
+            "media_input": SELECTED_EMBEDDING_SPEC["media_input"],
+        },
         "upload_input_sha256": combine_sha256_digests(
             bundle_sha,
             lexical_sha,
@@ -518,6 +547,19 @@ def test_selected_runtime_validates_full_assembly_and_rejects_lane_tampering(
     assert report["selected_release_binding_sha256"] == artifacts["manifest"][
         "selected_release_binding_sha256"
     ]
+
+    upload_path = (
+        work_dir
+        / "stage_outputs"
+        / "upload_retrieval"
+        / "index_upload_manifest.json"
+    )
+    drifted_manifest = dict(artifacts["manifest"])
+    drifted_manifest["media_input"] = "image_and_caption_text"
+    atomic_write_json(upload_path, drifted_manifest)
+    with pytest.raises(RuntimeArtifactContractError, match="media input differs"):
+        validate_runtime_artifact_contract(config, work_dir)
+    atomic_write_json(upload_path, artifacts["manifest"])
 
     page_cards_file = artifacts["assembly_file"].parent / artifacts["files"]["page_cards"][
         "file"

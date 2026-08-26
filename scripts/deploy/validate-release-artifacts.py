@@ -57,7 +57,29 @@ SELECTED_RECORD_KINDS = (
     "page_card",
     "action",
 )
-SELECTED_ASSEMBLY_SCHEMA = "mbzuai.selected_release_assembly.v1"
+SELECTED_ASSEMBLY_SCHEMA = "mbzuai.selected_release_assembly.v2"
+SELECTED_EMBEDDING_SPEC_KEYS = (
+    "provider",
+    "model",
+    "dimensions",
+    "query_format",
+    "document_format",
+    "media_input",
+)
+SELECTED_MEDIA_INPUT_MODES = {"caption_text", "image_and_caption_text"}
+SELECTED_SOURCE_HASH_KEYS = (
+    "decision_sha256",
+    "embedding_spec_sha256",
+    "candidate_manifest_sha256",
+    "candidate_records_sha256",
+    "pipeline_state_sha256",
+    "artifact_catalog_sha256",
+    "run_audit_sha256",
+    "resolved_config_sha256",
+    "chunk_index_sha256",
+    "page_graph_bridge_sha256",
+    "navigation_catalog_sha256",
+)
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v2"
 PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
@@ -385,10 +407,51 @@ def _combine_sha256_digests(*digests: str) -> str:
     return combined.hexdigest()
 
 
+def _normalize_selected_embedding_spec(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValidationError("selected release embedding_spec must be an object")
+    if set(value) != set(SELECTED_EMBEDDING_SPEC_KEYS):
+        raise ValidationError(
+            "selected release embedding_spec fields do not match the evaluated contract"
+        )
+    normalized: dict[str, Any] = {}
+    for key in SELECTED_EMBEDDING_SPEC_KEYS:
+        if key == "dimensions":
+            dimensions = _positive_int(value.get(key))
+            if dimensions <= 0:
+                raise ValidationError(
+                    "selected release embedding_spec.dimensions must be positive"
+                )
+            normalized[key] = dimensions
+            continue
+        text_value = str(value.get(key) or "").strip()
+        if not text_value:
+            raise ValidationError(f"selected release embedding_spec.{key} is required")
+        normalized[key] = text_value
+    normalized["media_input"] = str(normalized["media_input"]).casefold()
+    if normalized["media_input"] not in SELECTED_MEDIA_INPUT_MODES:
+        raise ValidationError(
+            "selected release embedding_spec.media_input is unsupported"
+        )
+    return normalized
+
+
+def _embedding_spec_sha256(value: Any) -> str:
+    normalized = _normalize_selected_embedding_spec(value)
+    encoded = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def _validate_selected_release_assembly(
     *,
     work_dir: Path,
     selected_profile: dict[str, Any],
+    embedder_config: dict[str, Any],
     upload: dict[str, Any],
 ) -> tuple[Path, Path, str, str, str, dict[str, int]]:
     assembly_path = (
@@ -409,6 +472,41 @@ def _validate_selected_release_assembly(
         errors.append("selected release assembly record kinds do not match the evaluated contract")
     if assembly.get("embedding_performed") is not False or assembly.get("upload_performed") is not False:
         errors.append("selected release assembly must remain a pre-embedding immutable artifact")
+
+    try:
+        embedding_spec = _normalize_selected_embedding_spec(assembly.get("embedding_spec"))
+    except ValidationError as exc:
+        errors.append(str(exc))
+        embedding_spec = {}
+    if embedding_spec:
+        configured_embedding = {
+            "provider": str(embedder_config.get("engine") or "").strip(),
+            "model": str(embedder_config.get("model") or "").strip(),
+            "dimensions": _positive_int(embedder_config.get("output_dimensionality")),
+            "query_format": str(embedder_config.get("query_format") or "").strip(),
+            "document_format": str(embedder_config.get("document_format") or "").strip(),
+            "media_input": str(embedder_config.get("media_input") or "").strip().casefold(),
+        }
+        for key in SELECTED_EMBEDDING_SPEC_KEYS:
+            if configured_embedding[key] != embedding_spec[key]:
+                errors.append(
+                    f"resolved embedder.{key} differs from the selected release"
+                )
+        uploaded_profile = (
+            upload.get("selected_profile")
+            if isinstance(upload.get("selected_profile"), dict)
+            else {}
+        )
+        if upload.get("media_input") != embedding_spec["media_input"]:
+            errors.append("vector upload media input differs from the selected release")
+        if uploaded_profile.get("media_input") != embedding_spec["media_input"]:
+            errors.append(
+                "vector upload selected-profile media input differs from the selected release"
+            )
+        if uploaded_profile.get("embedding_spec") != embedding_spec:
+            errors.append(
+                "vector upload embedding spec differs from the selected release"
+            )
 
     files = assembly.get("files") if isinstance(assembly.get("files"), dict) else {}
     binding_order = tuple(assembly.get("binding_order") or ())
@@ -462,21 +560,19 @@ def _validate_selected_release_assembly(
         errors.append("selected release assembly file entries must resolve uniquely")
 
     source = assembly.get("source") if isinstance(assembly.get("source"), dict) else {}
-    source_hash_keys = (
-        "decision_sha256",
-        "candidate_manifest_sha256",
-        "candidate_records_sha256",
-        "pipeline_state_sha256",
-        "artifact_catalog_sha256",
-        "run_audit_sha256",
-        "resolved_config_sha256",
-        "chunk_index_sha256",
-        "page_graph_bridge_sha256",
-        "navigation_catalog_sha256",
-    )
-    source_hashes = [str(source.get(key) or "").strip().lower() for key in source_hash_keys]
+    source_hashes = [
+        str(source.get(key) or "").strip().lower()
+        for key in SELECTED_SOURCE_HASH_KEYS
+    ]
     if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in source_hashes):
         errors.append("selected release assembly source hash set is incomplete")
+    embedding_spec_digest = str(
+        source.get("embedding_spec_sha256") or ""
+    ).strip().lower()
+    if embedding_spec and embedding_spec_digest != _embedding_spec_sha256(
+        embedding_spec
+    ):
+        errors.append("selected release embedding spec digest is invalid")
     binding_sha = str(assembly.get("assembly_sha256") or "").strip().lower()
     if len(file_hashes) == len(expected_binding_order):
         actual_binding_sha = _combine_sha256_digests(*source_hashes, *file_hashes)
@@ -852,6 +948,11 @@ def validate(args: argparse.Namespace) -> dict[str, Any]:
         ) = _validate_selected_release_assembly(
             work_dir=work_dir,
             selected_profile=selected_profile,
+            embedder_config=(
+                resolved_pipeline_config.get("embedder")
+                if isinstance(resolved_pipeline_config.get("embedder"), dict)
+                else {}
+            ),
             upload=upload,
         )
 

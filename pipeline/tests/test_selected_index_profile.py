@@ -42,6 +42,13 @@ def test_selected_index_prep_is_exactly_the_frozen_winner() -> None:
     }
     assert config["embedder"]["model"] == "gemini-embedding-2"
     assert config["embedder"]["output_dimensionality"] == 1536
+    assert config["embedder"]["query_format"] == (
+        "task: search result | query: {query}"
+    )
+    assert config["embedder"]["document_format"] == (
+        "title: {title} | text: {text}"
+    )
+    assert config["embedder"]["media_input"] == "caption_text"
     assert config["embedder"]["enable_sparse"] is False
     assert config["retrieval"]["index_mode"] == "dense_graph"
 
@@ -72,3 +79,16 @@ def test_selected_profile_guard_rejects_sparse_or_chunk_drift() -> None:
 
     assert "chunker.target_tokens does not match the controlled A/B winner" in errors
     assert "selected dense_graph profile must not generate sparse embeddings" in errors
+
+
+def test_selected_profile_guard_rejects_media_input_drift() -> None:
+    config = load_config(str(CONFIG_FILE))
+    decision = load_json_safe(DECISION_FILE, {})
+    drifted = deepcopy(config)
+    drifted["embedder"]["media_input"] = "image_and_caption_text"
+
+    errors = _profile_errors(drifted, decision)
+
+    assert (
+        "embedder.media_input does not match the controlled A/B winner" in errors
+    )

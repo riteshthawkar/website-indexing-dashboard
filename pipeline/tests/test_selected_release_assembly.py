@@ -10,9 +10,12 @@ from pipeline.core.config import load_config
 from pipeline.core.io import sha256_file
 from pipeline.core.release_assembly import (
     SELECTED_DENSE_RECORD_KINDS,
+    SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
     SelectedReleaseAssemblyError,
     assemble_selected_release,
+    selected_embedding_spec_sha256,
     selected_release_file_path,
+    validate_selected_release_embedding_spec,
 )
 
 
@@ -46,7 +49,22 @@ def real_assembly(tmp_path_factory: pytest.TempPathFactory) -> dict:
 
 
 def test_real_selected_release_assembly_is_exact_and_chunk_complete(real_assembly: dict) -> None:
+    assert real_assembly["schema_version"] == SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION
     assert real_assembly["status"] == "ready_for_embedding"
+    assert real_assembly["embedding_spec"] == {
+        "provider": "gemini",
+        "model": "gemini-embedding-2",
+        "dimensions": 1536,
+        "query_format": "task: search result | query: {query}",
+        "document_format": "title: {title} | text: {text}",
+        "media_input": "caption_text",
+    }
+    assert validate_selected_release_embedding_spec(real_assembly) == real_assembly[
+        "embedding_spec"
+    ]
+    assert real_assembly["source"]["embedding_spec_sha256"] == (
+        selected_embedding_spec_sha256(real_assembly["embedding_spec"])
+    )
     assert tuple(real_assembly["record_kinds"]) == SELECTED_DENSE_RECORD_KINDS
     assert real_assembly["record_kind_counts"] == {
         "chunk": 17259,
@@ -134,6 +152,30 @@ def test_assembly_manifest_file_resolution_rejects_symlinks(real_assembly: dict)
 
     with pytest.raises(SelectedReleaseAssemblyError, match="symlink"):
         selected_release_file_path(manifest, manifest_file, "chunks")
+
+
+def test_assembly_embedding_spec_rejects_digest_drift(real_assembly: dict) -> None:
+    manifest = deepcopy(real_assembly)
+    manifest["embedding_spec"] = {
+        **manifest["embedding_spec"],
+        "media_input": "image_and_caption_text",
+    }
+
+    with pytest.raises(SelectedReleaseAssemblyError, match="digest mismatch"):
+        validate_selected_release_embedding_spec(manifest)
+
+
+def test_assembly_embedding_spec_rejects_unsupported_media_mode(
+    real_assembly: dict,
+) -> None:
+    manifest = deepcopy(real_assembly)
+    manifest["embedding_spec"] = {
+        **manifest["embedding_spec"],
+        "media_input": "automatic",
+    }
+
+    with pytest.raises(SelectedReleaseAssemblyError, match="unsupported"):
+        validate_selected_release_embedding_spec(manifest)
 
 
 def test_selected_release_assembly_config_has_no_embedding_or_upload_stage() -> None:

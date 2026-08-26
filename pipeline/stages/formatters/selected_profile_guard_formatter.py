@@ -8,6 +8,10 @@ from typing import Any, Dict, List, Mapping
 
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe, sha256_file
+from pipeline.core.release_assembly import (
+    SelectedReleaseAssemblyError,
+    normalize_selected_embedding_spec,
+)
 from pipeline.core.registry import register_stage
 
 
@@ -37,7 +41,11 @@ def _profile_errors(config: Mapping[str, Any], decision: Mapping[str, Any]) -> L
         errors.append("chunker.max_chunks_per_document must be 0 (lossless)")
 
     embedder = config.get("embedder") if isinstance(config.get("embedder"), Mapping) else {}
-    embedding = winner.get("embedding_spec") if isinstance(winner.get("embedding_spec"), Mapping) else {}
+    try:
+        embedding = normalize_selected_embedding_spec(winner.get("embedding_spec"))
+    except SelectedReleaseAssemblyError as exc:
+        errors.append(str(exc))
+        embedding = {}
     expected_dimensions = int(embedding.get("dimensions") or 0)
     if str(embedder.get("engine") or "") != str(embedding.get("provider") or ""):
         errors.append("embedder.engine does not match the controlled A/B winner")
@@ -45,6 +53,19 @@ def _profile_errors(config: Mapping[str, Any], decision: Mapping[str, Any]) -> L
         errors.append("embedder.model does not match the controlled A/B winner")
     if int(embedder.get("output_dimensionality") or 0) != expected_dimensions:
         errors.append("embedder.output_dimensionality does not match the controlled A/B winner")
+    configured_embedding = {
+        "provider": str(embedder.get("engine") or "").strip(),
+        "model": str(embedder.get("model") or "").strip(),
+        "dimensions": int(embedder.get("output_dimensionality") or 0),
+        "query_format": str(embedder.get("query_format") or "").strip(),
+        "document_format": str(embedder.get("document_format") or "").strip(),
+        "media_input": str(embedder.get("media_input") or "").strip().casefold(),
+    }
+    for key in ("query_format", "document_format", "media_input"):
+        if embedding and configured_embedding[key] != embedding[key]:
+            errors.append(
+                f"embedder.{key} does not match the controlled A/B winner"
+            )
     if bool(embedder.get("enable_sparse", True)) or bool(
         embedder.get("use_sparse_embeddings", True)
     ):

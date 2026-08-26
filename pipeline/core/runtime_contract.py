@@ -370,11 +370,13 @@ def validate_runtime_artifact_contract(
         else:
             from pipeline.core.release_assembly import (
                 SELECTED_DENSE_RECORD_KINDS,
+                SELECTED_EMBEDDING_SPEC_KEYS,
                 SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
                 SELECTED_RELEASE_BINDING_ORDER,
                 SELECTED_RELEASE_SOURCE_HASH_KEYS,
                 SelectedReleaseAssemblyError,
                 selected_release_file_path,
+                validate_selected_release_embedding_spec,
             )
 
             assembly_payload = load_json_safe(assembly_path, None)
@@ -395,6 +397,57 @@ def validate_runtime_artifact_contract(
                     errors.append("selected release assembly variant does not match runtime config")
                 if tuple(assembly_payload.get("record_kinds") or []) != SELECTED_DENSE_RECORD_KINDS:
                     errors.append("selected release assembly record kinds drifted")
+                try:
+                    embedding_spec = validate_selected_release_embedding_spec(
+                        assembly_payload
+                    )
+                except SelectedReleaseAssemblyError as exc:
+                    errors.append(str(exc))
+                    embedding_spec = {}
+                if embedding_spec:
+                    embedder_config = (
+                        config.get("embedder")
+                        if isinstance(config.get("embedder"), Mapping)
+                        else {}
+                    )
+                    configured_embedding = {
+                        "provider": str(embedder_config.get("engine") or "").strip(),
+                        "model": str(embedder_config.get("model") or "").strip(),
+                        "dimensions": int(
+                            embedder_config.get("output_dimensionality") or 0
+                        ),
+                        "query_format": str(
+                            embedder_config.get("query_format") or ""
+                        ).strip(),
+                        "document_format": str(
+                            embedder_config.get("document_format") or ""
+                        ).strip(),
+                        "media_input": str(
+                            embedder_config.get("media_input") or ""
+                        ).strip().casefold(),
+                    }
+                    for key in SELECTED_EMBEDDING_SPEC_KEYS:
+                        if configured_embedding[key] != embedding_spec[key]:
+                            errors.append(
+                                f"runtime embedder.{key} differs from the selected release"
+                            )
+                    uploaded_profile = (
+                        manifest.get("selected_profile")
+                        if isinstance(manifest.get("selected_profile"), Mapping)
+                        else {}
+                    )
+                    if str(manifest.get("media_input") or "") != str(
+                        embedding_spec["media_input"]
+                    ) or str(uploaded_profile.get("media_input") or "") != str(
+                        embedding_spec["media_input"]
+                    ):
+                        errors.append(
+                            "vector upload media input differs from the selected release"
+                        )
+                    if uploaded_profile.get("embedding_spec") != embedding_spec:
+                        errors.append(
+                            "vector upload embedding spec differs from the selected release"
+                        )
                 if tuple(assembly_payload.get("binding_order") or []) != SELECTED_RELEASE_BINDING_ORDER:
                     errors.append("selected release assembly binding order drifted")
                 if assembly_payload.get("embedding_performed") is not False or assembly_payload.get(

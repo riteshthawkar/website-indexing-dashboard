@@ -44,6 +44,21 @@ INDEXING_BUILD = {
 INDEXING_BUILD_SHA256 = hashlib.sha256(
     json.dumps(INDEXING_BUILD, sort_keys=True, separators=(",", ":")).encode("utf-8")
 ).hexdigest()
+SELECTED_EMBEDDING_SPEC = {
+    "provider": "gemini",
+    "model": "gemini-embedding-2",
+    "dimensions": 1536,
+    "query_format": "task: search result | query: {query}",
+    "document_format": "title: {title} | text: {text}",
+    "media_input": "caption_text",
+}
+SELECTED_EMBEDDING_SPEC_SHA256 = hashlib.sha256(
+    json.dumps(
+        SELECTED_EMBEDDING_SPEC,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+).hexdigest()
 
 
 def _sha256(path: Path) -> str:
@@ -212,6 +227,14 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
             "action",
         ],
     }
+    resolved["config"]["embedder"] = {
+        "engine": SELECTED_EMBEDDING_SPEC["provider"],
+        "model": SELECTED_EMBEDDING_SPEC["model"],
+        "output_dimensionality": SELECTED_EMBEDDING_SPEC["dimensions"],
+        "query_format": SELECTED_EMBEDDING_SPEC["query_format"],
+        "document_format": SELECTED_EMBEDDING_SPEC["document_format"],
+        "media_input": SELECTED_EMBEDDING_SPEC["media_input"],
+    }
     _write_json(resolved_path, resolved)
 
     bundle_path = (
@@ -269,6 +292,7 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
     binding_order = tuple(record_files)
     source_hash_keys = (
         "decision_sha256",
+        "embedding_spec_sha256",
         "candidate_manifest_sha256",
         "candidate_records_sha256",
         "pipeline_state_sha256",
@@ -280,6 +304,7 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
         "navigation_catalog_sha256",
     )
     source = {key: hashlib.sha256(key.encode("utf-8")).hexdigest() for key in source_hash_keys}
+    source["embedding_spec_sha256"] = SELECTED_EMBEDDING_SPEC_SHA256
     assembly_binding = _combine_hashes(
         *(source[key] for key in source_hash_keys),
         *(files[key]["sha256"] for key in binding_order),
@@ -288,9 +313,10 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
     _write_json(
         assembly_path,
         {
-            "schema_version": "mbzuai.selected_release_assembly.v1",
+            "schema_version": "mbzuai.selected_release_assembly.v2",
             "status": "ready_for_embedding",
             "variant_id": "c650__gemini2_1536__dense_graph",
+            "embedding_spec": SELECTED_EMBEDDING_SPEC,
             "record_kinds": [
                 "chunk",
                 "parent",
@@ -329,7 +355,7 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
     assembly_sha = _sha256(assembly_path)
     navigation_sha = files["navigation_catalog"]["sha256"]
     bundle["selected_release_contract"] = {
-        "schema_version": "mbzuai.selected_release_assembly.v1",
+        "schema_version": "mbzuai.selected_release_assembly.v2",
         "variant_id": "c650__gemini2_1536__dense_graph",
         "manifest_sha256": assembly_sha,
         "assembly_sha256": assembly_binding,
@@ -366,6 +392,7 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
             "planned": counts,
             "uploaded": counts,
             "bundle_version": 6,
+            "media_input": SELECTED_EMBEDDING_SPEC["media_input"],
             "retrieval_bundle_sha256": _sha256(bundle_path),
             "selected_release_assembly_sha256": assembly_sha,
             "selected_release_binding_sha256": assembly_binding,
@@ -373,6 +400,8 @@ def _make_selected_required_artifacts(work_dir: Path) -> None:
             "selected_profile": {
                 "variant_id": "c650__gemini2_1536__dense_graph",
                 "record_kinds": list(resolved["config"]["selected_profile"]["record_kinds"]),
+                "embedding_spec": SELECTED_EMBEDDING_SPEC,
+                "media_input": SELECTED_EMBEDDING_SPEC["media_input"],
             },
             "verification": {
                 "dense": {
@@ -823,6 +852,30 @@ def test_selected_candidate_rejects_unevaluated_dense_lane(tmp_path: Path) -> No
 
     assert result.returncode != 0
     assert "unevaluated dense lane must be zero for facts" in result.stderr
+
+
+def test_selected_candidate_rejects_media_contract_drift(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    work_dir = runs_root / "selected-candidate"
+    _make_selected_required_artifacts(work_dir)
+    upload_path = (
+        work_dir
+        / "stage_outputs"
+        / "upload_retrieval"
+        / "index_upload_manifest.json"
+    )
+    upload = json.loads(upload_path.read_text(encoding="utf-8"))
+    upload["media_input"] = "image_and_caption_text"
+    _write_json(upload_path, upload)
+
+    result = _resolve(
+        tmp_path / "missing-active-release.json",
+        runs_root,
+        RETRIEVAL_WORK_DIR=str(work_dir),
+    )
+
+    assert result.returncode != 0
+    assert "vector upload media input differs" in result.stderr
 
 
 def test_retriever_start_rejects_placeholder_service_token(tmp_path: Path) -> None:

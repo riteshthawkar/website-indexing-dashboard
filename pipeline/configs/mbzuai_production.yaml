@@ -69,6 +69,12 @@ assertions:
   validate_concurrency: 16
 
 embedder:
+  # These formats are part of the controlled A/B winner. In particular, media
+  # must be embedded from its grounded caption text; sending image bytes would
+  # create a different, unevaluated representation.
+  query_format: "task: search result | query: {query}"
+  document_format: "title: {title} | text: {text}"
+  media_input: "caption_text"
   # Query embeddings may be retried once by the retriever. Keep two provider
   # attempts plus backoff comfortably inside the 110-second request budget.
   gemini_request_timeout_ms: 30000

@@ -16,8 +16,12 @@ from pipeline.core.graph_artifacts import resolve_canonical_graph_artifacts
 from pipeline.core.io import atomic_write_json, combine_sha256_digests, load_json_safe, sha256_file
 from pipeline.core.release_assembly import (
     SELECTED_DENSE_RECORD_KINDS,
+    SELECTED_EMBEDDING_SPEC_KEYS,
+    SELECTED_MEDIA_INPUT_CAPTION_TEXT,
+    SELECTED_MEDIA_INPUT_IMAGE_AND_CAPTION_TEXT,
     SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
     selected_release_file_path,
+    validate_selected_release_embedding_spec,
 )
 from pipeline.core.registry import register_stage
 from pipeline.stages.embedders.gemini_pinecone_embedder import (
@@ -219,6 +223,7 @@ def _validate_selected_lanes(
     paths: Mapping[str, str],
     lanes: Mapping[str, List[Dict[str, Any]]],
     variant_id: str,
+    embedder_config: Mapping[str, Any],
 ) -> Mapping[str, Any]:
     assembly_file = Path(str(paths.get("release_assembly") or "")).expanduser().resolve()
     payload = load_json_safe(assembly_file, None)
@@ -232,6 +237,20 @@ def _validate_selected_lanes(
         raise ValueError("Selected release assembly variant does not match the runtime profile")
     if tuple(payload.get("record_kinds") or []) != SELECTED_DENSE_RECORD_KINDS:
         raise ValueError("Selected release assembly record kinds differ from the evaluated profile")
+    embedding_spec = validate_selected_release_embedding_spec(payload)
+    configured_embedding = {
+        "provider": str(embedder_config.get("engine") or "").strip(),
+        "model": str(embedder_config.get("model") or "").strip(),
+        "dimensions": int(embedder_config.get("output_dimensionality") or 0),
+        "query_format": str(embedder_config.get("query_format") or "").strip(),
+        "document_format": str(embedder_config.get("document_format") or "").strip(),
+        "media_input": str(embedder_config.get("media_input") or "").strip().casefold(),
+    }
+    for key in SELECTED_EMBEDDING_SPEC_KEYS:
+        if configured_embedding[key] != embedding_spec[key]:
+            raise ValueError(
+                f"Selected release embedder.{key} differs from the evaluated profile"
+            )
 
     lane_file_keys = {
         "chunks": "chunks",
@@ -257,6 +276,37 @@ def _validate_selected_lanes(
         if lanes.get(lane):
             raise ValueError(f"Selected release contains unevaluated dense lane: {lane}")
     return payload
+
+
+def _apply_selected_media_input_contract(
+    records: Sequence[Dict[str, Any]],
+    assembly: Mapping[str, Any],
+) -> str:
+    """Make the evaluated media representation authoritative for upload."""
+
+    embedding_spec = validate_selected_release_embedding_spec(assembly)
+    media_input = str(embedding_spec["media_input"])
+    if media_input == SELECTED_MEDIA_INPUT_CAPTION_TEXT:
+        for record in records:
+            # The frozen `text` field is the evaluated grounded caption input.
+            # Do not let the presence of a local image silently change the
+            # representation that won the controlled A/B evaluation.
+            record["can_embed_multimodal"] = False
+        return media_input
+    if media_input == SELECTED_MEDIA_INPUT_IMAGE_AND_CAPTION_TEXT:
+        unavailable = [
+            str(record.get("id") or "<missing>")
+            for record in records
+            if not record.get("can_embed_multimodal")
+            or not Path(str(record.get("local_path") or "")).is_file()
+        ]
+        if unavailable:
+            raise ValueError(
+                "Selected multimodal media contract has unavailable image inputs: "
+                + ", ".join(unavailable[:10])
+            )
+        return media_input
+    raise ValueError(f"Unsupported selected media input contract: {media_input}")
 
 
 def _artifact_identity(ctx: StageContext, paths: Mapping[str, str]) -> Dict[str, Any]:
@@ -479,9 +529,15 @@ class GeminiPgVectorEmbedder(EmbedderStage):
                     paths=paths,
                     lanes=lanes,
                     variant_id=str(selected_profile.get("variant_id") or ""),
+                    embedder_config=config,
                 )
                 if selected
                 else {}
+            )
+            media_input = (
+                _apply_selected_media_input_contract(lanes["media"], assembly)
+                if selected
+                else "runtime_auto"
             )
         except (OSError, RuntimeError, ValueError) as exc:
             return StageResult.failure(str(exc))
@@ -645,6 +701,7 @@ class GeminiPgVectorEmbedder(EmbedderStage):
                                 "phase": f"uploading_{lane}",
                                 "model": model,
                                 "output_dimensionality": dimensions,
+                                "media_input": media_input,
                                 "upload_input_sha256": identity["upload_input_sha256"],
                                 "planned": totals,
                                 "uploaded": uploaded,
@@ -695,6 +752,7 @@ class GeminiPgVectorEmbedder(EmbedderStage):
             "sparse_index_name": "",
             "model": model,
             "output_dimensionality": dimensions,
+            "media_input": media_input,
             "namespaces": namespaces,
             "namespace_strategy": str(config.get("namespace_strategy") or "static").strip().lower(),
             "namespace_release_id": (
@@ -720,6 +778,8 @@ class GeminiPgVectorEmbedder(EmbedderStage):
                 "variant_id": str(selected_profile.get("variant_id") or ""),
                 "record_kinds": list(selected_profile.get("record_kinds") or []),
                 "assembly_sha256": str(assembly.get("assembly_sha256") or ""),
+                "embedding_spec": dict(assembly.get("embedding_spec") or {}),
+                "media_input": media_input,
             }
             if selected
             else {},
@@ -750,6 +810,7 @@ class GeminiPgVectorEmbedder(EmbedderStage):
                 "phase": "completed",
                 "model": model,
                 "output_dimensionality": dimensions,
+                "media_input": media_input,
                 "upload_input_sha256": identity["upload_input_sha256"],
                 "planned": totals,
                 "uploaded": totals,
@@ -772,6 +833,7 @@ class GeminiPgVectorEmbedder(EmbedderStage):
                     for lane, count in totals.items()
                 },
                 **media_metrics,
+                "media_input": media_input,
                 "engine": "gemini",
                 "model": model,
                 "vector_store": "pgvector",

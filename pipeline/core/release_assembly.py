@@ -9,6 +9,7 @@ re-chunking or regenerating evaluated text.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 from collections import Counter
@@ -23,7 +24,21 @@ from pipeline.core.io import (
 )
 
 
-SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION = "mbzuai.selected_release_assembly.v1"
+SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION = "mbzuai.selected_release_assembly.v2"
+SELECTED_MEDIA_INPUT_CAPTION_TEXT = "caption_text"
+SELECTED_MEDIA_INPUT_IMAGE_AND_CAPTION_TEXT = "image_and_caption_text"
+SELECTED_MEDIA_INPUT_MODES = (
+    SELECTED_MEDIA_INPUT_CAPTION_TEXT,
+    SELECTED_MEDIA_INPUT_IMAGE_AND_CAPTION_TEXT,
+)
+SELECTED_EMBEDDING_SPEC_KEYS = (
+    "provider",
+    "model",
+    "dimensions",
+    "query_format",
+    "document_format",
+    "media_input",
+)
 SELECTED_DENSE_RECORD_KINDS = (
     "chunk",
     "parent",
@@ -45,6 +60,7 @@ SELECTED_RELEASE_BINDING_ORDER = (
 )
 SELECTED_RELEASE_SOURCE_HASH_KEYS = (
     "decision_sha256",
+    "embedding_spec_sha256",
     "candidate_manifest_sha256",
     "candidate_records_sha256",
     "pipeline_state_sha256",
@@ -88,6 +104,80 @@ def _require_sha256(value: Any, *, label: str) -> str:
     if not _SHA256_RE.fullmatch(digest):
         raise SelectedReleaseAssemblyError(f"{label} must be a SHA-256 digest")
     return digest
+
+
+def normalize_selected_embedding_spec(value: Any) -> Dict[str, Any]:
+    """Return the evaluated embedding contract or fail closed on ambiguity."""
+
+    if not isinstance(value, Mapping):
+        raise SelectedReleaseAssemblyError(
+            "controlled A/B winner embedding_spec must be a mapping"
+        )
+    unknown_keys = sorted(set(value) - set(SELECTED_EMBEDDING_SPEC_KEYS))
+    if unknown_keys:
+        raise SelectedReleaseAssemblyError(
+            "controlled A/B winner embedding_spec has unsupported fields: "
+            + ", ".join(unknown_keys)
+        )
+    normalized: Dict[str, Any] = {}
+    for key in SELECTED_EMBEDDING_SPEC_KEYS:
+        if key == "dimensions":
+            try:
+                dimensions = int(value.get(key) or 0)
+            except (TypeError, ValueError) as exc:
+                raise SelectedReleaseAssemblyError(
+                    "controlled A/B winner embedding_spec.dimensions must be positive"
+                ) from exc
+            if dimensions <= 0:
+                raise SelectedReleaseAssemblyError(
+                    "controlled A/B winner embedding_spec.dimensions must be positive"
+                )
+            normalized[key] = dimensions
+        elif not str(value.get(key) or "").strip():
+            raise SelectedReleaseAssemblyError(
+                f"controlled A/B winner embedding_spec.{key} is required"
+            )
+        else:
+            normalized[key] = str(value[key]).strip()
+    media_input = str(normalized["media_input"]).casefold()
+    if media_input not in SELECTED_MEDIA_INPUT_MODES:
+        raise SelectedReleaseAssemblyError(
+            "controlled A/B winner embedding_spec.media_input is unsupported: "
+            f"{media_input}"
+        )
+    normalized["media_input"] = media_input
+    return normalized
+
+
+def selected_embedding_spec_sha256(value: Any) -> str:
+    normalized = normalize_selected_embedding_spec(value)
+    canonical = json.dumps(
+        normalized,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
+
+
+def validate_selected_release_embedding_spec(
+    manifest: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """Validate the manifest's embedding spec and its release binding digest."""
+
+    normalized = normalize_selected_embedding_spec(manifest.get("embedding_spec"))
+    source = manifest.get("source") if isinstance(manifest.get("source"), Mapping) else {}
+    expected = _require_sha256(
+        source.get("embedding_spec_sha256"),
+        label="selected release embedding_spec digest",
+    )
+    actual = selected_embedding_spec_sha256(normalized)
+    if actual != expected:
+        raise SelectedReleaseAssemblyError(
+            "selected release embedding_spec digest mismatch: "
+            f"expected {expected}, got {actual}"
+        )
+    return normalized
 
 
 def _verify_file(path: Path, expected: Any, *, label: str) -> str:
@@ -200,6 +290,26 @@ def _validate_checkpoint(
             )
     if int(chunker.get("max_chunks_per_document") or 0) != 0:
         raise SelectedReleaseAssemblyError("checkpoint chunking was not lossless")
+
+    checkpoint_embedder = (
+        snapshot_config.get("embedder")
+        if isinstance(snapshot_config.get("embedder"), Mapping)
+        else {}
+    )
+    winner_embedding = normalize_selected_embedding_spec(winner.get("embedding_spec"))
+    configured_embedding = {
+        "provider": str(checkpoint_embedder.get("engine") or "").strip(),
+        "model": str(checkpoint_embedder.get("model") or "").strip(),
+        "dimensions": int(checkpoint_embedder.get("output_dimensionality") or 0),
+        "query_format": str(checkpoint_embedder.get("query_format") or "").strip(),
+        "document_format": str(checkpoint_embedder.get("document_format") or "").strip(),
+        "media_input": str(checkpoint_embedder.get("media_input") or "").strip().casefold(),
+    }
+    for key in SELECTED_EMBEDDING_SPEC_KEYS:
+        if configured_embedding[key] != winner_embedding[key]:
+            raise SelectedReleaseAssemblyError(
+                f"checkpoint embedder.{key} differs from the controlled A/B winner"
+            )
 
     bridge = _strict_json(
         checkpoint_run_dir / _CHECKPOINT_FILES["page_graph_bridge_sha256"],
@@ -478,6 +588,8 @@ def assemble_selected_release(
     if not isinstance(decision, Mapping) or not isinstance(manifest, Mapping):
         raise SelectedReleaseAssemblyError("decision and candidate manifest must be objects")
     winner = _winner(decision, variant_id=variant_id)
+    embedding_spec = normalize_selected_embedding_spec(winner.get("embedding_spec"))
+    embedding_spec_sha = selected_embedding_spec_sha256(embedding_spec)
     winner_kinds = tuple(
         str(kind)
         for kind in (
@@ -581,11 +693,19 @@ def assemble_selected_release(
         },
     }
     binding_order = SELECTED_RELEASE_BINDING_ORDER
+    source = {
+        "decision_file": str(decision_file),
+        "decision_sha256": decision_digest,
+        "embedding_spec_sha256": embedding_spec_sha,
+        "candidate_manifest_file": str(candidate_manifest_file),
+        "candidate_manifest_sha256": manifest_digest,
+        "candidate_records_file": str(candidate_records_file),
+        "candidate_records_sha256": records_digest,
+        "checkpoint_run_dir": str(checkpoint_run_dir),
+        **checkpoint_hashes,
+    }
     assembly_sha = combine_sha256_digests(
-        decision_digest,
-        manifest_digest,
-        records_digest,
-        *[checkpoint_hashes[key] for key in _CHECKPOINT_FILES],
+        *[str(source[key]) for key in SELECTED_RELEASE_SOURCE_HASH_KEYS],
         *[str(files[key]["sha256"]) for key in binding_order],
     )
     navigation_stats = (
@@ -597,6 +717,7 @@ def assemble_selected_release(
         "schema_version": SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
         "status": "ready_for_embedding",
         "variant_id": variant_id,
+        "embedding_spec": embedding_spec,
         "record_kinds": list(configured_kinds),
         "record_kind_counts": counts,
         "dense_lane_counts": {
@@ -606,16 +727,7 @@ def assemble_selected_release(
             "page_cards": counts["page_card"],
             "actions": counts["action"],
         },
-        "source": {
-            "decision_file": str(decision_file),
-            "decision_sha256": decision_digest,
-            "candidate_manifest_file": str(candidate_manifest_file),
-            "candidate_manifest_sha256": manifest_digest,
-            "candidate_records_file": str(candidate_records_file),
-            "candidate_records_sha256": records_digest,
-            "checkpoint_run_dir": str(checkpoint_run_dir),
-            **checkpoint_hashes,
-        },
+        "source": source,
         "coverage": {
             "checkpoint_document_count": int(chunk_index.get("document_count") or 0),
             "checkpoint_chunk_count": int(chunk_index.get("chunk_count") or 0),
