@@ -70,6 +70,10 @@ _QUERY_EMBEDDING_RETRY_DELAY_SECONDS = max(
     0.0,
     float(os.getenv("RETRIEVAL_QUERY_EMBEDDING_RETRY_DELAY_SECONDS", "0.75") or "0"),
 )
+_GEMINI_QUERY_EMBEDDING_BATCH_SIZE = min(
+    100,
+    max(1, int(os.getenv("RETRIEVAL_QUERY_EMBEDDING_BATCH_SIZE", "100") or "100")),
+)
 _QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS = max(
     0.0,
     float(os.getenv("RETRIEVAL_QUERY_EMBEDDING_FAILURE_COOLDOWN_SECONDS", "300") or "0"),
@@ -3032,29 +3036,48 @@ def _embed_queries(
     if not use_prompt_instruction:
         config_kwargs["task_type"] = task_type
     config = types.EmbedContentConfig(**config_kwargs)
-    # The Google Gen AI SDK treats a plain list[str] as consecutive parts of a
-    # single Content object. Gemini Embedding 2 then returns one aggregate
-    # vector, not one vector per query. Keep each query in its own Content so
-    # batched evaluation has a strict one-to-one query/vector contract.
-    contents = [
-        types.Content(
-            role="user",
-            parts=[types.Part.from_text(text=query)],
-        )
-        for query in embed_queries
-    ]
-
     client = (
         _make_gemini_client(request_timeout_ms=request_timeout_ms)
         if request_timeout_ms is not None
         else _make_gemini_client()
     )
-    response = client.models.embed_content(
-        model=model,
-        contents=contents,
-        config=config,
-    )
-    vectors = [list(embedding.values) for embedding in response.embeddings]
+    vectors: List[List[float]] = []
+    batch_size = _GEMINI_QUERY_EMBEDDING_BATCH_SIZE
+    for start in range(0, len(embed_queries), batch_size):
+        batch_queries = embed_queries[start : start + batch_size]
+        # The Google Gen AI SDK treats a plain list[str] as consecutive parts
+        # of one Content object. Keep each query in its own Content so every
+        # provider batch has a strict one-to-one query/vector contract.
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=query)],
+            )
+            for query in batch_queries
+        ]
+        attempts = max(1, _QUERY_EMBEDDING_RETRIES + 1)
+        for attempt in range(attempts):
+            try:
+                response = client.models.embed_content(
+                    model=model,
+                    contents=contents,
+                    config=config,
+                )
+                batch_vectors = [list(embedding.values) for embedding in response.embeddings]
+                if len(batch_vectors) != len(batch_queries):
+                    raise RuntimeError(
+                        "Gemini query embedding cardinality mismatch: "
+                        f"requested={len(batch_queries)} returned={len(batch_vectors)} "
+                        f"batch_start={start}"
+                    )
+                vectors.extend(batch_vectors)
+                break
+            except Exception as exc:
+                if attempt >= attempts - 1 or not _retryable_query_embedding_error(exc):
+                    raise
+                delay = _QUERY_EMBEDDING_RETRY_DELAY_SECONDS * (2 ** attempt)
+                if delay > 0:
+                    time.sleep(delay)
     if len(vectors) != len(embed_queries):
         raise RuntimeError(
             "Gemini query embedding cardinality mismatch: "

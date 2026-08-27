@@ -88,6 +88,42 @@ def test_embed_queries_rejects_provider_cardinality_mismatch(monkeypatch):
         )
 
 
+def test_embed_queries_splits_requests_at_gemini_batch_limit(monkeypatch):
+    from pipeline.retrieval import adaptive_hybrid
+
+    batch_sizes = []
+
+    class FakeModels:
+        def embed_content(self, *, model, contents, config):
+            batch_sizes.append(len(contents))
+            offset = sum(batch_sizes[:-1])
+            return SimpleNamespace(
+                embeddings=[
+                    SimpleNamespace(values=[float(offset + index), 1.0])
+                    for index, _content in enumerate(contents)
+                ]
+            )
+
+    monkeypatch.setattr(adaptive_hybrid, "import_genai_types", _fake_genai_types)
+    monkeypatch.setattr(
+        adaptive_hybrid,
+        "_make_gemini_client",
+        lambda: SimpleNamespace(models=FakeModels()),
+    )
+
+    queries = [f"query {index}" for index in range(101)]
+    vectors = adaptive_hybrid._embed_queries(
+        queries,
+        model="gemini-embedding-2",
+        output_dimensionality=1536,
+    )
+
+    assert batch_sizes == [100, 1]
+    assert len(vectors) == len(queries)
+    assert vectors[0] == [0.0, 1.0]
+    assert vectors[-1] == [100.0, 1.0]
+
+
 def test_gemini_document_embedder_fails_closed_before_silent_truncation(monkeypatch):
     from pipeline.stages.embedders import gemini_pinecone_embedder as embedder
 
