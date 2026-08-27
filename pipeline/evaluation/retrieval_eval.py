@@ -16,6 +16,7 @@ from pipeline.core.config import load_config
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.evaluation.dataset import EvalExample, load_eval_examples
 from pipeline.evaluation.dataset_tools import validate_eval_examples
+from pipeline.evaluation.multilingual_v2 import normalize_evidence_text
 from pipeline.retrieval import AdaptiveHybridRetriever
 from pipeline.retrieval.adaptive_hybrid import apply_vector_upload_manifest_config
 
@@ -399,7 +400,106 @@ def _url_coverage_fraction(required_urls: Sequence[str], selected_urls: Sequence
     return hits / float(len(required))
 
 
-def _load_gold_ids_by_url(work_dir: str | Path) -> Dict[str, Dict[str, List[str]]]:
+_RETRIEVAL_RECORD_COLLECTIONS = (
+    "chunk_records",
+    "evidence_span_records",
+    "parent_records",
+    "media_records",
+    "page_card_records",
+    "action_records",
+    "fact_records",
+    "answer_records",
+    "assertion_records",
+    "summary_records",
+)
+
+
+def _identity_aliases(value: Any) -> List[str]:
+    identity = str(value or "").strip()
+    if not identity:
+        return []
+    if identity.startswith("media:"):
+        return [identity, identity.removeprefix("media:")]
+    return [identity]
+
+
+def _record_identity_payload(record: Mapping[str, Any]) -> Dict[str, Any]:
+    record_id = str(record.get("id") or "").strip()
+    kind = str(record.get("kind") or record.get("record_type") or "").strip().lower()
+
+    document_revision_ids = _unique_in_order(
+        [str(record.get("document_revision_id") or "")]
+    )
+    page_card_ids = _unique_in_order(
+        [
+            *[str(value) for value in record.get("page_card_ids") or []],
+            record_id if kind == "page_card" or record_id.startswith("page-card:") else "",
+        ]
+    )
+    section_ids = _unique_in_order(
+        [
+            *[str(value) for value in record.get("section_ids") or []],
+            str(record.get("section_id") or ""),
+        ]
+    )
+    action_ids = _unique_in_order(
+        [
+            str(record.get("action_id") or ""),
+            record_id if kind == "action" or record_id.startswith("page-action:") else "",
+        ]
+    )
+    media_ids = _unique_in_order(
+        [
+            *_identity_aliases(record.get("media_id")),
+            *(
+                _identity_aliases(record_id)
+                if kind == "media" or str(record.get("record_type") or "").lower() == "media"
+                else []
+            ),
+        ]
+    )
+    source_urls = _unique_in_order(
+        _normalize_reference_url(str(record.get(key) or ""))
+        for key in ("source_url", "canonical_url", "language_normalized_url", "url")
+        if _normalize_reference_url(str(record.get(key) or ""))
+    )
+    return {
+        "document_revision_ids": document_revision_ids,
+        "page_card_ids": page_card_ids,
+        "section_ids": section_ids,
+        "action_ids": action_ids,
+        "media_ids": media_ids,
+        "source_urls": source_urls,
+        "evidence_text": "",
+    }
+
+
+def _merge_record_identities(target: Dict[str, Any], source: Mapping[str, Any]) -> bool:
+    changed = False
+    for field_name in (
+        "document_revision_ids",
+        "page_card_ids",
+        "section_ids",
+        "action_ids",
+        "media_ids",
+        "source_urls",
+    ):
+        merged = _unique_in_order(
+            [
+                *[str(value) for value in target.get(field_name) or []],
+                *[str(value) for value in source.get(field_name) or []],
+            ]
+        )
+        if merged != list(target.get(field_name) or []):
+            target[field_name] = merged
+            changed = True
+    if not target.get("evidence_text") and source.get("evidence_text"):
+        target["evidence_text"] = str(source.get("evidence_text") or "")
+        changed = True
+    return changed
+
+
+def _load_gold_ids_by_url(work_dir: str | Path) -> Dict[str, Any]:
     work_path = Path(work_dir).resolve()
     bundle_path = work_path / "stage_outputs" / "finalize_retrieval_bundle" / "retrieval_bundle.json"
     if not bundle_path.exists():
@@ -408,7 +508,13 @@ def _load_gold_ids_by_url(work_dir: str | Path) -> Dict[str, Dict[str, List[str]
         bundle_path = work_path / "stage_outputs" / "build_retrieval_bundle" / "retrieval_bundle.json"
     payload = load_json_safe(bundle_path, default={})
     if not isinstance(payload, dict):
-        return {"gold_chunk_ids": {}, "gold_span_ids": {}, "gold_parent_ids": {}, "gold_media_ids": {}}
+        return {
+            "gold_chunk_ids": {},
+            "gold_span_ids": {},
+            "gold_parent_ids": {},
+            "gold_media_ids": {},
+            "record_identities": {},
+        }
 
     def _index_records(records: Sequence[Dict[str, Any]], *url_keys: str) -> Dict[str, List[str]]:
         indexed: Dict[str, List[str]] = defaultdict(list)
@@ -424,6 +530,56 @@ def _load_gold_ids_by_url(work_dir: str | Path) -> Dict[str, Dict[str, List[str]
                     indexed[normalized].append(record_id)
         return {key: _unique_in_order(values) for key, values in indexed.items()}
 
+    records_by_collection = {
+        collection_name: [
+            record
+            for record in (payload.get(collection_name) or [])
+            if isinstance(record, dict)
+        ]
+        for collection_name in _RETRIEVAL_RECORD_COLLECTIONS
+    }
+    record_identities: Dict[str, Dict[str, Any]] = {}
+    linked_record_ids: Dict[str, List[str]] = {}
+    for records in records_by_collection.values():
+        for record in records:
+            record_id = str(record.get("id") or "").strip()
+            if not record_id:
+                continue
+            identity = _record_identity_payload(record)
+            existing = record_identities.setdefault(record_id, identity)
+            if existing is not identity:
+                _merge_record_identities(existing, identity)
+            for alias in _identity_aliases(record_id):
+                record_identities.setdefault(alias, existing)
+            linked_record_ids[record_id] = _unique_in_order(
+                str(value)
+                for key in (
+                    "linked_chunk_ids",
+                    "source_chunk_ids",
+                    "linked_parent_ids",
+                    "source_parent_ids",
+                    "linked_span_ids",
+                    "source_span_ids",
+                )
+                for value in (record.get(key) or [])
+            )
+
+    # Facts, assertions, and summaries can omit document/page identities but
+    # link to records that carry them. Resolve two hops without retaining the
+    # 1+ GB retrieval bundle after this index has been built.
+    for _ in range(2):
+        changed = False
+        for record_id, linked_ids in linked_record_ids.items():
+            target = record_identities.get(record_id)
+            if target is None:
+                continue
+            for linked_id in linked_ids:
+                source = record_identities.get(linked_id)
+                if source is not None:
+                    changed = _merge_record_identities(target, source) or changed
+        if not changed:
+            break
+
     return {
         "gold_chunk_ids": _index_records(payload.get("chunk_records") or [], "source_url"),
         "gold_span_ids": _index_records(
@@ -434,6 +590,7 @@ def _load_gold_ids_by_url(work_dir: str | Path) -> Dict[str, Dict[str, List[str]
         ),
         "gold_parent_ids": _index_records(payload.get("parent_records") or [], "source_url"),
         "gold_media_ids": _index_records(payload.get("media_records") or [], "source_url", "url"),
+        "record_identities": record_identities,
     }
 
 
@@ -441,7 +598,7 @@ def _gold_ids(
     example: EvalExample,
     field_name: str,
     *,
-    ids_by_url: Dict[str, Dict[str, List[str]]] | None = None,
+    ids_by_url: Dict[str, Any] | None = None,
 ) -> List[str]:
     base_values = list(getattr(example, field_name) or [])
     metadata = dict(example.metadata or {})
@@ -459,6 +616,310 @@ def _gold_ids(
             *expanded_values,
         ]
     )
+
+
+def _identity_equivalents(value: Any) -> set[str]:
+    identity = str(value or "").strip()
+    if not identity:
+        return set()
+    if identity.startswith("media:"):
+        return {identity, identity.removeprefix("media:")}
+    return {identity}
+
+
+def _record_identities(
+    record_id: str,
+    *,
+    ids_by_url: Dict[str, Any] | None,
+) -> Dict[str, Any]:
+    lookup = (ids_by_url or {}).get("record_identities") or {}
+    identity = lookup.get(str(record_id or ""))
+    return dict(identity) if isinstance(identity, Mapping) else {}
+
+
+def _identity_values_for_records(
+    record_ids: Sequence[str],
+    field_name: str,
+    *,
+    ids_by_url: Dict[str, Any] | None,
+) -> List[str]:
+    values: List[str] = []
+    lookup = (ids_by_url or {}).get("record_identities") or {}
+    for record_id in record_ids:
+        record_id = str(record_id or "").strip()
+        if not record_id:
+            continue
+        identity = lookup.get(record_id)
+        if isinstance(identity, Mapping):
+            values.extend(str(value) for value in identity.get(field_name) or [])
+        if field_name == "document_revision_ids" and "document-revision:" in record_id:
+            suffix = record_id.split("document-revision:", 1)[1].split(":", 1)[0]
+            if suffix:
+                values.append(f"document-revision:{suffix}")
+        elif field_name == "page_card_ids" and record_id.startswith("page-card:"):
+            values.append(record_id)
+        elif field_name == "section_ids" and record_id.startswith(("page-section:", "document-section:")):
+            values.append(record_id)
+        elif field_name == "action_ids" and record_id.startswith("page-action:"):
+            values.append(record_id)
+        elif field_name == "media_ids" and (
+            isinstance(identity, Mapping) or record_id.startswith("media:")
+        ):
+            values.extend(_identity_equivalents(record_id))
+    return _unique_in_order(values)
+
+
+def _navigation_plan_identities(result: Mapping[str, Any]) -> Dict[str, List[str]]:
+    navigation_plan = result.get("navigation_plan")
+    if not isinstance(navigation_plan, Mapping):
+        navigation_plan = {}
+    target_page = navigation_plan.get("target_page")
+    if not isinstance(target_page, Mapping):
+        target_page = {}
+    steps = [
+        step
+        for step in (navigation_plan.get("steps") or [])
+        if isinstance(step, Mapping)
+    ]
+    return {
+        "document_revision_ids": _unique_in_order(
+            [
+                str(target_page.get("document_revision_id") or ""),
+                *[str(step.get("document_revision_id") or "") for step in steps],
+            ]
+        ),
+        "page_card_ids": _unique_in_order(
+            [
+                str(target_page.get("page_card_id") or ""),
+                *[str(step.get("page_card_id") or "") for step in steps],
+            ]
+        ),
+        "section_ids": _unique_in_order(
+            [
+                str(target_page.get("section_id") or ""),
+                *[str(step.get("section_id") or "") for step in steps],
+            ]
+        ),
+        "action_ids": _unique_in_order(str(step.get("action_id") or "") for step in steps),
+        "chunk_ids": _unique_in_order(
+            str(chunk_id)
+            for step in steps
+            for chunk_id in (step.get("chunk_ids") or [])
+        ),
+    }
+
+
+def _ranked_representation_ids(result: Mapping[str, Any]) -> List[str]:
+    evidence_pack = result.get("evidence_pack")
+    if not isinstance(evidence_pack, Mapping):
+        evidence_pack = {}
+    evidence_ids = [
+        str(item.get("id") or item.get("record_id") or "")
+        for item in (evidence_pack.get("items") or [])[:10]
+        if isinstance(item, Mapping)
+    ]
+    navigation = _navigation_plan_identities(result)
+    return _unique_in_order(
+        [
+            *evidence_ids,
+            *[str(value) for value in (result.get("selected_chunk_ids") or [])[:10]],
+            *[str(value) for value in (result.get("selected_evidence_span_ids") or [])[:10]],
+            *[str(value) for value in (result.get("selected_parent_ids") or [])[:5]],
+            *[str(value) for value in (result.get("selected_media_ids") or [])[:5]],
+            *[str(value) for value in (result.get("dense_page_card_ids") or [])[:5]],
+            *[str(value) for value in (result.get("dense_action_ids") or [])[:5]],
+            *navigation["chunk_ids"],
+            *navigation["page_card_ids"],
+            *navigation["action_ids"],
+        ]
+    )
+
+
+def _evidence_representation_ids(result: Mapping[str, Any]) -> List[str]:
+    evidence_pack = result.get("evidence_pack")
+    if not isinstance(evidence_pack, Mapping):
+        evidence_pack = {}
+    evidence_ids = [
+        str(item.get("id") or item.get("record_id") or "")
+        for item in (evidence_pack.get("items") or [])[:10]
+        if isinstance(item, Mapping)
+    ]
+    return _unique_in_order(
+        [
+            *evidence_ids,
+            *[str(value) for value in (result.get("selected_chunk_ids") or [])[:10]],
+            *[str(value) for value in (result.get("selected_evidence_span_ids") or [])[:10]],
+            *[str(value) for value in (result.get("selected_parent_ids") or [])[:5]],
+            *[str(value) for value in (result.get("selected_media_ids") or [])[:5]],
+        ]
+    )
+
+
+def _identity_hit(observed: Sequence[str], gold: Sequence[str]) -> float:
+    observed_keys = {
+        alias
+        for value in observed
+        for alias in _identity_equivalents(value)
+    }
+    gold_keys = {
+        alias
+        for value in gold
+        for alias in _identity_equivalents(value)
+    }
+    return 1.0 if gold_keys and observed_keys.intersection(gold_keys) else 0.0
+
+
+def _source_identity_keys(example: EvalExample) -> List[str]:
+    metadata_values = [
+        str(value)
+        for value in (example.metadata or {}).get("source_keys") or []
+        if str(value)
+    ]
+    if metadata_values:
+        return _unique_in_order(metadata_values)
+    return _unique_in_order(
+        [
+            *example.gold_document_revision_ids,
+            *example.gold_page_card_ids,
+            *example.gold_section_ids,
+            *example.gold_action_ids,
+            *example.gold_media_ids,
+        ]
+    )
+
+
+def _source_identity_recall(observed: Sequence[str], required: Sequence[str]) -> float:
+    if not required:
+        return 1.0
+    observed_keys = {
+        alias
+        for value in observed
+        for alias in _identity_equivalents(value)
+    }
+    hits = sum(
+        1
+        for value in required
+        if observed_keys.intersection(_identity_equivalents(value))
+    )
+    return hits / float(len(required))
+
+
+def _result_evidence_units(
+    result: Mapping[str, Any],
+    *,
+    ids_by_url: Dict[str, Any] | None,
+) -> List[Dict[str, Any]]:
+    raw_units: List[Mapping[str, Any]] = []
+    evidence_pack = result.get("evidence_pack")
+    if isinstance(evidence_pack, Mapping):
+        raw_units.extend(
+            item for item in evidence_pack.get("items") or [] if isinstance(item, Mapping)
+        )
+    for collection_name in (
+        "answer_documents",
+        "fact_documents",
+        "evidence_span_documents",
+        "retrieval_documents",
+        "media",
+    ):
+        raw_units.extend(
+            item for item in result.get(collection_name) or [] if isinstance(item, Mapping)
+        )
+
+    units: List[Dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _append_unit(record_id: str, raw_record: Mapping[str, Any] | None = None) -> None:
+        identity = _record_identities(record_id, ids_by_url=ids_by_url)
+        if raw_record:
+            _merge_record_identities(identity, _record_identity_payload(raw_record))
+        text_value = normalize_evidence_text(
+            "\n".join(
+                str((raw_record or {}).get(key) or "")
+                for key in (
+                    "raw_text",
+                    "text",
+                    "value",
+                    "caption",
+                    "dense_text",
+                    "lexical_text",
+                    "document_title",
+                    "section_heading",
+                    "breadcrumb",
+                )
+            )
+        )
+        if not text_value:
+            text_value = str(identity.get("evidence_text") or "")
+        key = (record_id, text_value)
+        if key in seen:
+            return
+        seen.add(key)
+        source_ids = _unique_in_order(
+            [
+                record_id,
+                *[str(value) for field_name in (
+                    "document_revision_ids",
+                    "page_card_ids",
+                    "section_ids",
+                    "action_ids",
+                    "media_ids",
+                ) for value in identity.get(field_name) or []],
+            ]
+        )
+        units.append({"id": record_id, "source_ids": source_ids, "text": text_value})
+
+    for raw_unit in raw_units:
+        record_id = str(raw_unit.get("id") or raw_unit.get("record_id") or "")
+        _append_unit(record_id, raw_unit)
+    return units
+
+
+def _evidence_quote_coverage(
+    example: EvalExample,
+    result: Mapping[str, Any],
+    *,
+    ids_by_url: Dict[str, Any] | None,
+) -> tuple[bool, float]:
+    quotes = [
+        (str(item.get("source_key") or ""), normalize_evidence_text(item.get("quote")))
+        for item in (example.metadata or {}).get("evidence_quotes") or []
+        if isinstance(item, Mapping)
+        and str(item.get("source_key") or "")
+        and normalize_evidence_text(item.get("quote"))
+    ]
+    if not quotes:
+        return False, 1.0
+    units = _result_evidence_units(result, ids_by_url=ids_by_url)
+    matched = 0
+    for source_key, quote in quotes:
+        source_aliases = _identity_equivalents(source_key)
+        if any(
+            quote in str(unit.get("text") or "")
+            and source_aliases.intersection(
+                alias
+                for value in unit.get("source_ids") or []
+                for alias in _identity_equivalents(value)
+            )
+            for unit in units
+        ):
+            matched += 1
+    return True, matched / float(len(quotes))
+
+
+def _percentile(values: Sequence[float], percentile: float) -> float:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return 0.0
+    if len(ordered) == 1:
+        return ordered[0]
+    position = max(0.0, min(1.0, percentile)) * (len(ordered) - 1)
+    lower = int(math.floor(position))
+    upper = int(math.ceil(position))
+    if lower == upper:
+        return ordered[lower]
+    fraction = position - lower
+    return ordered[lower] + ((ordered[upper] - ordered[lower]) * fraction)
 
 
 def _example_fingerprint(example: EvalExample) -> str:
@@ -574,6 +1035,32 @@ class QueryRetrievalScore:
     citation_support_rate: float = 1.0
     multi_page_coverage_rate: float = 1.0
     unsupported_abstention_rate: float = 0.0
+    has_gold_documents: bool = False
+    has_gold_page_cards: bool = False
+    has_gold_sections: bool = False
+    has_gold_actions: bool = False
+    has_exact_gold_media: bool = False
+    has_evidence_quotes: bool = False
+    selected_document_revision_ids: List[str] = field(default_factory=list)
+    selected_page_card_ids: List[str] = field(default_factory=list)
+    selected_section_ids: List[str] = field(default_factory=list)
+    selected_action_ids: List[str] = field(default_factory=list)
+    document_hit_at_10: float = 0.0
+    page_card_hit_at_5: float = 0.0
+    section_hit_at_10: float = 0.0
+    action_hit_at_5: float = 0.0
+    navigation_action_hit_at_5: float = 0.0
+    navigation_page_hit_at_1: float = 0.0
+    exact_media_hit_at_5: float = 0.0
+    source_identity_recall_at_10: float = 1.0
+    evidence_quote_coverage_at_10: float = 1.0
+    abstained: bool = False
+    abstention_correct: float = 0.0
+    false_abstention: float = 0.0
+    backend_latency_ms: float = 0.0
+    vector_backend_latency_ms: float = 0.0
+    routing_latency_ms: float = 0.0
+    graph_augment_latency_ms: float = 0.0
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -583,7 +1070,7 @@ def _score_query(
     example: EvalExample,
     result: Dict[str, Any],
     *,
-    ids_by_url: Dict[str, Dict[str, List[str]]] | None = None,
+    ids_by_url: Dict[str, Any] | None = None,
 ) -> QueryRetrievalScore:
     exact_gold_chunk_ids = _gold_ids(example, "gold_chunk_ids")
     gold_chunk_ids = _gold_ids(example, "gold_chunk_ids", ids_by_url=ids_by_url)
@@ -592,7 +1079,12 @@ def _score_query(
     recall_gold_chunk_ids = exact_gold_chunk_ids or gold_chunk_ids
     recall_gold_span_ids = exact_gold_span_ids or gold_span_ids
     gold_parent_ids = _gold_ids(example, "gold_parent_ids", ids_by_url=ids_by_url)
+    exact_gold_media_ids = _gold_ids(example, "gold_media_ids")
     gold_media_ids = _gold_ids(example, "gold_media_ids", ids_by_url=ids_by_url)
+    gold_document_revision_ids = _gold_ids(example, "gold_document_revision_ids")
+    gold_page_card_ids = _gold_ids(example, "gold_page_card_ids")
+    gold_section_ids = _gold_ids(example, "gold_section_ids")
+    gold_action_ids = _gold_ids(example, "gold_action_ids")
     seed_chunk_ids = _unique_in_order(result.get("seed_chunk_ids") or [])
     selected_chunk_ids = _unique_in_order(result.get("selected_chunk_ids") or [])
     selected_span_ids = _unique_in_order(result.get("selected_evidence_span_ids") or [])
@@ -603,6 +1095,76 @@ def _score_query(
         list(result.get("selected_media_ids") or [])
         + [str(item.get("id") or "") for item in (result.get("media") or []) if isinstance(item, dict)]
         + dense_media_ids
+    )
+    dense_page_card_ids = _unique_in_order(result.get("dense_page_card_ids") or [])
+    dense_action_ids = _unique_in_order(result.get("dense_action_ids") or [])
+    navigation_identities = _navigation_plan_identities(result)
+    representation_ids = _ranked_representation_ids(result)
+    evidence_representation_ids = _evidence_representation_ids(result)
+    selected_document_revision_ids = _unique_in_order(
+        [
+            *_identity_values_for_records(
+                representation_ids,
+                "document_revision_ids",
+                ids_by_url=ids_by_url,
+            ),
+            *navigation_identities["document_revision_ids"],
+        ]
+    )
+    selected_page_card_ids = _unique_in_order(
+        [
+            *_identity_values_for_records(
+                representation_ids,
+                "page_card_ids",
+                ids_by_url=ids_by_url,
+            ),
+            *navigation_identities["page_card_ids"],
+        ]
+    )
+    broad_selected_section_ids = _unique_in_order(
+        [
+            *_identity_values_for_records(
+                representation_ids,
+                "section_ids",
+                ids_by_url=ids_by_url,
+            ),
+            *navigation_identities["section_ids"],
+        ]
+    )
+    selected_section_ids = _unique_in_order(
+        [
+            *_identity_values_for_records(
+                evidence_representation_ids,
+                "section_ids",
+                ids_by_url=ids_by_url,
+            ),
+            *navigation_identities["section_ids"],
+        ]
+    )
+    selected_action_ids = _unique_in_order(
+        [
+            *_identity_values_for_records(
+                representation_ids,
+                "action_ids",
+                ids_by_url=ids_by_url,
+            ),
+            *navigation_identities["action_ids"],
+        ]
+    )
+    observed_source_identities = _unique_in_order(
+        [
+            *representation_ids,
+            *selected_document_revision_ids,
+            *selected_page_card_ids,
+            *broad_selected_section_ids,
+            *selected_action_ids,
+            *selected_media_ids,
+        ]
+    )
+    has_evidence_quotes, evidence_quote_coverage = _evidence_quote_coverage(
+        example,
+        result,
+        ids_by_url=ids_by_url,
     )
 
     seed_hit = _hit_at_k(seed_chunk_ids, gold_chunk_ids, 5)
@@ -658,12 +1220,22 @@ def _score_query(
         or result.get("retrieval_documents")
         or result.get("evidence_span_documents")
     )
-    no_answer_violation = 1.0 if example.no_answer and no_answer_evidence_present else 0.0
-    unsupported_abstention_rate = (
-        1.0
-        if example.no_answer and (bool(result.get("abstained")) or not no_answer_evidence_present)
-        else 0.0
+    abstained = (
+        bool(result.get("abstained"))
+        if "abstained" in result
+        else not no_answer_evidence_present
     )
+    no_answer_violation = 1.0 if example.no_answer and not abstained else 0.0
+    unsupported_abstention_rate = (
+        1.0 if example.no_answer and abstained else 0.0
+    )
+
+    def _latency_value(field_name: str) -> float:
+        try:
+            return max(0.0, float(result.get(field_name) or 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+
     return QueryRetrievalScore(
         id=example.id,
         query=example.query,
@@ -726,6 +1298,51 @@ def _score_query(
         citation_support_rate=citation_support_rate,
         multi_page_coverage_rate=multi_page_coverage_rate,
         unsupported_abstention_rate=unsupported_abstention_rate,
+        has_gold_documents=bool(gold_document_revision_ids),
+        has_gold_page_cards=bool(gold_page_card_ids),
+        has_gold_sections=bool(gold_section_ids),
+        has_gold_actions=bool(gold_action_ids),
+        has_exact_gold_media=bool(exact_gold_media_ids),
+        has_evidence_quotes=has_evidence_quotes,
+        selected_document_revision_ids=selected_document_revision_ids,
+        selected_page_card_ids=selected_page_card_ids,
+        selected_section_ids=selected_section_ids,
+        selected_action_ids=selected_action_ids,
+        document_hit_at_10=_identity_hit(
+            selected_document_revision_ids,
+            gold_document_revision_ids,
+        ),
+        page_card_hit_at_5=_identity_hit(
+            dense_page_card_ids[:5],
+            gold_page_card_ids,
+        ),
+        section_hit_at_10=_identity_hit(selected_section_ids, gold_section_ids),
+        action_hit_at_5=_identity_hit(dense_action_ids[:5], gold_action_ids),
+        navigation_action_hit_at_5=_identity_hit(
+            navigation_identities["action_ids"][:5],
+            gold_action_ids,
+        ),
+        navigation_page_hit_at_1=_identity_hit(
+            navigation_identities["page_card_ids"][:1],
+            gold_page_card_ids,
+        ),
+        exact_media_hit_at_5=_identity_hit(selected_media_ids[:5], exact_gold_media_ids),
+        source_identity_recall_at_10=_source_identity_recall(
+            observed_source_identities,
+            _source_identity_keys(example),
+        ),
+        evidence_quote_coverage_at_10=evidence_quote_coverage,
+        abstained=abstained,
+        abstention_correct=(
+            1.0
+            if (example.no_answer and abstained) or (not example.no_answer and not abstained)
+            else 0.0
+        ),
+        false_abstention=1.0 if not example.no_answer and abstained else 0.0,
+        backend_latency_ms=_latency_value("backend_latency_ms"),
+        vector_backend_latency_ms=_latency_value("vector_backend_latency_ms"),
+        routing_latency_ms=_latency_value("routing_latency_ms"),
+        graph_augment_latency_ms=_latency_value("graph_augment_latency_ms"),
     )
 
 
@@ -736,11 +1353,48 @@ def _aggregate_scores(scores: Sequence[QueryRetrievalScore]) -> Dict[str, float]
     span_scores = [score for score in answerable_scores if score.has_gold_spans]
     parent_scores = [score for score in answerable_scores if score.has_gold_parents]
     media_scores = [score for score in answerable_scores if score.has_gold_media]
+    exact_media_scores = [score for score in answerable_scores if score.has_exact_gold_media]
     entity_coverage_scores = [score for score in answerable_scores if score.has_required_entities]
     page_coverage_scores = [score for score in answerable_scores if score.has_required_pages]
     section_coverage_scores = [score for score in answerable_scores if score.has_required_sections]
     citation_scores = [score for score in answerable_scores if score.has_expected_citations]
     multi_page_scores = [score for score in answerable_scores if score.has_min_distinct_sources]
+    document_scores = [score for score in answerable_scores if score.has_gold_documents]
+    page_card_scores = [score for score in answerable_scores if score.has_gold_page_cards]
+    section_scores = [score for score in answerable_scores if score.has_gold_sections]
+    action_scores = [score for score in answerable_scores if score.has_gold_actions]
+    evidence_quote_scores = [score for score in answerable_scores if score.has_evidence_quotes]
+    source_identity_scores = [
+        score
+        for score in answerable_scores
+        if score.has_gold_documents
+        or score.has_gold_page_cards
+        or score.has_gold_sections
+        or score.has_gold_actions
+        or score.has_gold_media
+    ]
+    backend_latencies = [score.backend_latency_ms for score in scores if score.backend_latency_ms > 0.0]
+    vector_latencies = [
+        score.vector_backend_latency_ms
+        for score in scores
+        if score.vector_backend_latency_ms > 0.0
+    ]
+    routing_latencies = [score.routing_latency_ms for score in scores if score.routing_latency_ms > 0.0]
+    graph_augment_latencies = [
+        score.graph_augment_latency_ms
+        for score in scores
+        if score.graph_augment_latency_ms > 0.0
+    ]
+    answerable_accept_accuracy = _mean(score.abstention_correct for score in answerable_scores)
+    unsupported_abstain_accuracy = _mean(score.abstention_correct for score in no_answer_scores)
+    if answerable_scores and no_answer_scores:
+        abstention_balanced_accuracy = (
+            answerable_accept_accuracy + unsupported_abstain_accuracy
+        ) / 2.0
+    elif answerable_scores:
+        abstention_balanced_accuracy = answerable_accept_accuracy
+    else:
+        abstention_balanced_accuracy = unsupported_abstain_accuracy
     return {
         "query_count": float(len(scores)),
         "answerable_query_count": float(len(answerable_scores)),
@@ -749,11 +1403,19 @@ def _aggregate_scores(scores: Sequence[QueryRetrievalScore]) -> Dict[str, float]
         "eligible_span_query_count": float(len(span_scores)),
         "eligible_parent_query_count": float(len(parent_scores)),
         "eligible_media_query_count": float(len(media_scores)),
+        "eligible_exact_media_query_count": float(len(exact_media_scores)),
         "eligible_entity_coverage_query_count": float(len(entity_coverage_scores)),
         "eligible_page_coverage_query_count": float(len(page_coverage_scores)),
         "eligible_section_coverage_query_count": float(len(section_coverage_scores)),
         "eligible_citation_query_count": float(len(citation_scores)),
         "eligible_multi_page_query_count": float(len(multi_page_scores)),
+        "eligible_document_query_count": float(len(document_scores)),
+        "eligible_page_card_query_count": float(len(page_card_scores)),
+        "eligible_section_query_count": float(len(section_scores)),
+        "eligible_action_query_count": float(len(action_scores)),
+        "eligible_evidence_quote_query_count": float(len(evidence_quote_scores)),
+        "eligible_source_identity_query_count": float(len(source_identity_scores)),
+        "latency_query_count": float(len(backend_latencies)),
         "seed_chunk_hit_at_5": _mean(score.seed_chunk_hit_at_5 for score in chunk_scores),
         "chunk_hit_at_5": _mean(score.chunk_hit_at_5 for score in chunk_scores),
         "chunk_hit_at_10": _mean(score.chunk_hit_at_10 for score in chunk_scores),
@@ -777,13 +1439,44 @@ def _aggregate_scores(scores: Sequence[QueryRetrievalScore]) -> Dict[str, float]
         "media_hit_at_5": _mean(score.media_hit_at_5 for score in media_scores),
         "media_mrr_at_5": _mean(score.media_mrr_at_5 for score in media_scores),
         "expansion_gain_hit_rate": _mean(score.expansion_gain_hit for score in chunk_scores),
-        "no_answer_violation_rate": _mean(score.no_answer_violation for score in scores),
+        "no_answer_violation_rate": _mean(score.no_answer_violation for score in no_answer_scores),
         "required_entity_coverage": _mean(score.required_entity_coverage for score in entity_coverage_scores),
         "required_page_coverage": _mean(score.required_page_coverage for score in page_coverage_scores),
         "required_section_coverage": _mean(score.required_section_coverage for score in section_coverage_scores),
         "citation_support_rate": _mean(score.citation_support_rate for score in citation_scores),
         "multi_page_coverage_rate": _mean(score.multi_page_coverage_rate for score in multi_page_scores),
         "unsupported_abstention_rate": _mean(score.unsupported_abstention_rate for score in no_answer_scores),
+        "document_hit_at_10": _mean(score.document_hit_at_10 for score in document_scores),
+        "page_card_hit_at_5": _mean(score.page_card_hit_at_5 for score in page_card_scores),
+        "section_hit_at_10": _mean(score.section_hit_at_10 for score in section_scores),
+        "action_hit_at_5": _mean(score.action_hit_at_5 for score in action_scores),
+        "navigation_action_hit_at_5": _mean(
+            score.navigation_action_hit_at_5 for score in action_scores
+        ),
+        "navigation_page_hit_at_1": _mean(
+            score.navigation_page_hit_at_1 for score in action_scores
+        ),
+        "exact_media_hit_at_5": _mean(
+            score.exact_media_hit_at_5 for score in exact_media_scores
+        ),
+        "source_identity_recall_at_10": _mean(
+            score.source_identity_recall_at_10 for score in source_identity_scores
+        ),
+        "evidence_quote_coverage_at_10": _mean(
+            score.evidence_quote_coverage_at_10 for score in evidence_quote_scores
+        ),
+        "abstention_accuracy": _mean(score.abstention_correct for score in scores),
+        "answerable_accept_accuracy": answerable_accept_accuracy,
+        "unsupported_abstain_accuracy": unsupported_abstain_accuracy,
+        "abstention_balanced_accuracy": abstention_balanced_accuracy,
+        "false_abstention_rate": _mean(score.false_abstention for score in answerable_scores),
+        "backend_latency_mean_ms": _mean(backend_latencies),
+        "backend_latency_p50_ms": _percentile(backend_latencies, 0.50),
+        "backend_latency_p95_ms": _percentile(backend_latencies, 0.95),
+        "backend_latency_max_ms": max(backend_latencies, default=0.0),
+        "vector_backend_latency_p95_ms": _percentile(vector_latencies, 0.95),
+        "routing_latency_p95_ms": _percentile(routing_latencies, 0.95),
+        "graph_augment_latency_p95_ms": _percentile(graph_augment_latencies, 0.95),
     }
 
 
@@ -977,7 +1670,20 @@ _METRIC_ELIGIBILITY_COUNTS = {
     "required_section_coverage": "eligible_section_coverage_query_count",
     "citation_support_rate": "eligible_citation_query_count",
     "multi_page_coverage_rate": "eligible_multi_page_query_count",
+    "document_hit_at_10": "eligible_document_query_count",
+    "page_card_hit_at_5": "eligible_page_card_query_count",
+    "section_hit_at_10": "eligible_section_query_count",
+    "action_hit_at_5": "eligible_action_query_count",
+    "navigation_action_hit_at_5": "eligible_action_query_count",
+    "navigation_page_hit_at_1": "eligible_action_query_count",
+    "exact_media_hit_at_5": "eligible_exact_media_query_count",
+    "source_identity_recall_at_10": "eligible_source_identity_query_count",
+    "evidence_quote_coverage_at_10": "eligible_evidence_quote_query_count",
+    "no_answer_violation_rate": "no_answer_query_count",
     "unsupported_abstention_rate": "no_answer_query_count",
+    "unsupported_abstain_accuracy": "no_answer_query_count",
+    "answerable_accept_accuracy": "answerable_query_count",
+    "false_abstention_rate": "answerable_query_count",
 }
 
 
