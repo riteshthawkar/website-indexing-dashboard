@@ -163,6 +163,7 @@ _TERM_STOPWORDS = {
     "on",
     "or",
     "the",
+    "their",
     "to",
     "with",
     "إلى",
@@ -296,6 +297,14 @@ def _normalize_arabic_for_match(value: str) -> str:
 
 def _normalize_for_term_match(value: Any) -> str:
     text = unicodedata.normalize("NFKC", _text(value)).casefold()
+    # User-facing source labels and paths may retain percent encoding from a
+    # URL. Decode twice at most so ``Statistics%20for...`` and a safely
+    # double-encoded equivalent are scored as the same visible title.
+    for _attempt in range(2):
+        decoded = unquote(text)
+        if decoded == text:
+            break
+        text = decoded
     text = _normalize_arabic_for_match(text)
     # Thousands separators are formatting, not part of the numeric fact.
     # Keep decimal commas intact by requiring a three-digit group.
@@ -463,6 +472,9 @@ _ARABIC_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"تعاون", "تعاوني"}),
     frozenset({"اداري", "ادارة"}),
 )
+_ENGLISH_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"ahead", "before"}),
+)
 
 
 def _arabic_term_token_variants(token: str) -> set[str]:
@@ -553,8 +565,19 @@ def _term_token_supported(
         )
     if re.fullmatch(r"[a-z]+", token):
         token_variants = _english_term_token_variants(token)
-        return any(
+        if any(
             token_variants & _english_term_token_variants(response_token)
+            for response_token in response_tokens
+        ):
+            return True
+        equivalent_groups = [
+            group
+            for group in _ENGLISH_LEXICAL_EQUIVALENCE_GROUPS
+            if group & token_variants
+        ]
+        return any(
+            group & _english_term_token_variants(response_token)
+            for group in equivalent_groups
             for response_token in response_tokens
         )
     return False
@@ -708,6 +731,8 @@ def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
             "i can't find",
             "i do not have any information",
             "i don't have any information",
+            "i do not currently have information",
+            "i don't currently have information",
             "i have no information",
             "the available sources do not show",
             "the sources do not show",
@@ -724,6 +749,38 @@ def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
     return len(normalized) < 420 and any(
         _normalize_for_term_match(marker) in normalized for marker in _NO_ANSWER_MARKERS
     )
+
+
+_FORBIDDEN_TERM_NEGATION_BEFORE_RE = re.compile(
+    r"(?:\b(?:cannot|can't|does\s+not|doesn't|do\s+not|don't|is\s+not|isn't|"
+    r"are\s+not|aren't|no|never|not|without)\b|(?:لا|ليس|ليست|غير))[^.;:!?]{0,70}$",
+    re.IGNORECASE,
+)
+_FORBIDDEN_TERM_NEGATION_AFTER_RE = re.compile(
+    r"^[^.;:!?]{0,45}(?:\b(?:is\s+not|isn't|are\s+not|aren't|was\s+not|"
+    r"wasn't|were\s+not|weren't|not)\s+(?:covered|guaranteed|included|listed|"
+    r"offered|provided|supported)\b|(?:غير\s+(?:مضمون|مشمول|مدرج|متاح)))",
+    re.IGNORECASE,
+)
+
+
+def _forbidden_term_present(response: str, term: str) -> bool:
+    """Return true only when a prohibited fact is asserted, not explicitly denied."""
+
+    normalized_response = _normalize_for_term_match(response)
+    normalized_term = _normalize_for_term_match(term)
+    if not normalized_response or not normalized_term:
+        return False
+    for match in re.finditer(re.escape(normalized_term), normalized_response):
+        prefix = normalized_response[max(0, match.start() - 90) : match.start()]
+        suffix = normalized_response[match.end() : match.end() + 80]
+        negated_before = bool(_FORBIDDEN_TERM_NEGATION_BEFORE_RE.search(prefix))
+        negated_after = bool(_FORBIDDEN_TERM_NEGATION_AFTER_RE.search(suffix))
+        if "not only" in prefix[-20:]:
+            negated_before = False
+        if not (negated_before or negated_after):
+            return True
+    return False
 
 
 def _explicitly_denies_unsupported_premise(response: str) -> bool:
@@ -1598,7 +1655,7 @@ def _score_answer_row(
     expected_followup_topics = _metadata_list(metadata, "expected_followup_topics")
     expected_suggested_actions = _metadata_list(metadata, "expected_suggested_actions")
     missing_required, must_include_coverage = _required_terms_result(response, must_include, metadata)
-    forbidden_found = [term for term in must_not_include if _contains_casefolded(response, term)]
+    forbidden_found = [term for term in must_not_include if _forbidden_term_present(response, term)]
     response_non_empty = 1.0 if response else 0.0
     support_present = 1.0 if _source_support_present(row) else 0.0
     expected_reference_url_pass = _expected_reference_url_pass(metadata, row, no_answer=bool(example.no_answer))

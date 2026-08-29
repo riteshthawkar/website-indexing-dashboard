@@ -8,6 +8,7 @@ import pytest
 from pipeline.evaluation.answer_readiness import (
     _build_judge_prompt,
     _chat_prediction_row_from_payload,
+    _forbidden_term_present,
     _looks_like_no_answer,
     _post_chat_request,
     _required_term_supported,
@@ -170,6 +171,38 @@ def test_answer_matching_recognizes_production_no_relevant_information_wording()
     assert _looks_like_no_answer("No relevant information found in the supplied MBZUAI sources.")
     assert _looks_like_no_answer(
         "I do not have any information showing that MBZUAI has a private airport. [1]"
+    )
+    assert _looks_like_no_answer(
+        "I don’t currently have information confirming that MBZUAI operates a private airport."
+    )
+
+
+def test_answer_matching_decodes_visible_percent_encoded_titles():
+    assert _required_term_supported(
+        "Open Statistics%20for%20Business in the official site.",
+        "Statistics for Business",
+    )
+
+
+def test_answer_matching_accepts_ahead_before_visit_paraphrase():
+    assert _required_term_supported(
+        "Visitors should call before visiting MBZUAI.",
+        "ahead of their visit",
+    )
+
+
+def test_forbidden_term_matching_ignores_explicit_negative_caveat():
+    assert not _forbidden_term_present(
+        "The funded package does not guarantee airfare.",
+        "airfare",
+    )
+    assert not _forbidden_term_present(
+        "Airfare is not guaranteed as part of the funded package.",
+        "airfare",
+    )
+    assert _forbidden_term_present(
+        "The funded package includes airfare and health insurance.",
+        "airfare",
     )
 
 
