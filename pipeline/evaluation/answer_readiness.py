@@ -13,9 +13,11 @@ import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
 from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import unquote, urlparse, urlunparse
+from zoneinfo import ZoneInfo
 
 from pipeline.core.google_genai import import_genai
 from pipeline.core.io import atomic_write_json
@@ -26,7 +28,7 @@ from pipeline.evaluation.retrieval_eval import check_metric_gates, load_eval_gat
 
 _ANSWER_READINESS_REPORT_VERSION = 4
 _PREDICTION_METADATA_VERSION = 1
-_JUDGE_PROMPT_VERSION = "mbzuai-answer-readiness-judge-v2"
+_JUDGE_PROMPT_VERSION = "mbzuai-answer-readiness-judge-v3"
 AnswerProgressCallback = Callable[[str, Mapping[str, Any]], None]
 _OPENAI_JUDGE_CLIENT: Any | None = None
 _OPENAI_JUDGE_CLIENT_CONFIG: tuple[str, float, int] | None = None
@@ -452,6 +454,15 @@ def _term_tokens(value: Any) -> List[str]:
 _ARABIC_TERM_TOKEN_RE = re.compile(
     r"^[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]+$"
 )
+_ARABIC_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
+    # Governed, narrow semantic equivalents observed in source-grounded
+    # Arabic answers. These avoid failing the release gate on direct lexical
+    # alternations while leaving numbers, entities, and factual qualifiers
+    # subject to exact matching.
+    frozenset({"تراكم", "تجمع"}),
+    frozenset({"تعاون", "تعاوني"}),
+    frozenset({"اداري", "ادارة"}),
+)
 
 
 def _arabic_term_token_variants(token: str) -> set[str]:
@@ -525,8 +536,19 @@ def _term_token_supported(
         return True
     if _ARABIC_TERM_TOKEN_RE.fullmatch(token):
         token_variants = _arabic_term_token_variants(token)
-        return any(
+        if any(
             token_variants & _arabic_term_token_variants(response_token)
+            for response_token in response_tokens
+        ):
+            return True
+        equivalent_groups = [
+            group
+            for group in _ARABIC_LEXICAL_EQUIVALENCE_GROUPS
+            if group & token_variants
+        ]
+        return any(
+            group & _arabic_term_token_variants(response_token)
+            for group in equivalent_groups
             for response_token in response_tokens
         )
     if re.fullmatch(r"[a-z]+", token):
@@ -1162,10 +1184,20 @@ def _response_component_payload(row: Mapping[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _judge_reference_datetime() -> str:
+    configured = str(os.environ.get("ANSWER_READINESS_REFERENCE_DATETIME") or "").strip()
+    if configured:
+        return configured
+    return datetime.now(ZoneInfo("Asia/Dubai")).isoformat(timespec="seconds")
+
+
 def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
     example_metadata = dict(example.metadata or {})
+    reference_datetime = _judge_reference_datetime()
     payload = {
         "judge_prompt_version": _JUDGE_PROMPT_VERSION,
+        "evaluation_reference_datetime": reference_datetime,
+        "evaluation_timezone": "Asia/Dubai",
         "query": example.query,
         "query_type": example.query_type,
         "source_type": example.source_type,
@@ -1191,6 +1223,8 @@ def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
     compact_payload = _truncate_jsonable(payload, max_chars=24000)
     return (
         f"You are the production release judge for an MBZUAI retrieval-grounded chatbot. Prompt version: {_JUDGE_PROMPT_VERSION}.\n"
+        f"The authoritative evaluation date/time is {reference_datetime} in Asia/Dubai. Use it for every temporal judgment; "
+        "do not substitute a model training date, knowledge cutoff, or assumed current year.\n"
         "Evaluate the final user-facing answer and every attached artifact: retrieved evidence, sources, references, "
         "UI payload, injected components, suggested actions, follow-up questions, and response contract fields.\n\n"
         "Return strict JSON only. Do not include markdown or commentary outside the JSON object.\n\n"
@@ -1218,7 +1252,8 @@ def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
         "11. Use verdict 'pass' only for production-ready responses. Use 'review' for borderline responses and 'fail' for unsafe/incorrect/unsupported responses.\n"
         "12. Do not penalize an answer for including a term or detail that appears in the reference answer or required coverage. If your numeric scores are all production-ready "
         "(overall >= 0.80, correctness >= 0.75, groundedness >= 0.75, relevance >= 0.70, helpfulness >= 0.70, and safety >= 0.80), the verdict should normally be 'pass'; "
-        "use 'review' with high scores only when you can name a concrete production blocker.\n\n"
+        "use 'review' with high scores only when you can name a concrete production blocker.\n"
+        "13. Judge past, current, and future dates only against evaluation_reference_datetime. A date before that timestamp has passed; a date after it is future/upcoming.\n\n"
         "Output schema:\n"
         "{"
         "\"correctness\":0.0,"

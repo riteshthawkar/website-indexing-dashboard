@@ -6,6 +6,7 @@ import time
 import pytest
 
 from pipeline.evaluation.answer_readiness import (
+    _build_judge_prompt,
     _chat_prediction_row_from_payload,
     _looks_like_no_answer,
     _post_chat_request,
@@ -127,6 +128,30 @@ def test_arabic_answer_matching_handles_possessive_taa_marbuta_and_visual_labels
         "يمر المخطط بمرحلة Filtering ثم التنظيف.",
         "التصفية",
     )
+
+
+def test_arabic_answer_matching_accepts_governed_lexical_equivalents():
+    assert _required_term_supported("تُظهر الصورة تجمّع المياه بعد المطر.", "تراكم المياه")
+    assert _required_term_supported("يعتمد العمل على نموذج تعاوني مع الشركاء.", "التعاون")
+    assert _required_term_supported("تشرف لجان المجلس والإدارة على شؤون الجامعة.", "لجان إدارية")
+
+
+def test_judge_prompt_uses_explicit_dubai_reference_datetime(monkeypatch):
+    monkeypatch.setenv("ANSWER_READINESS_REFERENCE_DATETIME", "2026-08-29T12:30:00+04:00")
+
+    prompt = _build_judge_prompt(
+        EvalExample(
+            id="time-aware-judge",
+            query="Which listed news dates have passed?",
+            query_type="scoped",
+        ),
+        {"response": "The August 20, 2026 item has passed."},
+    )
+
+    assert "mbzuai-answer-readiness-judge-v3" in prompt
+    assert "2026-08-29T12:30:00+04:00" in prompt
+    assert "do not substitute a model training date" in prompt
+    assert "evaluation_reference_datetime" in prompt
 
 
 def test_answer_matching_normalizes_thousands_separators():
