@@ -10,6 +10,7 @@ from pipeline.evaluation.answer_readiness import (
     _looks_like_no_answer,
     _post_chat_request,
     _required_term_supported,
+    _normalize_url_for_match,
     _run_websocket_answer_predictions,
     _websocket_chat_request_async,
     evaluate_answer_readiness,
@@ -113,6 +114,62 @@ def test_arabic_answer_matching_normalizes_diacritics_digits_and_articles():
     assert _looks_like_no_answer("لا توجد معلومات موثوقة عن هذا المكتب في المصادر المتاحة.")
 
 
+def test_arabic_answer_matching_handles_possessive_taa_marbuta_and_visual_labels():
+    assert _required_term_supported(
+        "ترسيخ مكانتها كمركز رائد لمجتمع الذكاء الاصطناعي في أبوظبي.",
+        "ترسيخ مكانة أبوظبي",
+    )
+    assert _required_term_supported(
+        "تُظهر الصورة معالجاً حاسوبياً (computer processor chip).",
+        "شريحة معالج",
+    )
+    assert _required_term_supported(
+        "يمر المخطط بمرحلة Filtering ثم التنظيف.",
+        "التصفية",
+    )
+
+
+def test_answer_matching_normalizes_thousands_separators():
+    assert _required_term_supported("The cohort includes 5,000 participants.", "5000 participants")
+    assert _required_term_supported("تضم المبادرة ٥٬٠٠٠ مشارك.", "5000 مشارك")
+
+
+def test_answer_matching_accepts_interpretable_hazard_scale_paraphrase():
+    assert _required_term_supported(
+        "Average hazard is an interpretable, hazard-scale integral measure.",
+        "hazard-scale interpretation",
+    )
+
+
+def test_answer_matching_recognizes_production_no_relevant_information_wording():
+    assert _looks_like_no_answer("No relevant information found in the supplied MBZUAI sources.")
+    assert _looks_like_no_answer(
+        "I do not have any information showing that MBZUAI has a private airport. [1]"
+    )
+
+
+def test_answer_matching_recognizes_supported_context_followed_by_premise_denial():
+    from pipeline.evaluation.answer_readiness import (
+        _explicitly_denies_unsupported_premise,
+    )
+
+    response = (
+        "MBZUAI is five kilometers from Abu Dhabi International Airport, but I do "
+        "not have any information indicating that MBZUAI has a private airport or an "
+        "IATA code for one. [1]"
+    )
+
+    assert _explicitly_denies_unsupported_premise(response)
+
+
+def test_answer_url_matching_treats_percent_encoded_arabic_path_as_equivalent():
+    encoded = "https://mbzuai.ac.ae/ar/news/%D8%A7%D9%84%D8%B0%D9%83%D8%A7%D8%A1"
+    decoded = "https://mbzuai.ac.ae/ar/news/الذكاء"
+
+    assert _normalize_url_for_match(encoded) == _normalize_url_for_match(decoded)
+    assert _normalize_url_for_match(encoded.replace("%", "%25")) == _normalize_url_for_match(decoded)
+
+
 def test_answer_prediction_preserves_websocket_timeout_error_without_http_status():
     row = _chat_prediction_row_from_payload(
         payload={
@@ -132,6 +189,38 @@ def test_answer_prediction_preserves_websocket_timeout_error_without_http_status
     assert row["error"] == "websocket_answer_readiness_timeout"
     assert row["metadata"]["error"] == "websocket_answer_readiness_timeout"
     assert row["metadata"]["terminal_event"] == "timeout"
+
+
+def test_answer_prediction_preserves_structured_navigation_plan():
+    navigation_plan = {
+        "schema_version": "mbzuai.navigation_plan.v1",
+        "status": "ready",
+        "intent": "search",
+        "steps": [
+            {
+                "action_type": "search",
+                "target_url": "https://metaverse.mbzuai.ac.ae/",
+            }
+        ],
+    }
+    row = _chat_prediction_row_from_payload(
+        payload={
+            "response": "The Search action opens the Metaverse homepage. [1]",
+            "sources": [{"url": "https://metaverse.mbzuai.ac.ae/publications"}],
+            "navigation_plan": navigation_plan,
+        },
+        example=EvalExample(
+            id="navigation-row",
+            query="Where does Search go?",
+            query_type="scoped",
+        ),
+        backend="production_chat_http",
+        endpoint="http://127.0.0.1:8000/telegram-chat",
+        latency_ms=10.0,
+        eval_request_mode=True,
+    )
+
+    assert row["navigation_plan"] == navigation_plan
 
 
 def test_websocket_answer_prediction_reports_receive_timeout(monkeypatch):

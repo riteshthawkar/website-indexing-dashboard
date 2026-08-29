@@ -9024,6 +9024,52 @@ class TestAdaptiveHybridRetriever:
 
         assert "chunk-current" in retriever.chunk_map
 
+    def test_runtime_bridges_raw_chunk_hierarchy_keys_to_canonical_parent_ids(self, tmp_dir):
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+        run_dir = self._build_retrieval_run(tmp_dir)
+        stage_dir = run_dir / "stage_outputs" / "format_retrieval"
+        bundle_path = stage_dir / "retrieval_bundle.json"
+        lexical_path = stage_dir / "lexical_corpus.json"
+        bundle = load_json_safe(bundle_path, {})
+        canonical_section_id = "parent:c650:document-revision:doc1:section:abc123"
+        canonical_page_id = "parent:c650:document-revision:doc1:page"
+        for parent in bundle["parent_records"]:
+            if parent["id"] == "section-a":
+                parent["id"] = canonical_section_id
+            elif parent["id"] == "page-a":
+                parent["id"] = canonical_page_id
+        lexical = load_json_safe(lexical_path, [])
+        for record in lexical:
+            if record.get("id") == "section-a":
+                record["id"] = canonical_section_id
+        atomic_write_json(bundle_path, bundle)
+        atomic_write_json(lexical_path, lexical)
+
+        retriever = AdaptiveHybridRetriever(
+            config={
+                "embedder": {"pinecone_index": "idx"},
+                "retrieval": {"enable_sparse": False, "enable_rerank": False},
+            },
+            work_dir=run_dir,
+        )
+
+        assert retriever._parent_ids_for_chunk("chunk1", parent_type="section") == [
+            canonical_section_id
+        ]
+        assert retriever._parent_ids_for_chunk("chunk1", parent_type="page") == [
+            canonical_page_id
+        ]
+        assert retriever._canonical_parent_ids(
+            ["section-a", "page-a"],
+            chunk_ids=["chunk1"],
+        ) == [canonical_section_id, canonical_page_id]
+        assert retriever._select_parent_ids(["chunk1"])[0:2] == [
+            canonical_section_id,
+            canonical_page_id,
+        ]
+
     def _build_contact_lookup_run(self, tmp_dir):
         from pipeline.core.io import atomic_write_json
 
@@ -10995,6 +11041,9 @@ class TestAdaptiveHybridRetriever:
         assert classify_query_mode("What are the IT support working hours for the MBZUAI online screening exam?") == QueryMode.FACT
         assert classify_query_mode("Whose name does MBZUAI carry?") == QueryMode.FACT
         assert classify_query_mode("In which city is MBZUAI based?") == QueryMode.FACT
+        assert classify_query_mode(
+            "ما عنوان البريد الإلكتروني الذي ينبغي التواصل معه بشأن متطلبات إمكانية الوصول قبل زيارة جامعة محمد بن زايد للذكاء الاصطناعي؟"
+        ) == QueryMode.FACT
         assert classify_query_mode("What five core AI specializations does MBZUAI offer in its M.Sc. and Ph.D. programs?") == QueryMode.SCOPED
         assert classify_query_mode("What everyday campus amenities can MBZUAI students use on site?") == QueryMode.SCOPED
         assert classify_query_mode("Explain MBZUAI's legal basis and institutional affiliation.") == QueryMode.SCOPED
@@ -11007,6 +11056,27 @@ class TestAdaptiveHybridRetriever:
         profile = _lookup_query_profile("What everyday campus amenities can MBZUAI students use on site?")
         assert profile.answer_types == tuple()
         assert profile.is_exact_lookup is False
+
+    def test_website_reference_in_synthesis_is_not_treated_as_url_lookup(self):
+        from pipeline.retrieval.adaptive_hybrid import QueryMode, _lookup_query_profile, classify_query_mode
+
+        query = (
+            "What does the IFM website say it aims to build with partners, where is its "
+            "headquarters located, and in which cities does it have research centers?"
+        )
+        profile = _lookup_query_profile(query)
+
+        assert "website" not in profile.answer_types
+        assert profile.is_exact_lookup is False
+        assert classify_query_mode(query) == QueryMode.SYNTHESIS
+
+    def test_explicit_website_url_question_remains_an_exact_lookup(self):
+        from pipeline.retrieval.adaptive_hybrid import _lookup_query_profile
+
+        profile = _lookup_query_profile("What is the official website for MBZUAI?")
+
+        assert profile.answer_types == ("website",)
+        assert profile.is_exact_lookup is True
 
     def test_email_address_lookup_does_not_also_request_location(self):
         from pipeline.retrieval.adaptive_hybrid import _lookup_query_profile
@@ -11354,6 +11424,16 @@ class TestAdaptiveHybridRetriever:
             "dense_text": "About MBZUAI. The university supports academic offerings, students, and faculty in Abu Dhabi.",
             "child_chunk_ids": ["chunk3"],
         }
+        for parent_id in ("parent-specializations", "parent-about"):
+            parent_text = retriever.parent_map[parent_id]["dense_text"]
+            parent_tokens = set(mod._tokenize(parent_text))
+            retriever.lexical_map[parent_id] = {"id": parent_id, "text": parent_text}
+            retriever._namespace_tokens_by_id.setdefault(retriever.namespace_parents, {})[
+                parent_id
+            ] = parent_tokens
+            token_index = retriever._namespace_token_index.setdefault(retriever.namespace_parents, {})
+            for token in parent_tokens:
+                token_index.setdefault(token, []).append(parent_id)
 
         ids = retriever._local_parent_query_ids(
             "What five core AI specializations does MBZUAI offer in its M.Sc. and Ph.D. programs?",
@@ -12012,6 +12092,15 @@ class TestAdaptiveHybridRetriever:
             "linked_parent_ids": ["section-a", "page-a"],
         }
         retriever.media_texts_by_id["media_visual"] = "Campus map page 1 campus layout with buildings and facilities"
+        media_text = retriever.media_texts_by_id["media_visual"]
+        media_tokens = set(mod._tokenize(media_text))
+        retriever.lexical_map["media_visual"] = {"id": "media_visual", "text": media_text}
+        retriever._namespace_tokens_by_id.setdefault(retriever.namespace_media, {})[
+            "media_visual"
+        ] = media_tokens
+        token_index = retriever._namespace_token_index.setdefault(retriever.namespace_media, {})
+        for token in media_tokens:
+            token_index.setdefault(token, []).append("media_visual")
 
         ids = retriever._local_media_query_ids("What does the campus map show about the building layout?", top_k=2)
         assert ids[0] == "media_visual"
@@ -12972,6 +13061,7 @@ class TestGraphRAGRetriever:
         from pipeline.core.io import atomic_write_json
         from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
         from pipeline.retrieval.graph_rag import GraphRAGRetriever
+        import pipeline.retrieval.adaptive_hybrid as mod
 
         run_dir = TestAdaptiveHybridRetriever()._build_retrieval_run(tmp_dir)
         graph_dir = run_dir / "stage_outputs" / "promote_graph"
@@ -13026,6 +13116,19 @@ class TestGraphRAGRetriever:
             },
         }
         base = AdaptiveHybridRetriever(config=config, work_dir=run_dir)
+        assertion_text = "MBZUAI LOCATED_IN Masdar City, Abu Dhabi."
+        assertion_tokens = set(
+            mod._tokenize(
+                "MBZUAI located location city Masdar Abu Dhabi campus address " + assertion_text
+            )
+        )
+        base.lexical_map["assertion1"] = {"id": "assertion1", "text": assertion_text}
+        base._namespace_tokens_by_id.setdefault(base.namespace_assertions, {})[
+            "assertion1"
+        ] = assertion_tokens
+        token_index = base._namespace_token_index.setdefault(base.namespace_assertions, {})
+        for token in assertion_tokens:
+            token_index.setdefault(token, []).append("assertion1")
         seen = {}
 
         def _retrieve(query, *, query_vector=None, seed_overrides=None):
@@ -13309,13 +13412,19 @@ class TestRoutedHybridRetriever:
             graph_first=True,
         )
         retriever.graph._build_relation_query_plan = lambda query, mode, media_query: relation_plan
-        retriever.vector.retrieve = lambda query, query_vector=None: {
-            "query": query,
-            "mode": "fact",
-            "selected_chunk_ids": ["chunk1"],
-            "selected_parent_ids": ["page-a"],
-            "selected_media_ids": [],
-        }
+        vector_call = {}
+
+        def retrieve_vector(query, query_vector=None, mode_override=None):
+            vector_call["mode_override"] = mode_override
+            return {
+                "query": query,
+                "mode": "fact",
+                "selected_chunk_ids": ["chunk1"],
+                "selected_parent_ids": ["page-a"],
+                "selected_media_ids": [],
+            }
+
+        retriever.vector.retrieve = retrieve_vector
         retriever.graph.prepare_query_context = lambda query, **kwargs: GraphQueryContext(
             mode=kwargs.get("mode"),
             media_query=False,
@@ -13346,6 +13455,7 @@ class TestRoutedHybridRetriever:
         assert result["graph_used"] is True
         assert result["routing_parallel_vector_graph"] is True
         assert "relation_alias_expansion" in result["query_rewrite_labels"]
+        assert getattr(vector_call["mode_override"], "value", vector_call["mode_override"]) == "fact"
 
     def test_routed_retriever_runs_parallel_path_for_non_relation_queries(self, tmp_dir):
         from pipeline.retrieval.graph_rag import GraphQueryContext, RelationCandidateSet
@@ -13364,7 +13474,7 @@ class TestRoutedHybridRetriever:
         }
         retriever = RoutedHybridRetriever(config=config, work_dir=run_dir)
         retriever.vector.embed_query = lambda query: [0.1, 0.2]
-        retriever.vector.retrieve = lambda query, query_vector=None: {
+        retriever.vector.retrieve = lambda query, query_vector=None, mode_override=None: {
             "query": query,
             "mode": "scoped",
             "selected_chunk_ids": ["chunk1"],
@@ -13411,7 +13521,7 @@ class TestRoutedHybridRetriever:
         }
         retriever = RoutedHybridRetriever(config=config, work_dir=run_dir)
         retriever.vector.embed_query = lambda query: [0.1, 0.2]
-        retriever.vector.retrieve = lambda query, query_vector=None: {
+        retriever.vector.retrieve = lambda query, query_vector=None, mode_override=None: {
             "query": query,
             "mode": "fact",
             "selected_chunk_ids": ["chunk1"],
@@ -13466,7 +13576,7 @@ class TestRoutedHybridRetriever:
             graph_first=False,
         )
         retriever.graph._build_relation_query_plan = lambda query, mode, media_query: relation_plan
-        retriever.vector.retrieve = lambda query, query_vector=None: {
+        retriever.vector.retrieve = lambda query, query_vector=None, mode_override=None: {
             "query": query,
             "mode": "fact",
             "selected_chunk_ids": ["contact-chunk"],
@@ -15846,6 +15956,8 @@ class TestRetrievalEvaluation:
 
         assert report["query_count"] == 1
         assert report["execution"]["retrieval_error_count"] == 1
+        assert report["overall"]["retrieval_error_count"] == 1.0
+        assert report["overall"]["successful_query_count"] == 0.0
         assert report["retrieval_errors"][0]["id"] == "q1"
         assert "retriever exploded" in report["retrieval_errors"][0]["error"]
         assert report["overall"]["chunk_hit_at_10"] == 0.0
@@ -17159,6 +17271,42 @@ class TestRetrievalService:
 
 
 class TestIndexedLocalRetrieval:
+    def test_configured_vector_namespaces_alias_all_local_indexes(self):
+        from pipeline.retrieval.adaptive_hybrid import _register_configured_namespace_aliases
+
+        chunk_token_index = {"mbzuai": ["chunk-1"]}
+        chunk_tokens = {"chunk-1": {"mbzuai"}}
+        assertion_token_index = {"founded": ["assertion-1"]}
+        assertion_tokens = {"assertion-1": {"founded"}}
+        chunk_bm25 = object()
+        token_indexes = {
+            "chunks": chunk_token_index,
+            "assertions": assertion_token_index,
+        }
+        tokens_by_id = {
+            "chunks": chunk_tokens,
+            "assertions": assertion_tokens,
+        }
+        bm25_indexes = {"chunks": (["chunk-1"], chunk_bm25)}
+
+        _register_configured_namespace_aliases(
+            configured_to_canonical={
+                "mbzuai_main-chunks": "chunks",
+                "mbzuai_main-assertions": "assertions",
+                "mbzuai_main-media": "media",
+            },
+            token_indexes=token_indexes,
+            tokens_by_id=tokens_by_id,
+            bm25_indexes=bm25_indexes,
+        )
+
+        assert token_indexes["mbzuai_main-chunks"] is chunk_token_index
+        assert tokens_by_id["mbzuai_main-chunks"] is chunk_tokens
+        assert bm25_indexes["mbzuai_main-chunks"] is bm25_indexes["chunks"]
+        assert token_indexes["mbzuai_main-assertions"] is assertion_token_index
+        assert tokens_by_id["mbzuai_main-assertions"] is assertion_tokens
+        assert "mbzuai_main-media" not in token_indexes
+
     def test_lexical_query_ids_use_posting_index_without_bm25(self):
         from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
 

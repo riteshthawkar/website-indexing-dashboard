@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from pipeline.core.io import atomic_write_json
@@ -9,6 +11,36 @@ from pipeline.evaluation.retrieval_eval import (
     _load_gold_ids_by_url,
     _score_query,
 )
+
+
+def test_eval_retrieval_cli_forwards_governed_splits(monkeypatch, tmp_path) -> None:
+    import pipeline.cli as cli
+
+    captured = {}
+
+    def evaluate(**kwargs):
+        captured.update(kwargs)
+        return {"gates": {"passed": True, "path": "", "failures": []}}
+
+    monkeypatch.setattr(cli, "evaluate_retrieval_dataset", evaluate)
+    exit_code = cli.cmd_eval_retrieval(
+        SimpleNamespace(
+            config="production",
+            work_dir=str(tmp_path),
+            dataset="eval.jsonl",
+            gates=None,
+            query_cache=None,
+            retrieval_cache=None,
+            split=["selection"],
+            parallelism=4,
+            output=None,
+            quiet_progress=True,
+            json=True,
+        )
+    )
+
+    assert exit_code == 0
+    assert captured["splits"] == ["selection"]
 
 
 def test_retrieval_eval_scores_representation_v2_and_navigation(tmp_path) -> None:
@@ -200,3 +232,30 @@ def test_retrieval_eval_uses_explicit_abstention_and_no_answer_denominator() -> 
     assert aggregate["unsupported_abstain_accuracy"] == pytest.approx(0.5)
     assert aggregate["answerable_accept_accuracy"] == 1.0
     assert aggregate["abstention_balanced_accuracy"] == pytest.approx(0.75)
+
+
+def test_retrieval_eval_scores_explicit_bridged_representation_identities() -> None:
+    example = EvalExample(
+        id="bridged-identities",
+        query="What does this section say?",
+        query_type="scoped",
+        source_type="webpage",
+        gold_document_revision_ids=["document-revision:1"],
+        gold_page_card_ids=["page-card:1"],
+        gold_section_ids=["page-section:1"],
+    ).normalized()
+
+    score = _score_query(
+        example,
+        {
+            "abstained": False,
+            "selected_document_revision_ids": ["document-revision:1"],
+            "selected_page_card_ids": ["page-card:1"],
+            "selected_section_ids": ["page-section:1"],
+            "dense_page_card_ids": ["page-card:1"],
+        },
+    )
+
+    assert score.document_hit_at_10 == 1.0
+    assert score.page_card_hit_at_5 == 1.0
+    assert score.section_hit_at_10 == 1.0

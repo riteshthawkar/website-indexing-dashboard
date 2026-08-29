@@ -551,6 +551,11 @@ retrieval:
   # Graph catalog. Missing optional catalogs produce an unavailable plan.
   navigation_plan_required: false
   page_graph_navigation_catalog_file: null
+  # Re-rank only Page Cards already returned by the dense lane, using the
+  # independently selected chunk->page bridge as a small RRF corroboration.
+  page_card_evidence_fusion_enabled: true
+  page_card_evidence_fusion_weight: 0.15
+  page_card_evidence_fusion_rrf_k: 60
   hyde_enabled: false
   hyde_query_modes: ["synthesis"]
   hyde_model: "gpt-5-nano"
@@ -619,6 +624,12 @@ retrieval:
   max_context_chunks: 12
   max_parent_chunks: 10
   max_media_results: 4
+  # Expansion may add graph/parent/fact context, but it must retain leading
+  # candidates from the controlled A/B winner's dense lane.
+  dense_recall_floor_k: 2
+  dense_recall_window: 10
+  dense_parent_recall_floor_k: 1
+  dense_parent_recall_window: 5
   same_parent_expand_threshold: 2
   enable_sparse: true
   enable_rerank: true
@@ -639,6 +650,10 @@ retrieval:
   fact_abstain_min_token_overlap: 0.20
   fact_require_fact_support_overlap: 0.35
   abstain_min_support_score: 0.05
+  # A visual record can be independently answer-bearing even when surrounding
+  # text is too weak for the chunk abstention guard.
+  media_abstain_rescue_min_score: 1.25
+  media_abstain_rescue_min_overlap: 0.35
   temporal_exact_year_guard_enabled: true
   temporal_guard_top_k: 5
   parent_candidate_top_k: 3

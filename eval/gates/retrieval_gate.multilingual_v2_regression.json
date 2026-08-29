@@ -1,0 +1,52 @@
+{
+  "overall": {
+    "query_count": {"min": 26},
+    "answerable_query_count": {"min": 22},
+    "no_answer_query_count": {"min": 4},
+    "retrieval_error_count": {"max": 0},
+    "successful_query_count": {"min": 26},
+    "no_answer_violation_rate": {"max": 0.0},
+    "unsupported_abstention_rate": {"min": 1.0},
+    "answerable_accept_accuracy": {"min": 0.95},
+    "abstention_balanced_accuracy": {"min": 0.975},
+    "chunk_source_hit_at_10": {"min": 0.70},
+    "chunk_source_ndcg_at_10": {"min": 0.52},
+    "parent_hit_at_5": {"min": 0.70},
+    "document_hit_at_10": {"min": 0.90},
+    "page_card_hit_at_5": {"min": 0.82},
+    "section_hit_at_10": {"min": 0.50},
+    "source_identity_recall_at_10": {"min": 0.90},
+    "evidence_quote_coverage_at_10": {"min": 0.60},
+    "media_hit_at_5": {"min": 0.65},
+    "exact_media_hit_at_5": {"min": 0.70},
+    "multi_page_coverage_rate": {"min": 1.0},
+    "navigation_action_hit_at_5": {"min": 1.0},
+    "navigation_page_hit_at_1": {"min": 1.0},
+    "backend_latency_p50_ms": {"max": 6000},
+    "backend_latency_p95_ms": {"max": 12000},
+    "backend_latency_max_ms": {"max": 25000},
+    "vector_backend_latency_p95_ms": {"max": 9000},
+    "routing_latency_p95_ms": {"max": 5000},
+    "graph_augment_latency_p95_ms": {"max": 5000}
+  },
+  "by_language": {
+    "Arabic": {
+      "query_count": {"min": 13},
+      "no_answer_violation_rate": {"max": 0.0},
+      "unsupported_abstention_rate": {"min": 1.0},
+      "answerable_accept_accuracy": {"min": 0.90},
+      "chunk_source_hit_at_10": {"min": 0.55},
+      "document_hit_at_10": {"min": 0.80},
+      "source_identity_recall_at_10": {"min": 0.80}
+    },
+    "English": {
+      "query_count": {"min": 13},
+      "no_answer_violation_rate": {"max": 0.0},
+      "unsupported_abstention_rate": {"min": 1.0},
+      "answerable_accept_accuracy": {"min": 0.90},
+      "chunk_source_hit_at_10": {"min": 0.70},
+      "document_hit_at_10": {"min": 0.85},
+      "source_identity_recall_at_10": {"min": 0.85}
+    }
+  }
+}

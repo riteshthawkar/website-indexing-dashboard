@@ -19,6 +19,7 @@ from pipeline.vectorstores.pgvector_store import (
     PgVectorConfigurationError,
     PgVectorSettings,
     PgVectorStore,
+    VectorMatch,
 )
 
 
@@ -215,17 +216,10 @@ def test_pgvector_query_casts_list_parameters_to_vector() -> None:
         def fetchall(self):
             return self.rows
 
-    class Transaction:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, _exc_type, _exc, _traceback):
-            return None
-
     class Connection:
         @staticmethod
         def transaction():
-            return Transaction()
+            raise AssertionError("read queries must not open client-managed transactions")
 
         @staticmethod
         def execute(query, _parameters=None):
@@ -261,26 +255,82 @@ def test_pgvector_query_casts_list_parameters_to_vector() -> None:
     assert [(match.record_id, match.score) for match in matches] == [("chunk-1", 0.75)]
 
 
+def test_pgvector_reader_configures_hnsw_settings_once_per_pooled_session() -> None:
+    executed = []
+
+    class Connection:
+        @staticmethod
+        def execute(query, parameters=None):
+            executed.append((query, parameters))
+
+    store = object.__new__(PgVectorStore)
+    store.settings = PgVectorSettings(
+        dsn="postgresql://unused?sslmode=require",
+        purpose="read",
+        dimensions=3,
+        hnsw_ef_search=137,
+    )
+    store._register_vector = lambda _connection: None
+
+    store._configure_connection(Connection())
+
+    assert (
+        "SELECT set_config('hnsw.ef_search', %s, false)",
+        ("137",),
+    ) in executed
+    assert (
+        "SELECT set_config('hnsw.iterative_scan', 'strict_order', false)",
+        None,
+    ) in executed
+
+
+def test_pgvector_writer_does_not_apply_reader_hnsw_session_settings() -> None:
+    executed = []
+
+    class Connection:
+        @staticmethod
+        def execute(query, parameters=None):
+            executed.append((query, parameters))
+
+    store = object.__new__(PgVectorStore)
+    store.settings = PgVectorSettings(
+        dsn="postgresql://unused?sslmode=require",
+        purpose="write",
+        dimensions=3,
+    )
+    store._register_vector = lambda _connection: None
+
+    store._configure_connection(Connection())
+
+    assert not any("hnsw." in query for query, _parameters in executed)
+
+
 def test_adaptive_dense_lane_dispatches_to_pgvector() -> None:
     calls = []
 
     class Store:
-        def query_ids(self, **kwargs):
+        def query(self, **kwargs):
             calls.append(kwargs)
-            return ["chunk-1"]
+            return [VectorMatch(record_id="chunk-1", score=0.8125)]
 
     retriever = object.__new__(AdaptiveHybridRetriever)
     retriever.vector_store_provider = "pgvector"
     retriever.vector_release_id = "release-1"
     retriever._pgvector_store = Store()
 
+    scores = {}
     result = retriever._dense_query_ids(
         query_vector=[0.25, 0.75],
         namespace="chunks--release-1",
         top_k=4,
+        score_sink=scores,
+        score_key="chunk_dense_ids",
     )
 
     assert result == ["chunk-1"]
+    assert scores == {
+        "chunk_dense_ids": [{"id": "chunk-1", "score": 0.8125}]
+    }
     assert calls == [
         {
             "release_id": "release-1",

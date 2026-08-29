@@ -230,6 +230,889 @@ def test_adaptive_retriever_prefers_finalized_bundle_over_stale_build(tmp_path):
     assert "stale-span" not in retriever.evidence_span_map
 
 
+def test_page_card_dense_hit_bridges_to_chunks_by_document_revision(tmp_path):
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    stage_dir = tmp_path / "stage_outputs" / "format_retrieval"
+    stage_dir.mkdir(parents=True)
+    atomic_write_json(
+        stage_dir / "retrieval_bundle.json",
+        {
+            "version": 6,
+            "chunk_records": [
+                {
+                    "id": "chunk:ifm:about:0",
+                    "text": "The Institute of Foundation Models is based in Abu Dhabi.",
+                    "dense_text": "The Institute of Foundation Models is based in Abu Dhabi.",
+                    "document_revision_id": "document-revision:ifm-about",
+                    "source_url": "https://ifm.ai/about",
+                },
+                {
+                    "id": "chunk:other:0",
+                    "text": "An unrelated page.",
+                    "dense_text": "An unrelated page.",
+                    "document_revision_id": "document-revision:other",
+                    "source_url": "https://mbzuai.ac.ae/other",
+                },
+            ],
+            "parent_records": [],
+            "media_records": [],
+            "page_card_records": [
+                {
+                    "id": "page-card:ifm-about",
+                    "document_revision_id": "document-revision:ifm-about",
+                    "source_url": "https://ifm.ai/about",
+                    "title": "About IFM - Institute of Foundation Models",
+                }
+            ],
+            "action_records": [],
+            "fact_records": [],
+            "evidence_span_records": [],
+            "summary_records": [],
+            "assertion_records": [],
+            "entity_records": [],
+            "answer_records": [],
+        },
+    )
+    atomic_write_json(stage_dir / "lexical_corpus.json", [])
+
+    retriever = AdaptiveHybridRetriever(
+        config={
+            "embedder": {"pinecone_index": "test-index"},
+            "retrieval": {"enable_sparse": False, "enable_rerank": False},
+        },
+        work_dir=tmp_path,
+    )
+
+    assert retriever._seed_chunk_ids(["page-card:ifm-about"]) == [
+        "chunk:ifm:about:0"
+    ]
+
+
+def test_source_query_bonus_prefers_named_subdomain_identity():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    query = (
+        "What does the IFM website say it builds with partners, and where are "
+        "its headquarters and research hubs?"
+    )
+
+    ifm_bonus = retriever._source_query_bonus(
+        query,
+        source_url="https://ifm.ai/about",
+        document_title="About IFM - Institute of Foundation Models",
+        heading="Who We Are",
+        text="A global center for foundation models.",
+    )
+    generic_bonus = retriever._source_query_bonus(
+        query,
+        source_url="https://mbzuai.ac.ae/research/research-centers",
+        document_title="Research Centers - MBZUAI",
+        heading="Research centers",
+        text="Partners from academia work across research centers.",
+    )
+
+    assert ifm_bonus >= generic_bonus + 2.0
+
+
+def test_named_source_evidence_precedes_generic_topic_matches():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.evidence_span_map = {
+        "generic": {
+            "id": "generic",
+            "text": "Research centers work with partners across academia.",
+            "source_url": "https://mbzuai.ac.ae/research/research-centers",
+            "document_title": "Research Centers - MBZUAI",
+        },
+        "ifm-about": {
+            "id": "ifm-about",
+            "text": "IFM has its headquarters in Abu Dhabi and research hubs in Paris and Silicon Valley.",
+            "source_url": "https://ifm.ai/about",
+            "document_title": "About IFM",
+        },
+        "ifm-collaborate": {
+            "id": "ifm-collaborate",
+            "text": "IFM partners with academic institutions, research labs, startups, and enterprise leaders.",
+            "source_url": "https://ifm.ai/collaborate",
+            "document_title": "Collaborate with IFM",
+        },
+    }
+    retriever._score_text_match = lambda query, text: (
+        1.0 if "partners" in text.lower() else 0.5
+    )
+
+    ranked = retriever._promote_named_source_evidence_spans(
+        "What does the IFM website say about its headquarters, research hubs, and partners?",
+        ["generic", "ifm-about", "ifm-collaborate"],
+    )
+
+    assert ranked[:2] == ["ifm-collaborate", "ifm-about"]
+
+
+def test_evidence_pack_prioritizes_named_official_subdomain_sources():
+    from pipeline.retrieval.evidence_packer import (
+        _is_official_mbzuai_url,
+        build_evidence_pack,
+    )
+
+    result = {
+        "evidence_span_documents": [
+            {
+                "id": "generic-research-centers",
+                "text": "MBZUAI research centers work with partners from academia.",
+                "source_url": "https://mbzuai.ac.ae/research/research-centers",
+                "span_type": "general",
+            },
+            {
+                "id": "ifm-about",
+                "text": "IFM is headquartered in Abu Dhabi with research hubs in Paris and Silicon Valley.",
+                "source_url": "https://ifm.ai/about",
+                "document_title": "cd99ef32a7737302a82a",
+                "span_type": "general",
+            },
+            {
+                "id": "ifm-collaborate",
+                "text": "IFM partners with academic institutions, labs, startups, and enterprise leaders.",
+                "source_url": "https://ifm.ai/collaborate",
+                "span_type": "general",
+            },
+            {
+                "id": "corrupted-chunk",
+                "text": "TI",
+                "source_url": "https://ifm.ai/",
+                "document_title": "c5771aec882eacb81dfa",
+                "span_type": "general",
+            },
+        ]
+    }
+
+    pack = build_evidence_pack(
+        query=(
+            "What does the IFM website say about its headquarters, research "
+            "hubs, and partners?"
+        ),
+        result=result,
+        max_items=3,
+        max_chars=4000,
+    )
+
+    assert [item["id"] for item in pack["items"][:2]] == [
+        "ifm-about",
+        "ifm-collaborate",
+    ]
+    assert pack["items"][0]["document_title"] == "About"
+    assert all(item["id"] != "corrupted-chunk" for item in pack["items"])
+    assert _is_official_mbzuai_url("https://ifm.ai/about") is True
+
+
+def test_evidence_pack_does_not_emit_tiny_budget_tail_fragments():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    result = {
+        "evidence_span_documents": [
+            {
+                "id": "a-long-ifm-span",
+                "text": ("IFM " + ("research " * 87)).strip(),
+                "source_url": "https://ifm.ai/about",
+                "span_type": "general",
+            },
+            {
+                "id": "z-followup-span",
+                "text": "This otherwise valid evidence would only fit as a tiny fragment.",
+                "source_url": "https://ifm.ai/collaborate",
+                "span_type": "general",
+            },
+        ]
+    }
+
+    pack = build_evidence_pack(
+        query="What does IFM say about research?",
+        result=result,
+        max_items=4,
+        max_chars=800,
+    )
+
+    assert pack["items"]
+    assert all(len(item["text"]) >= 20 for item in pack["items"])
+    assert all(len(item["text"].split()) >= 3 for item in pack["items"])
+
+
+def test_evidence_pack_keeps_complete_job_requirements_chunk_within_source_cap():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/senior-grants-specialist-3"
+    pack = build_evidence_pack(
+        query=(
+            "What are the minimum education and experience requirements for "
+            "the Senior Grants Specialist role?"
+        ),
+        result={
+            "evidence_span_documents": [
+                {
+                    "id": "responsibilities-one",
+                    "text": (
+                        "Grants Lifecycle Administration: administer pre-award, "
+                        "post-award, and closeout processes and provide guidance "
+                        "on compliance requirements."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Senior Grants Specialist",
+                    "span_type": "requirement",
+                },
+                {
+                    "id": "responsibilities-two",
+                    "text": (
+                        "Maintain grant records, conduct compliance reviews, and "
+                        "support internal and external audits."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Senior Grants Specialist",
+                    "span_type": "requirement",
+                },
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "complete-requirements-chunk",
+                    "text": (
+                        "TITLE: Senior Grants Specialist. Academic Qualifications "
+                        "Required: Bachelor's degree in business administration, "
+                        "finance, public administration, or Higher Education "
+                        "Administration. A postgraduate degree is preferred. "
+                        "Professional Experience Required: minimum of 5 years of "
+                        "experience in research or grants administration."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Senior Grants Specialist",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    selected_ids = {item["id"] for item in pack["items"]}
+    assert "complete-requirements-chunk" in selected_ids
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "Bachelor's degree" in packed_text
+    assert "minimum of 5 years" in packed_text
+
+
+def test_arabic_qualification_query_keeps_english_requirements_span():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/data-platform-engineer-iaai"
+    pack = build_evidence_pack(
+        query=(
+            "ما المؤهل الأكاديمي المطلوب لوظيفة Data Platform Engineer "
+            "في معهد IAAI؟"
+        ),
+        result={
+            "fact_documents": [
+                {
+                    "id": "role-summary",
+                    "text": "This position is well suited for an early-career engineer.",
+                    "source_url": source_url,
+                    "document_title": "Data Platform Engineer IAAI",
+                },
+                {
+                    "id": "collaboration-summary",
+                    "text": "The role works closely with an Applied Research Scientist.",
+                    "source_url": source_url,
+                    "document_title": "Data Platform Engineer IAAI",
+                },
+            ],
+            "evidence_span_documents": [
+                {
+                    "id": "academic-qualifications",
+                    "text": (
+                        "Academic Qualifications Required: Bachelor's degree in "
+                        "computer science, data engineering, information systems, "
+                        "software engineering, or a related field. A Master's "
+                        "degree is preferred but not mandatory."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Data Platform Engineer IAAI",
+                    "span_type": "requirement",
+                }
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "complete-qualification-chunk",
+                    "text": (
+                        "TITLE: Data Platform Engineer IAAI. Academic Qualifications "
+                        "Required: Bachelor's degree in computer science, data "
+                        "engineering, information systems, software engineering, "
+                        "or a related field. A Master's degree is preferred but "
+                        "not mandatory."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Data Platform Engineer IAAI",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    selected_ids = {item["id"] for item in pack["items"]}
+    assert "academic-qualifications" in selected_ids
+    assert "complete-qualification-chunk" in selected_ids
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "Bachelor's degree" in packed_text
+    assert "preferred but not mandatory" in packed_text
+
+
+def test_arabic_qualification_query_compacts_long_chunk_around_complete_block():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/data-platform-engineer-iaai"
+    long_preamble = " ".join(
+        f"Platform background paragraph {index} about agricultural systems."
+        for index in range(90)
+    )
+    pack = build_evidence_pack(
+        query=(
+            "ما المؤهل الأكاديمي المطلوب لوظيفة Data Platform Engineer "
+            "في معهد IAAI؟"
+        ),
+        result={
+            "fact_documents": [
+                {
+                    "id": "bachelor-only-fragment",
+                    "text": "Academic Qualifications Required: Bachelor's degree in a related field.",
+                    "source_url": source_url,
+                    "document_title": "Data Platform Engineer IAAI",
+                }
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "complete-long-qualification-chunk",
+                    "text": (
+                        f"TITLE: Data Platform Engineer IAAI. {long_preamble} "
+                        "Academic Qualifications Required: Bachelor's degree in "
+                        "computer science, data engineering, information systems, "
+                        "software engineering, or a related field. A Master's "
+                        "degree is preferred but not mandatory. Professional "
+                        "Experience Required: two years of relevant experience."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Data Platform Engineer IAAI",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    assert pack["items"][0]["id"] == "complete-long-qualification-chunk"
+    assert len(pack["items"][0]["text"]) <= 2400
+    assert "Bachelor's degree" in pack["items"][0]["text"]
+    assert "A Master's degree is preferred but not mandatory" in pack["items"][0]["text"]
+
+
+def test_evidence_pack_keeps_complete_arabic_roles_chunk_over_scope_shift():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://mbzuai.ac.ae/ar/study/faculty/carlos-bustamante-ar"
+    pack = build_evidence_pack(
+        query=(
+            "ما المناصب التي شغلها كارلوس بوستامانتي في جامعة ستانفورد "
+            "قبل انضمامه إلى جامعة محمد بن زايد للذكاء الاصطناعي؟"
+        ),
+        result={
+            "evidence_span_documents": [
+                {
+                    "id": "partial-stanford-role",
+                    "text": (
+                        "قبل انضمامه إلى جامعة محمد بن زايد للذكاء الاصطناعي، "
+                        "شغل كارلوس بوستامانتي منصب أستاذ في جامعة ستانفورد."
+                    ),
+                    "source_url": source_url,
+                    "span_type": "general",
+                },
+                {
+                    "id": "cornell-scope-shift",
+                    "text": (
+                        "وقبل انضمامه إلى جامعة ستانفورد، كان عضو هيئة تدريس في "
+                        "جامعة كورنيل وشغل منصب المدير المشارك لمركز كورنيل."
+                    ),
+                    "source_url": source_url,
+                    "span_type": "general",
+                },
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "complete-stanford-roles",
+                    "text": (
+                        "قبل انضمامه إلى جامعة محمد بن زايد للذكاء الاصطناعي، شغل "
+                        "كارلوس بوستامانتي في جامعة ستانفورد مناصب أستاذ في علوم "
+                        "البيانات الحيوية الطبية وعلم الوراثة، وأول رئيس لقسم علوم "
+                        "البيانات الحيوية الطبية، والمؤسس والمدير لمركز ستانفورد "
+                        "للحوسبة الوراثية والتطورية والجينوميات البشرية."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "كارلوس بوستامانتي",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    selected_ids = {item["id"] for item in pack["items"]}
+    assert "complete-stanford-roles" in selected_ids
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "المؤسس والمدير" in packed_text
+    assert "جامعة كورنيل" not in packed_text
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "According to the infographic, what percentage are male and female?",
+        "بحسب الإنفوغراف، ما النسبة المئوية للذكور وما نسبة الإناث؟",
+    ],
+)
+def test_evidence_pack_reserves_ranked_media_for_multilingual_visual_queries(query):
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    result = {
+        "evidence_span_documents": [
+            {
+                "id": f"generic-span-{index}",
+                "text": "General university evidence that should not displace the selected visual record.",
+                "source_url": f"https://mbzuai.ac.ae/news/generic-{index}",
+                "span_type": "general",
+            }
+            for index in range(8)
+        ],
+        "media": [
+            {
+                "id": "gender-infographic",
+                "text": (
+                    "SEMANTIC_CAPTION: Participant demographics infographic. "
+                    "VISIBLE_TEXT: 25% إناث 75% ذكور."
+                ),
+                "source_url": "https://staticcdn.mbzuai.ac.ae/prospectus-arabic.pdf",
+                "media_type": "image",
+            }
+        ],
+    }
+
+    pack = build_evidence_pack(query=query, result=result, max_items=8, max_chars=8000)
+
+    assert pack["items"][0]["kind"] == "media"
+    assert pack["items"][0]["id"] == "gender-infographic"
+    assert "25% إناث 75% ذكور" in pack["items"][0]["text"]
+    assert pack["items"][0]["authority_score"] == pytest.approx(0.95)
+
+
+def test_evidence_pack_does_not_force_media_into_non_visual_queries():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    pack = build_evidence_pack(
+        query="What are the graduate admission requirements?",
+        result={
+            "evidence_span_documents": [
+                {
+                    "id": "admissions-span",
+                    "text": "Graduate admission requirements include an eligible bachelor's degree.",
+                    "source_url": "https://mbzuai.ac.ae/study/graduate-admission-process",
+                    "span_type": "fact",
+                }
+            ],
+            "media": [
+                {
+                    "id": "decorative-photo",
+                    "text": "A decorative campus photograph with no admissions details.",
+                    "source_url": "https://mbzuai.ac.ae/campus",
+                    "media_type": "image",
+                }
+            ],
+        },
+        max_items=1,
+        max_chars=2000,
+    )
+
+    assert [item["id"] for item in pack["items"]] == ["admissions-span"]
+
+
+def test_evidence_pack_promotes_qr_invitation_media_and_caps_visual_candidates():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    result = {
+        "media": [
+            {
+                "id": "faculty-portfolio",
+                "text": "MBZUAI Faculty Portfolio 2024-2025. Scan QR for a digital copy.",
+                "source_url": "https://careers.mbzuai.ac.ae/engineering-vacancies",
+            },
+            {
+                "id": "conference-speaker",
+                "text": "A conference speaker profile card.",
+                "source_url": "https://staticcdn.mbzuai.ac.ae/conference.pdf",
+            },
+            {
+                "id": "brand-page",
+                "text": "A brand guideline page with typography examples.",
+                "source_url": "https://staticcdn.mbzuai.ac.ae/brand.pdf",
+            },
+            {
+                "id": "unrelated-visual",
+                "text": "A research laboratory photograph.",
+                "source_url": "https://mbzuai.ac.ae/research",
+            },
+        ]
+    }
+
+    pack = build_evidence_pack(
+        query="What document is shown in the image, and what does it invite the viewer to do?",
+        result=result,
+        max_items=8,
+        max_chars=8000,
+    )
+
+    media_items = [item for item in pack["items"] if item["kind"] == "media"]
+    assert media_items[0]["id"] == "faculty-portfolio"
+    assert len(media_items) == 3
+
+
+def test_evidence_pack_prefers_same_language_arabic_visual_evidence():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    pack = build_evidence_pack(
+        query="بحسب الإنفوغراف، ما النسبة المئوية للذكور وما نسبة الإناث؟",
+        result={
+            "media": [
+                {
+                    "id": "arabic-demographics",
+                    "text": "إنفوغراف المشاركين. النص المرئي: 75% ذكور و25% إناث.",
+                    "source_url": "https://staticcdn.mbzuai.ac.ae/arabic-prospectus.pdf",
+                },
+                {
+                    "id": "english-demographics",
+                    "text": "Participant demographics infographic: 71% Male and 29% Female.",
+                    "source_url": "https://staticcdn.mbzuai.ac.ae/english-prospectus.pdf",
+                },
+            ]
+        },
+        max_items=4,
+        max_chars=4000,
+    )
+
+    assert pack["items"][0]["id"] == "arabic-demographics"
+
+
+def test_evidence_pack_preserves_top_mixed_language_named_diagram():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    pack = build_evidence_pack(
+        query=(
+            "ما الخطوة الثانية في الإطار المعروض لبناء "
+            "Cultural Commonsense Knowledge Graph، وما الفكرة العامة لها؟"
+        ),
+        result={
+            "media": [
+                {
+                    "id": "gold-english-diagram",
+                    "text": (
+                        "Cultural Commonsense Knowledge Graph framework. "
+                        "Step two: ITERATIVE EXPANSION with forward and intermediate expansion."
+                    ),
+                    "source_url": "https://mbzuai.ac.ae/news/cultural-archives",
+                },
+                {
+                    "id": "arabic-adjacent-visual-one",
+                    "text": "صورة عربية عن قياس المعرفة الثقافية وبناء مجموعة معيارية.",
+                    "source_url": "https://mbzuai.ac.ae/ar/news/cultural-benchmark",
+                },
+                {
+                    "id": "arabic-adjacent-visual-two",
+                    "text": "رسم عربي عام عن نماذج الذكاء الاصطناعي والثقافة.",
+                    "source_url": "https://mbzuai.ac.ae/ar/news/cultural-models",
+                },
+                {
+                    "id": "arabic-adjacent-visual-three",
+                    "text": "مخطط عربي عام عن أرشيفات ثقافية خفية.",
+                    "source_url": "https://mbzuai.ac.ae/ar/news/cultural-archives",
+                },
+            ]
+        },
+        max_items=4,
+        max_chars=4000,
+    )
+
+    assert pack["items"][0]["id"] == "gold-english-diagram"
+
+
+def test_evidence_pack_preserves_visible_text_beyond_long_media_context():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    long_context = " ".join(["Generic regional context"] * 170)
+    pack = build_evidence_pack(
+        query="What does the map indicate about road impact and the area measured for points of interest?",
+        result={
+            "media": [
+                {
+                    "id": "rain-impact-map",
+                    "text": (
+                        "IMAGE: Figure 3: Analysis map\n"
+                        "DOCUMENT: Rain case study\n"
+                        f"CONTEXT: {long_context}\n"
+                        "VISIBLE_TEXT: 140 km roads are impacted, including highways and main roads. "
+                        "For points of interest, a 0.2 km radius is considered.\n"
+                        "CONTEXTUAL_CAPTION: Satellite analysis map of impacted infrastructure.\n"
+                        "SOURCE_URL: https://staticcdn.mbzuai.ac.ae/rain-study.pdf"
+                    ),
+                    "source_url": "https://staticcdn.mbzuai.ac.ae/rain-study.pdf",
+                }
+            ]
+        },
+        max_items=4,
+        max_chars=2400,
+    )
+
+    evidence = pack["items"][0]["text"]
+    assert "140 km roads" in evidence
+    assert "0.2 km radius" in evidence
+    assert "CONTEXTUAL_CAPTION" in evidence
+    assert len(evidence) <= 2400
+
+
+def test_evidence_pack_keeps_complete_table_visible_text_when_it_fits():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    rows = " ".join([f"Model-{index} Avg {index}.00" for index in range(35)])
+    visible_text = f"Hindi MCQ Benchmarks {rows} Llama-3.1-70B Instruct Avg 47.96"
+    pack = build_evidence_pack(
+        query="Which model has the highest Avg in the Hindi MCQ Benchmarks table?",
+        result={
+            "media": [
+                {
+                    "id": "hindi-table",
+                    "text": (
+                        "IMAGE: Table 4\n"
+                        "DOCUMENT: Hindi model evaluation\n"
+                        f"CONTEXT: {'irrelevant prose ' * 200}\n"
+                        f"VISIBLE_TEXT: {visible_text}\n"
+                        "SEMANTIC_CAPTION: A table comparing Hindi model benchmarks."
+                    ),
+                    "source_url": "https://mbzuai.ac.ae/news/hindi-model",
+                }
+            ]
+        },
+        max_items=4,
+        max_chars=2400,
+    )
+
+    evidence = pack["items"][0]["text"]
+    assert "Llama-3.1-70B Instruct Avg 47.96" in evidence
+    assert len(evidence) <= 2400
+
+
+def _bare_media_scorer(media_by_id):
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.media_texts_by_id = {
+        media_id: str(media.get("text") or "")
+        for media_id, media in media_by_id.items()
+    }
+    return retriever
+
+
+def test_media_relevance_prefers_exact_collected_data_visual():
+    media_by_id = {
+        "hpp-visual": {
+            "id": "hpp-visual",
+            "text": (
+                "A glowing blue head diagram. Collected data are automatically analysed "
+                "and are not reviewed or used for diagnosis."
+            ),
+            "source_url": "https://mbzuai.ac.ae/research/healthcare",
+        },
+        "generic-visual": {
+            "id": "generic-visual",
+            "text": "A glowing blue artificial-intelligence research illustration.",
+            "source_url": "https://mbzuai.ac.ae/research",
+        },
+    }
+    retriever = _bare_media_scorer(media_by_id)
+    query = "What does the image say happens to the collected data?"
+
+    assert retriever._score_media_relevance(query, media_by_id["hpp-visual"]) > retriever._score_media_relevance(
+        query,
+        media_by_id["generic-visual"],
+    )
+
+
+def test_media_relevance_prefers_explicit_pdf_page_number():
+    media_by_id = {
+        "page-10": {
+            "id": "page-10",
+            "media_type": "image",
+            "text": (
+                "IMAGE: Visual from Class of 2024 Arabic page 10. "
+                "VISIBLE_TEXT: الإسهام في تطوير تقنيات الجيل التالي."
+            ),
+            "source_url": "https://staticcdn.mbzuai.ac.ae/class-of-2024-arabic.pdf",
+        },
+        "same-event-photo": {
+            "id": "same-event-photo",
+            "media_type": "image",
+            "text": "IMAGE: A graduate portrait from the Class of 2024 ceremony.",
+            "source_url": "https://mbzuai.ac.ae/ar/commencement-2024",
+        },
+    }
+    retriever = _bare_media_scorer(media_by_id)
+    query = "في الصفحة 10 من برنامج دفعة 2024 العربي، ماذا تعرض الصورة؟"
+
+    assert retriever._score_media_relevance(
+        query,
+        media_by_id["page-10"],
+    ) > retriever._score_media_relevance(query, media_by_id["same-event-photo"])
+
+
+def test_media_relevance_prefers_qr_invitation_visual():
+    media_by_id = {
+        "faculty-portfolio": {
+            "id": "faculty-portfolio",
+            "text": "MBZUAI Faculty Portfolio 2024-2025. Scan QR for a digital copy.",
+            "source_url": "https://careers.mbzuai.ac.ae/engineering-vacancies",
+        },
+        "generic-visual": {
+            "id": "generic-visual",
+            "text": "A photograph of faculty members speaking at an event.",
+            "source_url": "https://mbzuai.ac.ae/faculty",
+        },
+    }
+    retriever = _bare_media_scorer(media_by_id)
+    query = "What document is shown in the image, and what does it invite the viewer to do?"
+
+    assert retriever._score_media_relevance(
+        query,
+        media_by_id["faculty-portfolio"],
+    ) > retriever._score_media_relevance(query, media_by_id["generic-visual"])
+
+
+def test_media_relevance_prefers_complete_academic_gpa_entry():
+    media_by_id = {
+        "declaration": {
+            "id": "declaration",
+            "text": "Application tabs: Personal Details, Academic History, Declaration.",
+            "source_url": "https://staticcdn.mbzuai.ac.ae/application.pdf",
+        },
+        "programming-course": {
+            "id": "programming-course",
+            "text": (
+                "Programming Courses Taken. Course Name Python Programming. "
+                "Final Mark 4.0. Maximum Possible Mark 4.0."
+            ),
+            "source_url": "https://staticcdn.mbzuai.ac.ae/application.pdf",
+        },
+        "academic-gpa": {
+            "id": "academic-gpa",
+            "text": (
+                "Academic History. University Name Carnegie Mellon University. "
+                "Degree Level Bachelor. Major Artificial Intelligence. "
+                "Cumulative Grade Point Average (CGPA) 4.0. Maximum Possible "
+                "Grade Point Average (GPA) 4.0."
+            ),
+            "source_url": "https://staticcdn.mbzuai.ac.ae/application.pdf",
+        },
+    }
+    retriever = _bare_media_scorer(media_by_id)
+    query = (
+        "What academic history example is shown in the form, and what does it "
+        "say about the GPA fields?"
+    )
+
+    target_score = retriever._score_media_relevance(
+        query,
+        media_by_id["academic-gpa"],
+    )
+    assert target_score > retriever._score_media_relevance(
+        query,
+        media_by_id["declaration"],
+    )
+    assert target_score > retriever._score_media_relevance(
+        query,
+        media_by_id["programming-course"],
+    )
+
+
+def test_media_relevance_prefers_same_language_gender_infographic():
+    media_by_id = {
+        "arabic-demographics": {
+            "id": "arabic-demographics",
+            "text": "إنفوغراف المشاركين. النص المرئي: 75% ذكور و25% إناث.",
+            "source_url": "https://staticcdn.mbzuai.ac.ae/arabic-prospectus.pdf",
+        },
+        "english-demographics": {
+            "id": "english-demographics",
+            "text": "Participant demographics infographic: 71% Male and 29% Female.",
+            "source_url": "https://staticcdn.mbzuai.ac.ae/english-prospectus.pdf",
+        },
+    }
+    retriever = _bare_media_scorer(media_by_id)
+    query = "بحسب الإنفوغراف، ما النسبة المئوية للذكور وما نسبة الإناث؟"
+
+    assert retriever._score_media_relevance(
+        query,
+        media_by_id["arabic-demographics"],
+    ) > retriever._score_media_relevance(query, media_by_id["english-demographics"])
+
+
+def test_media_relevance_crosses_languages_for_after_rain_visual():
+    from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
+
+    media_by_id = {
+        "after-rain-map": {
+            "id": "after-rain-map",
+            "text": (
+                "Figure 2: After Rain. Satellite imagery captured on April 17, 2024, "
+                "depicting water accumulation post-rainfall in Dubai."
+            ),
+            "source_url": "https://staticcdn.mbzuai.ac.ae/rain-case-study.pdf",
+        },
+        "arabic-watermark-visual": {
+            "id": "arabic-watermark-visual",
+            "text": "صورة عربية تقارن طرق إزالة العلامات المائية من الصور الاصطناعية.",
+            "source_url": "https://mbzuai.ac.ae/ar/news/watermark-study",
+        },
+    }
+    retriever = _bare_media_scorer(media_by_id)
+    query = "ماذا تُظهر صورة ما بعد المطر في هذه الدراسة؟"
+
+    aliases = set(_semantic_query_alias_tokens(query))
+    assert {"after", "rain", "water", "accumulation"} <= aliases
+    assert retriever._score_media_relevance(
+        query,
+        media_by_id["after-rain-map"],
+    ) > retriever._score_media_relevance(query, media_by_id["arabic-watermark-visual"])
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What does the table show?",
+        "ما الخطوة الثانية في الإطار المعروض؟",
+        "بحسب الإنفوغراف، ما النسب المعروضة؟",
+    ],
+)
+def test_multilingual_visual_cues_enable_media_retrieval(query):
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+
+    assert _is_media_query(query) is True
+
+
 def test_query_embedding_cache_reuses_successful_vectors(monkeypatch):
     from pipeline.retrieval import adaptive_hybrid as mod
 
@@ -758,6 +1641,641 @@ def test_routed_coverage_planner_treats_official_working_hours_as_specific_targe
     assert "/about/faq" in retriever._explicit_required_page_markers("What are MBZUAI's official working hours?")
 
 
+def test_explicit_page_marker_establishes_specificity_for_arabic_visitor_contact():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    query = (
+        "إلى أي عنوان بريد إلكتروني يجب على الزوار التواصل إذا احتاجوا "
+        "إلى متطلبات معينة للدخول؟"
+    )
+    contact_url = "https://mbzuai.ac.ae/ar/about/contact"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.unsupported_intent_guard_enabled = False
+    retriever._coverage_page_records = [
+        {
+            "source_url": contact_url,
+            "normalized_url": retriever._normalize_source_url(contact_url),
+            "search_text": query.casefold(),
+            "tokens": set(_tokenize(query)),
+            "identity_text": "صفحة التواصل مع الجامعة",
+            "identity_tokens": set(_tokenize("صفحة التواصل مع الجامعة")),
+        }
+    ]
+
+    plan = retriever._infer_coverage_requirements(query, "exact_fact")
+
+    assert plan["required_pages"] == [contact_url]
+    assert plan["required_pages_source"] == "explicit_markers"
+
+    runtime_plan = retriever._coverage_plan_for_result(
+        query=query,
+        payload={},
+        mode=QueryMode.FACT,
+    )
+
+    assert runtime_plan["required_pages"] == [contact_url]
+    assert runtime_plan["required_pages_source"] == "explicit_markers"
+
+
+def test_routed_coverage_page_records_include_page_cards_and_ifm_domain():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "ifm-about": {
+                "id": "ifm-about",
+                "source_url": "https://ifm.ai/about",
+                "title": "About IFM",
+                "page_type": "about",
+                "purpose_summary": "Explains the Institute of Foundation Models.",
+            }
+        },
+        evidence_span_map={},
+        chunk_map={},
+        summary_map={},
+        parent_map={},
+    )
+
+    records = retriever._build_coverage_page_records()
+
+    assert [record["source_url"] for record in records] == ["https://ifm.ai/about"]
+    assert "about ifm" in records[0]["identity_text"]
+
+
+def test_routed_coverage_path_markers_match_only_exact_page_and_language_variant():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert retriever._coverage_marker_matches(
+        "/about/leadership",
+        "https://mbzuai.ac.ae/about/leadership/",
+    )
+    assert retriever._coverage_marker_matches(
+        "/about/leadership",
+        "https://mbzuai.ac.ae/ar/about/leadership",
+    )
+    assert not retriever._coverage_marker_matches(
+        "/about/leadership",
+        "https://mbzuai.ac.ae/about/leadership/president",
+    )
+
+
+def test_routed_coverage_explicit_pages_prefer_arabic_language_variant():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    english_url = "https://mbzuai.ac.ae/about/leadership"
+    arabic_url = "https://mbzuai.ac.ae/ar/about/leadership"
+    retriever._coverage_page_records = [
+        {
+            "source_url": english_url,
+            "normalized_url": retriever._normalize_source_url(english_url),
+            "search_text": "leadership and governance",
+            "tokens": set(_tokenize("leadership and governance")),
+            "identity_text": "leadership and governance",
+            "identity_tokens": set(_tokenize("leadership and governance")),
+        },
+        {
+            "source_url": arabic_url,
+            "normalized_url": retriever._normalize_source_url(arabic_url),
+            "search_text": "القيادة والحوكمة",
+            "tokens": set(_tokenize("القيادة والحوكمة")),
+            "identity_text": "القيادة والحوكمة",
+            "identity_tokens": set(_tokenize("القيادة والحوكمة")),
+        },
+    ]
+
+    plan = retriever._infer_coverage_requirements(
+        "ماذا تعرض صفحة القيادة والحوكمة؟",
+        "exact_fact",
+    )
+
+    assert plan["required_pages"] == [arabic_url]
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_url", "other_url"),
+    [
+        (
+            "What eligibility age does the Human Phenotype Project page specify?",
+            "https://hpp.mbzuai.ac.ae/",
+            "https://hpp.mbzuai.ac.ae/privacy",
+        ),
+        (
+            "What does the MBZUAI Library homepage show?",
+            "https://library.mbzuai.ac.ae/",
+            "https://library.mbzuai.ac.ae/newest-technology",
+        ),
+        (
+            "What does the IFM about page say about IFM?",
+            "https://ifm.ai/about",
+            "https://mbzuai.ac.ae/about",
+        ),
+    ],
+)
+def test_routed_coverage_root_and_host_specific_markers_are_exact(query, expected_url, other_url):
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._coverage_page_records = [
+        {
+            "source_url": expected_url,
+            "normalized_url": retriever._normalize_source_url(expected_url),
+            "search_text": query.casefold(),
+            "tokens": set(_tokenize(query)),
+            "identity_text": query.casefold(),
+            "identity_tokens": set(_tokenize(query)),
+        },
+        {
+            "source_url": other_url,
+            "normalized_url": retriever._normalize_source_url(other_url),
+            "search_text": query.casefold(),
+            "tokens": set(_tokenize(query)),
+            "identity_text": query.casefold(),
+            "identity_tokens": set(_tokenize(query)),
+        },
+    ]
+
+    plan = retriever._infer_coverage_requirements(query, "exact_fact")
+
+    assert plan["required_pages"] == [expected_url]
+
+
+def test_routed_page_target_score_prefers_exact_page_identity():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    query = "What does the Office of the Registrar page provide?"
+
+    def page(identity: str, body: str) -> dict:
+        return {
+            "normalized_url": "https://mbzuai.ac.ae/student-resources/example",
+            "search_text": body.casefold(),
+            "tokens": set(_tokenize(body)),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+        }
+
+    exact = page("Office of the Registrar", "student records and registration services")
+    generic = page("Student Resources", "Office of the Registrar student records and registration services")
+
+    assert retriever._page_target_score(query, exact) > retriever._page_target_score(query, generic)
+
+
+def test_routed_coverage_disambiguates_projects_and_research_projects_pages():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    projects_url = "https://mbzuai.ac.ae/ar/projects"
+    research_projects_url = "https://mbzuai.ac.ae/ar/research/projects"
+    retriever._coverage_page_records = [
+        {
+            "source_url": projects_url,
+            "normalized_url": retriever._normalize_source_url(projects_url),
+            "search_text": "صفحة المشاريع موضوعات بحثية",
+            "tokens": set(_tokenize("صفحة المشاريع موضوعات بحثية")),
+            "identity_text": "المشاريع",
+            "identity_tokens": set(_tokenize("المشاريع")),
+        },
+        {
+            "source_url": research_projects_url,
+            "normalized_url": retriever._normalize_source_url(research_projects_url),
+            "search_text": "مراكز البحوث والمشاريع تطبيقات الذكاء الاصطناعي",
+            "tokens": set(_tokenize("مراكز البحوث والمشاريع تطبيقات الذكاء الاصطناعي")),
+            "identity_text": "البحوث المشاريع",
+            "identity_tokens": set(_tokenize("البحوث المشاريع")),
+        },
+    ]
+
+    scoped = retriever._infer_coverage_requirements(
+        "ما أنواع الموضوعات البحثية التي تغطيها صفحة المشاريع؟",
+        "scoped",
+    )
+    synthesis = retriever._infer_coverage_requirements(
+        "كيف تساهم مراكز البحوث والمشاريع في تطوير تطبيقات الذكاء الاصطناعي؟",
+        "broad_synthesis",
+    )
+
+    assert scoped["required_pages"] == [projects_url]
+    assert synthesis["required_pages"] == [research_projects_url]
+
+
+def test_routed_coverage_resolves_ifm_about_and_collaboration_pages():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    about_url = "https://ifm.ai/about"
+    collaborate_url = "https://ifm.ai/collaborate"
+    retriever._coverage_page_records = [
+        {
+            "source_url": about_url,
+            "normalized_url": retriever._normalize_source_url(about_url),
+            "search_text": "institute of foundation models global center of excellence",
+            "tokens": set(_tokenize("institute of foundation models global center of excellence")),
+            "identity_text": "about ifm institute of foundation models",
+            "identity_tokens": set(_tokenize("about ifm institute of foundation models")),
+        },
+        {
+            "source_url": collaborate_url,
+            "normalized_url": retriever._normalize_source_url(collaborate_url),
+            "search_text": "collaboration career opportunities join us",
+            "tokens": set(_tokenize("collaboration career opportunities join us")),
+            "identity_text": "collaborate institute of foundation models",
+            "identity_tokens": set(_tokenize("collaborate institute of foundation models")),
+        },
+    ]
+
+    plan = retriever._infer_coverage_requirements(
+        "What is the Institute of Foundation Models at MBZUAI, and how does it describe its collaboration and career opportunities?",
+        "broad_synthesis",
+    )
+
+    assert plan["required_pages"] == [about_url, collaborate_url]
+
+
+def test_routed_required_page_backfill_bridges_page_alias_to_shared_chunks():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    requested_url = "https://mbzuai.ac.ae/ar/projects"
+    canonical_url = "https://mbzuai.ac.ae/ar/research/projects"
+    revision_id = "document-revision:projects"
+    chunk_id = "chunk:c650:document-revision:projects:00001:topics"
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "requested": {
+                "id": "page-card:requested",
+                "source_url": requested_url,
+                "document_revision_id": revision_id,
+                "linked_chunk_ids": [chunk_id],
+                "title": "المشاريع",
+            },
+            "canonical": {
+                "id": "page-card:canonical",
+                "source_url": canonical_url,
+                "document_revision_id": revision_id,
+                "linked_chunk_ids": [chunk_id],
+                "title": "المشاريع",
+            },
+        },
+        evidence_span_map={},
+        fact_map={},
+        summary_map={},
+        parent_map={},
+        chunk_map={
+            chunk_id: {
+                "id": chunk_id,
+                "source_url": canonical_url,
+                "document_revision_id": revision_id,
+                "document_title": "المشاريع",
+                "text": "تشمل الموضوعات البحثية التزييف العميق وتحليل الصور الطبية.",
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    retriever._coverage_page_records = retriever._build_coverage_page_records()
+    payload = {
+        "selected_chunk_ids": [],
+        "selected_fact_ids": [],
+        "selected_evidence_span_ids": [],
+        "retrieval_documents": [],
+        "abstained": False,
+    }
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query="ما الموضوعات التي تغطيها صفحة المشاريع؟",
+        payload=payload,
+        coverage_plan={"required_pages": [requested_url]},
+    )
+
+    assert changed is True
+    assert payload["selected_chunk_ids"] == [chunk_id]
+    assert payload["retrieval_documents"][0]["source_url"] == requested_url
+    assert payload["retrieval_documents"][0]["canonical_url"] == canonical_url
+
+
+def test_routed_required_page_backfill_injects_complete_parent_for_list_query():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    page_url = "https://library.mbzuai.ac.ae/newest-technology"
+    revision_id = "document-revision:library-news"
+    parent_id = f"parent:c650:{revision_id}:page"
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "page": {
+                "id": "page-card:library-news",
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "title": "News on AI and Technology",
+            }
+        },
+        evidence_span_map={},
+        fact_map={},
+        summary_map={},
+        chunk_map={},
+        parent_map={
+            parent_id: {
+                "id": parent_id,
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "document_title": "News on AI and Technology",
+                "text": (
+                    "Child-monitoring apps might need a reboot. "
+                    "We still don't know how people are really using AI. "
+                    "The role of the astronaut is in flux. See 15 more."
+                ),
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    retriever._coverage_page_records = retriever._build_coverage_page_records()
+    payload = {
+        "selected_chunk_ids": [],
+        "selected_parent_ids": [],
+        "selected_fact_ids": [],
+        "selected_evidence_span_ids": [],
+        "retrieval_documents": [],
+        "abstained": False,
+    }
+    query = "What recent MIT Technology Review items are shown?"
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query=query,
+        payload=payload,
+        coverage_plan={"intent": "scoped", "required_pages": [page_url]},
+    )
+    pack = build_evidence_pack(
+        query=query,
+        result=payload,
+        max_items=4,
+        max_chars=4000,
+        max_per_source=2,
+        coverage_plan={"intent": "scoped", "required_pages": [page_url]},
+    )
+
+    assert changed is True
+    assert payload["selected_parent_ids"][0] == parent_id
+    assert pack["items"][0]["id"] == parent_id
+    assert "Child-monitoring apps might need a reboot" in pack["items"][0]["text"]
+    assert "See 15 more" in pack["items"][0]["text"]
+
+
+def test_evidence_pack_reserves_leaf_chunk_for_required_multi_detail_page():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    page_url = "https://mbzuai.ac.ae/ar/news/career-fair"
+    parent_text = (
+        "معرض التدريب المهني وفرص العمل وفر للطلبة دعماً مهنياً مباشراً. "
+        + ("تفاصيل عامة عن المعرض. " * 180)
+    )
+    result = {
+        "retrieval_documents": [
+            {
+                "id": "parent:c650:career-fair:page",
+                "text": parent_text,
+                "source_url": page_url,
+                "coverage_aggregate": True,
+            },
+            {
+                "id": "chunk:c650:career-fair:00000",
+                "text": (
+                    "مكن المعرض أكثر من 160 طالباً وطالبة من التواصل مع "
+                    "48 من شركاء الجامعة والحصول على دعم مهني."
+                ),
+                "source_url": page_url,
+            },
+        ],
+        "fact_documents": [
+            {
+                "id": f"fact-{index}",
+                "text": "وفر المعرض فرصاً ودعماً مهنياً للطلبة.",
+                "source_url": page_url,
+            }
+            for index in range(4)
+        ],
+    }
+
+    pack = build_evidence_pack(
+        query="ما الذي جعل المعرض مهماً للطلبة، وما الدعم الذي وفره لهم؟",
+        result=result,
+        max_items=4,
+        max_chars=8000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "scoped",
+            "required_pages": [page_url],
+            "required_entities": [],
+            "required_sections": [],
+        },
+    )
+
+    packed_ids = [item["id"] for item in pack["items"]]
+    assert "parent:c650:career-fair:page" in packed_ids
+    assert "chunk:c650:career-fair:00000" in packed_ids
+    assert any("48 من شركاء الجامعة" in item["text"] for item in pack["items"])
+
+
+def test_answer_readiness_arabic_term_matching_handles_clitics_and_pronouns():
+    from pipeline.evaluation.answer_readiness import _required_term_supported
+
+    assert _required_term_supported(
+        "يضمن المكتب تزويد الطلاب بأفضل الخدمات طوال فترة دراستهم.",
+        "أفضل الخدمات طيلة فترة دراستهم",
+    )
+    assert _required_term_supported(
+        "تسعى الجامعة إلى مواصلة النمو وتوسيع نطاق العمل.",
+        "توسيع نطاق عملنا",
+    )
+    assert _required_term_supported(
+        "كما يتعاون أعضاء الهيئة التدريسية مع الشركاء.",
+        "التعاون",
+    )
+    assert _required_term_supported(
+        "تشمل المنحة مخصصًا شهريًا مجزيًا.",
+        "مخصص شهري",
+    )
+    assert _required_term_supported(
+        "درجة الماجستير مفضلة وغير إلزامي.",
+        "غير إلزامية",
+    )
+    assert _required_term_supported(
+        "مدة البرنامج عامان بدوام جزئي.",
+        "سنتين",
+    )
+
+
+def test_answer_readiness_term_matching_handles_cross_language_dates_and_safe_variants():
+    from pipeline.evaluation.answer_readiness import _required_term_supported
+
+    assert _required_term_supported(
+        "The talk is scheduled for July 22, 2026 at 11:00 AM.",
+        "22 يوليو 2026",
+    )
+    assert _required_term_supported(
+        "The Board helps interpret the institution to the public.",
+        "interpreting the institution to the public",
+    )
+    assert _required_term_supported(
+        "The META Wall is a multi-purpose 270-degree LED space.",
+        "270 LED space",
+    )
+    assert _required_term_supported(
+        "The action opens the applicant portal login page.",
+        "login/start page",
+    )
+
+
+def test_routed_static_page_markers_choose_canonical_language_routes_and_avoid_program_noise():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert retriever._explicit_required_page_markers(
+        "According to the leadership and mission pages, what is MBZUAI's mission and vision?"
+    ) == ["/about/leadership", "/about/mission-and-vision"]
+    assert retriever._explicit_required_page_markers(
+        "Where are IFM's headquarters and research hubs located?"
+    ) == ["https://ifm.ai/about"]
+    assert retriever._explicit_required_page_markers(
+        "Who can apply for onsite access to the MBZUAI Library's resources by email?"
+    ) == ["https://library.mbzuai.ac.ae/the-library"]
+    assert retriever._explicit_required_page_markers(
+        "كيف يصف قسم تعلّم الآلة مجالات تركيزه الرئيسة وما الذي يقدمه للطلاب؟"
+    ) == ["/ar/research-department/machine-learning-department"]
+    assert retriever._explicit_required_page_markers(
+        "اذكر مثالاً واحداً على موضوع مشروع بحثي مذكور في صفحة المشاريع."
+    ) == ["/research/projects"]
+    assert retriever._explicit_required_page_markers(
+        "ما هي الرسالة التي تذكرها الجامعة، وكيف تربطها القيادة بخدمة دولة الإمارات؟"
+    ) == ["/about/leadership", "/about/mission"]
+    research_markers = retriever._explicit_required_page_markers(
+        "How do the research centers and projects pages describe their work?"
+    )
+    assert "/research/research-centers" in research_markers
+    assert "/research-centers" not in research_markers
+    funding_markers = retriever._explicit_required_page_markers(
+        "What funding differences are described between the M.Sc. and Ph.D. programs?"
+    )
+    assert "/ai-programs" not in funding_markers
+    assert "mbzuai_faculty_brochure" not in funding_markers
+
+
+def test_routed_static_page_markers_cover_named_multisource_arabic_routes():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    ifm_markers = retriever._explicit_required_page_markers(
+        "ما الذي يصفه موقع IFM بأنه يسعى إلى بنائه مع الشركاء، وأين يقع مقره الرئيسي وما المدن التي لديه فيها مراكز أبحاث؟"
+    )
+    assert ifm_markers == ["https://ifm.ai/about", "https://ifm.ai/collaborate"]
+
+    career_markers = retriever._explicit_required_page_markers(
+        "ما هي أقسام الوظائف المفتوحة في صفحة الوظائف، وما هي مراكز MBZUAI الثلاثة المذكورة فيها؟"
+    )
+    assert career_markers == [
+        "https://careers.mbzuai.ac.ae",
+        "https://careers.mbzuai.ac.ae/vacancies",
+    ]
+
+    governance_markers = retriever._explicit_required_page_markers(
+        "ما الذي تقوله صفحة القيادة والحوكمة، وما الذي توضحه وثيقة الحوكمة عن اللجان؟"
+    )
+    assert governance_markers == ["/about/leadership", "governance_structure.pdf"]
+
+    degree_markers = retriever._explicit_required_page_markers(
+        "ما المؤهلات والتوجه المهني المطلوبان من الخريجين للالتحاق ببرامج الماجستير والدكتوراه؟"
+    )
+    assert degree_markers == ["/study/msc-programs", "/study/phd-programs"]
+
+    service_markers = retriever._explicit_required_page_markers(
+        "ما الخدمات التي يقدمها مكتب التسجيل وفريق الخدمات المهنية والتدريب؟"
+    )
+    assert service_markers == [
+        "/student-resources/office-of-the-registrar",
+        "/student-resources/student-careers-and-internships",
+    ]
+
+
+def test_routed_static_page_markers_cover_time_specific_named_pages():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert retriever._explicit_required_page_markers(
+        "كم عدد الطلاب الجدد الذين استقبلتهم الجامعة في العام الأكاديمي الجديد؟"
+    ) == [
+        "welcomes-400-students-including-inaugural-undergraduate-cohort"
+    ]
+    assert retriever._explicit_required_page_markers(
+        "When is Xiang Meng's upcoming AI talk scheduled?"
+    ) == ["https://ai-nexus.mbzuai.ac.ae/previous-ai-talks"]
+    assert retriever._explicit_required_page_markers(
+        "According to the Human Phenotype Project pages, who can participate, what is the study duration, and what are its goals?"
+    ) == [
+        "https://hpp.mbzuai.ac.ae",
+        "/news/new-human-phenotype-project-findings-illuminate-pathways-to-precision-medicine",
+    ]
+
+
+def test_routed_static_page_markers_cover_named_answer_evidence_pages():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert retriever._explicit_required_page_markers(
+        "ما الهدف الذي أُنشئ من أجله مركز الذكاء الاصطناعي التكاملي (CIAI)؟"
+    ) == ["/research/research-centers/ciai"]
+    assert retriever._explicit_required_page_markers(
+        "ما مجالات اهتمامات البروفيسورة دانييلا روس البحثية؟"
+    ) == ["/about/leadership/daniela-rus"]
+    assert retriever._explicit_required_page_markers(
+        "ما الدعم الذي وفره معرض التدريب المهني وفرص العمل للطلبة؟"
+    ) == [
+        "/news/mbzuai-students-connect-with-industry-partners-to-secure-internship-and-career-opportunities"
+    ]
+    assert retriever._explicit_required_page_markers(
+        "ما مدة الدراسة وفرص المنح وشروط القبول في برنامج البكالوريوس؟"
+    ) == ["/study/mbzuai-undergraduate", "/study/ug-admission-process"]
+
+    assert retriever._explicit_required_page_markers(
+        "What does the MBZUAI Visitor Program say visitors can get hands-on access to?"
+    ) == ["https://research.mbzuai.ac.ae/visitor-program"]
+    assert retriever._explicit_required_page_markers(
+        "How does MBZUAI engage with industry and capture value?"
+    ) == ["https://research.mbzuai.ac.ae/partnerships-and-engagements"]
+    assert retriever._explicit_required_page_markers(
+        "What are the META Wall uses and what GPU options does the Metaverse Center offer?"
+    ) == ["https://metaverse.mbzuai.ac.ae/studio"]
+
+
+def test_routed_static_page_markers_cover_multi_aspect_admissions_and_library_pages():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert retriever._explicit_required_page_markers(
+        "What academic and documentation requirements apply to undergraduate applicants, including English proficiency and the application fee?"
+    ) == ["/study/ug-admission-process", "/study/undergraduate-program"]
+    assert retriever._explicit_required_page_markers(
+        "I am visiting the MBZUAI Library as a researcher resident in the UAE. What visitor access can I request, who can borrow materials and licensed electronic resources, and where are physical resources discoverable?"
+    ) == [
+        "https://library.mbzuai.ac.ae/visitor-information",
+        "https://library.mbzuai.ac.ae/Borrowing_Information",
+    ]
+
+
 def test_routed_coverage_planner_cleans_command_prefix_entities_and_arabic_static_pages():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -912,6 +2430,92 @@ def test_answer_generation_reference_maps_prefer_finalized_bundle(tmp_path):
     assert "final-parent" in maps["parents"]
     assert "final-media" in maps["media"]
     assert "stale-chunk" not in maps["chunks"]
+
+
+def test_synthesis_expansion_breaks_equal_section_scores_by_seed_order():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_context_chunks = 8
+    retriever.max_parent_chunks = 1
+    retriever.same_parent_expand_threshold = 1
+    retriever.parent_candidate_top_k = 2
+    retriever.chunk_map = {
+        "seed-z": {"id": "seed-z"},
+        "seed-a": {"id": "seed-a"},
+    }
+    retriever.parent_map = {
+        "section:z-first": {"parent_type": "section"},
+        "section:a-second": {"parent_type": "section"},
+    }
+    section_by_chunk = {
+        "seed-z": ["section:z-first"],
+        "seed-a": ["section:a-second"],
+    }
+    calls = []
+
+    def parent_ids(chunk_id, *, parent_type=None):
+        return section_by_chunk.get(chunk_id, []) if parent_type == "section" else []
+
+    def rank_children(_query, parent_id, *, top_k):
+        calls.append((parent_id, top_k))
+        return [f"child:{parent_id}"]
+
+    retriever._parent_ids_for_chunk = parent_ids
+    retriever._rank_parent_child_chunk_ids = rank_children
+    retriever._expand_fact = lambda values: list(values)
+
+    expanded = retriever._expand_scoped_or_synthesis(
+        ["seed-z", "seed-a"],
+        query="Compare the two pages",
+        mode=QueryMode.SYNTHESIS,
+    )
+
+    assert [parent_id for parent_id, _top_k in calls] == [
+        "section:z-first",
+        "section:a-second",
+    ]
+    assert expanded == [
+        "seed-z",
+        "seed-a",
+        "child:section:z-first",
+        "child:section:a-second",
+    ]
+
+
+def test_scoped_expansion_falls_back_to_page_when_no_section_expands():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_context_chunks = 8
+    retriever.max_parent_chunks = 2
+    retriever.same_parent_expand_threshold = 1
+    retriever.parent_candidate_top_k = 2
+    retriever.chunk_map = {"seed": {"id": "seed"}}
+    retriever.parent_map = {"page:profile": {"parent_type": "page"}}
+
+    def parent_ids(_chunk_id, *, parent_type=None):
+        if parent_type == "section":
+            return []
+        if parent_type == "page":
+            return ["page:profile"]
+        return []
+
+    retriever._parent_ids_for_chunk = parent_ids
+    retriever._rank_parent_child_chunk_ids = (
+        lambda _query, parent_id, *, top_k: ["page-child"]
+        if parent_id == "page:profile"
+        else []
+    )
+    retriever._expand_fact = lambda values: list(values)
+
+    expanded = retriever._expand_scoped_or_synthesis(
+        ["seed"],
+        query="Tell me about this profile",
+        mode=QueryMode.SCOPED,
+    )
+
+    assert expanded == ["seed", "page-child"]
 
 
 def test_adaptive_retriever_records_lane_timings():
@@ -2146,6 +3750,9 @@ def test_unsupported_intent_guard_flags_private_confidential_live_and_future_que
     assert retriever._unsupported_intent_reason("What are the exact questions on the current screening exam?")
     assert retriever._unsupported_intent_reason("What is the shuttle live location right now?")
     assert retriever._unsupported_intent_reason(f"Who won MBZUAI's {future_year} robotics hackathon and what was the prize amount?")
+    assert retriever._unsupported_intent_reason(f"What will MBZUAI's exact tuition fee be in {future_year}?")
+    assert retriever._unsupported_intent_reason(f"Who will deliver MBZUAI's {future_year} commencement address?")
+    assert retriever._unsupported_intent_reason(f"من سيلقي كلمة حفل تخرج الجامعة لعام {future_year}؟")
     assert not retriever._unsupported_intent_reason("What PhD programs does MBZUAI offer?")
 
     retriever.unsupported_intent_guard_enabled = False
@@ -2272,6 +3879,193 @@ def test_answer_readiness_scores_generated_answers(tmp_path, monkeypatch):
     assert report["by_benchmark_tag"]["contact_lookup"]["no_answer_pass_rate"] == 1.0
 
 
+def test_answer_readiness_can_combine_governed_splits_without_materializing_subset(
+    tmp_path,
+    monkeypatch,
+):
+    from pipeline.evaluation import answer_readiness
+
+    dataset = tmp_path / "governed.jsonl"
+    rows = [
+        {
+            "id": "selection-row",
+            "query": "Selection question",
+            "query_type": "fact",
+            "source_type": "webpage",
+            "reference_answer": "Selection answer",
+            "gold_chunk_ids": ["selection-chunk"],
+            "metadata": {"split": "selection"},
+        },
+        {
+            "id": "regression-row",
+            "query": "Regression question",
+            "query_type": "fact",
+            "source_type": "webpage",
+            "reference_answer": "Regression answer",
+            "gold_chunk_ids": ["regression-chunk"],
+            "metadata": {"split": "regression"},
+        },
+        {
+            "id": "sealed-holdout-row",
+            "query": "Sealed question",
+            "query_type": "fact",
+            "source_type": "webpage",
+            "reference_answer": "Sealed answer",
+            "gold_chunk_ids": ["holdout-chunk"],
+            "metadata": {"split": "holdout"},
+        },
+    ]
+    dataset.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+
+    def fake_generate_answer_predictions(**kwargs):
+        selected_examples = kwargs["examples"]
+        assert [example.id for example in selected_examples] == [
+            "selection-row",
+            "regression-row",
+        ]
+        Path(kwargs["output_path"]).write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "id": example.id,
+                        "response": example.reference_answer,
+                        "retrieved_contexts": [example.reference_answer],
+                    }
+                )
+                for example in selected_examples
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {"row_count": len(selected_examples)}
+
+    monkeypatch.setattr(
+        answer_readiness,
+        "generate_answer_predictions",
+        fake_generate_answer_predictions,
+    )
+
+    report = answer_readiness.evaluate_answer_readiness(
+        config_name="default",
+        work_dir=tmp_path,
+        dataset_path=dataset,
+        mode="local",
+        judge_enabled=False,
+        splits=["selection", "regression"],
+    )
+
+    assert report["requested_splits"] == ["selection", "regression"]
+    assert report["query_count"] == 2
+    assert {row["id"] for row in report["queries"]} == {
+        "selection-row",
+        "regression-row",
+    }
+
+
+def test_answer_readiness_query_id_filter_is_governed_by_selected_splits(
+    tmp_path,
+    monkeypatch,
+):
+    from pipeline.evaluation import answer_readiness
+
+    dataset = tmp_path / "governed.jsonl"
+    rows = [
+        {
+            "id": "selection-row",
+            "query": "Selection question",
+            "query_type": "fact",
+            "source_type": "webpage",
+            "reference_answer": "Selection answer",
+            "gold_chunk_ids": ["selection-chunk"],
+            "metadata": {"split": "selection"},
+        },
+        {
+            "id": "regression-row",
+            "query": "Regression question",
+            "query_type": "fact",
+            "source_type": "webpage",
+            "reference_answer": "Regression answer",
+            "gold_chunk_ids": ["regression-chunk"],
+            "metadata": {"split": "regression"},
+        },
+        {
+            "id": "sealed-holdout-row",
+            "query": "Sealed question",
+            "query_type": "fact",
+            "source_type": "webpage",
+            "reference_answer": "Sealed answer",
+            "gold_chunk_ids": ["holdout-chunk"],
+            "metadata": {"split": "holdout"},
+        },
+    ]
+    dataset.write_text(
+        "\n".join(json.dumps(row) for row in rows) + "\n",
+        encoding="utf-8",
+    )
+    generator_calls = []
+
+    def fake_generate_answer_predictions(**kwargs):
+        selected_examples = kwargs["examples"]
+        generator_calls.append([example.id for example in selected_examples])
+        Path(kwargs["output_path"]).write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "id": example.id,
+                        "response": example.reference_answer,
+                        "retrieved_contexts": [example.reference_answer],
+                    }
+                )
+                for example in selected_examples
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {"row_count": len(selected_examples)}
+
+    monkeypatch.setattr(
+        answer_readiness,
+        "generate_answer_predictions",
+        fake_generate_answer_predictions,
+    )
+
+    report = answer_readiness.evaluate_answer_readiness(
+        config_name="default",
+        work_dir=tmp_path,
+        dataset_path=dataset,
+        mode="local",
+        judge_enabled=False,
+        splits=["selection", "regression"],
+        example_ids=["regression-row", "selection-row", "regression-row"],
+    )
+
+    assert report["requested_example_ids"] == [
+        "regression-row",
+        "selection-row",
+    ]
+    assert report["query_count"] == 2
+    assert generator_calls == [["selection-row", "regression-row"]]
+
+    with pytest.raises(
+        ValueError,
+        match="not present in selected governed split.*sealed-holdout-row",
+    ):
+        answer_readiness.evaluate_answer_readiness(
+            config_name="default",
+            work_dir=tmp_path,
+            dataset_path=dataset,
+            mode="local",
+            judge_enabled=False,
+            splits=["selection", "regression"],
+            example_ids=["sealed-holdout-row"],
+        )
+
+    assert generator_calls == [["selection-row", "regression-row"]]
+
+
 def test_local_answer_predictions_continue_after_row_error(tmp_path, monkeypatch):
     from pipeline.evaluation import answer_generation
 
@@ -2380,6 +4174,9 @@ def test_support_parent_expansion_finds_application_detail_chunks_before_overvie
     retriever = object.__new__(AdaptiveHybridRetriever)
     retriever.parent_candidate_top_k = 3
     retriever.max_parent_chunks = 6
+    retriever.local_parent_candidate_pool = 64
+    retriever.local_index_max_postings_per_token = 64
+    retriever.namespace_parents = "parents"
     retriever.parent_map = {
         "program": {
             "id": "program",
@@ -2413,6 +4210,35 @@ def test_support_parent_expansion_finds_application_detail_chunks_before_overvie
             "text": "The online screening exam covers math, programming, and machine learning. Recommended online courses include Programming for Everybody, Python Data Structures, Mathematics for Machine Learning: Linear Algebra, and An Intuitive Introduction to Probability.",
         },
     }
+    retriever.lexical_map = {
+        "program": {
+            "id": "program",
+            "text": retriever.parent_map["program"]["text"],
+        }
+    }
+    retriever._namespace_token_index = {
+        "parents": {
+            "statistics": ["program"],
+            "data": ["program"],
+            "science": ["program"],
+            "screening": ["program"],
+            "exam": ["program"],
+            "courses": ["program"],
+        }
+    }
+    retriever._namespace_tokens_by_id = {
+        "parents": {
+            "program": {
+                "statistics",
+                "data",
+                "science",
+                "screening",
+                "exam",
+                "courses",
+            }
+        }
+    }
+    retriever._bm25_by_namespace = {}
 
     query = "What topics are covered in the online screening exam for the PhD in Statistics and Data Science program, and are there any recommended courses to prepare?"
     parent_ids = retriever._support_parent_ids_for_query(query, top_k=3)
@@ -2420,6 +4246,62 @@ def test_support_parent_expansion_finds_application_detail_chunks_before_overvie
 
     assert parent_ids == ["program"]
     assert chunk_ids[0] == "screening"
+
+
+def test_support_parent_expansion_never_rescores_the_complete_parent_corpus():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = object.__new__(AdaptiveHybridRetriever)
+    retriever.local_parent_candidate_pool = 8
+    retriever.namespace_parents = "release-parents"
+    retriever.local_index_max_postings_per_token = 64
+    retriever.parent_map = {
+        "candidate": {
+            "id": "candidate",
+            "parent_type": "page",
+            "source_url": "https://mbzuai.ac.ae/study/scholarships",
+            "document_title": "Scholarships",
+            "text": "MBZUAI scholarship funding and stipend information.",
+        },
+        "must-not-score": {
+            "id": "must-not-score",
+            "parent_type": "page",
+            "source_url": "https://mbzuai.ac.ae/unrelated",
+            "document_title": "Unrelated",
+            "text": "Unrelated page.",
+        },
+    }
+    retriever.lexical_map = {
+        parent_id: {"id": parent_id, "text": parent["text"]}
+        for parent_id, parent in retriever.parent_map.items()
+    }
+    retriever._namespace_token_index = {
+        "release-parents": {
+            "scholarship": ["candidate"],
+            "funding": ["candidate"],
+        }
+    }
+    retriever._namespace_tokens_by_id = {
+        "release-parents": {
+            "candidate": {"mbzuai", "scholarship", "funding", "stipend", "information"},
+            "must-not-score": {"unrelated", "page"},
+        }
+    }
+    retriever._bm25_by_namespace = {}
+    seen_titles = []
+    original_source_bonus = retriever._source_query_bonus
+
+    def tracked_source_bonus(query, **kwargs):
+        seen_titles.append(kwargs.get("document_title"))
+        return original_source_bonus(query, **kwargs)
+
+    retriever._source_query_bonus = tracked_source_bonus
+
+    assert retriever._support_parent_ids_for_query(
+        "What scholarship funding does MBZUAI provide?",
+        top_k=3,
+    ) == ["candidate"]
+    assert seen_titles == ["Scholarships"]
 
 
 def test_temporal_guard_abstains_when_requested_admission_cycle_is_missing():
@@ -2961,7 +4843,10 @@ def test_answer_readiness_accepts_common_no_answer_wording(tmp_path, monkeypatch
 
 
 def test_answer_readiness_no_answer_detector_allows_local_limitations_in_cited_answers():
-    from pipeline.evaluation.answer_readiness import _looks_like_no_answer
+    from pipeline.evaluation.answer_readiness import (
+        _explicitly_denies_unsupported_premise,
+        _looks_like_no_answer,
+    )
 
     answer = (
         "MBZUAI's official working hours are 8:00 AM to 6:00 PM, Monday to Thursday, "
@@ -2974,6 +4859,69 @@ def test_answer_readiness_no_answer_detector_allows_local_limitations_in_cited_a
         "I couldn't confirm that specific detail from the available MBZUAI information.",
         "grounded",
     )
+    cited_denial = "MBZUAI does **not** have a private airport in the available information. [1]"
+    assert not _looks_like_no_answer(cited_denial, "grounded")
+    assert _explicitly_denies_unsupported_premise(cited_denial)
+
+
+def test_answer_readiness_accepts_cited_explicit_premise_denial_for_no_answer_gold(
+    tmp_path,
+    monkeypatch,
+):
+    from pipeline.evaluation import answer_readiness
+
+    dataset = tmp_path / "readiness.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "unsupported-premise",
+                "query": "What is the IATA code for the university's private airport?",
+                "query_type": "fact",
+                "source_type": "none",
+                "no_answer": True,
+                "reference_answer": "The sources do not establish that it has one.",
+                "metadata": {"answer_must_not_include": ["DXB"]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    gates = tmp_path / "answer_gates.json"
+    gates.write_text(
+        json.dumps({"overall": {"no_answer_pass_rate": {"min": 1.0}}}),
+        encoding="utf-8",
+    )
+
+    def fake_generate_answer_predictions(**kwargs):
+        Path(kwargs["output_path"]).write_text(
+            json.dumps(
+                {
+                    "id": "unsupported-premise",
+                    "response": (
+                        "The university does **not** have a private airport mentioned in the "
+                        "available information. [1]"
+                    ),
+                    "sources": [{"url": "https://example.edu/transport", "cite_num": "1"}],
+                    "response_kind": "grounded",
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return {"row_count": 1}
+
+    monkeypatch.setattr(answer_readiness, "generate_answer_predictions", fake_generate_answer_predictions)
+    report = answer_readiness.evaluate_answer_readiness(
+        config_name="default",
+        work_dir=tmp_path,
+        dataset_path=dataset,
+        gates_path=gates,
+        mode="local",
+        judge_enabled=False,
+    )
+
+    assert report["gates"]["passed"] is True
+    assert report["overall"]["no_answer_pass_rate"] == 1.0
 
 
 def test_answer_readiness_required_terms_match_equivalent_time_formats():
@@ -2993,6 +4941,197 @@ def test_answer_readiness_required_terms_match_equivalent_time_formats():
     support_window = "IT support is available Monday to Thursday from 8:00 AM to 5:00 PM and Friday from 8:00 AM to 12:30 PM."
     assert _required_term_supported(support_window, "12:30")
     assert _required_term_supported(support_window, "8:00")
+
+
+def test_answer_readiness_required_terms_match_arabic_clitics_and_inflection():
+    from pipeline.evaluation.answer_readiness import _required_term_supported
+
+    response = (
+        "يقع المقر في أبوظبي، مع مراكز في وادي السيليكون وباريس. "
+        "ويعمل IFM مع الشركاء والمؤسسات الأكاديمية ومختبرات الأبحاث "
+        "والشركات الناشئة."
+    )
+
+    assert _required_term_supported(response, "وادي السيليكون وباريس")
+    assert _required_term_supported(
+        response,
+        "شركاء أكاديميون ومختبرات وشركات ناشئة",
+    )
+    assert _required_term_supported(
+        "تُظهر الصورة شريحة/معالج حاسوبي تحيط به مسارات إلكترونية.",
+        "شريحة معالِج",
+    )
+    assert not _required_term_supported(
+        response,
+        "العلوم والنطاق والقيمة الاجتماعية",
+    )
+
+
+def test_answer_readiness_required_terms_match_dash_and_analysis_spelling_variants():
+    from pipeline.evaluation.answer_readiness import _required_term_supported
+
+    assert _required_term_supported(
+        "The image shows the MBZUAI Faculty Portfolio 2024–2025.",
+        "MBZUAI Faculty Portfolio 2024-2025",
+    )
+    assert _required_term_supported(
+        "The collected data are automatically analyzed.",
+        "automatically analysed",
+    )
+    assert _required_term_supported(
+        "The output is a generative-AI-assisted supplier communication draft.",
+        "generative AI",
+    )
+    assert _required_term_supported(
+        "انتُخب رئيسًا لدولة الإمارات العربية المتحدة.",
+        "رئيساً للدولة",
+    )
+    assert _required_term_supported(
+        "ينبغي أن يكون المتقدمون باحثين ذوي خبرة.",
+        "باحثون ذوو خبرة",
+    )
+    assert _required_term_supported(
+        "لديهم رغبة قوية في الإسهام في العلم والإنسانية.",
+        "المساهمة في العلم والإنسانية",
+    )
+    assert not _required_term_supported(
+        "The collected data are manually reviewed.",
+        "automatically analysed",
+    )
+
+
+def test_answer_readiness_supports_multilingual_alternative_term_groups():
+    from pipeline.evaluation.answer_readiness import _required_terms_result
+
+    response = (
+        "المؤهل المطلوب هو درجة ماجستير في السياسات العامة وإدارة التعليم "
+        "العالي والقانون أو مجال ذي صلة."
+    )
+    metadata = {
+        "answer_must_include_any_groups": [
+            ["public policy/guidelines", "السياسات العامة"],
+            ["law", "القانون"],
+        ]
+    }
+
+    missing, coverage = _required_terms_result(
+        response,
+        ["درجة ماجستير"],
+        metadata,
+    )
+
+    assert missing == []
+    assert coverage == pytest.approx(1.0)
+
+
+def test_answer_readiness_accepts_faithful_cross_lingual_ifm_labels():
+    from pipeline.evaluation.answer_readiness import _required_terms_result
+
+    response = (
+        "المعهد مركز عالمي مكرّس لدفع علم النماذج التأسيسية وحجمها وقيمتها الاجتماعية، "
+        "ومقره في أبوظبي وله مراكز في Silicon Valley وParis، ويتعاون مع المؤسسات "
+        "الأكاديمية ومختبرات الأبحاث والشركات الناشئة."
+    )
+    missing, coverage = _required_terms_result(
+        response,
+        ["أبوظبي", "شركاء أكاديميون ومختبرات وشركات ناشئة"],
+        {
+            "answer_must_include_any_groups": [
+                [
+                    "العلوم والنطاق والقيمة الاجتماعية",
+                    "علم النماذج التأسيسية وحجمها وقيمتها الاجتماعية",
+                    "science, scale, and social value",
+                ],
+                [
+                    "وادي السيليكون وباريس",
+                    "Silicon Valley وParis",
+                    "Silicon Valley and Paris",
+                ],
+            ]
+        },
+    )
+
+    assert missing == []
+    assert coverage == pytest.approx(1.0)
+
+
+def test_answer_readiness_accepts_faithful_media_instruction_paraphrases():
+    from pipeline.evaluation.answer_readiness import _required_terms_result
+
+    arabic_response = (
+        "توضح الصورة شريحة معالج، وأن التدريب يتطلب استثمارات كبيرة في العتاد "
+        "وقدرة حسابية عالية ومعالجات مهيأة لعمليات المصفوفات."
+    )
+    missing, coverage = _required_terms_result(
+        arabic_response,
+        ["شريحة معالِج", "عمليات المصفوفات"],
+        {
+            "answer_must_include_any_groups": [
+                ["قدرة الحوسبة", "قدرة حاسوبية", "قدرة حسابية"],
+                ["متطلبات العتاد", "استثمارات كبيرة في العتاد", "العتاد (hardware)"],
+            ]
+        },
+    )
+    assert missing == []
+    assert coverage == pytest.approx(1.0)
+
+    missing, coverage = _required_terms_result(
+        "Complete the required account-creation fields, tick the reCAPTCHA, and click Submit.",
+        [],
+        {
+            "answer_must_include_any_groups": [
+                [
+                    "required information",
+                    "required registration fields",
+                    "required details",
+                    "required account-creation fields",
+                ],
+                ["reCAPTCHA box", "complete the reCAPTCHA", "tick the reCAPTCHA"],
+                ["Submit button", "click Submit", "submit the form"],
+            ]
+        },
+    )
+    assert missing == []
+    assert coverage == pytest.approx(1.0)
+
+
+def test_answer_readiness_accepts_governed_alternate_reference_url():
+    from pipeline.evaluation.answer_readiness import _expected_reference_url_pass
+
+    metadata = {
+        "expected_reference_urls": [
+            "https://mbzuai.ac.ae/study/msc-programs",
+        ],
+        "alternate_expected_reference_urls": {
+            "https://mbzuai.ac.ae/study/msc-programs": [
+                "https://mbzuai.ac.ae/study/master-in-applied-ai",
+            ]
+        },
+    }
+    row = {
+        "sources": [
+            {"url": "https://mbzuai.ac.ae/study/master-in-applied-ai/"},
+        ]
+    }
+
+    assert _expected_reference_url_pass(metadata, row, no_answer=False) == 1.0
+
+
+def test_answer_readiness_reports_each_unsatisfied_alternative_group_once():
+    from pipeline.evaluation.answer_readiness import _required_terms_result
+
+    missing, coverage = _required_terms_result(
+        "تمر العملية عبر المعالجة المسبقة ثم التنظيف وإزالة التكرار.",
+        ["المعالجة المسبقة", "التنظيف", "إزالة التكرار"],
+        {
+            "answer_must_include_any_groups": [
+                ["التصفية", "الترشيح"],
+            ]
+        },
+    )
+
+    assert missing == ["التصفية OR الترشيح"]
+    assert coverage == pytest.approx(0.75)
 
 
 def test_http_answer_readiness_does_not_send_probe_header_by_default(monkeypatch):
@@ -4410,6 +6549,36 @@ def test_retrieval_cache_fingerprint_includes_pinecone_contract_fields():
     )
 
 
+def test_retrieval_cache_fingerprint_includes_serving_implementation(monkeypatch):
+    from pipeline.evaluation import retrieval_eval
+
+    config = {
+        "embedder": {
+            "model": "gemini-embedding-2",
+            "output_dimensionality": 1536,
+        },
+        "retrieval": {"retriever_backend": "routed_hybrid"},
+    }
+    monkeypatch.setattr(
+        retrieval_eval,
+        "production_serving_contract_fingerprint",
+        lambda _config: "serving-code-v1",
+    )
+    first = retrieval_eval._config_fingerprint(
+        retrieval_eval._retrieval_cache_config_payload(config)
+    )
+    monkeypatch.setattr(
+        retrieval_eval,
+        "production_serving_contract_fingerprint",
+        lambda _config: "serving-code-v2",
+    )
+    second = retrieval_eval._config_fingerprint(
+        retrieval_eval._retrieval_cache_config_payload(config)
+    )
+
+    assert first != second
+
+
 def test_retrieval_eval_expands_gold_ids_from_expected_source_urls(tmp_path):
     from pipeline.evaluation.dataset import EvalExample
     from pipeline.evaluation import retrieval_eval
@@ -5570,3 +7739,835 @@ def test_routed_coverage_plan_routes_generic_shuttle_query_to_contact_evidence()
 
     assert contact_url in plan["required_pages"]
     assert undergrad_url not in plan["required_pages"]
+
+
+def test_dense_recall_floor_keeps_leading_dense_chunks_inside_top_ten():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_context_chunks = 12
+    retriever.dense_recall_floor_k = 2
+    retriever.dense_recall_window = 10
+    retriever.chunk_map = {
+        value: {"id": value}
+        for value in [
+            *[f"expanded-{index}" for index in range(12)],
+            "dense-1",
+            "dense-2",
+        ]
+    }
+
+    selected = retriever._preserve_dense_chunk_recall(
+        [f"expanded-{index}" for index in range(12)],
+        ["dense-1", "dense-2", "dense-3"],
+    )
+
+    assert selected[:8] == [f"expanded-{index}" for index in range(8)]
+    assert selected[8:10] == ["dense-1", "dense-2"]
+    assert len(selected) == 12
+
+
+def test_dense_parent_recall_floor_keeps_dense_page_parent_inside_top_five():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.dense_parent_recall_floor_k = 1
+    retriever.dense_parent_recall_window = 5
+    retriever.chunk_map = {"dense": {"id": "dense"}}
+    retriever.parent_map = {
+        **{f"parent-{index}": {"id": f"parent-{index}"} for index in range(6)},
+        "dense-page": {"id": "dense-page", "parent_type": "page"},
+    }
+    retriever.parent_ids_by_chunk = {"dense": ["dense-page"]}
+    retriever.section_parent_ids_by_chunk = {"dense": []}
+    retriever.page_parent_ids_by_chunk = {"dense": ["dense-page"]}
+
+    selected = retriever._preserve_dense_parent_recall(
+        [f"parent-{index}" for index in range(6)],
+        ["dense"],
+    )
+
+    assert selected[4] == "dense-page"
+    assert len(selected) == 6
+
+
+def test_explicit_dense_media_hit_is_not_discarded_by_chunk_attachment():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_media_results = 4
+    retriever.chunk_map = {
+        "selected": {"id": "selected", "media_ids": ["linked"]}
+    }
+    retriever.parent_map = {}
+    retriever.parent_ids_by_chunk = {"selected": []}
+    retriever.section_parent_ids_by_chunk = {"selected": []}
+    retriever.page_parent_ids_by_chunk = {"selected": []}
+    retriever.media_map = {
+        "dense-gold": {
+            "id": "dense-gold",
+            "media_type": "image",
+            "linked_chunk_ids": ["other"],
+        },
+        "linked": {
+            "id": "linked",
+            "media_type": "image",
+            "linked_chunk_ids": ["selected"],
+        },
+    }
+    retriever._is_low_signal_media = lambda media: False
+    retriever._score_media_relevance = lambda query, media: (
+        1.0 if media["id"] == "dense-gold" else 0.9
+    )
+
+    selected = retriever._attach_media(
+        ["selected"],
+        ["dense-gold"],
+        "What does the image show?",
+    )
+
+    assert [item["id"] for item in selected][:2] == ["dense-gold", "linked"]
+
+
+def test_strong_official_media_can_rescue_weak_surrounding_text():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.rrf_k = 60
+    retriever.max_media_results = 4
+    retriever.media_abstain_rescue_min_score = 1.25
+    retriever.media_abstain_rescue_min_overlap = 0.35
+    query = (
+        "في الصفحة 10 من برنامج دفعة 2024 العربي، ما الهدف المذكور "
+        "في النص على الصورة؟ image figure visual"
+    )
+    media_text = (
+        "IMAGE: Visual from Class of 2024 Arabic page 10 "
+        "VISIBLE_TEXT: الإسهام في تطوير تقنيات الجيل التالي التي ستدعم "
+        "جهود الارتقاء ببنى النقل التحتية إلى مستويات أفضل هو هدفي"
+    )
+    retriever.media_map = {
+        "gold-media": {
+            "id": "gold-media",
+            "media_type": "image",
+            "source_url": "https://staticcdn.mbzuai.ac.ae/class-of-2024-arabic.pdf",
+            "text": media_text,
+        }
+    }
+    retriever.media_texts_by_id = {"gold-media": media_text}
+
+    assert retriever._has_grounded_media_candidates(
+        query=query,
+        media_rankings=(
+            ["gold-media"],
+            ["repeated-a", "repeated-b", "repeated-c", "repeated-d"],
+            ["repeated-a", "repeated-b", "repeated-c", "repeated-d"],
+        ),
+    ) is True
+
+
+def test_generic_media_hit_does_not_bypass_abstention():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.rrf_k = 60
+    retriever.max_media_results = 4
+    retriever.media_abstain_rescue_min_score = 1.25
+    retriever.media_abstain_rescue_min_overlap = 0.35
+    retriever.media_map = {
+        "generic": {
+            "id": "generic",
+            "media_type": "image",
+            "source_url": "https://mbzuai.ac.ae/about",
+            "text": "IMAGE: A generic photograph of the university campus.",
+        }
+    }
+    retriever.media_texts_by_id = {
+        "generic": "IMAGE: A generic photograph of the university campus."
+    }
+
+    assert retriever._has_grounded_media_candidates(
+        query="Show the orbital laboratory diagram for MBZUAI's Mars campus.",
+        media_rankings=(["generic"], [], []),
+    ) is False
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "ماذا تعرض الصورة في التقرير؟",
+        "ما المواقع الموضحة على الخريطة؟",
+        "اشرح المخطط المرئي في ملف PDF.",
+    ],
+)
+def test_arabic_visual_queries_route_to_the_media_lane(query):
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+
+    assert _is_media_query(query) is True
+
+
+def test_arabic_nonvisual_fact_query_does_not_route_to_the_media_lane():
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+
+    assert _is_media_query("ما متطلبات القبول في برنامج الماجستير؟") is False
+
+
+def test_arabic_academic_qualification_query_adds_english_retrieval_aliases():
+    from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
+
+    aliases = set(
+        _semantic_query_alias_tokens(
+            "ما المؤهل الأكاديمي المطلوب لوظيفة Data Platform Engineer؟"
+        )
+    )
+
+    assert {"academic", "degree", "bachelor", "master", "preferred"} <= aliases
+
+
+def test_upstream_rewrite_preserves_semantic_aliases_from_original_user_query():
+    from pipeline.retrieval.routed_hybrid import QueryRewriteBundle, RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    rewritten = QueryRewriteBundle(
+        vector_query="leadership role and governance committees",
+        graph_query="leadership role and governance committees",
+        labels=("upstream_query_plan",),
+    )
+
+    result = retriever._preserve_original_query_aliases(
+        rewritten,
+        query="leadership role and governance committees",
+        original_query="ما الذي تقوله صفحة القيادة والحوكمة عن دور الرئيس؟",
+    )
+
+    assert "التنفيذي" in result.vector_query
+    assert "الصلاحيات" in result.vector_query
+    assert "original_query_semantic_alias_expansion" in result.labels
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_aliases"),
+    [
+        (
+            "ما هي أقسام الوظائف المفتوحة في صفحة الوظائف؟",
+            {"faculty", "research", "engineering", "professional", "vacancies"},
+        ),
+        (
+            "What does the MBZUAI Visitor Program say visitors can get hands-on access to?",
+            {"research", "experience", "personalized", "demos", "talks"},
+        ),
+        (
+            "How does MBZUAI describe the way it engages with industry and captures value?",
+            {"exploration", "refinement", "proposal", "engagement", "agreement"},
+        ),
+        (
+            "ما الدعم الذي وفره معرض التدريب المهني وفرص العمل للطلبة؟",
+            {"جلسات", "تدريب", "مهني", "فردية", "وكالات", "التوظيف"},
+        ),
+        (
+            "ما المجالات التي تركز عليها اهتمامات البروفيسورة دانييلا روس البحثية؟",
+            {"الاستقلالية", "الذكاء", "autonomy", "intelligence"},
+        ),
+        (
+            "ما الذي تقوله صفحة القيادة والحوكمة عن دور الرئيس؟",
+            {"التنفيذي", "مهام", "الصلاحيات", "إدارة", "chief", "executive"},
+        ),
+    ],
+)
+def test_named_multifacet_queries_add_page_local_retrieval_aliases(
+    query,
+    expected_aliases,
+):
+    from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
+
+    assert expected_aliases <= set(_semantic_query_alias_tokens(query))
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "ما هي أقسام الوظائف المفتوحة في صفحة الوظائف؟",
+        "ما الذي يصفه موقع IFM بأنه يبنيه مع الشركاء، وأين يقع مقره؟",
+        "How does MBZUAI engage with industry and capture value?",
+        "What can visitors get hands-on access to?",
+        "ما الدعم الذي وفره معرض التدريب المهني للطلبة؟",
+        "ما اللجان التي تشرف على شؤون الجامعة؟",
+        "ما الدور الذي تشغله ريما المقرب، وما طبيعة الجهة التي تعمل فيها؟",
+    ],
+)
+def test_multifacet_queries_request_bounded_complete_page_evidence(query):
+    from pipeline.retrieval.evidence_packer import _MULTI_DETAIL_QUERY_RE
+    from pipeline.retrieval.routed_hybrid import _AGGREGATE_REQUIRED_PAGE_QUERY_RE
+
+    assert _MULTI_DETAIL_QUERY_RE.search(query)
+    assert _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(query)
+
+
+def test_navigation_target_resolves_to_complete_page_parent():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        parent_map={
+            "parent:c650:document-revision:directory:page": {
+                "id": "parent:c650:document-revision:directory:page",
+                "document_revision_id": "document-revision:directory",
+                "page_card_ids": ["page-card:directory"],
+            },
+            "parent:c650:document-revision:directory:section:people": {
+                "id": "parent:c650:document-revision:directory:section:people",
+                "document_revision_id": "document-revision:directory",
+                "page_card_ids": ["page-card:directory"],
+            },
+        }
+    )
+
+    parent_ids = retriever._navigation_target_parent_ids(
+        {
+            "target_page": {
+                "document_revision_id": "document-revision:directory",
+                "page_card_id": "page-card:directory",
+            }
+        }
+    )
+
+    assert parent_ids == ["parent:c650:document-revision:directory:page"]
+
+
+def test_navigation_catalog_resolves_selected_representation_identities():
+    from pipeline.retrieval.navigation_planner import (
+        NAVIGATION_CATALOG_SCHEMA_VERSION,
+        GroundedNavigationPlanner,
+    )
+
+    planner = GroundedNavigationPlanner(
+        catalog={
+            "schema_version": NAVIGATION_CATALOG_SCHEMA_VERSION,
+            "source_bridge_coverage_passed": True,
+            "source_bridge_status": "passed",
+            "pages": [
+                {
+                    "page_card_id": "page-card:1",
+                    "document_revision_id": "document-revision:1",
+                    "source_url": "https://mbzuai.ac.ae/page",
+                }
+            ],
+            "chunks": [
+                {
+                    "chunk_id": "chunk:1",
+                    "document_revision_id": "document-revision:1",
+                    "page_card_id": "page-card:1",
+                    "section_id": "document-section:1",
+                    "page_section_ids": ["page-section:1"],
+                }
+            ],
+            "actions": [],
+        }
+    )
+
+    identities = planner.representation_identities(
+        {
+            "selected_chunk_ids": ["chunk:1"],
+            "dense_page_card_ids": ["page-card:1"],
+            "selected_parent_ids": [
+                "parent:c650:document-revision:1:page"
+            ],
+        }
+    )
+
+    assert identities == {
+        "document_revision_ids": ["document-revision:1"],
+        "page_card_ids": ["page-card:1"],
+        "section_ids": ["document-section:1", "page-section:1"],
+        "chunk_ids": ["chunk:1"],
+    }
+
+
+def test_multi_type_answer_selection_uses_a_bounded_candidate_pool():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.local_answer_candidate_pool = 32
+    retriever.local_index_max_postings_per_token = 512
+    retriever.answer_map = {}
+    retriever.answer_ids_by_type = {"email": [], "website": []}
+    retriever.answer_ids_by_subtype = {}
+    retriever.answer_token_index = {"salman": [], "khan": []}
+
+    for answer_type in ("email", "website"):
+        for index in range(5_000):
+            answer_id = f"{answer_type}:{index}"
+            retriever.answer_map[answer_id] = {
+                "id": answer_id,
+                "answer_type": answer_type,
+                "answer_subtype": "generic",
+                "value": f"irrelevant-{index}",
+            }
+            retriever.answer_ids_by_type[answer_type].append(answer_id)
+
+    expected_ids = ["email:salman", "website:salman"]
+    for answer_id, answer_type in zip(expected_ids, ("email", "website")):
+        retriever.answer_map[answer_id] = {
+            "id": answer_id,
+            "answer_type": answer_type,
+            "answer_subtype": "profile",
+            "value": f"Salman Khan {answer_type}",
+        }
+        # Put the relevant records outside the confidence-ordered fallback so
+        # the test exercises the token-index path rather than an early seed.
+        retriever.answer_ids_by_type[answer_type].append(answer_id)
+        retriever.answer_token_index["salman"].append(answer_id)
+        retriever.answer_token_index["khan"].append(answer_id)
+
+    scored_ids = []
+
+    def _score(_query, answer):
+        scored_ids.append(answer["id"])
+        return 10.0 if answer["id"] in expected_ids else 0.1
+
+    retriever._score_answer_record = _score
+
+    selected = retriever._select_answer_ids_for_query(
+        "What are Salman Khan's email address and website?",
+        [],
+        top_k=4,
+    )
+
+    assert selected[:2] == expected_ids
+    assert len(scored_ids) <= retriever.local_answer_candidate_pool
+
+
+def test_navigation_action_becomes_conflict_free_answer_evidence():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    payload = {
+        "answer_documents": [
+            {
+                "id": "generic-admissions-email",
+                "answer_type": "email",
+                "value": "admission@mbzuai.ac.ae",
+            },
+            {
+                "id": "profile-page",
+                "answer_type": "website",
+                "value": "https://mbzuai.ac.ae/ar/study/faculty/salman-khan-01",
+            },
+        ],
+        "selected_answer_ids": ["generic-admissions-email", "profile-page"],
+    }
+    navigation_plan = {
+        "status": "ready",
+        "goal": "Open Salman Khan's email action",
+        "target_page": {
+            "title": "سلمان خان - MBZUAI",
+            "url": "https://mbzuai.ac.ae/ar/study/faculty/salman-khan-01",
+            "document_revision_id": "document-revision:salman",
+        },
+        "steps": [
+            {
+                "action_id": "page-action:salman-email",
+                "action_type": "email",
+                "label": "البريد الالكتروني",
+                "target_url": "mailto:salman.khan@mbzuai.ac.ae",
+                "section_id": "page-section:contact",
+                "chunk_ids": ["chunk:salman"],
+            }
+        ],
+    }
+
+    applied = retriever._apply_navigation_action_evidence(
+        payload,
+        navigation_plan,
+    )
+
+    assert applied is True
+    assert payload["answer_documents"][0]["id"] == "page-action:salman-email"
+    assert payload["answer_documents"][0]["value"] == "salman.khan@mbzuai.ac.ae"
+    assert payload["answer_documents"][0]["source_url"].endswith("salman-khan-01")
+    assert "generic-admissions-email" not in payload["selected_answer_ids"]
+    assert "profile-page" in payload["selected_answer_ids"]
+
+
+def test_actionable_navigation_target_becomes_a_required_evidence_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    coverage_plan = {"required_pages": ["https://mbzuai.ac.ae/about/contact"]}
+    navigation_plan = {
+        "status": "ready",
+        "target_page": {
+            "url": "https://library.mbzuai.ac.ae/md-sohail/",
+        },
+    }
+
+    changed = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+    changed_again = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+
+    assert changed is True
+    assert changed_again is False
+    assert coverage_plan["required_pages"] == [
+        "https://library.mbzuai.ac.ae/md-sohail/",
+        "https://mbzuai.ac.ae/about/contact",
+    ]
+
+
+def test_exact_navigation_action_scopes_coverage_to_its_owning_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    target_url = "https://library.mbzuai.ac.ae/md-sohail"
+    coverage_plan = {
+        "required_pages": [
+            target_url,
+            "https://library.mbzuai.ac.ae/directory-listing",
+            "https://mbzuai.ac.ae/news/unrelated",
+        ]
+    }
+    navigation_plan = {
+        "status": "ready",
+        "target_page": {"url": target_url},
+        "steps": [
+            {
+                "action_type": "email",
+                "target_url": "mailto:md.sohail@mbzuai.ac.ae",
+            }
+        ],
+    }
+
+    changed = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+    changed_again = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+
+    assert changed is True
+    assert changed_again is False
+    assert coverage_plan["required_pages"] == [target_url]
+
+
+def test_conflicting_navigation_action_cannot_override_explicit_page_requirement():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    coverage_plan = {
+        "required_pages": ["https://mbzuai.ac.ae/ar/about/contact"],
+        "required_pages_source": "explicit_markers",
+    }
+    navigation_plan = {
+        "status": "ready",
+        "confidence": 1.0,
+        "source": "page_graph_navigation_catalog",
+        "target_page": {
+            "url": "https://mbzuai.ac.ae/ar/the-node/commencement-2025-info",
+        },
+        "steps": [
+            {
+                "action_id": "page-action:commencement-email",
+                "action_type": "email",
+                "target_url": "mailto:campus.life@mbzuai.ac.ae",
+            }
+        ],
+        "evidence": {"action_ids": ["page-action:commencement-email"]},
+        "warnings": [],
+    }
+
+    changed = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+
+    assert changed is False
+    assert coverage_plan["required_pages"] == [
+        "https://mbzuai.ac.ae/ar/about/contact"
+    ]
+    assert navigation_plan["status"] == "not_requested"
+    assert navigation_plan["target_page"] is None
+    assert navigation_plan["steps"] == []
+    assert navigation_plan["source"] == "explicit_coverage_guard"
+    assert navigation_plan["warnings"] == [
+        "navigation_action_suppressed_by_explicit_page_requirement"
+    ]
+
+
+def test_navigation_action_can_use_catalog_verified_previous_page_alias():
+    from pipeline.core.page_graph_bridge import NAVIGATION_CATALOG_SCHEMA_VERSION
+    from pipeline.retrieval.navigation_planner import GroundedNavigationPlanner
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    current_url = "https://mbzuai.ac.ae/ar/about/leadership"
+    previous_url = "https://mbzuai.ac.ae/ar/about/leadership-prev"
+    planner = GroundedNavigationPlanner(
+        catalog={
+            "schema_version": NAVIGATION_CATALOG_SCHEMA_VERSION,
+            "source_bridge_coverage_passed": True,
+            "source_bridge_status": "ready",
+            "pages": [
+                {
+                    "page_card_id": "page-card:current",
+                    "source_url": current_url,
+                    "title": "القيادة والحوكمة - MBZUAI",
+                    "language": "ar",
+                    "page_type": "leadership",
+                },
+                {
+                    "page_card_id": "page-card:previous",
+                    "source_url": previous_url,
+                    "title": "القيادة والحوكمة - MBZUAI",
+                    "language": "ar",
+                    "page_type": "leadership",
+                },
+            ],
+            "chunks": [],
+            "actions": [],
+        }
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.navigation_planner = planner
+    coverage_plan = {
+        "required_pages": [current_url],
+        "required_pages_source": "explicit_markers",
+    }
+    navigation_plan = {
+        "status": "ready",
+        "target_page": {"url": previous_url},
+        "steps": [
+            {
+                "action_id": "page-action:governance",
+                "action_type": "download",
+                "target_url": "https://staticcdn.mbzuai.ac.ae/governance.pdf",
+            }
+        ],
+        "warnings": [],
+    }
+
+    assert planner.page_urls_share_identity(current_url, previous_url) is True
+    assert retriever._require_navigation_target_page(coverage_plan, navigation_plan) is True
+    assert coverage_plan["required_pages"] == [previous_url]
+    assert navigation_plan["status"] == "ready"
+    assert navigation_plan["warnings"] == [
+        "navigation_target_page_alias_resolved"
+    ]
+
+
+def test_evidence_pack_prioritizes_validated_navigation_action():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    result = {
+        "answer_documents": [
+            {
+                "id": "page-action:salman-email",
+                "record_type": "navigation_action",
+                "answer_type": "email",
+                "text": "The verified email action points to salman.khan@mbzuai.ac.ae.",
+                "source_url": "https://mbzuai.ac.ae/ar/study/faculty/salman-khan-01",
+                "document_title": "سلمان خان - MBZUAI",
+                "confidence": 1.0,
+                "authority_score": 1.0,
+            },
+            {
+                "id": "generic-admissions-email",
+                "text": "The admissions email is admission@mbzuai.ac.ae.",
+                "source_url": "https://mbzuai.ac.ae/about/contact",
+            },
+        ],
+        "retrieval_documents": [
+            {
+                "id": "profile-context",
+                "text": "Salman Khan is an associate professor of computer vision.",
+                "source_url": "https://mbzuai.ac.ae/ar/study/faculty/salman-khan-01",
+            }
+        ],
+    }
+
+    evidence_pack = build_evidence_pack(
+        query="Where does Salman Khan's email action point?",
+        result=result,
+        max_items=4,
+    )
+
+    assert evidence_pack["items"][0]["kind"] == "action"
+    assert evidence_pack["items"][0]["id"] == "page-action:salman-email"
+    assert all(
+        "admission@mbzuai.ac.ae" not in item["text"]
+        for item in evidence_pack["items"]
+    )
+    assert any(item["id"] == "profile-context" for item in evidence_pack["items"])
+
+
+def test_evidence_pack_reserves_contiguous_chunk_for_using_explanation():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://ai-nexus.mbzuai.ac.ae/previous-ai-talks"
+    result = {
+        "fact_documents": [
+            {
+                "id": "speaker-fact",
+                "text": "Xiang Meng gave the average-hazard talk.",
+                "source_url": source_url,
+            }
+        ],
+        "evidence_span_documents": [
+            {
+                "id": "definition-span",
+                "text": "Average hazard is an interpretable hazard-scale measure.",
+                "source_url": source_url,
+                "span_type": "sentence_window",
+            },
+            {
+                "id": "title-span",
+                "text": "Average Hazard for Robust Survival Analysis by Xiang Meng.",
+                "source_url": source_url,
+                "span_type": "sentence_window",
+            },
+            {
+                "id": "outcome-span",
+                "text": "It can support more reliable trial conclusions and inform drug approvals.",
+                "source_url": source_url,
+                "span_type": "sentence_window",
+            },
+        ],
+        "retrieval_documents": [
+            {
+                "id": "chunk:average-hazard",
+                "text": (
+                    "The talk defines average hazard as an interpretable hazard-scale measure. "
+                    "It compares the measure with the Cox hazard ratio and says average hazard "
+                    "can support more reliable trial conclusions and inform drug approvals."
+                ),
+                "source_url": source_url,
+            }
+        ],
+    }
+
+    pack = build_evidence_pack(
+        query="What does Xiang Meng's talk say about using average hazard?",
+        result=result,
+        max_items=4,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [source_url],
+        },
+    )
+
+    assert pack["items"][0]["id"] == "chunk:average-hazard"
+    assert "more reliable trial conclusions" in pack["items"][0]["text"]
+
+
+def test_evidence_pack_recognizes_example_shown_in_form_as_media_query():
+    from pipeline.retrieval.evidence_packer import (
+        _is_explicit_media_query,
+        build_evidence_pack,
+    )
+
+    query = (
+        "What academic history example is shown in the form, and what does it "
+        "say about the GPA fields?"
+    )
+    media_text = (
+        "IMAGE: Academic history form\n"
+        "VISIBLE_TEXT: Carnegie Mellon University Bachelor Artificial Intelligence "
+        "CGPA 4.0 Maximum Possible GPA 4.0. The maximum possible GPA is the maximum "
+        "score on the university grading scale."
+    )
+    pack = build_evidence_pack(
+        query=query,
+        result={
+            "evidence_span_documents": [
+                {
+                    "id": "generic-gpa",
+                    "text": "Successful applicants generally have strong grades.",
+                    "source_url": "https://mbzuai.ac.ae/study/undergraduate-program",
+                    "span_type": "sentence_window",
+                }
+            ],
+            "media": [
+                {
+                    "id": "academic-form",
+                    "text": media_text,
+                    "source_url": "https://staticcdn.mbzuai.ac.ae/application.pdf",
+                }
+            ],
+        },
+        max_items=4,
+        max_chars=4000,
+    )
+
+    assert _is_explicit_media_query(query)
+    assert pack["items"][0]["id"] == "academic-form"
+    assert "Carnegie Mellon University" in pack["items"][0]["text"]
+
+
+def test_evidence_pack_adds_arabic_president_role_answer_aliases():
+    from pipeline.retrieval.evidence_packer import _query_terms
+
+    terms = _query_terms(
+        "ما الذي تقوله صفحة القيادة والحوكمة عن دور الرئيس؟"
+    )
+
+    assert {
+        "الرئيس التنفيذي",
+        "التنفيذي",
+        "الصلاحيات",
+        "إدارة الجامعة",
+        "إدارة",
+    } <= terms
+
+
+def test_evidence_pack_prefers_exact_arabic_president_role_chunk():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    leadership_url = "https://mbzuai.ac.ae/ar/about/leadership"
+    governance_url = "https://staticcdn.mbzuai.ac.ae/governance.pdf"
+    pack = build_evidence_pack(
+        query=(
+            "ما الذي تقوله صفحة القيادة والحوكمة عن دور الرئيس، وما الذي توضحه "
+            "وثيقة الحوكمة عن اللجان التي تشرف على شؤون الجامعة؟"
+        ),
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:generic-opening",
+                    "text": "يرحب الرئيس بمجلس الأمناء ويعرض نمو الجامعة وشراكاتها.",
+                    "source_url": leadership_url,
+                },
+                {
+                    "id": "chunk:exact-role",
+                    "text": (
+                        "يؤدي رئيس الجامعة مهام الرئيس التنفيذي ويمارس، بتوجيه مجلس "
+                        "الأمناء، الصلاحيات اللازمة لإدارة الجامعة وشؤونها."
+                    ),
+                    "source_url": leadership_url,
+                },
+                {
+                    "id": "chunk:governance",
+                    "text": (
+                        "The board and management committees oversee strategic and "
+                        "operational matters of the university."
+                    ),
+                    "source_url": governance_url,
+                },
+            ]
+        },
+        max_items=6,
+        max_chars=5000,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [leadership_url, governance_url],
+        },
+    )
+
+    leadership_items = [
+        item for item in pack["items"] if item["source_url"] == leadership_url
+    ]
+    assert leadership_items[0]["id"] == "chunk:exact-role"

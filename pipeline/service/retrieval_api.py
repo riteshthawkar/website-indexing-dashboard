@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -61,6 +62,16 @@ class RetrieveRequest(BaseModel):
         min_length=1,
         max_length=4096,
         description="Natural-language query text.",
+    )
+    original_query: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=4096,
+        description=(
+            "Optional original user wording when query is an upstream rewrite. "
+            "It is used for coverage, language, and navigation grounding, not as "
+            "an instruction to bypass the frozen retrieval corpus."
+        ),
     )
     request_id: str | None = Field(
         default=None,
@@ -371,6 +382,7 @@ def _health_payload(app: FastAPI) -> Dict[str, Any]:
 def _normalize_cache_query(
     query: str,
     *,
+    original_query: str | None = None,
     skip_query_planner: bool = False,
     navigation_context: Mapping[str, Any] | None = None,
 ) -> str:
@@ -380,9 +392,10 @@ def _normalize_cache_query(
     navigation_key = json.dumps(
         dict(navigation_context or {}), ensure_ascii=True, sort_keys=True, separators=(",", ":")
     )
+    original_key = " ".join(str(original_query or "").strip().split()).casefold()
     return (
         f"planner-skip={int(bool(skip_query_planner))}:"
-        f"navigation={navigation_key}:{normalized_query}"
+        f"navigation={navigation_key}:original={original_key}:{normalized_query}"
     )
 
 
@@ -390,6 +403,7 @@ async def _get_cached_result(
     app: FastAPI,
     query: str,
     *,
+    original_query: str | None = None,
     skip_query_planner: bool = False,
     navigation_context: Mapping[str, Any] | None = None,
 ) -> Dict[str, Any] | None:
@@ -398,6 +412,7 @@ async def _get_cached_result(
         return None
     cache_key = _normalize_cache_query(
         query,
+        original_query=original_query,
         skip_query_planner=skip_query_planner,
         navigation_context=navigation_context,
     )
@@ -421,6 +436,7 @@ async def _cache_result(
     query: str,
     payload: Dict[str, Any],
     *,
+    original_query: str | None = None,
     skip_query_planner: bool = False,
     navigation_context: Mapping[str, Any] | None = None,
 ) -> None:
@@ -430,6 +446,7 @@ async def _cache_result(
         return
     cache_key = _normalize_cache_query(
         query,
+        original_query=original_query,
         skip_query_planner=skip_query_planner,
         navigation_context=navigation_context,
     )
@@ -719,6 +736,13 @@ def create_retrieval_service_app(
         query = payload.query.strip()
         if not query:
             raise HTTPException(status_code=400, detail="query must not be empty")
+        original_query = (
+            payload.original_query.strip()
+            if payload.original_query is not None
+            else None
+        )
+        if original_query == query:
+            original_query = None
 
         request_id = payload.request_id or str(uuid.uuid4())
         started_at = time.perf_counter()
@@ -734,6 +758,7 @@ def create_retrieval_service_app(
         cached_result = await _get_cached_result(
             app,
             query,
+            original_query=original_query,
             skip_query_planner=payload.skip_query_planner,
             navigation_context=navigation_context,
         )
@@ -745,6 +770,7 @@ def create_retrieval_service_app(
             output["service_config_name"] = app.state.config_name
             output["service_cache_hit"] = True
             output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
+            output["service_original_query_forwarded"] = bool(original_query)
             output["service_navigation_context_forwarded"] = bool(
                 navigation_context
             )
@@ -778,6 +804,22 @@ def create_retrieval_service_app(
                 retrieval_options["skip_query_planner"] = True
             if navigation_context is not None:
                 retrieval_options["navigation_context"] = navigation_context
+            original_query_forwarded = False
+            if original_query is not None:
+                try:
+                    retrieve_parameters = inspect.signature(retriever.retrieve).parameters
+                    accepts_original_query = (
+                        "original_query" in retrieve_parameters
+                        or any(
+                            parameter.kind == inspect.Parameter.VAR_KEYWORD
+                            for parameter in retrieve_parameters.values()
+                        )
+                    )
+                except (TypeError, ValueError):
+                    accepts_original_query = False
+                if accepts_original_query:
+                    retrieval_options["original_query"] = original_query
+                    original_query_forwarded = True
             retrieval_future = loop.run_in_executor(
                 executor,
                 lambda: retriever.retrieve(query, **retrieval_options),
@@ -817,6 +859,7 @@ def create_retrieval_service_app(
             app,
             query,
             output,
+            original_query=original_query,
             skip_query_planner=payload.skip_query_planner,
             navigation_context=navigation_context,
         )
@@ -826,6 +869,7 @@ def create_retrieval_service_app(
         output["service_config_name"] = app.state.config_name
         output["service_cache_hit"] = False
         output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
+        output["service_original_query_forwarded"] = bool(original_query_forwarded)
         output["service_navigation_context_forwarded"] = bool(navigation_context)
         return output
 

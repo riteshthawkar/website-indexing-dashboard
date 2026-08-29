@@ -5,7 +5,7 @@ import os
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Sequence
 
 from pipeline.core.google_genai import import_genai
 from pipeline.core.io import load_json_safe
@@ -97,25 +97,25 @@ def _selected_answer_records(retriever: Any, retrieval_result: Dict[str, Any]) -
     selected_ids = [str(value) for value in (retrieval_result.get("selected_answer_ids") or []) if str(value)]
     records: List[Dict[str, Any]] = []
     seen_ids = set()
-    for answer_id in selected_ids:
-        if answer_id in seen_ids:
-            continue
-        seen_ids.add(answer_id)
-        answer = answer_map.get(answer_id)
-        if isinstance(answer, dict) and answer:
-            records.append(answer)
-    if records:
-        return records
-    seen_doc_ids = set()
+    # Validated page actions are synthesized at retrieval time and therefore
+    # do not exist in the immutable answer map. Merge direct documents first
+    # instead of treating them only as a fallback.
     for doc in retrieval_result.get("answer_documents") or []:
         if not isinstance(doc, dict):
             continue
         answer_id = str(doc.get("id") or "")
-        if not answer_id or answer_id in seen_doc_ids:
+        if not answer_id or answer_id in seen_ids:
             continue
-        seen_doc_ids.add(answer_id)
         if str(doc.get("answer_type") or ""):
             records.append(doc)
+            seen_ids.add(answer_id)
+    for answer_id in selected_ids:
+        if answer_id in seen_ids:
+            continue
+        answer = answer_map.get(answer_id)
+        if isinstance(answer, dict) and answer:
+            records.append(answer)
+            seen_ids.add(answer_id)
     return records
 
 
@@ -452,9 +452,10 @@ def generate_answer_predictions(
     timeout_seconds: float = 120.0,
     max_retries: int = 2,
     resume_predictions: bool = False,
+    examples: Sequence[EvalExample] | None = None,
 ) -> Dict[str, Any]:
     retriever = AdaptiveHybridRetriever.from_config(config_name=config_name, work_dir=work_dir)
-    examples = load_eval_examples(dataset_path)
+    examples = list(examples) if examples is not None else load_eval_examples(dataset_path)
     maps = _bundle_maps(work_dir)
 
     output_path = Path(output_path)

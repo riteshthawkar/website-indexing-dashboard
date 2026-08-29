@@ -50,3 +50,31 @@ def test_routed_rewrite_bundle_preserves_deterministic_navigation_intent():
     assert bundle.navigation_intent == "apply"
     assert bundle.navigation_goal == "How do I apply to MBZUAI?"
     assert bundle.navigation_confidence >= 0.9
+
+
+def test_query_planner_cannot_invent_navigation_for_factual_website_reference(monkeypatch):
+    import pipeline.core.query_planner as module
+
+    monkeypatch.setattr(module, "make_openai_client", lambda: object())
+    monkeypatch.setattr(
+        module,
+        "json_completion",
+        lambda **_kwargs: {
+            "query_type": "synthesis",
+            "vector_query": "IFM partners headquarters research centers",
+            "graph_query": "IFM locations partnerships",
+            "navigation_intent": "open_page",
+            "navigation_goal": "Open IFM website",
+            "navigation_confidence": 0.99,
+            "confidence": 0.9,
+        },
+    )
+
+    result = module.plan_query(
+        query="What does the IFM website say about its partners and research centers?",
+        model="gpt-test",
+    )
+
+    assert result["navigation_intent"] == "none"
+    assert result["navigation_goal"] == ""
+    assert result["navigation_confidence"] == 0.0

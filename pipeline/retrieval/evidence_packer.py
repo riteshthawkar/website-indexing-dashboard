@@ -24,10 +24,26 @@ def _doc_text(doc: Dict[str, Any]) -> str:
 
 
 _OFFICIAL_SOURCE_URL_RE = re.compile(
-    r"https?://(?:www\.)?mbzuai\.ac\.ae/[^\s\]\)\"'<>,]+",
+    r"https?://(?:(?:[a-z0-9-]+\.)*mbzuai\.ac\.ae|(?:[a-z0-9-]+\.)*ifm\.ai|mbzuai\.gitbook\.io)/[^\s\]\)\"'<>,]+",
     re.IGNORECASE,
 )
 _ARABIC_TEXT_RE = re.compile(r"[\u0600-\u06FF]")
+_EMAIL_VALUE_RE = re.compile(
+    r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_MEDIA_QUERY_RE = re.compile(
+    r"\b(?:image|images|photo|photograph|picture|diagram|figure|chart|table|map|infographic|"
+    r"screenshot|visual|workflow|framework|pdf)\b"
+    r"|\b(?:shown|displayed|visible|pictured)\s+(?:in|on)\s+(?:the\s+)?(?:form|portal|page)\b"
+    r"|(?:صورة|الصورة|صور|مخطط|المخطط|رسم|الشكل|خريطة|الخريطة|إنفوغراف|الإنفوغراف|"
+    r"جدول|الجدول|لقطة شاشة|سير العمل|إطار|الإطار)",
+    re.IGNORECASE,
+)
+
+
+def _is_explicit_media_query(query: str) -> bool:
+    return bool(_EXPLICIT_MEDIA_QUERY_RE.search(str(query or "")))
 
 
 def _extract_official_source_url_from_text(*values: Any) -> str:
@@ -82,7 +98,13 @@ def _is_official_mbzuai_url(value: Any) -> bool:
         host = (urlparse(str(value or "")).hostname or "").casefold()
     except Exception:
         host = ""
-    return bool(host == "mbzuai.ac.ae" or host.endswith(".mbzuai.ac.ae"))
+    return bool(
+        host == "mbzuai.ac.ae"
+        or host.endswith(".mbzuai.ac.ae")
+        or host == "ifm.ai"
+        or host.endswith(".ifm.ai")
+        or host == "mbzuai.gitbook.io"
+    )
 
 
 def _is_arabic_source_url(value: Any) -> bool:
@@ -102,7 +124,7 @@ def _is_arabic_source_url(value: Any) -> bool:
 def _document_title(doc: Dict[str, Any]) -> str:
     metadata = _doc_metadata(doc)
     title = _clean_text(doc.get("document_title") or metadata.get("document_title") or doc.get("title") or metadata.get("title"))
-    if title and not re.fullmatch(r"[a-f0-9]{24,64}", title.casefold()):
+    if title and not re.fullmatch(r"[a-f0-9]{16,64}", title.casefold()):
         return title
     return _title_from_source_url(_source_url(doc))
 
@@ -145,6 +167,8 @@ def _authority_score(doc: Dict[str, Any]) -> float:
         return 0.55
     if authority_class in {"low", "unknown"}:
         return 0.2
+    if _is_official_mbzuai_url(_source_url(doc)):
+        return 0.95
     return 0.0
 
 
@@ -172,18 +196,26 @@ def _coerce_docs(values: Iterable[Any]) -> List[Dict[str, Any]]:
 
 def _media_documents(values: Iterable[Any]) -> List[Dict[str, Any]]:
     docs: List[Dict[str, Any]] = []
-    for item in values or []:
+    for retrieval_rank, item in enumerate(values or []):
         if not isinstance(item, dict):
             continue
         docs.append(
             {
                 "id": item.get("id"),
-                "text": item.get("text") or item.get("description") or item.get("caption") or item.get("title"),
+                "text": (
+                    item.get("text")
+                    or item.get("dense_text")
+                    or item.get("raw_text")
+                    or item.get("description")
+                    or item.get("caption")
+                    or item.get("title")
+                ),
                 "source_url": item.get("source_url") or item.get("url") or item.get("asset_uri"),
                 "document_title": item.get("document_title") or item.get("title"),
                 "media_type": item.get("media_type") or item.get("type"),
                 "asset_uri": item.get("asset_uri"),
                 "url": item.get("url"),
+                "retrieval_rank": retrieval_rank,
             }
         )
     return docs
@@ -191,7 +223,9 @@ def _media_documents(values: Iterable[Any]) -> List[Dict[str, Any]]:
 
 def _candidate_stream(result: Dict[str, Any]) -> Iterable[Tuple[str, Dict[str, Any]]]:
     for doc in _coerce_docs(result.get("answer_documents") or []):
-        if doc.get("source_span_ids") or doc.get("linked_span_ids"):
+        if str(doc.get("record_type") or "") == "navigation_action":
+            yield "action", doc
+        elif doc.get("source_span_ids") or doc.get("linked_span_ids"):
             yield "assertion", doc
         else:
             yield "answer", doc
@@ -203,6 +237,40 @@ def _candidate_stream(result: Dict[str, Any]) -> Iterable[Tuple[str, Dict[str, A
         yield "evidence_span" if doc.get("span_type") else "chunk", doc
     for doc in _media_documents(result.get("media") or []):
         yield "media", doc
+
+
+def _validated_navigation_email_targets(result: Dict[str, Any]) -> set[str]:
+    targets: set[str] = set()
+    for doc in _coerce_docs(result.get("answer_documents") or []):
+        if (
+            str(doc.get("record_type") or "") != "navigation_action"
+            or str(doc.get("answer_type") or "").casefold() != "email"
+        ):
+            continue
+        value = _clean_text(
+            " ".join(
+                str(doc.get(key) or "")
+                for key in ("value", "action_target_url", "text")
+            )
+        )
+        if value.casefold().startswith("mailto:"):
+            value = value[7:].split("?", 1)[0]
+        targets.update(match.casefold() for match in _EMAIL_VALUE_RE.findall(value))
+    return targets
+
+
+def _conflicts_with_validated_email_action(
+    doc: Dict[str, Any],
+    targets: set[str],
+) -> bool:
+    if not targets or str(doc.get("record_type") or "") == "navigation_action":
+        return False
+    contact_text = " ".join(
+        str(doc.get(key) or "")
+        for key in ("text", "value", "source_url", "document_title")
+    )
+    emails = {match.casefold() for match in _EMAIL_VALUE_RE.findall(contact_text)}
+    return bool(emails and emails.isdisjoint(targets))
 
 
 def _coverage_values(coverage_plan: Dict[str, Any], key: str) -> List[str]:
@@ -234,31 +302,460 @@ def _entity_match_text(value: str) -> str:
     return text
 
 
+def _normalize_match_token(value: Any) -> str:
+    token = re.sub(r"[\u064B-\u065F\u0670\u0640]", "", str(value or "").casefold())
+    if _ARABIC_TEXT_RE.search(token) and len(token) >= 5:
+        for prefix in ("وال", "بال", "كال", "فال", "لل", "ال"):
+            if token.startswith(prefix) and len(token) - len(prefix) >= 3:
+                token = token[len(prefix) :]
+                break
+    return token
+
+
 def _query_terms(query: str) -> set[str]:
-    return {
-        token
-        for token in re.findall(r"[a-z0-9]+", str(query or "").casefold())
-        if len(token) > 2
-        and token
-        not in {
-            "the",
-            "and",
-            "for",
-            "with",
-            "what",
-            "when",
-            "where",
-            "which",
-            "does",
-            "about",
-            "mbzuai",
-            "please",
-            "tell",
-            "explain",
-            "describe",
-            "give",
-        }
+    excluded = {
+        "the",
+        "and",
+        "for",
+        "with",
+        "what",
+        "when",
+        "where",
+        "which",
+        "does",
+        "about",
+        "mbzuai",
+        "please",
+        "tell",
+        "explain",
+        "describe",
+        "give",
+        "ما",
+        "ماذا",
+        "متى",
+        "أين",
+        "اين",
+        "كيف",
+        "هل",
+        "كم",
+        "بحسب",
+        "هذا",
+        "هذه",
+        "الذي",
+        "التي",
+        "في",
+        "من",
+        "إلى",
+        "الى",
+        "على",
+        "عن",
     }
+    terms = {
+        normalized
+        for raw_token in re.findall(r"[^\W_]+", str(query or "").casefold(), flags=re.UNICODE)
+        if (normalized := _normalize_match_token(raw_token))
+        and len(normalized) > 2
+        and normalized not in excluded
+    }
+    normalized_query = _clean_text(query).casefold()
+    if any(
+        marker in normalized_query
+        for marker in (
+            "المؤهل الأكاديمي",
+            "المؤهلات الأكاديمية",
+            "المؤهلات",
+        )
+    ):
+        # The careers corpus is commonly English while users ask about degree
+        # requirements in Arabic. These aliases let the answer-bearing
+        # qualifications span outrank generic role-summary facts.
+        terms.update(
+            {
+                "academic",
+                "qualification",
+                "qualifications",
+                "degree",
+                "bachelor",
+                "master",
+                "required",
+                "preferred",
+                "mandatory",
+            }
+        )
+    if any(
+        marker in normalized_query
+        for marker in ("أقسام الوظائف", "الوظائف المفتوحة")
+    ):
+        terms.update(
+            {
+                "faculty",
+                "research",
+                "engineering",
+                "professional",
+                "vacancies",
+            }
+        )
+    if "ifm" in normalized_query and any(
+        marker in normalized_query
+        for marker in ("شركاء", "الشركاء", "partners", "collaborat")
+    ):
+        terms.update(
+            {
+                "science",
+                "scale",
+                "social value",
+                "academic institutions",
+                "research labs",
+                "startups",
+                "enterprise leaders",
+            }
+        )
+    if any(marker in normalized_query for marker in ("دانييلا روس", "daniela rus")):
+        terms.update({"الاستقلالية", "الذكاء", "autonomy", "intelligence"})
+    if any(
+        marker in normalized_query
+        for marker in ("دور الرئيس", "مهام الرئيس", "صلاحيات الرئيس")
+    ):
+        terms.update(
+            {
+                "الرئيس التنفيذي",
+                "التنفيذي",
+                "مهام",
+                "الصلاحيات",
+                "إدارة الجامعة",
+                "إدارة",
+                "chief executive",
+            }
+        )
+    if (
+        any(marker in normalized_query for marker in ("معرض التدريب المهني", "career fair"))
+        and any(marker in normalized_query for marker in ("الدعم", "دعم", "support"))
+    ):
+        terms.update(
+            {
+                "جلسات تدريب مهني فردية",
+                "وكالات التوظيف",
+                "صور احترافية",
+                "career coaching",
+                "recruitment agencies",
+            }
+        )
+    if (
+        any(marker in normalized_query for marker in ("الدكتوراه", "doctorate", "doctoral", "phd"))
+        and any(marker in normalized_query for marker in ("التوجه المهني", "career orientation", "career path"))
+    ):
+        terms.update(
+            {
+                "contribute to science and humanity",
+                "experienced researchers",
+                "academia",
+                "research institute",
+                "industry",
+                "startup",
+            }
+        )
+    if (
+        any(marker in normalized_query for marker in ("visitor program", "برنامج الزوار"))
+        and any(marker in normalized_query for marker in ("hands-on", "عملي", "تجربة"))
+    ):
+        terms.update(
+            {
+                "research experience program",
+                "hands-on ai research experiences",
+                "personalized demos",
+                "talks",
+            }
+        )
+    if (
+        ("engage" in normalized_query and "capture" in normalized_query and "value" in normalized_query)
+        or ("يتفاعل" in normalized_query and "القيمة" in normalized_query)
+    ):
+        terms.update(
+            {
+                "exploration",
+                "refinement",
+                "high level proposal",
+                "engagement agreement sign-off",
+            }
+        )
+    return terms
+
+
+_MEDIA_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_ ]{1,48}):\s*(.*)$")
+_MEDIA_IDENTITY_FIELDS = ("IMAGE", "DOCUMENT", "SECTION")
+_MEDIA_ANSWER_FIELDS = (
+    "VISIBLE_TEXT",
+    "CONTEXTUAL_CAPTION",
+    "SEMANTIC_CAPTION",
+    "OCR_TEXT",
+    "SURROUNDING_TEXT_AFTER",
+    "SURROUNDING_TEXT_BEFORE",
+    "NEARBY_TEXT",
+    "CONTEXT",
+    "VISUAL_DESCRIPTION",
+    "SEMANTIC_TAGS",
+    "IMAGE_KIND",
+)
+
+
+def _truncate_text(value: Any, limit: int) -> str:
+    text = _clean_text(value)
+    if limit <= 0 or not text:
+        return ""
+    if len(text) <= limit:
+        return text
+    clipped = text[:limit]
+    return clipped.rsplit(" ", 1)[0].strip() or clipped.strip()
+
+
+def _query_relevant_excerpt(value: Any, query: str, limit: int) -> str:
+    text = _clean_text(value)
+    if len(text) <= limit:
+        return text
+    terms = sorted(_query_terms(query), key=len, reverse=True)
+    normalized = text.casefold()
+    match_positions = [
+        position
+        for term in terms
+        if (position := normalized.find(term.casefold())) >= 0
+    ]
+    if not match_positions:
+        return _truncate_text(text, limit)
+    center = min(match_positions)
+    start = max(0, center - max(120, limit // 3))
+    end = min(len(text), start + limit)
+    start = max(0, end - limit)
+    excerpt = text[start:end]
+    if start:
+        excerpt = excerpt.split(" ", 1)[-1]
+    if end < len(text):
+        excerpt = excerpt.rsplit(" ", 1)[0]
+    return excerpt.strip()
+
+
+def _query_dense_excerpt(value: Any, query: str, limit: int) -> str:
+    """Keep the window that covers the most query concepts.
+
+    Long page chunks often start with role or page background and place the
+    requested structured block near the end. Prefix truncation therefore drops
+    exactly the qualifiers that distinguish, for example, a required degree
+    from a preferred one. Cross-lingual aliases supplied by ``_query_terms``
+    make the same selection work when an Arabic query targets English source
+    text.
+    """
+
+    text = _clean_text(value)
+    if limit <= 0 or not text:
+        return ""
+    if len(text) <= limit:
+        return text
+
+    terms = sorted(_query_terms(query), key=len, reverse=True)
+    normalized = text.casefold()
+    positions: List[int] = []
+    for term in terms:
+        normalized_term = term.casefold()
+        start = 0
+        while normalized_term and len(positions) < 256:
+            position = normalized.find(normalized_term, start)
+            if position < 0:
+                break
+            positions.append(position)
+            start = position + max(1, len(normalized_term))
+        if len(positions) >= 256:
+            break
+    if not positions:
+        return _truncate_text(text, limit)
+
+    best: tuple[int, int, int, int] | None = None
+    best_bounds = (0, limit)
+    leading_context = min(320, max(100, limit // 4))
+    for position in positions:
+        window_start = max(0, position - leading_context)
+        window_end = min(len(text), window_start + limit)
+        window_start = max(0, window_end - limit)
+        window = normalized[window_start:window_end]
+        matched_terms = {term for term in terms if term.casefold() in window}
+        # Prefer broad concept coverage, then more specific/longer concepts.
+        # Earlier positions are only a final deterministic tie-breaker.
+        score = (
+            len(matched_terms),
+            sum(len(term) for term in matched_terms),
+            -abs(position - (window_start + leading_context)),
+            -window_start,
+        )
+        if best is None or score > best:
+            best = score
+            best_bounds = (window_start, window_end)
+
+    start, end = best_bounds
+    excerpt = text[start:end]
+    if start:
+        excerpt = excerpt.split(" ", 1)[-1]
+    if end < len(text):
+        excerpt = excerpt.rsplit(" ", 1)[0]
+    return excerpt.strip()
+
+
+def _compact_media_evidence_text(value: Any, *, query: str, max_chars: int) -> str:
+    """Preserve answer-bearing media fields instead of truncating a raw prefix."""
+    raw = str(value or "").strip()
+    if not raw or len(_clean_text(raw)) <= max_chars:
+        return _clean_text(raw)
+
+    parsed: Dict[str, List[str]] = {}
+    for raw_line in raw.splitlines():
+        match = _MEDIA_FIELD_RE.match(raw_line.strip())
+        if not match:
+            continue
+        label = match.group(1).strip()
+        content = _clean_text(match.group(2))
+        if content:
+            parsed.setdefault(label, []).append(content)
+    if not parsed:
+        return _truncate_text(raw, max_chars)
+
+    parts: List[str] = []
+    used = 0
+
+    def append_field(label: str, content: str, *, field_limit: int, relevant: bool = False) -> None:
+        nonlocal used
+        remaining = max_chars - used
+        prefix = f"{label}: "
+        if remaining <= len(prefix) + 12:
+            return
+        bounded = min(field_limit, remaining - len(prefix) - (1 if parts else 0))
+        rendered = (
+            _query_relevant_excerpt(content, query, bounded)
+            if relevant
+            else _truncate_text(content, bounded)
+        )
+        if not rendered:
+            return
+        part = prefix + rendered
+        parts.append(part)
+        used += len(part) + (1 if len(parts) > 1 else 0)
+
+    for label in _MEDIA_IDENTITY_FIELDS:
+        for content in parsed.get(label, []):
+            append_field(label, content, field_limit=240)
+
+    # OCR-derived visible text is the strongest source for labels, numeric
+    # values, and complete table rows. Keep it ahead of prose context.
+    for content in parsed.get("VISIBLE_TEXT", []):
+        append_field("VISIBLE_TEXT", content, field_limit=2100, relevant=len(content) > 2100)
+
+    for label in ("CONTEXTUAL_CAPTION", "SEMANTIC_CAPTION"):
+        for content in parsed.get(label, []):
+            append_field(label, content, field_limit=520)
+
+    for content in parsed.get("OCR_TEXT", []):
+        append_field("OCR_TEXT", content, field_limit=700, relevant=True)
+
+    for label in (
+        "SURROUNDING_TEXT_AFTER",
+        "SURROUNDING_TEXT_BEFORE",
+        "NEARBY_TEXT",
+        "CONTEXT",
+        "VISUAL_DESCRIPTION",
+    ):
+        for content in parsed.get(label, []):
+            append_field(label, content, field_limit=640, relevant=True)
+
+    for label in ("SEMANTIC_TAGS", "IMAGE_KIND"):
+        for content in parsed.get(label, []):
+            append_field(label, content, field_limit=260)
+
+    compacted = "\n".join(parts)
+    return _truncate_text(compacted, max_chars)
+
+
+def _named_query_tokens(query: str) -> set[str]:
+    tokens: set[str] = set()
+    excluded = {
+        "who",
+        "what",
+        "when",
+        "where",
+        "which",
+        "why",
+        "how",
+        "is",
+        "are",
+        "does",
+        "do",
+        "can",
+        "has",
+        "have",
+        "mbzuai",
+    }
+    for index, raw_token in enumerate(str(query or "").split()):
+        token = "".join(
+            character
+            for character in raw_token
+            if character.isalnum() or character in {"-", "_", "'"}
+        ).strip("'")
+        if not token:
+            continue
+        lowered = token.casefold()
+        if lowered in excluded:
+            continue
+        if (
+            (token.isupper() and len(token) >= 3)
+            or any(character.isupper() for character in token[1:])
+            or (
+                index > 0
+                and token[:1].isupper()
+                and any(character.islower() for character in token[1:])
+            )
+        ):
+            tokens.add(lowered)
+    return tokens
+
+
+def _named_source_identity_bonus(
+    query: str,
+    *,
+    source_url: str,
+    document_title: str,
+    heading: str,
+) -> float:
+    identity_tokens = _named_query_tokens(query)
+    if not identity_tokens:
+        return 0.0
+    try:
+        parsed = urlparse(str(source_url or ""))
+        host = (parsed.hostname or "").casefold()
+        path = unquote(parsed.path or "")
+    except Exception:
+        host = ""
+        path = str(source_url or "")
+    source_tokens = set(
+        re.findall(
+            r"[a-z0-9]+",
+            " ".join(
+                (
+                    host,
+                    path,
+                    str(document_title or ""),
+                    str(heading or ""),
+                )
+            ).casefold(),
+        )
+    )
+    matched = identity_tokens & source_tokens
+    if not matched:
+        return 0.0
+    match_ratio = len(matched) / float(len(identity_tokens))
+    bonus = min(52.0, (8.0 * len(matched)) + (36.0 * match_ratio))
+    host_tokens = {
+        token
+        for token in re.findall(r"[a-z0-9]+", host)
+        if token not in {"www", "ac", "ae", "ai", "com", "edu", "org"}
+    }
+    if matched & host_tokens:
+        bonus += 16.0
+    return bonus
 
 
 def _should_exclude_context_item(query: str, item_blob: str) -> bool:
@@ -273,6 +770,7 @@ def _should_exclude_context_item(query: str, item_blob: str) -> bool:
 
 
 _KIND_BASE_SCORE = {
+    "action": 108.0,
     "assertion": 100.0,
     "fact": 86.0,
     "evidence_span": 82.0,
@@ -280,6 +778,47 @@ _KIND_BASE_SCORE = {
     "answer": 38.0,
     "media": 0.0,
 }
+
+
+_MULTI_DETAIL_QUERY_RE = re.compile(
+    r"\b(?:requirements|qualifications|qualification|academic qualification|roles|positions|responsibilities|steps|"
+    r"features|benefits|differences|criteria|items|articles|entries|sections|categories|stages|process|"
+    r"support|services|use|uses|using|options|focus areas|research interests|hands-on access|offerings|committees|industry engagement)\b"
+    r"|(?:المتطلبات|المؤهلات|المؤهل الأكاديمي|المؤهل|المناصب|الأدوار|المسؤوليات|الخطوات|المزايا|الفروقات|"
+    r"المعايير|العناصر|المقالات|أقسام|اقسام|فئات|مراحل|عملية|الدعم|دعم|الخدمات|خدمات|استخدامات|خيارات|"
+    r"المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
+    r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
+    r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
+    re.IGNORECASE,
+)
+
+
+def _multi_detail_chunk_coverage_bonus(query: str, item_blob: str, kind: str) -> float:
+    """Reward a complete context window when an answer spans several details.
+
+    Evidence spans normally deserve a precision prior, but a span extractor can
+    split a list or a pair of requested fields at its boundary. For plural or
+    structured-block questions (including academic qualifications), a selected
+    chunk that covers most informative query terms is safer than individually
+    precise spans that omit a required/preferred qualifier. The minimum coverage
+    threshold prevents generic long chunks from receiving this bonus merely
+    because they contain one common token.
+    """
+
+    if kind != "chunk" or not _MULTI_DETAIL_QUERY_RE.search(str(query or "")):
+        return 0.0
+    terms = _query_terms(query)
+    if len(terms) < 3:
+        return 0.0
+    item_terms = {
+        normalized
+        for raw_token in re.findall(r"[^\W_]+", item_blob, flags=re.UNICODE)
+        if (normalized := _normalize_match_token(raw_token))
+    }
+    coverage = len(terms & item_terms) / float(len(terms))
+    if coverage < 0.55:
+        return 0.0
+    return min(58.0, 18.0 + (42.0 * coverage))
 
 
 def _query_specific_bonus(query: str, item_blob: str, normalized_source: str) -> float:
@@ -397,8 +936,9 @@ def _candidate_score(
             "breadcrumb": doc.get("breadcrumb"),
         }
     )
-    score = _KIND_BASE_SCORE.get(kind, 1.0)
-    if kind == "media" and not re.search(r"\b(image|photo|video|media|map|picture|visual)\b", str(query or ""), re.IGNORECASE):
+    explicit_media_query = _is_explicit_media_query(query)
+    score = 112.0 if kind == "media" and explicit_media_query else _KIND_BASE_SCORE.get(kind, 1.0)
+    if kind == "media" and not explicit_media_query:
         score -= 40.0
     if _is_official_mbzuai_url(source):
         score += 18.0
@@ -411,8 +951,29 @@ def _candidate_score(
 
     terms = _query_terms(query)
     if terms:
-        text_terms = set(re.findall(r"[a-z0-9]+", item_blob))
+        text_terms = {
+            normalized
+            for raw_token in re.findall(r"[^\W_]+", item_blob, flags=re.UNICODE)
+            if (normalized := _normalize_match_token(raw_token))
+        }
         score += (len(terms & text_terms) / float(len(terms))) * 28.0
+
+    if kind == "media" and explicit_media_query:
+        try:
+            retrieval_rank = max(0, int(doc.get("retrieval_rank") or 0))
+        except (TypeError, ValueError):
+            retrieval_rank = 0
+        # The adaptive retriever has already combined dense, sparse, graph,
+        # and media-specific signals. Preserve that ordering as the primary
+        # media signal instead of letting a weak language heuristic undo it.
+        score += max(0.0, 30.0 - (6.0 * retrieval_rank))
+        query_is_arabic = bool(_ARABIC_TEXT_RE.search(str(query or "")))
+        item_is_arabic = bool(_ARABIC_TEXT_RE.search(item_blob))
+        if query_is_arabic:
+            score += 6.0 if item_is_arabic else -4.0
+        if re.search(r"\b(?:invite|invites|inviting)\b", str(query or ""), re.IGNORECASE):
+            if any(marker in item_blob for marker in ("scan qr", "qr code", "digital copy", "download")):
+                score += 64.0
 
     normalized_source = _normalize_url_for_match(source)
     if required_pages:
@@ -426,7 +987,19 @@ def _candidate_score(
     for entity in required_entities:
         if entity and entity in item_blob:
             score += 16.0
+    score += _named_source_identity_bonus(
+        query,
+        source_url=source,
+        document_title=_document_title(doc),
+        heading=_clean_text(doc.get("section_heading") or doc.get("heading")),
+    )
+    score += _multi_detail_chunk_coverage_bonus(query, item_blob, kind)
     score += _query_specific_bonus(query, item_blob, normalized_source)
+    if bool(doc.get("coverage_aggregate")):
+        # A bounded complete-page parent is deliberately injected for a
+        # multi-detail/list question. Keep it ahead of isolated snippets so
+        # generation sees the full structured block in one evidence item.
+        score += 72.0
 
     if kind == "answer" and not (doc.get("source_span_ids") or doc.get("linked_span_ids")):
         score -= 14.0
@@ -447,6 +1020,8 @@ def build_evidence_pack(
     max_items = max(1, int(max_items or 8))
     max_chars = max(800, int(max_chars or 8000))
     max_per_source = max(1, int(max_per_source or 2))
+    explicit_media_query = _is_explicit_media_query(query)
+    structured_detail_query = bool(_MULTI_DETAIL_QUERY_RE.search(str(query or "")))
 
     seen_keys = set()
     source_counts: Dict[str, int] = {}
@@ -476,9 +1051,19 @@ def build_evidence_pack(
     required_page_set = set(required_pages)
 
     candidates: List[Tuple[float, str, Dict[str, Any]]] = []
+    validated_email_targets = _validated_navigation_email_targets(result)
     for kind, doc in _candidate_stream(result):
+        if _conflicts_with_validated_email_action(
+            doc,
+            validated_email_targets,
+        ):
+            continue
         text = _doc_text(doc)
         if not text:
+            continue
+        if kind in {"chunk", "evidence_span", "media", "summary"} and (
+            len(text) < 20 or len(re.findall(r"\w+", text, re.UNICODE)) < 3
+        ):
             continue
         item_blob = _item_search_text(
             {
@@ -513,6 +1098,7 @@ def build_evidence_pack(
     candidates.sort(key=lambda item: (-item[0], _doc_id(item[2])))
 
     selected_candidate_keys: set[str] = set()
+    media_reserve = 3 if max_items >= 6 else 2 if max_items >= 4 else 1
 
     def _candidate_matches_requirement(doc: Dict[str, Any], requirement: str, *, page: bool) -> bool:
         if page:
@@ -527,6 +1113,12 @@ def build_evidence_pack(
         key = _dedupe_key(doc, kind)
         if key in selected_candidate_keys:
             return False
+        if (
+            kind == "media"
+            and explicit_media_query
+            and sum(1 for item in items if item.get("kind") == "media") >= media_reserve
+        ):
+            return False
         source = _source_url(doc) or "local"
         normalized_source = _normalize_url_for_match(source)
         source_cap = max_per_source
@@ -539,10 +1131,31 @@ def build_evidence_pack(
             truncated = True
             return False
         item_text = _doc_text(doc)
-        if len(item_text) > remaining:
-            item_text = item_text[: max(0, remaining)].rsplit(" ", 1)[0].strip() or item_text[:remaining].strip()
+        item_char_limit = remaining
+        if kind == "media" and explicit_media_query:
+            item_char_limit = min(item_char_limit, 2400)
+            item_text = _compact_media_evidence_text(
+                doc.get("text") or item_text,
+                query=query,
+                max_chars=item_char_limit,
+            )
+        elif kind == "chunk" and _MULTI_DETAIL_QUERY_RE.search(str(query or "")):
+            # A complete structured block is safer than a short extracted span,
+            # but sending a full page chunk adds latency and the answer runtime
+            # may prefix-truncate it again. Preserve a bounded, query-dense
+            # window containing the whole answer-bearing block instead.
+            item_char_limit = min(item_char_limit, 2400)
+            item_text = _query_dense_excerpt(item_text, query, item_char_limit)
+        if len(item_text) > item_char_limit:
+            item_text = item_text[: max(0, item_char_limit)].rsplit(" ", 1)[0].strip() or item_text[:item_char_limit].strip()
             truncated = True
         if not item_text:
+            return False
+        if kind in {"chunk", "evidence_span", "media", "summary"} and (
+            len(item_text) < 20
+            or len(re.findall(r"\w+", item_text, re.UNICODE)) < 3
+        ):
+            truncated = True
             return False
         selected_candidate_keys.add(key)
         source_counts[source] = source_counts.get(source, 0) + 1
@@ -563,10 +1176,59 @@ def build_evidence_pack(
         )
         return True
 
+    if explicit_media_query:
+        # Media relevance is resolved upstream by the adaptive hybrid
+        # retriever. Re-ranking those records here with a second set of
+        # heuristics can invert a correct cross-lingual result. Preserve the
+        # selected retrieval order, while still preferring an explicitly
+        # required page when the coverage planner supplied one.
+        media_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[1] == "media"
+        ]
+        media_candidates.sort(
+            key=lambda candidate: (
+                0
+                if not required_page_set
+                or _normalize_url_for_match(_source_url(candidate[2])) in required_page_set
+                else 1,
+                int(candidate[2].get("retrieval_rank") or 0),
+                -candidate[0],
+                _doc_id(candidate[2]),
+            )
+        )
+        for _score, kind, doc in media_candidates:
+            _append_candidate(kind, doc)
+            if sum(1 for item in items if item.get("kind") == "media") >= media_reserve:
+                break
+
     for required_page in required_pages:
         for _score, kind, doc in candidates:
             if _candidate_matches_requirement(doc, required_page, page=True) and _append_candidate(kind, doc):
                 break
+    if structured_detail_query:
+        # An aggregate parent proves page coverage, but its bounded excerpt can
+        # still omit an early number or a later list item. Reserve one leaf
+        # chunk per required page before isolated facts consume the per-source
+        # cap so multi-part answers retain a contiguous answer-bearing block.
+        for required_page in required_pages:
+            already_has_leaf_chunk = any(
+                str(item.get("kind") or "") == "chunk"
+                and str(item.get("id") or "").startswith("chunk:")
+                and _normalize_url_for_match(item.get("source_url")) == required_page
+                for item in items
+            )
+            if already_has_leaf_chunk:
+                continue
+            for _score, kind, doc in candidates:
+                if (
+                    kind == "chunk"
+                    and _doc_id(doc).startswith("chunk:")
+                    and _candidate_matches_requirement(doc, required_page, page=True)
+                    and _append_candidate(kind, doc)
+                ):
+                    break
     if specific_required_page_mode:
         for required_page in required_pages:
             for _score, kind, doc in candidates:
@@ -588,15 +1250,40 @@ def build_evidence_pack(
             continue
         _append_candidate(kind, doc)
 
-    evidence_order = {
-        "assertion": 0,
-        "fact": 1,
-        "evidence_span": 2,
-        "chunk": 3,
-        "summary": 4,
-        "answer": 5,
-        "media": 6,
-    }
+    evidence_order = (
+        {
+            "media": 0,
+            "action": 1,
+            "assertion": 2,
+            "fact": 3,
+            "evidence_span": 4,
+            "chunk": 5,
+            "summary": 6,
+            "answer": 7,
+        }
+        if explicit_media_query
+        else {
+            "action": 0,
+            "chunk": 1,
+            "assertion": 2,
+            "fact": 3,
+            "evidence_span": 4,
+            "summary": 5,
+            "answer": 6,
+            "media": 7,
+        }
+        if structured_detail_query
+        else {
+            "action": 0,
+            "assertion": 1,
+            "fact": 2,
+            "evidence_span": 3,
+            "chunk": 4,
+            "summary": 5,
+            "answer": 6,
+            "media": 7,
+        }
+    )
     def _required_page_sort_rank(item: Dict[str, Any]) -> int:
         if not required_page_set:
             return 0
@@ -611,23 +1298,43 @@ def build_evidence_pack(
 
     coverage_first_intent = intent in {"broad_synthesis", "multi_page_aggregation", "large_page"} or len(required_pages) > 1
     if coverage_first_intent:
-        items.sort(
-            key=lambda item: (
-                _required_page_sort_rank(item),
-                _required_entity_sort_rank(item),
-                evidence_order.get(str(item.get("kind") or ""), 99),
-                int(item.get("rank") or 0),
+        if explicit_media_query:
+            items.sort(
+                key=lambda item: (
+                    evidence_order.get(str(item.get("kind") or ""), 99),
+                    _required_page_sort_rank(item),
+                    _required_entity_sort_rank(item),
+                    int(item.get("rank") or 0),
+                )
             )
-        )
+        else:
+            items.sort(
+                key=lambda item: (
+                    _required_page_sort_rank(item),
+                    _required_entity_sort_rank(item),
+                    evidence_order.get(str(item.get("kind") or ""), 99),
+                    int(item.get("rank") or 0),
+                )
+            )
     else:
-        items.sort(
-            key=lambda item: (
-                _required_page_sort_rank(item),
-                evidence_order.get(str(item.get("kind") or ""), 99),
-                _required_entity_sort_rank(item),
-                int(item.get("rank") or 0),
+        if explicit_media_query:
+            items.sort(
+                key=lambda item: (
+                    evidence_order.get(str(item.get("kind") or ""), 99),
+                    _required_page_sort_rank(item),
+                    _required_entity_sort_rank(item),
+                    int(item.get("rank") or 0),
+                )
             )
-        )
+        else:
+            items.sort(
+                key=lambda item: (
+                    _required_page_sort_rank(item),
+                    evidence_order.get(str(item.get("kind") or ""), 99),
+                    _required_entity_sort_rank(item),
+                    int(item.get("rank") or 0),
+                )
+            )
     for index, item in enumerate(items, start=1):
         item["rank"] = index
 

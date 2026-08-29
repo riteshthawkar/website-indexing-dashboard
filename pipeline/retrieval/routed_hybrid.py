@@ -12,7 +12,11 @@ from threading import BoundedSemaphore, Lock
 from typing import Any, Dict, List, Mapping, Sequence
 from urllib.parse import unquote, urlparse
 
-from pipeline.core.evidence_adjudicator import adjudicate_factual_evidence
+from pipeline.core.evidence_adjudicator import (
+    adjudicate_factual_evidence,
+    heuristic_adjudicate_factual_evidence,
+    query_requires_premise_grounding,
+)
 from pipeline.core.navigation_intent import normalize_navigation_context
 from pipeline.core.query_expansion import hyde_expansion
 from pipeline.core.query_planner import plan_query
@@ -38,6 +42,18 @@ from .graph_rag import GraphQueryContext, GraphRAGRetriever, RelationCandidateSe
 
 logger = logging.getLogger(__name__)
 _ADJUDICATOR_RUNTIME_INIT_LOCK = Lock()
+_AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
+    r"\b(?:requirements|qualifications|roles|responsibilities|features|benefits|"
+    r"differences|criteria|items|articles|entries|listed|shown|displayed|sections|"
+    r"categories|stages|process|support|services|uses|options|focus areas|"
+    r"research interests|hands-on access|offerings|committees|industry engagement)\b"
+    r"|(?:المتطلبات|المؤهلات|الأدوار|المسؤوليات|المزايا|الفروقات|المعايير|العناصر|"
+    r"المقالات|أقسام|اقسام|فئات|مراحل|عملية|الدعم|دعم|الخدمات|خدمات|استخدامات|"
+    r"خيارات|المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
+    r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
+    r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
+    re.IGNORECASE,
+)
 
 
 def _with_retriever_backend(config: Dict[str, Any], backend: str) -> Dict[str, Any]:
@@ -153,6 +169,17 @@ class RoutedHybridRetriever:
         self.navigation_plan_required = bool(
             retrieval_cfg.get("navigation_plan_required", False)
         )
+        self.page_card_evidence_fusion_enabled = bool(
+            retrieval_cfg.get("page_card_evidence_fusion_enabled", True)
+        )
+        self.page_card_evidence_fusion_weight = max(
+            0.0,
+            float(retrieval_cfg.get("page_card_evidence_fusion_weight") or 0.15),
+        )
+        self.page_card_evidence_fusion_rrf_k = max(
+            1,
+            int(retrieval_cfg.get("page_card_evidence_fusion_rrf_k") or 60),
+        )
         self.navigation_planner = GroundedNavigationPlanner.from_runtime(
             work_dir=self.work_dir,
             configured_path=retrieval_cfg.get("page_graph_navigation_catalog_file"),
@@ -248,6 +275,11 @@ class RoutedHybridRetriever:
         self.model = self.vector.model
         self.output_dimensionality = self.vector.output_dimensionality
         self._coverage_page_records = self._build_coverage_page_records()
+        self._coverage_page_records_by_url = {
+            str(page.get("normalized_url") or ""): page
+            for page in self._coverage_page_records
+            if str(page.get("normalized_url") or "")
+        }
 
         self.graph: GraphRAGRetriever | None = None
         self.graph_init_error: str | None = None
@@ -342,6 +374,44 @@ class RoutedHybridRetriever:
         mode = classify_query_mode(query)
         media_query = _is_media_query(query)
         return self.graph._build_relation_query_plan(query, mode=mode, media_query=media_query)
+
+    def _preserve_original_query_aliases(
+        self,
+        rewrites: QueryRewriteBundle,
+        *,
+        query: str,
+        original_query: str,
+    ) -> QueryRewriteBundle:
+        """Carry deterministic user-language aliases through an upstream rewrite."""
+
+        if not original_query.strip() or original_query.strip() == query.strip():
+            return rewrites
+        aliases = _semantic_query_alias_tokens(original_query)
+        if not aliases:
+            return rewrites
+        vector_query = self._append_alias_tokens(
+            rewrites.vector_query,
+            aliases,
+            max_new_tokens=6,
+        )
+        if vector_query == rewrites.vector_query:
+            return rewrites
+        return QueryRewriteBundle(
+            vector_query=vector_query,
+            graph_query=vector_query,
+            labels=tuple(
+                dict.fromkeys(
+                    [
+                        *rewrites.labels,
+                        "original_query_semantic_alias_expansion",
+                    ]
+                )
+            ),
+            navigation_intent=rewrites.navigation_intent,
+            navigation_goal=rewrites.navigation_goal,
+            navigation_confidence=rewrites.navigation_confidence,
+            navigation_source=rewrites.navigation_source,
+        )
 
     def _build_query_rewrite_bundle(
         self,
@@ -503,13 +573,30 @@ class RoutedHybridRetriever:
                     "result",
                     "results",
                     "awardee",
+                    "tuition",
+                    "fee",
+                    "fees",
+                    "commencement",
+                    "speaker",
+                    "keynote",
+                    "schedule",
+                    "deadline",
+                    "exact amount",
                     "الفائز",
                     "فاز",
                     "الجائزة",
                     "النتائج",
+                    "الرسوم",
+                    "رسوم",
+                    "حفل تخرج",
+                    "كلمة حفل",
+                    "المتحدث",
+                    "سيلقي",
+                    "الجدول",
+                    "الموعد النهائي",
                 )
             ):
-                return "unsupported_future_event_result"
+                return "unsupported_future_mutable_fact"
 
         return ""
 
@@ -574,12 +661,81 @@ class RoutedHybridRetriever:
         if payload.get("abstained"):
             payload.setdefault("verification_status", "not_required_abstained")
             return payload
-        if str(payload.get("mode") or "").strip().lower() != QueryMode.FACT.value:
+        intent_summary = self._intent_summary(query)
+        premise_grounding_required = query_requires_premise_grounding(
+            query, intent_summary
+        )
+        payload["premise_grounding_required"] = premise_grounding_required
+        if (
+            bool(payload.get("navigation_evidence_rescued"))
+            and not premise_grounding_required
+        ):
+            # The navigation planner validates these records against the
+            # immutable Page Card/action catalog after retrieval.  Text-only
+            # adjudication cannot add signal for a navigation-only rescue and
+            # can incorrectly discard a valid action because its surrounding
+            # prose ranked poorly.  Scoped factual premises still flow through
+            # the fail-closed adjudicator above this exception.
+            payload.setdefault("adjudication_used", False)
+            payload.setdefault("verification_status", "verified_navigation_catalog")
+            payload.setdefault("adjudication_reason", "grounded_navigation_evidence")
+            return payload
+        media_documents = [
+            item
+            for item in (payload.get("media") or [])
+            if isinstance(item, Mapping) and str(item.get("id") or "")
+        ]
+        media_evidence_verified = bool(
+            media_documents and payload.get("media_evidence_rescued")
+        )
+        media_verifier = getattr(
+            getattr(self, "vector", None),
+            "_has_grounded_media_candidates",
+            None,
+        )
+        if (
+            media_documents
+            and not media_evidence_verified
+            and callable(media_verifier)
+        ):
+            media_rankings = (
+                payload.get("dense_media_ids") or [],
+                payload.get("sparse_media_ids") or [],
+                payload.get("local_media_ids") or [],
+            )
+            if not any(media_rankings):
+                media_rankings = (payload.get("selected_media_ids") or [],)
+            media_evidence_verified = bool(
+                media_verifier(
+                    query=str(payload.get("query_rewritten") or query),
+                    media_rankings=media_rankings,
+                )
+            )
+        if media_evidence_verified:
+            # Media records carry OCR, captions, source URLs, and independent
+            # dense/sparse ranks. A text-only adjudicator cannot validate that
+            # evidence and can incorrectly discard the exact visual because
+            # its surrounding prose is weak or unrelated.
+            payload["media_evidence_verified"] = True
+            payload.setdefault("adjudication_used", False)
+            payload["verification_status"] = "verified_media_evidence"
+            payload["adjudication_reason"] = "grounded_media_evidence"
+            return payload
+        if (
+            str(payload.get("mode") or "").strip().lower() != QueryMode.FACT.value
+            and not premise_grounding_required
+        ):
             payload.setdefault("adjudication_used", False)
             payload.setdefault("verification_status", "skipped_non_fact")
             return payload
 
-        if bool(getattr(self, "selective_adjudication_enabled", False)) and not self._should_run_evidence_adjudication(payload):
+        if (
+            bool(getattr(self, "selective_adjudication_enabled", False))
+            and not self._should_run_evidence_adjudication(
+                payload,
+                premise_grounding_required=premise_grounding_required,
+            )
+        ):
             payload.setdefault("adjudication_used", False)
             payload.setdefault("verification_status", "skipped_high_confidence")
             return payload
@@ -600,7 +756,7 @@ class RoutedHybridRetriever:
 
         adjudication_kwargs = {
             "query": query,
-            "intent_summary": self._intent_summary(query),
+            "intent_summary": intent_summary,
             "answer_documents": answer_documents[: self.evidence_adjudicator_answer_limit],
             "fact_documents": fact_documents[: self.evidence_adjudicator_fact_limit],
             "retrieval_documents": retrieval_documents[: max(8, self.evidence_adjudicator_chunk_limit + 2)],
@@ -619,37 +775,70 @@ class RoutedHybridRetriever:
             "max_fact_ids": self.evidence_adjudicator_fact_limit,
             "max_chunk_ids": self.evidence_adjudicator_chunk_limit,
         }
+
+        def heuristic_fallback() -> Dict[str, Any]:
+            return heuristic_adjudicate_factual_evidence(
+                query=query,
+                intent_summary=intent_summary,
+                answer_documents=answer_documents[: self.evidence_adjudicator_answer_limit],
+                fact_documents=fact_documents[: self.evidence_adjudicator_fact_limit],
+                retrieval_documents=retrieval_documents[: max(8, self.evidence_adjudicator_chunk_limit + 2)],
+                max_answer_ids=self.evidence_adjudicator_answer_limit,
+                max_fact_ids=self.evidence_adjudicator_fact_limit,
+                max_chunk_ids=self.evidence_adjudicator_chunk_limit,
+            )
+
         self._initialize_evidence_adjudicator_runtime()
         capacity = self._evidence_adjudicator_capacity
         if not capacity.acquire(blocking=False):
-            payload.setdefault("adjudication_used", False)
-            payload["verification_status"] = "skipped_busy"
-            payload["adjudication_reason"] = "evidence_adjudicator_capacity_exhausted"
-            return payload
-
-        try:
-            future = self._evidence_adjudicator_executor.submit(
-                adjudicate_factual_evidence,
-                **adjudication_kwargs,
-            )
-        except RuntimeError:
-            capacity.release()
-            payload.setdefault("adjudication_used", False)
-            payload["verification_status"] = "skipped_unavailable"
-            payload["adjudication_reason"] = "evidence_adjudicator_unavailable"
-            return payload
-
-        # Release only when provider work actually exits. ``Future.cancel`` does
-        # not stop a running network call and must not free capacity early.
-        future.add_done_callback(lambda _future: capacity.release())
-        try:
-            adjudication = future.result(timeout=max(0.1, float(getattr(self, "evidence_adjudicator_timeout_sec", 12.0))))
-        except FutureTimeoutError:
-            future.cancel()
-            payload.setdefault("adjudication_used", False)
-            payload["verification_status"] = "skipped_timeout"
-            payload["adjudication_reason"] = "evidence_adjudicator_timeout"
-            return payload
+            if premise_grounding_required:
+                adjudication = heuristic_fallback()
+            else:
+                payload.setdefault("adjudication_used", False)
+                payload["verification_status"] = "skipped_busy"
+                payload["adjudication_reason"] = "evidence_adjudicator_capacity_exhausted"
+                return payload
+        else:
+            try:
+                future = self._evidence_adjudicator_executor.submit(
+                    adjudicate_factual_evidence,
+                    **adjudication_kwargs,
+                )
+            except RuntimeError:
+                capacity.release()
+                if premise_grounding_required:
+                    adjudication = heuristic_fallback()
+                else:
+                    payload.setdefault("adjudication_used", False)
+                    payload["verification_status"] = "skipped_unavailable"
+                    payload["adjudication_reason"] = "evidence_adjudicator_unavailable"
+                    return payload
+            else:
+                # Release only when provider work actually exits. ``Future.cancel``
+                # does not stop a running network call and must not free capacity early.
+                future.add_done_callback(lambda _future: capacity.release())
+                try:
+                    adjudication = future.result(
+                        timeout=max(
+                            0.1,
+                            float(
+                                getattr(
+                                    self,
+                                    "evidence_adjudicator_timeout_sec",
+                                    12.0,
+                                )
+                            ),
+                        )
+                    )
+                except FutureTimeoutError:
+                    future.cancel()
+                    if premise_grounding_required:
+                        adjudication = heuristic_fallback()
+                    else:
+                        payload.setdefault("adjudication_used", False)
+                        payload["verification_status"] = "skipped_timeout"
+                        payload["adjudication_reason"] = "evidence_adjudicator_timeout"
+                        return payload
 
         payload["adjudication_used"] = bool(
             adjudication.get("used")
@@ -707,7 +896,14 @@ class RoutedHybridRetriever:
             ]
         return payload
 
-    def _should_run_evidence_adjudication(self, payload: Dict[str, Any]) -> bool:
+    def _should_run_evidence_adjudication(
+        self,
+        payload: Dict[str, Any],
+        *,
+        premise_grounding_required: bool = False,
+    ) -> bool:
+        if premise_grounding_required:
+            return True
         confidence = float(payload.get("retrieval_confidence") or 0.0)
         if confidence <= 0.55:
             return True
@@ -755,16 +951,28 @@ class RoutedHybridRetriever:
             for value in (payload.get("required_entities") or inferred.get("required_entities") or [])
             if str(value).strip()
         ]
+        payload_required_pages = (
+            payload.get("required_pages")
+            or payload.get("required_source_urls")
+            or []
+        )
         required_pages = [
             str(value)
             for value in (
-                payload.get("required_pages")
-                or payload.get("required_source_urls")
+                payload_required_pages
                 or inferred.get("required_pages")
                 or []
             )
             if str(value).strip()
         ]
+        required_pages_source = str(
+            payload.get("required_pages_source")
+            or (
+                "retrieval_payload"
+                if payload_required_pages
+                else inferred.get("required_pages_source") or "none"
+            )
+        )
         required_sections = [
             str(value)
             for value in (payload.get("required_sections") or inferred.get("required_sections") or [])
@@ -797,6 +1005,7 @@ class RoutedHybridRetriever:
             "intent": intent,
             "required_entities": required_entities,
             "required_pages": required_pages,
+            "required_pages_source": required_pages_source,
             "required_sections": required_sections,
             "selected_span_ids": selected_span_ids,
             "coverage_status": coverage_status,
@@ -871,7 +1080,12 @@ class RoutedHybridRetriever:
             path = normalized
         if re.search(r"campus[_-]?map", path):
             return "pdf:campus-map"
-        return normalized
+        try:
+            parsed = urlparse(normalized)
+        except Exception:
+            return normalized
+        family_path = re.sub(r"^/ar(?=/|$)", "", parsed.path or "")
+        return f"{parsed.scheme}://{parsed.netloc}{family_path}".rstrip("/")
 
     def _coverage_page_recency_key(self, value: Any) -> tuple[int, int, int]:
         try:
@@ -886,14 +1100,27 @@ class RoutedHybridRetriever:
         version_score = int(version_match.group(1)) if version_match else 0
         return (date_score, version_score, len(path))
 
-    def _dedupe_explicit_pages_by_family(self, pages: Sequence[str]) -> List[str]:
+    def _dedupe_explicit_pages_by_family(
+        self,
+        pages: Sequence[str],
+        *,
+        query: str = "",
+    ) -> List[str]:
         selected_by_family: Dict[str, str] = {}
+        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
+
+        def selection_key(page: str) -> tuple[int, int, int, int]:
+            normalized = self._normalize_source_url(page)
+            page_is_arabic = "/ar/" in normalized or normalized.endswith("/ar")
+            language_match = int(query_is_arabic == page_is_arabic) if query else 0
+            return (language_match, *self._coverage_page_recency_key(page))
+
         for page in pages:
             if not str(page or "").strip():
                 continue
             family = self._coverage_page_family_key(page)
             current = selected_by_family.get(family)
-            if current is None or self._coverage_page_recency_key(page) > self._coverage_page_recency_key(current):
+            if current is None or selection_key(str(page)) > selection_key(current):
                 selected_by_family[family] = str(page)
         return list(selected_by_family.values())
 
@@ -912,9 +1139,39 @@ class RoutedHybridRetriever:
                 return str(value).strip()
         return ""
 
+    def _is_coverage_source_url(self, value: Any) -> bool:
+        try:
+            host = (urlparse(str(value or "")).hostname or "").casefold()
+        except Exception:
+            return False
+        return bool(
+            host == "mbzuai.ac.ae"
+            or host.endswith(".mbzuai.ac.ae")
+            or host == "ifm.ai"
+            or host.endswith(".ifm.ai")
+        )
+
+    def _coverage_marker_matches(self, marker: str, source_url: str) -> bool:
+        marker = str(marker or "").casefold().strip()
+        normalized_url = self._normalize_source_url(source_url)
+        if not marker or not normalized_url:
+            return False
+        if marker.startswith(("http://", "https://")):
+            return normalized_url == self._normalize_source_url(marker)
+        if marker.startswith("/"):
+            try:
+                path = unquote(urlparse(normalized_url).path or "").casefold().rstrip("/")
+            except Exception:
+                return False
+            language_neutral_path = re.sub(r"^/ar(?=/|$)", "", path)
+            marker_path = unquote(marker).rstrip("/")
+            return path == marker_path or language_neutral_path == marker_path
+        return marker.strip("/") in normalized_url
+
     def _build_coverage_page_records(self) -> List[Dict[str, Any]]:
         by_url: Dict[str, Dict[str, Any]] = {}
         sources = [
+            getattr(self.vector, "page_card_map", {}),
             getattr(self.vector, "evidence_span_map", {}),
             getattr(self.vector, "chunk_map", {}),
             getattr(self.vector, "summary_map", {}),
@@ -928,7 +1185,7 @@ class RoutedHybridRetriever:
                     continue
                 source_url = self._source_url_from_record(record)
                 key = self._normalize_source_url(source_url)
-                if not key or "mbzuai.ac.ae" not in key:
+                if not key or not self._is_coverage_source_url(source_url):
                     continue
                 page = by_url.setdefault(
                     key,
@@ -936,8 +1193,35 @@ class RoutedHybridRetriever:
                         "source_url": source_url.rstrip("/"),
                         "normalized_url": key,
                         "parts": [],
+                        "identity_parts": [],
+                        "document_revision_ids": set(),
+                        "linked_chunk_ids": set(),
                     },
                 )
+                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                document_revision_id = str(
+                    record.get("document_revision_id")
+                    or metadata.get("document_revision_id")
+                    or ""
+                ).strip()
+                if document_revision_id:
+                    page["document_revision_ids"].add(document_revision_id)
+                for chunk_id in (
+                    [record.get("id")]
+                    if str(record.get("id") or "").startswith("chunk:")
+                    else []
+                ) + list(record.get("linked_chunk_ids") or []):
+                    if str(chunk_id or "").strip():
+                        page["linked_chunk_ids"].add(str(chunk_id).strip())
+                for value in (
+                    record.get("document_title"),
+                    record.get("title"),
+                    record.get("page_type"),
+                    record.get("purpose_summary"),
+                ):
+                    text = str(value or "").strip()
+                    if text:
+                        page["identity_parts"].append(text[:600])
                 for value in (
                     record.get("document_title"),
                     record.get("title"),
@@ -958,18 +1242,89 @@ class RoutedHybridRetriever:
             parsed = urlparse(page["source_url"])
             slug_text = " ".join(part.replace("-", " ") for part in unquote(parsed.path or "").split("/") if part)
             search_text = " ".join([slug_text, *page["parts"]])[:12000].casefold()
+            identity_text = " ".join(
+                [parsed.hostname or "", slug_text, *page["identity_parts"]]
+            )[:2400].casefold()
             records.append(
                 {
                     "source_url": page["source_url"],
                     "normalized_url": page["normalized_url"],
                     "search_text": search_text,
                     "tokens": set(_tokenize(search_text)),
+                    "identity_text": identity_text,
+                    "identity_tokens": set(_tokenize(identity_text)),
+                    "document_revision_ids": set(page["document_revision_ids"]),
+                    "linked_chunk_ids": set(page["linked_chunk_ids"]),
                 }
             )
         return records
 
+    def _coverage_page_record_for_url(self, value: Any) -> Dict[str, Any] | None:
+        normalized = self._normalize_source_url(value)
+        if not normalized:
+            return None
+        lookup = getattr(self, "_coverage_page_records_by_url", None)
+        if isinstance(lookup, dict) and normalized in lookup:
+            return lookup[normalized]
+        for page in getattr(self, "_coverage_page_records", []) or []:
+            if str(page.get("normalized_url") or "") == normalized:
+                return page
+        return None
+
+    def _coverage_pages_share_representation(self, left: Any, right: Any) -> bool:
+        left_page = self._coverage_page_record_for_url(left)
+        right_page = self._coverage_page_record_for_url(right)
+        if not left_page or not right_page:
+            return False
+        left_revisions = set(left_page.get("document_revision_ids") or set())
+        right_revisions = set(right_page.get("document_revision_ids") or set())
+        if left_revisions and right_revisions and left_revisions & right_revisions:
+            return True
+        left_chunks = set(left_page.get("linked_chunk_ids") or set())
+        right_chunks = set(right_page.get("linked_chunk_ids") or set())
+        return bool(left_chunks and right_chunks and left_chunks & right_chunks)
+
+    def _record_matches_required_page(
+        self,
+        record: Mapping[str, Any],
+        required_page: str,
+    ) -> bool:
+        source_url = self._source_url_from_record(dict(record))
+        if self._normalize_source_url(source_url) == self._normalize_source_url(required_page):
+            return True
+        required_record = self._coverage_page_record_for_url(required_page)
+        if not required_record:
+            return False
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+        record_revision = str(
+            record.get("document_revision_id")
+            or metadata.get("document_revision_id")
+            or ""
+        ).strip()
+        if record_revision and record_revision in set(
+            required_record.get("document_revision_ids") or set()
+        ):
+            return True
+        record_chunk_ids = {
+            str(value).strip()
+            for value in [
+                record.get("id")
+                if str(record.get("id") or "").startswith("chunk:")
+                else "",
+                record.get("chunk_id"),
+                *(record.get("linked_chunk_ids") or []),
+            ]
+            if str(value or "").strip()
+        }
+        return bool(
+            record_chunk_ids
+            & set(required_record.get("linked_chunk_ids") or set())
+        )
+
     def _query_has_specific_target(self, query: str) -> bool:
         lower = query.casefold()
+        if self._explicit_required_page_markers(query):
+            return True
         if re.search(r"\bcontact\b.{0,60}\badmissions?\b", lower) or re.search(
             r"\badmissions?\b.{0,60}\bcontact\b",
             lower,
@@ -1026,6 +1381,16 @@ class RoutedHybridRetriever:
                 "newcomer briefing",
                 "visitor should know",
                 "arriving at mbzuai",
+                "according to the page",
+                "according to the homepage",
+                "on the page",
+                "homepage",
+                "صفحة",
+                "الصفحة",
+                "موقع",
+                "الموقع",
+                "بحسب صفحة",
+                "وفق صفحة",
             )
         ):
             return True
@@ -1123,10 +1488,72 @@ class RoutedHybridRetriever:
         query_tokens = set(_tokenize(query))
         if not query_tokens:
             return 0.0
+        generic_tokens = {
+            "a",
+            "about",
+            "according",
+            "and",
+            "are",
+            "does",
+            "for",
+            "from",
+            "how",
+            "in",
+            "is",
+            "it",
+            "mbzuai",
+            "of",
+            "on",
+            "page",
+            "say",
+            "says",
+            "site",
+            "the",
+            "to",
+            "what",
+            "which",
+            "with",
+            "ما",
+            "ماذا",
+            "كيف",
+            "في",
+            "من",
+            "على",
+            "عن",
+            "بحسب",
+            "وفق",
+            "صفحة",
+            "الصفحة",
+            "موقع",
+            "الموقع",
+            "جامعة",
+            "الجامعة",
+        }
+        informative_query_tokens = {
+            token for token in query_tokens if token not in generic_tokens and len(token) > 1
+        } or query_tokens
         page_tokens = set(page.get("tokens") or set())
+        identity_tokens = set(page.get("identity_tokens") or set())
         search_text = str(page.get("search_text") or "")
         url = str(page.get("normalized_url") or "")
-        score = len(query_tokens & page_tokens) / float(len(query_tokens))
+        content_overlap = informative_query_tokens & page_tokens
+        identity_overlap = informative_query_tokens & identity_tokens
+        score = 0.72 * (
+            len(content_overlap) / float(len(informative_query_tokens))
+        )
+        score += min(0.72, 0.16 * float(len(identity_overlap)))
+        if identity_overlap:
+            score += 0.28 * (
+                len(identity_overlap) / float(len(informative_query_tokens))
+            )
+        if any(marker in lower_query for marker in ("page", "homepage", "site", "صفحة", "الصفحة", "موقع", "الموقع")):
+            score += min(0.24, 0.08 * float(len(identity_overlap)))
+        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
+        url_is_arabic = "/ar/" in url or url.endswith("/ar")
+        if query_is_arabic:
+            score += 0.14 if url_is_arabic else -0.06
+        elif url_is_arabic:
+            score -= 0.20
         for phrase in (
             "machine learning",
             "computer vision",
@@ -1189,7 +1616,228 @@ class RoutedHybridRetriever:
 
     def _explicit_required_page_markers(self, query: str) -> List[str]:
         lower = query.casefold()
+        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
         markers: List[str] = []
+        if any(
+            phrase in lower
+            for phrase in (
+                "leadership page",
+                "leadership and governance",
+                "leadership and mission pages",
+                "صفحة القيادة",
+                "القيادة والحوكمة",
+                "الخطة الاستراتيجية",
+            )
+        ) or ("الرسالة" in lower and "القيادة" in lower):
+            markers.append("/about/leadership")
+        mission_requested = any(
+            phrase in lower
+            for phrase in (
+                "mission page",
+                "mission and vision",
+                "university mission",
+                "رسالة الجامعة",
+                "صفحة الرسالة",
+                "رسالتنا",
+            )
+        ) or ("الرسالة" in lower and "القيادة" in lower)
+        if mission_requested:
+            markers.append(
+                "/about/mission" if query_is_arabic else "/about/mission-and-vision"
+            )
+        if "office of the registrar" in lower or "مكتب التسجيل" in lower:
+            markers.append("/student-resources/office-of-the-registrar")
+        research_projects_page_requested = any(
+            phrase in lower
+            for phrase in (
+                "research projects page",
+                "research centers and projects pages",
+                "research centres and projects pages",
+                "مراكز البحوث والمشاريع",
+                "مشروع بحثي",
+                "مشاريع بحثية",
+            )
+        )
+        if research_projects_page_requested:
+            markers.append("/research/projects")
+        if any(
+            phrase in lower
+            for phrase in (
+                "projects page",
+                "صفحة المشاريع",
+                "صفحة المشروعات",
+            )
+        ) and not research_projects_page_requested:
+            markers.append("/projects")
+        if any(
+            phrase in lower
+            for phrase in (
+                "research centers page",
+                "research centres page",
+                "research centers and projects pages",
+                "research centres and projects pages",
+                "صفحة مراكز البحوث",
+                "مراكز البحوث والمشاريع",
+            )
+        ):
+            markers.append("/research/research-centers")
+        if "graduate admission process" in lower or "graduate admissions process" in lower:
+            markers.append("/study/graduate-admission-process")
+        if "university catalogue" in lower or "university catalog" in lower:
+            markers.append("university-catalogue-2024-2025")
+        if "human phenotype project" in lower:
+            markers.append("https://hpp.mbzuai.ac.ae")
+            if (
+                "pages" in lower
+                or re.search(
+                    r"\b(?:duration|goals?|participat(?:e|ion)|longitudinal|findings?)\b",
+                    lower,
+                )
+            ):
+                markers.append(
+                    "/news/new-human-phenotype-project-findings-illuminate-pathways-to-precision-medicine"
+                )
+        if "mbzuai visitor program" in lower or (
+            "visitor program" in lower
+            and re.search(r"\b(?:hands-on|access|research experience|demos?|visitors?)\b", lower)
+        ):
+            markers.append("https://research.mbzuai.ac.ae/visitor-program")
+        if (
+            re.search(r"\b(?:engag(?:e|es|ement|ing) with industry|captures? value)\b", lower)
+            or ("industry" in lower and "capture value" in lower)
+        ):
+            markers.append("https://research.mbzuai.ac.ae/partnerships-and-engagements")
+        if "meta wall" in lower and re.search(r"\b(?:gpu|uses?|metaverse center)\b", lower):
+            markers.append("https://metaverse.mbzuai.ac.ae/studio")
+        if "digital twin lab" in lower:
+            markers.append("/publications/digital-twin-lab")
+        if "mbzuai latest publications" in lower:
+            markers.append("/mbzuai-scopus")
+        if "news on ai and technology" in lower:
+            if "page" in lower and "homepage" not in lower:
+                markers.append("/newest-technology")
+            else:
+                markers.append("https://library.mbzuai.ac.ae")
+        if "library homepage" in lower or "mbzuai library homepage" in lower:
+            markers.append("https://library.mbzuai.ac.ae")
+        if (
+            "library" in lower
+            and "onsite" in lower
+            and re.search(r"\b(access|resources?|email|apply)\b", lower)
+        ):
+            markers.append("https://library.mbzuai.ac.ae/the-library")
+        if "ifm homepage" in lower:
+            markers.append("https://ifm.ai")
+        if "ifm about" in lower or "about ifm" in lower:
+            markers.append("https://ifm.ai/about")
+        if re.search(r"\bifm\b", lower) and re.search(
+            r"\b(headquarters?|research hubs?|locations?|located)\b",
+            lower,
+        ):
+            markers.append("https://ifm.ai/about")
+        if re.search(r"\bifm\b", lower) and re.search(
+            r"(?:مقر|مقره|مراكز? أبحاث|مراكز? بحوث|أين يقع|المدن)",
+            lower,
+        ):
+            markers.append("https://ifm.ai/about")
+        if re.search(r"\bifm\b", lower) and re.search(
+            r"(?:الشركاء|شراكات|التعاون|يتعاون|بناء.{0,30}(?:المستقبل|الذكاء الاصطناعي))",
+            lower,
+        ):
+            markers.append("https://ifm.ai/collaborate")
+        if "ifm collaborate" in lower or "ifm collaboration" in lower:
+            markers.append("https://ifm.ai/collaborate")
+        if "institute of foundation models" in lower:
+            markers.append("https://ifm.ai/about")
+            if re.search(r"\b(?:collaborat\w*|career\w*|join|opportunit\w*)\b", lower):
+                markers.append("https://ifm.ai/collaborate")
+        if (
+            re.search(r"(?:زوار|الزوار).{0,80}(?:متطلبات|الدخول)", lower)
+            or re.search(r"(?:متطلبات|الدخول).{0,80}(?:زوار|الزوار)", lower)
+        ):
+            markers.append("/about/contact")
+        if query_is_arabic and re.search(
+            r"(?:أقسام|اقسام).{0,40}(?:الوظائف المفتوحة|صفحة الوظائف)|"
+            r"(?:الوظائف المفتوحة|صفحة الوظائف).{0,60}(?:أقسام|اقسام|مراكز)",
+            lower,
+        ):
+            markers.extend(
+                [
+                    "https://careers.mbzuai.ac.ae",
+                    "https://careers.mbzuai.ac.ae/vacancies",
+                ]
+            )
+        if query_is_arabic and re.search(
+            r"(?:الطلاب الجدد|طالبا? جديدا?).{0,80}(?:العام الأكاديمي الجديد|عام أكاديمي)",
+            lower,
+        ):
+            markers.append(
+                "welcomes-400-students-including-inaugural-undergraduate-cohort"
+            )
+        if (
+            "وثيقة الحوكمة" in lower
+            or re.search(r"\bgovernance (?:structure )?(?:document|pdf)\b", lower)
+        ):
+            markers.append("governance_structure.pdf")
+        if re.search(r"(?:جميع|كل).{0,40}(?:برامج الدكتوراه|برنامج الدكتوراه)", lower):
+            markers.append("/study/phd-programs")
+        if "برامج الماجستير" in lower and re.search(r"(?:القبول|الالتحاق|المعدل|الوثائق|اللغة)", lower):
+            markers.append("/study/msc-programs")
+        if (
+            "برامج الماجستير" in lower
+            and "الدكتوراه" in lower
+            and re.search(r"(?:المؤهلات|الخريجين|الالتحاق|التوجه المهني)", lower)
+        ):
+            markers.extend(["/study/msc-programs", "/study/phd-programs"])
+        if (
+            "فريق الخدمات المهنية والتدريب" in lower
+            or ("الخدمات المهنية" in lower and "التدريب" in lower)
+        ):
+            markers.append("/student-resources/student-careers-and-internships")
+        if "ciai" in lower or "مركز الذكاء الاصطناعي التكاملي" in lower:
+            markers.append("/research/research-centers/ciai")
+        if "daniela rus" in lower or "دانييلا روس" in lower:
+            markers.append("/about/leadership/daniela-rus")
+        if query_is_arabic and re.search(
+            r"معرض التدريب المهني وفرص العمل|معرض.{0,20}(?:التدريب|الوظائف)",
+            lower,
+        ):
+            markers.append(
+                "/news/mbzuai-students-connect-with-industry-partners-to-secure-internship-and-career-opportunities"
+            )
+        if query_is_arabic and re.search(r"(?:برنامج )?البكالوريوس", lower) and re.search(
+            r"(?:مدة الدراسة|المنح|شروط القبول|الثانوية|90%)",
+            lower,
+        ):
+            markers.extend(["/study/mbzuai-undergraduate", "/study/ug-admission-process"])
+        if re.search(r"\bundergraduate applicants?\b", lower) and re.search(
+            r"\b(?:academic|documentation|transcripts?|graduation certificates?|english proficiency|application fee)\b",
+            lower,
+        ):
+            markers.extend(["/study/ug-admission-process", "/study/undergraduate-program"])
+        if "library" in lower and re.search(
+            r"\b(?:researcher resident|visitor access|receive visitors|visit request|visiting)\b",
+            lower,
+        ):
+            markers.append("https://library.mbzuai.ac.ae/visitor-information")
+        if "library" in lower and re.search(
+            r"\b(?:borrow materials?|licensed electronic resources?|physical resources?|search engine)\b",
+            lower,
+        ):
+            markers.append("https://library.mbzuai.ac.ae/Borrowing_Information")
+        if "xiang meng" in lower or "average hazard for robust survival analysis" in lower:
+            markers.append("https://ai-nexus.mbzuai.ac.ae/previous-ai-talks")
+        if (
+            query_is_arabic
+            and "قسم" in lower
+            and re.search(r"تعل.{0,3}م\s+ال(?:آ|ا)لة", lower)
+        ):
+            markers.append("/ar/research-department/machine-learning-department")
+        if "machine learning department" in lower and re.search(
+            r"\b(focus|research|students?|offers?|provides?)\b",
+            lower,
+        ):
+            markers.append("/research-department/machine-learning-department")
         if "ai reach" in lower:
             markers.append("/study/ai-reach")
         if "kentaro inui" in lower:
@@ -1198,11 +1846,13 @@ class RoutedHybridRetriever:
             slug = re.sub(r"[^a-z0-9]+", "-", name.casefold()).strip("-")
             if slug:
                 markers.append(f"/study/faculty/{slug}")
-        if re.search(
-            r"\b(core ai specializations|specializations|m\.sc\. and ph\.d\.|m\.sc|ph\.d|msc and phd|masters? and phd|ai programs)\b",
-            lower,
-        ):
-            if "five" in lower or "core ai specializations" in lower or "m.sc" in lower or "ph.d" in lower or "msc and phd" in lower:
+        specialization_catalog_query = bool(
+            re.search(r"\b(core ai specializations|specializations|ai programs)\b", lower)
+            or re.search(r"\b(?:what|which) (?:m\.sc\.?|msc|masters?) and (?:ph\.d\.?|phd) programs\b", lower)
+            or re.search(r"\blist (?:the )?(?:m\.sc\.?|msc|masters?) and (?:ph\.d\.?|phd) programs\b", lower)
+        )
+        if specialization_catalog_query:
+            if "five" in lower or "core ai specializations" in lower:
                 markers.append("mbzuai_faculty_brochure")
             markers.append("/ai-programs")
         if re.search(r"\b(law|established|affiliated|executive council|institutional identity)\b", lower):
@@ -1225,6 +1875,7 @@ class RoutedHybridRetriever:
         if (
             re.search(r"\b(location|located|where mbzuai|working hours|offices operate|weekday|parking)\b", lower)
             and not screening_exam_context
+            and not re.search(r"\bifm\b", lower)
             and not re.search(
                 r"\b(guest|visitor|visitors|visiting)\b",
                 lower,
@@ -1338,15 +1989,23 @@ class RoutedHybridRetriever:
             markers.append("/study/master-in-applied-ai")
         return list(dict.fromkeys(markers))
 
-    def _infer_coverage_requirements(self, query: str, intent: str) -> Dict[str, List[str]]:
-        if not self._query_has_specific_target(query):
-            return {"required_pages": [], "required_entities": [], "required_sections": []}
+    def _infer_coverage_requirements(self, query: str, intent: str) -> Dict[str, Any]:
         explicit_markers = self._explicit_required_page_markers(query)
+        if not explicit_markers and not self._query_has_specific_target(query):
+            return {
+                "required_pages": [],
+                "required_entities": [],
+                "required_sections": [],
+                "required_pages_source": "none",
+            }
         if explicit_markers:
             explicit_pages = []
             for page in self._coverage_page_records:
                 normalized_url = str(page.get("normalized_url") or "")
-                if any(marker.casefold().strip("/") in normalized_url for marker in explicit_markers):
+                if any(
+                    self._coverage_marker_matches(marker, normalized_url)
+                    for marker in explicit_markers
+                ):
                     explicit_pages.append(str(page.get("source_url") or ""))
             if explicit_pages and not re.search(r"[\u0600-\u06FF]", query):
                 english_pages = [
@@ -1356,7 +2015,10 @@ class RoutedHybridRetriever:
                 ]
                 if english_pages:
                     explicit_pages = english_pages
-            explicit_pages = self._dedupe_explicit_pages_by_family(explicit_pages)
+            explicit_pages = self._dedupe_explicit_pages_by_family(
+                explicit_pages,
+                query=query,
+            )
             if explicit_pages:
                 entities: List[str] = []
                 if intent == "multi_page_aggregation" or len(explicit_pages) > 1:
@@ -1369,6 +2031,7 @@ class RoutedHybridRetriever:
                     "required_pages": list(dict.fromkeys(explicit_pages))[:6 if intent == "multi_page_aggregation" else 4],
                     "required_entities": list(dict.fromkeys(entities)),
                     "required_sections": [],
+                    "required_pages_source": "explicit_markers",
                 }
         scored = [
             (self._page_target_score(query, page), page)
@@ -1388,6 +2051,7 @@ class RoutedHybridRetriever:
             "required_pages": pages,
             "required_entities": list(dict.fromkeys(entities)),
             "required_sections": [],
+            "required_pages_source": "heuristic",
         }
 
     def _selected_source_urls(self, payload: Dict[str, Any]) -> set[str]:
@@ -1411,13 +2075,22 @@ class RoutedHybridRetriever:
         return urls
 
     def _span_payload_from_record(self, span: Dict[str, Any], *, required_page: str = "") -> Dict[str, Any]:
-        source_url = self._source_url_from_record(span) or required_page
+        canonical_source_url = self._source_url_from_record(span)
+        source_url = canonical_source_url or required_page
+        if (
+            required_page
+            and canonical_source_url
+            and self._normalize_source_url(canonical_source_url)
+            != self._normalize_source_url(required_page)
+            and self._record_matches_required_page(span, required_page)
+        ):
+            source_url = required_page
         return {
             "id": str(span.get("id") or ""),
             "text": str(span.get("text") or span.get("dense_text") or ""),
             "span_type": str(span.get("span_type") or "general"),
             "source_url": source_url,
-            "canonical_url": str(span.get("canonical_url") or ""),
+            "canonical_url": str(span.get("canonical_url") or canonical_source_url or ""),
             "document_title": _clean_document_title(span.get("document_title") or span.get("title"), source_url),
             "section_heading": str(span.get("section_heading") or span.get("heading") or ""),
             "breadcrumb": str(span.get("breadcrumb") or ""),
@@ -1430,7 +2103,16 @@ class RoutedHybridRetriever:
         }
 
     def _fact_payload_from_record(self, fact: Dict[str, Any], *, required_page: str = "") -> Dict[str, Any]:
-        source_url = self._source_url_from_record(fact) or required_page
+        canonical_source_url = self._source_url_from_record(fact)
+        source_url = canonical_source_url or required_page
+        if (
+            required_page
+            and canonical_source_url
+            and self._normalize_source_url(canonical_source_url)
+            != self._normalize_source_url(required_page)
+            and self._record_matches_required_page(fact, required_page)
+        ):
+            source_url = required_page
         return {
             "id": str(fact.get("id") or ""),
             "text": str(fact.get("text") or fact.get("dense_text") or ""),
@@ -1446,6 +2128,55 @@ class RoutedHybridRetriever:
             "coverage_injected": True,
         }
 
+    def _chunk_payload_from_record(
+        self,
+        chunk: Dict[str, Any],
+        *,
+        required_page: str = "",
+    ) -> Dict[str, Any]:
+        canonical_source_url = self._source_url_from_record(chunk)
+        source_url = canonical_source_url or required_page
+        if (
+            required_page
+            and canonical_source_url
+            and self._normalize_source_url(canonical_source_url)
+            != self._normalize_source_url(required_page)
+            and self._record_matches_required_page(chunk, required_page)
+        ):
+            source_url = required_page
+        text = str(chunk.get("dense_text") or chunk.get("text") or "")
+        title = _clean_document_title(
+            chunk.get("document_title") or chunk.get("title"),
+            source_url,
+        )
+        return {
+            "id": str(chunk.get("id") or ""),
+            "text": text,
+            "source_url": source_url,
+            "canonical_url": canonical_source_url,
+            "document_title": title,
+            "section_heading": str(
+                chunk.get("section_heading") or chunk.get("heading") or ""
+            ),
+            "breadcrumb": str(chunk.get("breadcrumb") or ""),
+            "document_revision_id": str(chunk.get("document_revision_id") or ""),
+            "linked_parent_ids": [
+                str(value)
+                for value in (
+                    chunk.get("linked_parent_ids")
+                    or chunk.get("parent_ids")
+                    or []
+                )
+                if str(value)
+            ],
+            "metadata": {
+                "document_source": source_url,
+                "canonical_url": canonical_source_url,
+                "document_title": title,
+            },
+            "coverage_injected": True,
+        }
+
     def _required_page_match_rank(self, source_url: str, required_pages: Sequence[str]) -> tuple[int, bool] | None:
         normalized_source = self._normalize_source_url(source_url)
         if not normalized_source:
@@ -1457,6 +2188,8 @@ class RoutedHybridRetriever:
             if normalized_source == normalized_required:
                 return (index, True)
             if source_family == self._coverage_page_family_key(required_page):
+                family_match = (index, False)
+            elif self._coverage_pages_share_representation(source_url, required_page):
                 family_match = (index, False)
         return family_match
 
@@ -1609,12 +2342,11 @@ class RoutedHybridRetriever:
         return bonus
 
     def _best_required_page_spans(self, query: str, required_page: str, *, limit: int = 2) -> List[Dict[str, Any]]:
-        required_normalized = self._normalize_source_url(required_page)
         scored: List[tuple[float, Dict[str, Any]]] = []
         for span in getattr(self.vector, "evidence_span_map", {}).values():
             if not isinstance(span, dict):
                 continue
-            if self._normalize_source_url(self._source_url_from_record(span)) != required_normalized:
+            if not self._record_matches_required_page(span, required_page):
                 continue
             text = " ".join(
                 str(span.get(key) or "")
@@ -1644,12 +2376,11 @@ class RoutedHybridRetriever:
         return output
 
     def _best_required_page_facts(self, query: str, required_page: str, *, limit: int = 1) -> List[Dict[str, Any]]:
-        required_normalized = self._normalize_source_url(required_page)
         scored: List[tuple[float, Dict[str, Any]]] = []
         for fact in getattr(self.vector, "fact_map", {}).values():
             if not isinstance(fact, dict):
                 continue
-            if self._normalize_source_url(self._source_url_from_record(fact)) != required_normalized:
+            if not self._record_matches_required_page(fact, required_page):
                 continue
             text = " ".join(
                 str(fact.get(key) or "")
@@ -1666,6 +2397,101 @@ class RoutedHybridRetriever:
                 scored.append((score, fact))
         scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
         return [self._fact_payload_from_record(fact, required_page=required_page) for _score, fact in scored[:limit]]
+
+    def _best_required_page_chunks(
+        self,
+        query: str,
+        required_page: str,
+        *,
+        limit: int = 2,
+    ) -> List[Dict[str, Any]]:
+        scored: List[tuple[float, Dict[str, Any]]] = []
+        chunk_map = getattr(self.vector, "chunk_map", {})
+        required_record = self._coverage_page_record_for_url(required_page) or {}
+        linked_chunk_ids = [
+            str(value)
+            for value in required_record.get("linked_chunk_ids") or []
+            if str(value)
+        ]
+        candidate_chunks = (
+            [chunk_map[chunk_id] for chunk_id in linked_chunk_ids if chunk_id in chunk_map]
+            if linked_chunk_ids
+            else list(chunk_map.values())
+        )
+        for chunk in candidate_chunks:
+            if not isinstance(chunk, dict) or not self._record_matches_required_page(
+                chunk,
+                required_page,
+            ):
+                continue
+            text = " ".join(
+                str(chunk.get(key) or "")
+                for key in (
+                    "document_title",
+                    "section_heading",
+                    "heading",
+                    "breadcrumb",
+                    "text",
+                    "dense_text",
+                    "sparse_text",
+                )
+            )
+            if not text.strip():
+                continue
+            try:
+                score = float(self.vector._score_text_match(query, text))
+            except Exception:
+                score = 0.0
+            score += self._facet_relevance_bonus(
+                query,
+                text,
+                self._source_url_from_record(chunk),
+            )
+            scored.append((score, chunk))
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+        return [
+            self._chunk_payload_from_record(chunk, required_page=required_page)
+            for _score, chunk in scored[:limit]
+        ]
+
+    def _best_required_page_parent(
+        self,
+        query: str,
+        required_page: str,
+    ) -> Dict[str, Any] | None:
+        """Return one complete-page parent for explicit list/detail queries."""
+
+        if not _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or "")):
+            return None
+        scored: List[tuple[float, Dict[str, Any]]] = []
+        for parent_id, parent in getattr(self.vector, "parent_map", {}).items():
+            if not isinstance(parent, dict) or not str(parent_id or "").endswith(":page"):
+                continue
+            if not self._record_matches_required_page(parent, required_page):
+                continue
+            text = str(parent.get("dense_text") or parent.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                score = float(self.vector._score_text_match(query, text))
+            except Exception:
+                score = 0.0
+            score += self._facet_relevance_bonus(
+                query,
+                text,
+                self._source_url_from_record(parent),
+            )
+            scored.append((score, parent))
+        if not scored:
+            return None
+        scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+        payload = self._chunk_payload_from_record(
+            scored[0][1],
+            required_page=required_page,
+        )
+        payload["record_type"] = "required_page_parent"
+        payload["coverage_aggregate"] = True
+        return payload
 
     def _prioritize_required_page_evidence(
         self,
@@ -1773,10 +2599,37 @@ class RoutedHybridRetriever:
             return False
         existing_span_ids = {str(value) for value in (payload.get("selected_evidence_span_ids") or []) if str(value)}
         existing_fact_ids = {str(value) for value in (payload.get("selected_fact_ids") or []) if str(value)}
+        existing_chunk_ids = {str(value) for value in (payload.get("selected_chunk_ids") or []) if str(value)}
         changed = False
+        aggregate_page_query = bool(
+            _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
+        )
+        fact_limit = 4 if aggregate_page_query else 1
+        chunk_limit = 3 if aggregate_page_query else 2
+        span_limit = 4 if aggregate_page_query else 2
         for required_page in required_pages:
             normalized_required = self._normalize_source_url(required_page)
-            injected_facts = self._best_required_page_facts(query, required_page, limit=1)
+            injected_parent = self._best_required_page_parent(query, required_page)
+            if injected_parent:
+                payload.setdefault("selected_parent_ids", [])
+                payload.setdefault("retrieval_documents", [])
+                parent_id = str(injected_parent.get("id") or "")
+                existing_document_ids = {
+                    str(doc.get("id") or "")
+                    for doc in payload["retrieval_documents"]
+                    if isinstance(doc, dict)
+                }
+                if parent_id and parent_id not in existing_document_ids:
+                    payload["retrieval_documents"].insert(0, injected_parent)
+                    changed = True
+                if parent_id and parent_id not in payload["selected_parent_ids"]:
+                    payload["selected_parent_ids"].insert(0, parent_id)
+                    changed = True
+            injected_facts = self._best_required_page_facts(
+                query,
+                required_page,
+                limit=fact_limit,
+            )
             if injected_facts:
                 payload.setdefault("fact_documents", [])
                 payload.setdefault("selected_fact_ids", [])
@@ -1802,8 +2655,44 @@ class RoutedHybridRetriever:
                             payload.setdefault("selected_parent_ids", [])
                             if parent_id not in payload["selected_parent_ids"]:
                                 payload["selected_parent_ids"].insert(0, parent_id)
-                    changed = True
-            injected_spans = self._best_required_page_spans(query, required_page, limit=2)
+                changed = True
+            injected_chunks = self._best_required_page_chunks(
+                query,
+                required_page,
+                limit=chunk_limit,
+            )
+            if injected_chunks:
+                payload.setdefault("selected_chunk_ids", [])
+                payload.setdefault("retrieval_documents", [])
+                existing_required_docs = {
+                    (
+                        str(doc.get("id") or ""),
+                        self._normalize_source_url(self._source_url_from_record(doc)),
+                    )
+                    for doc in payload["retrieval_documents"]
+                    if isinstance(doc, dict)
+                }
+                for chunk in reversed(injected_chunks):
+                    chunk_id = str(chunk.get("id") or "")
+                    document_key = (chunk_id, normalized_required)
+                    if document_key not in existing_required_docs:
+                        payload["retrieval_documents"].insert(0, chunk)
+                        existing_required_docs.add(document_key)
+                        changed = True
+                    if chunk_id and chunk_id not in existing_chunk_ids:
+                        payload["selected_chunk_ids"].insert(0, chunk_id)
+                        existing_chunk_ids.add(chunk_id)
+                        changed = True
+                    for parent_id in chunk.get("linked_parent_ids") or []:
+                        if parent_id:
+                            payload.setdefault("selected_parent_ids", [])
+                            if parent_id not in payload["selected_parent_ids"]:
+                                payload["selected_parent_ids"].insert(0, parent_id)
+            injected_spans = self._best_required_page_spans(
+                query,
+                required_page,
+                limit=span_limit,
+            )
             if not injected_spans:
                 continue
             payload.setdefault("evidence_span_documents", [])
@@ -1840,6 +2729,244 @@ class RoutedHybridRetriever:
             payload["verification_status"] = "backfilled_required_page_evidence"
         return changed
 
+    def _navigation_target_parent_ids(
+        self,
+        navigation_plan: Mapping[str, Any] | None,
+    ) -> List[str]:
+        """Resolve a grounded navigation target to its complete-page parent."""
+
+        if not isinstance(navigation_plan, Mapping):
+            return []
+        target_page = navigation_plan.get("target_page")
+        if not isinstance(target_page, Mapping):
+            return []
+        document_revision_id = str(
+            target_page.get("document_revision_id") or ""
+        ).strip()
+        page_card_id = str(target_page.get("page_card_id") or "").strip()
+        if not document_revision_id and not page_card_id:
+            return []
+        matches: List[str] = []
+        for parent_id, parent in getattr(self.vector, "parent_map", {}).items():
+            parent_id = str(parent_id or "")
+            if not parent_id.endswith(":page") or not isinstance(parent, Mapping):
+                continue
+            same_document = bool(
+                document_revision_id
+                and str(parent.get("document_revision_id") or "").strip()
+                == document_revision_id
+            )
+            same_page = bool(
+                page_card_id
+                and page_card_id
+                in {
+                    str(value).strip()
+                    for value in parent.get("page_card_ids") or []
+                    if str(value).strip()
+                }
+            )
+            if same_document or same_page:
+                matches.append(parent_id)
+        return sorted(dict.fromkeys(matches))
+
+    @staticmethod
+    def _navigation_action_answer_type(action_type: str) -> str:
+        normalized = str(action_type or "").strip().casefold()
+        if normalized == "email":
+            return "email"
+        if normalized in {"phone", "call"}:
+            return "phone"
+        return "website"
+
+    def _apply_navigation_action_evidence(
+        self,
+        payload: Dict[str, Any],
+        navigation_plan: Mapping[str, Any] | None,
+    ) -> bool:
+        """Materialize validated action targets as conflict-free evidence."""
+
+        if not isinstance(navigation_plan, Mapping) or navigation_plan.get(
+            "status"
+        ) not in {"partial", "ready"}:
+            return False
+        target_page = navigation_plan.get("target_page")
+        if not isinstance(target_page, Mapping):
+            return False
+        source_url = str(target_page.get("url") or "").strip()
+        document_title = str(target_page.get("title") or "").strip()
+        document_revision_id = str(
+            target_page.get("document_revision_id") or ""
+        ).strip()
+        action_documents: List[Dict[str, Any]] = []
+        exact_answer_types: set[str] = set()
+        for step in navigation_plan.get("steps") or []:
+            if not isinstance(step, Mapping):
+                continue
+            action_type = str(step.get("action_type") or "").strip().casefold()
+            action_id = str(step.get("action_id") or "").strip()
+            target_url = str(step.get("target_url") or "").strip()
+            if action_type == "open_page" or not action_id or not target_url:
+                continue
+            answer_type = self._navigation_action_answer_type(action_type)
+            exact_answer_types.add(answer_type)
+            value = target_url
+            if answer_type == "email" and target_url.casefold().startswith("mailto:"):
+                value = unquote(target_url[7:].split("?", 1)[0]).strip()
+            elif answer_type == "phone" and target_url.casefold().startswith("tel:"):
+                value = unquote(target_url[4:].split("?", 1)[0]).strip()
+            label = str(step.get("label") or action_type).strip()
+            subject = document_title or str(navigation_plan.get("goal") or "").strip()
+            action_documents.append(
+                {
+                    "id": action_id,
+                    "record_type": "navigation_action",
+                    "answer_type": answer_type,
+                    "answer_subtype": action_type,
+                    "value": value,
+                    "text": (
+                        f"The verified {label} action on {subject or 'the official page'} "
+                        f"points to {value}."
+                    ),
+                    "subject_text": subject,
+                    "source_url": source_url,
+                    "document_title": document_title,
+                    "document_revision_id": document_revision_id,
+                    "section_id": str(step.get("section_id") or "").strip(),
+                    "linked_chunk_ids": [
+                        str(chunk_id)
+                        for chunk_id in step.get("chunk_ids") or []
+                        if str(chunk_id)
+                    ],
+                    "action_target_url": target_url,
+                    "confidence": 1.0,
+                    "authority_score": 1.0,
+                    "authority_class": "official",
+                }
+            )
+        if not action_documents:
+            return False
+
+        existing_documents = [
+            dict(doc)
+            for doc in payload.get("answer_documents") or []
+            if isinstance(doc, Mapping)
+            and str(doc.get("answer_type") or "").strip().casefold()
+            not in exact_answer_types
+        ]
+        payload["answer_documents"] = [*action_documents, *existing_documents]
+        payload["selected_answer_ids"] = [
+            str(doc.get("id") or "")
+            for doc in payload["answer_documents"]
+            if str(doc.get("id") or "")
+        ]
+        payload["navigation_action_evidence_applied"] = True
+        return True
+
+    def _require_navigation_target_page(
+        self,
+        coverage_plan: Dict[str, Any],
+        navigation_plan: Mapping[str, Any] | None,
+    ) -> bool:
+        if not isinstance(navigation_plan, Mapping) or navigation_plan.get(
+            "status"
+        ) not in {"partial", "ready"}:
+            return False
+        target_page = navigation_plan.get("target_page")
+        if not isinstance(target_page, Mapping):
+            return False
+        target_url = str(target_page.get("url") or "").strip()
+        normalized_target = self._normalize_source_url(target_url)
+        if not normalized_target:
+            return False
+        required_pages = [
+            str(value).strip()
+            for value in coverage_plan.get("required_pages") or []
+            if str(value).strip()
+        ]
+        has_exact_action_target = any(
+            isinstance(step, Mapping)
+            and str(step.get("action_type") or "").strip().casefold()
+            != "open_page"
+            and bool(str(step.get("target_url") or "").strip())
+            for step in navigation_plan.get("steps") or []
+        )
+        if has_exact_action_target:
+            target_matches_required_page = any(
+                self._normalize_source_url(value) == normalized_target
+                for value in required_pages
+            )
+            navigation_planner = getattr(self, "navigation_planner", None)
+            target_aliases_required_page = bool(
+                navigation_planner
+                and any(
+                    navigation_planner.page_urls_share_identity(
+                        value,
+                        target_url,
+                    )
+                    for value in required_pages
+                )
+            )
+            if (
+                coverage_plan.get("required_pages_source") == "explicit_markers"
+                and required_pages
+                and not target_matches_required_page
+                and not target_aliases_required_page
+            ):
+                # Deterministic page requirements encode an explicit entity or
+                # page named by the user. A semantically similar action on a
+                # different page must not replace that evidence contract.
+                if isinstance(navigation_plan, dict):
+                    warnings = [
+                        str(value)
+                        for value in navigation_plan.get("warnings") or []
+                        if str(value)
+                    ]
+                    warnings.append(
+                        "navigation_action_suppressed_by_explicit_page_requirement"
+                    )
+                    navigation_plan["status"] = "not_requested"
+                    navigation_plan["confidence"] = 0.0
+                    navigation_plan["source"] = "explicit_coverage_guard"
+                    navigation_plan["target_page"] = None
+                    navigation_plan["steps"] = []
+                    navigation_plan["evidence"] = {
+                        "page_card_ids": [],
+                        "document_revision_ids": [],
+                        "section_ids": [],
+                        "chunk_ids": [],
+                        "action_ids": [],
+                    }
+                    navigation_plan["warnings"] = list(dict.fromkeys(warnings))
+                return False
+            if target_aliases_required_page and not target_matches_required_page:
+                warnings = [
+                    str(value)
+                    for value in navigation_plan.get("warnings") or []
+                    if str(value)
+                ]
+                warnings.append("navigation_target_page_alias_resolved")
+                if isinstance(navigation_plan, dict):
+                    navigation_plan["warnings"] = list(dict.fromkeys(warnings))
+            # Once the page graph has validated a concrete action target, the
+            # answer contract is scoped to that action's owning page.  Keeping
+            # approximate coverage pages here can force unrelated evidence
+            # (for example, a news article beside a staff email action) into
+            # the final prompt and weaken otherwise exact grounding.
+            already_exclusive = (
+                len(required_pages) == 1
+                and self._normalize_source_url(required_pages[0])
+                == normalized_target
+            )
+            coverage_plan["required_pages"] = [target_url]
+            return not already_exclusive
+        if any(
+            self._normalize_source_url(value) == normalized_target
+            for value in required_pages
+        ):
+            return False
+        coverage_plan["required_pages"] = [target_url, *required_pages]
+        return True
+
     def retrieve(
         self,
         query: str,
@@ -1847,11 +2974,13 @@ class RoutedHybridRetriever:
         query_vector: List[float] | None = None,
         skip_query_planner: bool = False,
         navigation_context: Mapping[str, Any] | None = None,
+        original_query: str | None = None,
     ) -> Dict[str, Any]:
         routing_started = time.perf_counter()
-        mode = classify_query_mode(query)
-        media_query = _is_media_query(query)
-        unsupported_reason = self._unsupported_intent_reason(query)
+        coverage_query = str(original_query or "").strip() or query
+        mode = classify_query_mode(coverage_query)
+        media_query = _is_media_query(coverage_query)
+        unsupported_reason = self._unsupported_intent_reason(coverage_query)
         if unsupported_reason:
             routing_latency_ms = (time.perf_counter() - routing_started) * 1000.0
             payload = self._abstained_payload_from_result(
@@ -1863,6 +2992,7 @@ class RoutedHybridRetriever:
             payload.update(
                 {
                     "query": query,
+                    "original_query": coverage_query,
                     "query_rewritten": query,
                     "query_rewrite_labels": [],
                     "graph_query_rewritten": query,
@@ -1886,13 +3016,13 @@ class RoutedHybridRetriever:
             payload["retrieval_confidence"] = confidence
             payload["confidence_factors"] = factors
             coverage_plan = self._coverage_plan_for_result(
-                query=query,
+                query=coverage_query,
                 payload=payload,
                 mode=mode,
             )
             budget_items, budget_chars, budget_max_per_source = self._evidence_budget_for_plan(coverage_plan)
             payload["evidence_pack"] = build_evidence_pack(
-                query=query,
+                query=coverage_query,
                 result=payload,
                 max_items=budget_items,
                 max_chars=budget_chars,
@@ -1963,8 +3093,13 @@ class RoutedHybridRetriever:
                 navigation_confidence=rewrites.navigation_confidence,
                 navigation_source=rewrites.navigation_source,
             )
+        rewrites = self._preserve_original_query_aliases(
+            rewrites,
+            query=query,
+            original_query=coverage_query,
+        )
         planned_navigation_context = normalize_navigation_context(
-            query,
+            coverage_query,
             navigation_context
             or {
                 "intent": rewrites.navigation_intent,
@@ -2004,6 +3139,7 @@ class RoutedHybridRetriever:
             retrieved = self.vector.retrieve(
                 rewrites.vector_query,
                 query_vector=query_vector,
+                mode_override=mode,
             )
             return retrieved, round((time.perf_counter() - started) * 1000.0, 3)
 
@@ -2075,8 +3211,9 @@ class RoutedHybridRetriever:
         preliminary_confidence, preliminary_factors = score_retrieval_confidence(payload)
         payload["retrieval_confidence"] = preliminary_confidence
         payload["confidence_factors"] = preliminary_factors
-        payload = self._apply_evidence_adjudication(query, payload)
+        payload = self._apply_evidence_adjudication(coverage_query, payload)
         payload["query"] = query
+        payload["original_query"] = coverage_query
         payload["query_rewritten"] = rewrites.vector_query
         payload["query_rewrite_labels"] = list(dict.fromkeys([*rewrites.labels, *graph_context.rewrite_labels]))
         payload["graph_query_rewritten"] = graph_context.rewritten_query if decision.graph_available else query
@@ -2116,12 +3253,12 @@ class RoutedHybridRetriever:
         payload["retrieval_confidence"] = confidence
         payload["confidence_factors"] = factors
         coverage_plan = self._coverage_plan_for_result(
-            query=query,
+            query=coverage_query,
             payload=payload,
             mode=mode,
         )
         if self._augment_payload_for_required_coverage(
-            query=query,
+            query=coverage_query,
             payload=payload,
             coverage_plan=coverage_plan,
         ):
@@ -2129,14 +3266,34 @@ class RoutedHybridRetriever:
             payload["retrieval_confidence"] = confidence
             payload["confidence_factors"] = factors
             coverage_plan = self._coverage_plan_for_result(
-                query=query,
+                query=coverage_query,
                 payload=payload,
                 mode=mode,
             )
         self._prioritize_required_page_evidence(
-            query=query,
+            query=coverage_query,
             payload=payload,
             coverage_plan=coverage_plan,
+        )
+        dense_page_card_ids_before_fusion = [
+            str(value)
+            for value in payload.get("dense_page_card_ids") or []
+            if str(value)
+        ]
+        if self.page_card_evidence_fusion_enabled:
+            payload["dense_page_card_ids"] = (
+                self.navigation_planner.fuse_page_card_ranking(
+                    payload,
+                    evidence_weight=self.page_card_evidence_fusion_weight,
+                    rrf_k=self.page_card_evidence_fusion_rrf_k,
+                )
+            )
+        payload["dense_page_card_ids_pre_fusion"] = (
+            dense_page_card_ids_before_fusion
+        )
+        payload["page_card_fusion_applied"] = bool(
+            payload.get("dense_page_card_ids")
+            != dense_page_card_ids_before_fusion
         )
         selected_parent_ids = [
             str(value)
@@ -2145,13 +3302,63 @@ class RoutedHybridRetriever:
         ]
         if selected_parent_ids:
             payload["selected_parent_ids"] = self.vector._diversify_parent_ids_for_query(
-                query,
+                coverage_query,
                 selected_parent_ids,
                 limit=len(selected_parent_ids),
             )
+        if self.navigation_plan_enabled:
+            payload["navigation_plan"] = self.navigation_planner.plan(
+                query=coverage_query,
+                result=payload,
+                navigation_context=planned_navigation_context,
+            )
+            payload["navigation_intent"] = planned_navigation_context["intent"]
+            payload["navigation_target_page_required"] = (
+                self._require_navigation_target_page(
+                    coverage_plan,
+                    payload["navigation_plan"],
+                )
+            )
+            navigation_parent_ids = self._navigation_target_parent_ids(
+                payload["navigation_plan"]
+            )
+            if navigation_parent_ids:
+                existing_parent_ids = [
+                    str(value)
+                    for value in payload.get("selected_parent_ids") or []
+                    if str(value)
+                ]
+                parent_limit = max(len(existing_parent_ids), len(navigation_parent_ids))
+                payload["selected_parent_ids"] = (
+                    self.vector._diversify_parent_ids_for_query(
+                        coverage_query,
+                        list(
+                            dict.fromkeys(
+                                [*navigation_parent_ids, *existing_parent_ids]
+                            )
+                        ),
+                        limit=parent_limit,
+                    )
+                )
+            self._apply_navigation_action_evidence(
+                payload,
+                payload["navigation_plan"],
+            )
+        representation_identities = self.navigation_planner.representation_identities(
+            payload,
+            query=coverage_query,
+            chunk_records=getattr(self.vector, "chunk_map", {}),
+        )
+        payload["selected_document_revision_ids"] = representation_identities[
+            "document_revision_ids"
+        ]
+        payload["selected_page_card_ids"] = representation_identities[
+            "page_card_ids"
+        ]
+        payload["selected_section_ids"] = representation_identities["section_ids"]
         budget_items, budget_chars, budget_max_per_source = self._evidence_budget_for_plan(coverage_plan)
         payload["evidence_pack"] = build_evidence_pack(
-            query=query,
+            query=coverage_query,
             result=payload,
             max_items=budget_items,
             max_chars=budget_chars,
@@ -2163,13 +3370,6 @@ class RoutedHybridRetriever:
         payload["missing_required_entities"] = payload["evidence_pack"].get("missing_required_entities") or []
         payload["missing_required_pages"] = payload["evidence_pack"].get("missing_required_pages") or []
         payload["missing_required_sections"] = payload["evidence_pack"].get("missing_required_sections") or []
-        if self.navigation_plan_enabled:
-            payload["navigation_plan"] = self.navigation_planner.plan(
-                query=query,
-                result=payload,
-                navigation_context=planned_navigation_context,
-            )
-            payload["navigation_intent"] = planned_navigation_context["intent"]
         payload["retrieval_trace"] = {
             "backend": decision.backend,
             "reason": decision.reason,
@@ -2180,6 +3380,18 @@ class RoutedHybridRetriever:
             "lane_latency_ms": payload.get("lane_latency_ms") or {},
             "rerank_latency_ms": payload.get("rerank_latency_ms") or 0.0,
             "rerank_method": payload.get("rerank_method") or "",
+            "page_card_fusion_applied": bool(
+                payload.get("page_card_fusion_applied")
+            ),
+            "navigation_action_evidence_applied": bool(
+                payload.get("navigation_action_evidence_applied")
+            ),
+            "navigation_target_page_required": bool(
+                payload.get("navigation_target_page_required")
+            ),
+            "media_evidence_verified": bool(
+                payload.get("media_evidence_verified")
+            ),
             "vector_backend_latency_ms": payload.get("vector_backend_latency_ms") or 0.0,
             "graph_context_latency_ms": payload.get("graph_context_latency_ms") or 0.0,
             "graph_augment_latency_ms": payload.get("graph_augment_latency_ms") or 0.0,

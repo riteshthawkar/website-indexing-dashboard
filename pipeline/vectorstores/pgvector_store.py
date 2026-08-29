@@ -337,6 +337,21 @@ class PgVectorStore:
             "SELECT set_config('idle_in_transaction_session_timeout', %s, false)",
             (f"{self.settings.idle_transaction_timeout_ms}ms",),
         )
+        if self.settings.purpose == "read":
+            # These are immutable store-level read settings, so configure them
+            # once per pooled session.  Opening a transaction and issuing SET
+            # LOCAL before every search creates an idle-in-transaction window:
+            # a dense-lane worker can be descheduled by concurrent CPU-heavy
+            # graph/local work after SET LOCAL but before the vector SELECT.
+            # A single autocommit SELECT below has no such client-side gap and
+            # also avoids two extra database round trips per dense lane.
+            connection.execute(
+                "SELECT set_config('hnsw.ef_search', %s, false)",
+                (str(self.settings.hnsw_ef_search),),
+            )
+            connection.execute(
+                "SELECT set_config('hnsw.iterative_scan', 'strict_order', false)"
+            )
 
     def open(self) -> None:
         self._pool.open(wait=True, timeout=self.settings.connect_timeout_seconds)
@@ -522,18 +537,10 @@ class PgVectorStore:
             status_sql,
         )
         with self._pool.connection(timeout=self.settings.pool_timeout_seconds) as connection:
-            with connection.transaction():
-                connection.execute(
-                    "SELECT set_config('hnsw.ef_search', %s, true)",
-                    (str(self.settings.hnsw_ef_search),),
-                )
-                connection.execute(
-                    "SELECT set_config('hnsw.iterative_scan', 'strict_order', true)"
-                )
-                rows = connection.execute(
-                    query,
-                    (query_vector, str(release_id), str(namespace), query_vector, limit),
-                ).fetchall()
+            rows = connection.execute(
+                query,
+                (query_vector, str(release_id), str(namespace), query_vector, limit),
+            ).fetchall()
         return [
             VectorMatch(record_id=str(row["record_id"]), score=float(row["score"]))
             for row in rows

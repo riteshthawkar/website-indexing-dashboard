@@ -474,8 +474,260 @@ def test_navigation_catalog_excludes_external_actions_and_plan_is_evidence_bound
 
 def test_navigation_intent_is_explicit_and_multilingual():
     assert infer_navigation_context("What degrees does MBZUAI offer?")["intent"] == "none"
+    assert infer_navigation_context("What does the IFM website say about its research centers?")["intent"] == "none"
+    assert infer_navigation_context("Open the official IFM page")["intent"] == "open_page"
     assert infer_navigation_context("Please download the campus map PDF")["intent"] == "download"
     assert infer_navigation_context("كيف أتواصل مع الجامعة؟")["intent"] == "contact"
+    assert infer_navigation_context("What does the Search action take me to?")["intent"] == "search"
+    assert infer_navigation_context("ما الذي يحمّل هذا الزر؟")["intent"] == "download"
+    assert infer_navigation_context("ما عنوان البريد الذي ستراسل به الجامعة؟")["intent"] == "contact"
+    assert infer_navigation_context("أين أذهب لتقديم طلب التوظيف؟")["intent"] == "apply"
+    assert infer_navigation_context(
+        "ما الميزة المالية التي تقدمها جميع برامج الدكتوراه في الجامعة؟"
+    )["intent"] == "none"
+    assert infer_navigation_context(
+        "According to the graduate admission process page, what funding is provided?"
+    )["intent"] == "none"
+    assert infer_navigation_context(
+        "What are the steps in the graduate admission process?"
+    )["intent"] == "follow_steps"
+
+
+def test_upstream_planner_cannot_promote_informational_process_page_to_navigation():
+    from pipeline.core.navigation_intent import normalize_navigation_context
+
+    query = "According to the graduate admission process page, what funding is provided?"
+    context = normalize_navigation_context(
+        query,
+        {
+            "intent": "follow_steps",
+            "goal": query,
+            "confidence": 0.99,
+            "source": "retrieval_query_planner",
+        },
+    )
+
+    assert context["intent"] == "none"
+
+
+def test_upstream_planner_cannot_promote_arabic_offers_fact_to_apply_action():
+    from pipeline.core.navigation_intent import normalize_navigation_context
+
+    query = "ما الميزة المالية التي تقدمها جميع برامج الدكتوراه في الجامعة؟"
+    context = normalize_navigation_context(
+        query,
+        {
+            "intent": "apply",
+            "goal": query,
+            "confidence": 0.99,
+            "source": "retrieval_query_planner",
+        },
+    )
+
+    assert context["intent"] == "none"
+
+
+def test_navigation_planner_preserves_direct_page_and_action_evidence():
+    catalog = build_navigation_catalog(_ready_bridge())
+    login_action = deepcopy(
+        next(action for action in catalog["actions"] if action["action_id"] == "action:apply")
+    )
+    login_action.update(
+        {
+            "action_id": "action:apply-login",
+            "action_type": "login",
+            "label": "Apply Now",
+            "target_url": "https://apply.mbzuai.ac.ae/login",
+            "canonical_target_url": "https://apply.mbzuai.ac.ae/login",
+        }
+    )
+    catalog["actions"] = [
+        action for action in catalog["actions"] if action["action_id"] != "action:apply"
+    ]
+    catalog["actions"].append(login_action)
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="If I use the Apply Now action, where does it lead?",
+        result={
+            # Repeated weak evidence from a linked page must not outweigh the
+            # direct Page Card/action lanes.
+            "evidence_pack": {
+                "items": [
+                    {"source_url": "https://apply.mbzuai.ac.ae/"}
+                    for _ in range(12)
+                ]
+            },
+            "dense_page_card_ids": ["page:admissions", "page:portal"],
+            "dense_action_ids": ["action:apply-login"],
+        },
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["target_page"]["page_card_id"] == "page:admissions"
+    assert plan["steps"][1]["action_id"] == "action:apply-login"
+    assert plan["steps"][1]["action_type"] == "login"
+
+
+def test_navigation_planner_prefers_directory_action_context_over_profile_tie():
+    catalog = build_navigation_catalog(_ready_bridge())
+    catalog["pages"] = [
+        {
+            "page_card_id": "page:profile",
+            "document_revision_id": "revision:profile",
+            "source_url": "https://mbzuai.ac.ae/people/mark-juan/",
+            "canonical_url": "https://mbzuai.ac.ae/people/mark-juan/",
+            "title": "Mark Juan",
+            "purpose_summary": "Official profile.",
+            "language": "en",
+            "page_type": "profile",
+            "topic_labels": [],
+            "audience_labels": [],
+            "sections": [],
+            "chunk_ids": [],
+            "outgoing_page_card_ids": [],
+            "action_ids": ["action:profile-email"],
+        },
+        {
+            "page_card_id": "page:directory",
+            "document_revision_id": "revision:directory",
+            "source_url": "https://mbzuai.ac.ae/directory/",
+            "canonical_url": "https://mbzuai.ac.ae/directory/",
+            "title": "Directory listing",
+            "purpose_summary": "Official people directory.",
+            "language": "en",
+            "page_type": "directory",
+            "topic_labels": [],
+            "audience_labels": [],
+            "sections": [],
+            "chunk_ids": [],
+            "outgoing_page_card_ids": [],
+            "action_ids": ["action:directory-email"],
+        },
+    ]
+    catalog["chunks"] = []
+    catalog["actions"] = [
+        {
+            "action_id": "action:profile-email",
+            "page_card_id": "page:profile",
+            "label": "Email",
+            "context_label": "",
+            "source_section_heading": "",
+            "action_type": "email",
+            "target_url": "mailto:mark.juan@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:mark.juan@mbzuai.ac.ae",
+            "target_kind": "email",
+            "official_target": True,
+        },
+        {
+            "action_id": "action:directory-email",
+            "page_card_id": "page:directory",
+            "label": "Email",
+            "context_label": "Mark Juan",
+            "source_section_heading": "Mark Juan",
+            "source_section_id": "section:mark-juan",
+            "action_type": "email",
+            "target_url": "mailto:mark.juan@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:mark.juan@mbzuai.ac.ae",
+            "target_kind": "email",
+            "official_target": True,
+        },
+    ]
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="What is the email address linked to Mark Juan in the directory listing?",
+        result={
+            "dense_page_card_ids": ["page:profile", "page:directory"],
+            "dense_action_ids": [
+                "action:directory-email",
+                "action:profile-email",
+            ],
+        },
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["target_page"]["page_card_id"] == "page:directory"
+    assert plan["steps"][1]["action_id"] == "action:directory-email"
+
+    profile_plan = planner.plan(
+        query="What email is linked to Mark Juan on his library profile page?",
+        result={
+            "dense_page_card_ids": ["page:profile", "page:directory"],
+            "dense_action_ids": [
+                "action:directory-email",
+                "action:profile-email",
+            ],
+        },
+    )
+    assert profile_plan["target_page"]["page_card_id"] == "page:profile"
+    assert profile_plan["steps"][1]["action_id"] == "action:profile-email"
+
+
+def test_navigation_planner_late_fuses_page_cards_with_selected_chunk_identity():
+    catalog = build_navigation_catalog(_ready_bridge())
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    fused = planner.fuse_page_card_ranking(
+        {
+            "dense_page_card_ids": ["page:portal", "page:admissions"],
+            "selected_chunk_ids": ["chunk:requirements"],
+        },
+        evidence_weight=0.15,
+        rrf_k=60,
+    )
+
+    assert fused == ["page:admissions", "page:portal"]
+
+
+def test_navigation_planner_bridges_selected_chunks_to_query_relevant_sections():
+    catalog = build_navigation_catalog(_ready_bridge())
+    admissions = next(
+        page
+        for page in catalog["pages"]
+        if page["page_card_id"] == "page:admissions"
+    )
+    admissions["chunk_ids"] = ["chunk:one", "chunk:two"]
+    admissions["sections"] = [
+        {
+            "section_id": "section:funding",
+            "section_kind": "page_heading",
+            "heading": "Funding and benefits",
+            "chunk_ids": [],
+        },
+        {
+            "section_id": "section:requirements",
+            "section_kind": "page_heading",
+            "heading": "Application requirements",
+            "chunk_ids": [],
+        },
+    ]
+    catalog["chunks"] = [
+        {
+            "chunk_id": "chunk:one",
+            "document_revision_id": "revision:admissions",
+            "page_card_id": "page:admissions",
+            "section_id": "",
+            "page_section_ids": [],
+        }
+    ]
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    identities = planner.representation_identities(
+        {
+            "selected_chunk_ids": ["chunk:one"],
+            "dense_page_card_ids": ["page:admissions"],
+        },
+        query="What funding and benefits are provided to funded students?",
+        chunk_records={
+            "chunk:one": {
+                "text": "All funded students receive comprehensive financial support."
+            }
+        },
+    )
+
+    assert "section:funding" in identities["section_ids"]
+    assert "section:requirements" not in identities["section_ids"]
 
 
 def test_navigation_planner_prefers_specific_contact_endpoint_over_general_email():
@@ -516,6 +768,28 @@ def test_navigation_planner_prefers_specific_contact_endpoint_over_general_email
         result=evidence,
     )
     assert general_plan["steps"][1]["target_url"] == "mailto:info@mbzuai.ac.ae"
+
+
+def test_navigation_planner_does_not_substitute_email_for_requested_phone_number():
+    catalog = build_navigation_catalog(_ready_bridge())
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="What phone number should I call for admissions?",
+        result={
+            "evidence_pack": {
+                "items": [
+                    {
+                        "source_url": "https://mbzuai.ac.ae/study/graduate-admission-process/"
+                    }
+                ]
+            }
+        },
+    )
+
+    assert plan["status"] == "partial"
+    assert len(plan["steps"]) == 1
+    assert plan["steps"][0]["action_type"] == "open_page"
 
 
 def test_navigation_planner_rejects_catalog_from_failed_bridge():

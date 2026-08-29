@@ -20,6 +20,20 @@ NAVIGATION_INTENTS = frozenset(
     }
 )
 
+_FOLLOW_STEPS_PATTERN = (
+    r"\b(?:"
+    r"how (?:do|can|should) i|"
+    r"what (?:do i do|comes) next|"
+    r"where (?:do|should) i (?:start|begin)|"
+    r"guide me|walk me through|"
+    r"(?:what|which) (?:are|is) (?:the )?(?:steps?|process|procedure|instructions?)|"
+    r"steps? (?:to|for|in)|"
+    r"instructions? (?:to|for|on)|"
+    r"(?:explain|describe|show me) (?:the )?(?:application|admission|registration) (?:process|procedure)"
+    r")\b|"
+    r"(?:ما هي الخطوات|ما الخطوات|كيفية|الإجراءات|الاجراءات|أرشدني|ارشدني)"
+)
+
 
 def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
@@ -39,17 +53,17 @@ def infer_navigation_context(query: str) -> Dict[str, Any]:
         ),
         (
             "download",
-            r"\b(?:download|pdf|brochure|prospectus|downloadable)\b|تحميل|تنزيل|ملف pdf|كتيب",
+            r"\b(?:download|pdf|brochure|prospectus|downloadable)\b|تحميل|تنزيل|(?:يحم[ّ]?ل|يحمل)\s+(?:هذا|الزر)|ملف pdf|كتيب",
             0.94,
         ),
         (
             "contact",
-            r"\b(?:contact|email|e-mail|phone|telephone|call)\b|تواصل|اتصل|البريد الإلكتروني|البريد الالكتروني|هاتف",
+            r"\b(?:contact|email|e-mail|phone|telephone|call)\b|تواصل|اتصل|مراسلة|تراسل|(?:عنوان\s+)?البريد|هاتف",
             0.94,
         ),
         (
             "apply",
-            r"\b(?:apply|application portal|submit (?:my |an )?application)\b|(?:قد[ّ]?م|التقديم|طلب الالتحاق)",
+            r"\b(?:apply|application portal|submit (?:my |an )?application)\b|(?:\bقد[ّ]?م\b|\bتقديم\b|\bالتقديم\b|\bطلب (?:التوظيف|الالتحاق)\b)",
             0.94,
         ),
         (
@@ -59,17 +73,18 @@ def infer_navigation_context(query: str) -> Dict[str, Any]:
         ),
         (
             "search",
-            r"\b(?:site search|search the (?:site|website|library|catalogue|catalog))\b|ابحث في الموقع|بحث الموقع",
+            r"\b(?:site search|search action|search (?:button|link)|search the (?:site|website|library|catalogue|catalog))\b|(?:إجراء|زر|رابط) البحث|ابحث في الموقع|بحث الموقع",
             0.90,
         ),
         (
             "follow_steps",
-            r"\b(?:how (?:do|can|should) i|steps?|process|procedure|instructions?|what (?:do i do|comes) next|guide me)\b|(?:ما هي الخطوات|ما الخطوات|كيفية|الإجراءات|الاجراءات|أرشدني|ارشدني)",
+            _FOLLOW_STEPS_PATTERN,
             0.84,
         ),
         (
             "open_page",
-            r"\b(?:open|take me to|where (?:can|do) i find|official page|website|link to)\b|(?:افتح|خذني إلى|خذني الى|الصفحة الرسمية|رابط)",
+            r"\b(?:open|take me to|where (?:can|do) i find|show me (?:the )?(?:official )?page|give me (?:the )?(?:official )?(?:page|link)|link to)\b"
+            r"|(?:افتح|خذني إلى|خذني الى|أين أجد|اين اجد|أعطني رابط|اعطني رابط|رابط إلى|رابط الى)",
             0.82,
         ),
     )
@@ -101,6 +116,26 @@ def normalize_navigation_context(
         confidence = max(0.0, min(1.0, float(value.get("confidence") or 0.0)))
     except (TypeError, ValueError):
         confidence = 0.0
+    # A model planner must not turn an informational reference such as
+    # "According to the admission process page, what funding is provided?"
+    # into a navigation workflow merely because the page title contains the
+    # word "process". Require an explicit request for steps before accepting
+    # this one intent from upstream.
+    if intent == "follow_steps" and not re.search(
+        _FOLLOW_STEPS_PATTERN,
+        _clean_text(query).casefold(),
+        flags=re.IGNORECASE,
+    ):
+        return fallback
+    # Action plans can replace otherwise relevant evidence with a button,
+    # email address, or destination page. Require an explicit deterministic
+    # signal for every action intent instead of trusting a model-only
+    # promotion. This also protects Arabic informational verbs such as
+    # "تقدمها" ("it offers") from being treated as the imperative "قدّم"
+    # ("apply").
+    explicit_action_intents = NAVIGATION_INTENTS - {"none", "follow_steps"}
+    if intent in explicit_action_intents and fallback["intent"] != intent:
+        return fallback
     if intent == "none" and fallback["intent"] != "none":
         return fallback
     if intent != "none" and confidence >= 0.5:

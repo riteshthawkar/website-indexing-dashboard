@@ -562,8 +562,19 @@ class GraphRAGRetriever:
         self._ensure_local_graph_loaded()
         if not self.assertion_map:
             return []
+        expanded_query = self._expanded_relation_query(query, plan)
+        candidate_ids = self.base._lexical_query_ids(
+            expanded_query,
+            max(128, self.graph_relation_local_candidate_limit * 16),
+            namespace=self.base.namespace_assertions,
+        )
+        if not candidate_ids:
+            return []
         scored: List[Tuple[str, float]] = []
-        for assertion_id, node in self.assertion_map.items():
+        for assertion_id in candidate_ids:
+            node = self.assertion_map.get(str(assertion_id))
+            if not node:
+                continue
             score = self._score_relation_assertion_candidate(query, plan, node)
             if score <= 0.0:
                 continue
@@ -610,7 +621,10 @@ class GraphRAGRetriever:
                 chunk_id = str(chunk_id)
                 if chunk_id:
                     chunk_scores[chunk_id] = max(chunk_scores.get(chunk_id, 0.0), bonus)
-            for parent_id in props.get("source_parent_ids") or []:
+            for parent_id in self.base._canonical_parent_ids(
+                props.get("source_parent_ids") or [],
+                chunk_ids=props.get("source_chunk_ids") or [],
+            ):
                 parent_id = str(parent_id)
                 if parent_id:
                     parent_scores[parent_id] = max(parent_scores.get(parent_id, 0.0), parent_bonus)
@@ -622,7 +636,10 @@ class GraphRAGRetriever:
                 chunk_id = str(chunk_id)
                 if chunk_id:
                     chunk_scores[chunk_id] = max(chunk_scores.get(chunk_id, 0.0), bonus)
-            for parent_id in fact.get("linked_parent_ids") or []:
+            for parent_id in self.base._canonical_parent_ids(
+                fact.get("linked_parent_ids") or [],
+                chunk_ids=fact.get("linked_chunk_ids") or [],
+            ):
                 parent_id = str(parent_id)
                 if parent_id:
                     parent_scores[parent_id] = max(parent_scores.get(parent_id, 0.0), parent_bonus)
@@ -837,7 +854,12 @@ class GraphRAGRetriever:
             return -1.0
         score = self.base._score_text_match(query, fact.get("dense_text") or fact.get("text") or "")
         linked_chunk_ids = {str(value) for value in (fact.get("linked_chunk_ids") or []) if str(value)}
-        linked_parent_ids = {str(value) for value in (fact.get("linked_parent_ids") or []) if str(value)}
+        linked_parent_ids = set(
+            self.base._canonical_parent_ids(
+                fact.get("linked_parent_ids") or [],
+                chunk_ids=fact.get("linked_chunk_ids") or [],
+            )
+        )
         if linked_chunk_ids & {str(value) for value in chunk_ids if str(value)}:
             score += self.graph_chunk_fact_bonus
         if linked_parent_ids & {str(value) for value in parent_ids if str(value)}:
@@ -850,7 +872,12 @@ class GraphRAGRetriever:
             return -1.0
         score = self.base._score_media_relevance(query, media)
         linked_chunk_ids = {str(value) for value in (media.get("linked_chunk_ids") or []) if str(value)}
-        linked_parent_ids = {str(value) for value in (media.get("linked_parent_ids") or []) if str(value)}
+        linked_parent_ids = set(
+            self.base._canonical_parent_ids(
+                media.get("linked_parent_ids") or [],
+                chunk_ids=media.get("linked_chunk_ids") or [],
+            )
+        )
         if linked_chunk_ids & {str(value) for value in chunk_ids if str(value)}:
             score += self.graph_chunk_media_bonus
         if linked_parent_ids & {str(value) for value in parent_ids if str(value)}:
@@ -907,7 +934,10 @@ class GraphRAGRetriever:
             "source_span_ids": [str(value) for value in (props.get("source_span_ids") or []) if str(value)],
             "linked_span_ids": [str(value) for value in (props.get("source_span_ids") or []) if str(value)],
             "linked_chunk_ids": [str(value) for value in (props.get("source_chunk_ids") or []) if str(value)],
-            "linked_parent_ids": [str(value) for value in (props.get("source_parent_ids") or []) if str(value)],
+            "linked_parent_ids": self.base._canonical_parent_ids(
+                props.get("source_parent_ids") or [],
+                chunk_ids=props.get("source_chunk_ids") or [],
+            ),
             "document_summary": "",
             "media": [],
         }
@@ -916,7 +946,13 @@ class GraphRAGRetriever:
         node = self.assertion_map.get(str(assertion_id))
         if not node:
             node = self._neo4j_node_cache().get(str(assertion_id))
-        return dict(node.get("properties") or {}) if isinstance(node, dict) else {}
+        props = dict(node.get("properties") or {}) if isinstance(node, dict) else {}
+        if props.get("source_parent_ids"):
+            props["source_parent_ids"] = self.base._canonical_parent_ids(
+                props.get("source_parent_ids") or [],
+                chunk_ids=props.get("source_chunk_ids") or [],
+            )
+        return props
 
     def _score_community_summary(self, query: str, community_id: str) -> float:
         node = self.community_map.get(str(community_id))
@@ -1017,8 +1053,15 @@ class GraphRAGRetriever:
             for media in selected_media
             if (
                 chunk_id in (media.get("linked_chunk_ids") or [])
-                or chunk.get("page_key") in (media.get("linked_parent_ids") or [])
-                or chunk.get("section_key") in (media.get("linked_parent_ids") or [])
+                or bool(
+                    set(self.base._parent_ids_for_chunk(str(chunk_id)))
+                    & set(
+                        self.base._canonical_parent_ids(
+                            media.get("linked_parent_ids") or [],
+                            chunk_ids=media.get("linked_chunk_ids") or [],
+                        )
+                    )
+                )
             )
         ]
         return {
@@ -1102,7 +1145,7 @@ class GraphRAGRetriever:
             node = self._neo4j_node_cache().get(str(assertion_id))
         if not node:
             return -1.0
-        props = dict(node.get("properties") or {})
+        props = self._assertion_props(assertion_id)
         text = str(props.get("text") or props.get("evidence") or "")
         score = self.base._score_text_match(query, text)
         source_chunk_ids = {str(value) for value in (props.get("source_chunk_ids") or []) if str(value)}
@@ -1294,7 +1337,10 @@ class GraphRAGRetriever:
                 if not chunk_id:
                     continue
                 chunk_graph_scores[chunk_id] = chunk_graph_scores.get(chunk_id, 0.0) + fact_bonus
-            for parent_id in fact.get("linked_parent_ids") or []:
+            for parent_id in self.base._canonical_parent_ids(
+                fact.get("linked_parent_ids") or [],
+                chunk_ids=fact.get("linked_chunk_ids") or [],
+            ):
                 parent_id = str(parent_id)
                 if not parent_id:
                     continue
@@ -1308,7 +1354,10 @@ class GraphRAGRetriever:
                 if not chunk_id:
                     continue
                 chunk_graph_scores[chunk_id] = chunk_graph_scores.get(chunk_id, 0.0) + media_bonus
-            for parent_id in media.get("linked_parent_ids") or []:
+            for parent_id in self.base._canonical_parent_ids(
+                media.get("linked_parent_ids") or [],
+                chunk_ids=media.get("linked_chunk_ids") or [],
+            ):
                 parent_id = str(parent_id)
                 if not parent_id:
                     continue
@@ -1329,7 +1378,10 @@ class GraphRAGRetriever:
                 if not chunk_id:
                     continue
                 chunk_graph_scores[chunk_id] = chunk_graph_scores.get(chunk_id, 0.0) + assertion_bonus
-            for parent_id in props.get("source_parent_ids") or []:
+            for parent_id in self.base._canonical_parent_ids(
+                props.get("source_parent_ids") or [],
+                chunk_ids=props.get("source_chunk_ids") or [],
+            ):
                 parent_id = str(parent_id)
                 if not parent_id:
                     continue

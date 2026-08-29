@@ -255,12 +255,15 @@ stages:
 
 retrieval:
   index_mode: "dense_graph"
-  serving_contract_revision: "mbzuai-routed-hybrid-v1"
+  serving_contract_revision: "mbzuai-routed-hybrid-v3"
   retriever_backend: "routed_hybrid"
   routed_graph_required: true
   query_planner_enabled: true
   navigation_plan_enabled: true
   navigation_plan_required: true
+  page_card_evidence_fusion_enabled: true
+  page_card_evidence_fusion_weight: 0.15
+  page_card_evidence_fusion_rrf_k: 60
   query_planner_model: "gpt-5-nano-2025-08-07"
   evidence_adjudicator_enabled: true
   evidence_adjudicator_model: "gpt-5-nano-2025-08-07"
@@ -269,6 +272,10 @@ retrieval:
   evidence_adjudicator_max_workers: 2
   enable_sparse: false
   enable_rerank: false
+  dense_recall_floor_k: 2
+  dense_recall_window: 10
+  dense_parent_recall_floor_k: 1
+  dense_parent_recall_window: 5
 
 # These values document the backend behavior exercised by answer-readiness
 # evaluation. Bump answer_pipeline_revision whenever the grounded prompt or

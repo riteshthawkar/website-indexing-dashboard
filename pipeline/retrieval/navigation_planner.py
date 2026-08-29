@@ -103,6 +103,42 @@ _GENERAL_CONTACT_EMAIL_LOCAL_PARTS = {
     "inquiries",
 }
 
+_EMAIL_CONTACT_QUERY_TERMS = {
+    "email",
+    "emails",
+    "e-mail",
+    "mail",
+    "بريد",
+    "البريد",
+    "إلكتروني",
+    "الكتروني",
+}
+_TELEPHONE_CONTACT_QUERY_TERMS = {
+    "phone",
+    "phones",
+    "telephone",
+    "telephones",
+    "هاتف",
+    "الهاتف",
+}
+_DIRECTORY_SURFACE_TERMS = {
+    "directory",
+    "listing",
+    "دليل",
+    "الدليل",
+    "قائمة",
+    "القائمة",
+}
+_PROFILE_SURFACE_TERMS = {
+    "profile",
+    "biography",
+    "bio",
+    "بروفايل",
+    "البروفايل",
+    "الملف",
+    "السيرة",
+}
+
 
 def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
@@ -114,6 +150,98 @@ def _tokens(value: Any) -> set[str]:
         for token in _TOKEN_RE.findall(_clean_text(value))
         if len(token) > 1 and token.casefold() not in _STOP_WORDS
     }
+
+
+def _ordered_tokens(value: Any) -> List[str]:
+    return [
+        token.casefold()
+        for token in _TOKEN_RE.findall(_clean_text(value))
+        if len(token) > 1 and token.casefold() not in _STOP_WORDS
+    ]
+
+
+def _query_phrase_match_score(query: str, page_text: str) -> float:
+    query_tokens = _ordered_tokens(query)
+    normalized_page = " ".join(_ordered_tokens(page_text))
+    if len(query_tokens) < 2 or not normalized_page:
+        return 0.0
+    matched: set[str] = set()
+    score = 0.0
+    for width, weight in ((4, 3.5), (3, 2.75), (2, 2.0)):
+        if len(query_tokens) < width:
+            continue
+        for index in range(len(query_tokens) - width + 1):
+            phrase = " ".join(query_tokens[index : index + width])
+            if phrase in matched or phrase not in normalized_page:
+                continue
+            matched.add(phrase)
+            score += weight
+            if score >= 6.0:
+                return 6.0
+    return score
+
+
+def _normalized_boundary_text(value: Any) -> str:
+    return " ".join(
+        token.casefold() for token in _TOKEN_RE.findall(_clean_text(value))
+    )
+
+
+def _heading_matches_chunk_boundary(
+    heading: Any,
+    chunk: Mapping[str, Any],
+) -> bool:
+    """Match a Page Card heading only to a heading-shaped chunk text line."""
+
+    normalized_heading = _normalized_boundary_text(heading)
+    if not normalized_heading:
+        return False
+    heading_tokens = normalized_heading.split()
+    text = str(
+        chunk.get("text") or chunk.get("raw_text") or chunk.get("dense_text") or ""
+    )
+    for raw_line in text.splitlines():
+        normalized_line = _normalized_boundary_text(raw_line)
+        line_tokens = normalized_line.split()
+        if not normalized_line or len(normalized_line) > 180 or len(line_tokens) > 14:
+            continue
+        if normalized_line == normalized_heading:
+            return True
+        if (
+            normalized_line.startswith(f"{normalized_heading} ")
+            and len(line_tokens) <= len(heading_tokens) + 2
+        ):
+            return True
+    return False
+
+
+def _page_surface_constraint_score(
+    query: str,
+    page: Mapping[str, Any],
+) -> float:
+    """Honor an explicit directory/profile surface named by the user."""
+
+    query_tokens = _tokens(query)
+    requested_directory = bool(query_tokens & _DIRECTORY_SURFACE_TERMS)
+    requested_profile = bool(query_tokens & _PROFILE_SURFACE_TERMS)
+    if requested_directory == requested_profile:
+        return 0.0
+    identity_text = " ".join(
+        _clean_text(page.get(key))
+        for key in ("title", "purpose_summary", "page_type", "source_url")
+    )
+    identity_tokens = _tokens(identity_text)
+    is_directory = bool(identity_tokens & _DIRECTORY_SURFACE_TERMS)
+    if requested_directory:
+        return 8.0 if is_directory else 0.0
+    if is_directory:
+        return -8.0
+    # Some extracted people pages are typed as generic content and do not
+    # literally contain "profile". A two-token person/title match plus the
+    # absence of directory markers is sufficient corroboration.
+    title_overlap = len(query_tokens & _tokens(page.get("title")))
+    is_profile = bool(identity_tokens & _PROFILE_SURFACE_TERMS) or title_overlap >= 2
+    return 4.0 if is_profile else 0.0
 
 
 def _normalized_url(value: Any) -> str:
@@ -186,6 +314,31 @@ def _contact_action_is_semantic(action: Mapping[str, Any]) -> bool:
             material,
         )
     )
+
+
+def _action_satisfies_intent(action: Mapping[str, Any], intent: str) -> bool:
+    action_type = _clean_text(action.get("action_type"))
+    desired = _ACTION_TYPES_BY_INTENT.get(intent, set())
+    if action_type in desired:
+        return _contact_action_is_semantic(action)
+    # Extraction records the target mechanism (for example, a login endpoint)
+    # while the visible control can express the user's goal (for example,
+    # "Apply Now").  Keep both facts: accept the action only when its grounded
+    # label/context explicitly expresses the requested intent.
+    material = " ".join(
+        _clean_text(action.get(key))
+        for key in ("label", "context_label", "source_section_heading")
+    ).casefold()
+    intent_patterns = {
+        "apply": r"\b(?:apply|application|submit application)\b|التقديم|تقديم|طلب الالتحاق",
+        "register": r"\b(?:register|registration|sign up|enrol|enroll)\b|التسجيل|سج[ّ]?ل",
+        "contact": r"\b(?:contact|email|e-mail|phone|telephone|call)\b|تواصل|اتصل|بريد|هاتف",
+        "download": r"\b(?:download|pdf|brochure|prospectus)\b|تحميل|تنزيل",
+        "login": r"\b(?:log[ -]?in|sign[ -]?in|portal)\b|تسجيل الدخول|بوابة",
+        "search": r"\bsearch\b|بحث",
+    }
+    pattern = intent_patterns.get(intent)
+    return bool(pattern and re.search(pattern, material, flags=re.IGNORECASE))
 
 
 def _page_satisfies_intent(page: Mapping[str, Any], intent: str) -> bool:
@@ -368,6 +521,213 @@ class GroundedNavigationPlanner:
             return planner
         return cls(catalog=payload, catalog_path=str(selected))
 
+    def representation_identities(
+        self,
+        result: Mapping[str, Any],
+        *,
+        query: str = "",
+        chunk_records: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> Dict[str, List[str]]:
+        """Resolve selected records to the frozen document/page/section IDs."""
+
+        document_revision_ids: List[str] = []
+        page_card_ids: List[str] = []
+        section_ids: List[str] = []
+        chunk_ids = [
+            _clean_text(value)
+            for value in result.get("selected_chunk_ids") or []
+            if _clean_text(value)
+        ]
+        corroborated_page_ids: set[str] = set()
+        chunk_records = chunk_records or {}
+        for chunk_id in chunk_ids:
+            bridge = self.chunks_by_id.get(chunk_id) or {}
+            page_card_id = _clean_text(bridge.get("page_card_id"))
+            document_revision_ids.append(
+                _clean_text(bridge.get("document_revision_id"))
+            )
+            page_card_ids.append(page_card_id)
+            section_ids.append(_clean_text(bridge.get("section_id")))
+            section_ids.extend(
+                _clean_text(value)
+                for value in bridge.get("page_section_ids") or []
+            )
+            if page_card_id in self.pages_by_id:
+                corroborated_page_ids.add(page_card_id)
+                page = self.pages_by_id[page_card_id]
+                page_sections = [
+                    section
+                    for section in page.get("sections") or []
+                    if isinstance(section, Mapping)
+                    and _clean_text(section.get("section_id"))
+                    and _clean_text(section.get("section_kind")) == "page_heading"
+                ]
+                page_chunk_ids = [
+                    _clean_text(value)
+                    for value in page.get("chunk_ids") or []
+                    if _clean_text(value)
+                ]
+                if page_chunk_ids == [chunk_id]:
+                    # The selected chunk is the complete page, so every raw
+                    # heading is a valid identity for that evidence item.
+                    section_ids.extend(
+                        _clean_text(section.get("section_id"))
+                        for section in page_sections
+                    )
+                else:
+                    chunk_record = chunk_records.get(chunk_id) or {}
+                    section_ids.extend(
+                        _clean_text(section.get("section_id"))
+                        for section in page_sections
+                        if _heading_matches_chunk_boundary(
+                            section.get("heading"), chunk_record
+                        )
+                    )
+        for page_card_id in result.get("dense_page_card_ids") or []:
+            page_card_id = _clean_text(page_card_id)
+            page = self.pages_by_id.get(page_card_id) or {}
+            page_card_ids.append(page_card_id)
+            document_revision_ids.append(
+                _clean_text(page.get("document_revision_id"))
+            )
+
+        # Traverse Page Card -> section only when two independent lanes agree:
+        # the Page Card is in the top-three semantic lane and a selected chunk
+        # corroborates the same page. The overlap threshold keeps this a
+        # high-precision identity bridge rather than a catalog-wide search.
+        query_tokens = _tokens(query)
+        if query_tokens:
+            section_candidates: List[tuple[float, int, str]] = []
+            normalized_query = " ".join(_ordered_tokens(query))
+            for page_rank, raw_page_id in enumerate(
+                list(result.get("dense_page_card_ids") or [])[:3], start=1
+            ):
+                page_id = _clean_text(raw_page_id)
+                if page_id not in corroborated_page_ids:
+                    continue
+                page = self.pages_by_id.get(page_id) or {}
+                for section in page.get("sections") or []:
+                    if not isinstance(section, Mapping):
+                        continue
+                    if _clean_text(section.get("section_kind")) != "page_heading":
+                        continue
+                    section_id = _clean_text(section.get("section_id"))
+                    heading_tokens = _tokens(section.get("heading"))
+                    if not section_id or not heading_tokens:
+                        continue
+                    overlap = len(query_tokens & heading_tokens)
+                    if overlap < 2:
+                        continue
+                    heading_coverage = overlap / float(len(heading_tokens))
+                    query_coverage = overlap / float(len(query_tokens))
+                    normalized_heading = " ".join(
+                        _ordered_tokens(section.get("heading"))
+                    )
+                    phrase_match = bool(
+                        normalized_heading
+                        and normalized_heading in normalized_query
+                    )
+                    if heading_coverage < 0.5 and not phrase_match:
+                        continue
+                    score = (
+                        (3.0 * heading_coverage)
+                        + query_coverage
+                        + (1.0 if phrase_match else 0.0)
+                    )
+                    section_candidates.append((-score, page_rank, section_id))
+            section_candidates.sort()
+            section_ids.extend(
+                section_id
+                for _score, _page_rank, section_id in section_candidates[:3]
+            )
+
+        navigation_plan = result.get("navigation_plan")
+        if isinstance(navigation_plan, Mapping):
+            target_page = navigation_plan.get("target_page")
+            if isinstance(target_page, Mapping):
+                page_card_ids.append(_clean_text(target_page.get("page_card_id")))
+                document_revision_ids.append(
+                    _clean_text(target_page.get("document_revision_id"))
+                )
+            navigation_evidence = navigation_plan.get("evidence")
+            if isinstance(navigation_evidence, Mapping):
+                page_card_ids.extend(
+                    _clean_text(value)
+                    for value in navigation_evidence.get("page_card_ids") or []
+                )
+                document_revision_ids.extend(
+                    _clean_text(value)
+                    for value in navigation_evidence.get("document_revision_ids") or []
+                )
+                section_ids.extend(
+                    _clean_text(value)
+                    for value in navigation_evidence.get("section_ids") or []
+                )
+        for parent_id in result.get("selected_parent_ids") or []:
+            parent_id = _clean_text(parent_id)
+            if "document-revision:" not in parent_id:
+                continue
+            suffix = parent_id.split("document-revision:", 1)[1].split(":", 1)[0]
+            if suffix:
+                document_revision_ids.append(f"document-revision:{suffix}")
+        return {
+            "document_revision_ids": list(
+                dict.fromkeys(value for value in document_revision_ids if value)
+            ),
+            "page_card_ids": list(
+                dict.fromkeys(value for value in page_card_ids if value)
+            ),
+            "section_ids": list(
+                dict.fromkeys(value for value in section_ids if value)
+            ),
+            "chunk_ids": list(dict.fromkeys(chunk_ids)),
+        }
+
+    def fuse_page_card_ranking(
+        self,
+        result: Mapping[str, Any],
+        *,
+        evidence_weight: float = 0.15,
+        rrf_k: int = 60,
+    ) -> List[str]:
+        """Late-fuse Page Card semantics with selected-chunk page identity.
+
+        The candidate set remains the dense Page Card lane. Selected chunks
+        only corroborate and reorder those existing candidates, so this cannot
+        invent a Page Card that the semantic lane did not retrieve.
+        """
+
+        dense_page_ids = list(
+            dict.fromkeys(
+                _clean_text(value)
+                for value in result.get("dense_page_card_ids") or []
+                if _clean_text(value)
+            )
+        )
+        if len(dense_page_ids) < 2 or evidence_weight <= 0.0:
+            return dense_page_ids
+        evidence_page_ids: List[str] = []
+        for chunk_id in result.get("selected_chunk_ids") or []:
+            chunk = self.chunks_by_id.get(_clean_text(chunk_id)) or {}
+            page_id = _clean_text(chunk.get("page_card_id"))
+            if page_id and page_id not in evidence_page_ids:
+                evidence_page_ids.append(page_id)
+        if not evidence_page_ids:
+            return dense_page_ids
+        evidence_ranks = {
+            page_id: rank
+            for rank, page_id in enumerate(evidence_page_ids, start=1)
+        }
+        scored: List[tuple[float, int, str]] = []
+        for dense_rank, page_id in enumerate(dense_page_ids, start=1):
+            score = 1.0 / float(max(1, rrf_k) + dense_rank)
+            evidence_rank = evidence_ranks.get(page_id)
+            if evidence_rank is not None:
+                score += evidence_weight / float(max(1, rrf_k) + evidence_rank)
+            scored.append((-score, dense_rank, page_id))
+        scored.sort()
+        return [page_id for _score, _dense_rank, page_id in scored]
+
     def _empty_plan(
         self,
         *,
@@ -423,6 +783,46 @@ class GroundedNavigationPlanner:
             ]
         )
 
+    def page_urls_share_identity(self, first_url: Any, second_url: Any) -> bool:
+        """Return whether two catalog URLs are aliases of the same page surface.
+
+        A refreshed page and a retained ``-prev`` route can have the same
+        official title, language, and page type while only one preserves a
+        historical action such as a PDF download. This check is deliberately
+        catalog-bound and same-host so an action cannot jump to a merely
+        similar page on another site.
+        """
+
+        first_normalized = _normalized_url(first_url)
+        second_normalized = _normalized_url(second_url)
+        if not first_normalized or not second_normalized:
+            return False
+        if first_normalized == second_normalized:
+            return True
+        first_id = self.pages_by_url.get(first_normalized)
+        second_id = self.pages_by_url.get(second_normalized)
+        if not first_id or not second_id:
+            return False
+        first_page = self.pages_by_id.get(first_id) or {}
+        second_page = self.pages_by_id.get(second_id) or {}
+        try:
+            first_host = (urlsplit(first_normalized).hostname or "").casefold()
+            second_host = (urlsplit(second_normalized).hostname or "").casefold()
+        except ValueError:
+            return False
+        if not first_host or first_host != second_host:
+            return False
+        first_title = _normalized_boundary_text(first_page.get("title"))
+        second_title = _normalized_boundary_text(second_page.get("title"))
+        if not first_title or first_title != second_title:
+            return False
+        for key in ("page_type", "language"):
+            first_value = _clean_text(first_page.get(key)).casefold().split("-", 1)[0]
+            second_value = _clean_text(second_page.get(key)).casefold().split("-", 1)[0]
+            if first_value and second_value and first_value != second_value:
+                return False
+        return True
+
     def _score_pages(
         self,
         *,
@@ -431,30 +831,114 @@ class GroundedNavigationPlanner:
         intent: str,
     ) -> tuple[List[tuple[float, str]], set[str]]:
         query_tokens = _tokens(query)
-        scores: Dict[str, float] = defaultdict(float)
+        lane_scores: Dict[str, Dict[str, float]] = {
+            "source": {},
+            "chunk": {},
+            "page_card": {},
+            "action": {},
+        }
+        page_card_ranks: Dict[str, int] = {}
+        action_page_ranks: Dict[str, int] = {}
         evidence_page_ids: set[str] = set()
+
+        def record_lane_score(lane: str, page_id: str, score: float) -> None:
+            lane_scores[lane][page_id] = max(
+                float(score), float(lane_scores[lane].get(page_id, 0.0))
+            )
+
         for rank, source_url in enumerate(_candidate_source_urls(result), start=1):
             page_id = self.pages_by_url.get(_normalized_url(source_url))
             if page_id:
-                scores[page_id] += max(5.0, 13.0 - float(rank))
+                record_lane_score("source", page_id, max(5.0, 13.0 - float(rank)))
                 evidence_page_ids.add(page_id)
         for rank, chunk_id in enumerate(result.get("selected_chunk_ids") or [], start=1):
             chunk = self.chunks_by_id.get(_clean_text(chunk_id))
             page_id = _clean_text((chunk or {}).get("page_card_id"))
             if page_id in self.pages_by_id:
-                scores[page_id] += max(6.0, 16.0 - float(rank))
+                record_lane_score("chunk", page_id, max(6.0, 16.0 - float(rank)))
                 evidence_page_ids.add(page_id)
         for rank, page_id in enumerate(result.get("dense_page_card_ids") or [], start=1):
             page_id = _clean_text(page_id)
             if page_id in self.pages_by_id:
-                scores[page_id] += max(7.0, 17.0 - float(rank))
+                page_card_ranks.setdefault(page_id, rank)
+                record_lane_score(
+                    "page_card", page_id, max(9.0, 26.0 - (3.0 * float(rank - 1)))
+                )
                 evidence_page_ids.add(page_id)
         for rank, action_id in enumerate(result.get("dense_action_ids") or [], start=1):
             action = self.actions_by_id.get(_clean_text(action_id))
             page_id = _clean_text((action or {}).get("page_card_id"))
-            if page_id in self.pages_by_id:
-                scores[page_id] += max(6.5, 15.0 - float(rank))
+            if (
+                page_id in self.pages_by_id
+                and isinstance(action, Mapping)
+                and _action_satisfies_intent(action, intent)
+            ):
+                action_page_ranks[page_id] = min(
+                    rank, action_page_ranks.get(page_id, rank)
+                )
+                context_tokens = _tokens(
+                    " ".join(
+                        _clean_text(action.get(key))
+                        for key in ("context_label", "source_section_heading")
+                    )
+                )
+                context_overlap_bonus = min(
+                    4.0,
+                    2.0 * float(len(query_tokens & context_tokens)),
+                )
+                record_lane_score(
+                    "action",
+                    page_id,
+                    max(10.0, 30.0 - (3.0 * float(rank - 1)))
+                    + context_overlap_bonus,
+                )
                 evidence_page_ids.add(page_id)
+                target_url = _clean_text(
+                    action.get("canonical_target_url") or action.get("target_url")
+                )
+                target_page_id = self.pages_by_url.get(_normalized_url(target_url))
+                # An internal action can bridge a listing/card to the exact
+                # content page.  Use it only when the independent Page Card
+                # lane also retrieved that target, so traversal cannot invent
+                # a destination from an action alone.
+                if target_page_id in page_card_ranks:
+                    action_page_ranks[target_page_id] = min(
+                        rank, action_page_ranks.get(target_page_id, rank)
+                    )
+                    record_lane_score(
+                        "action",
+                        target_page_id,
+                        max(9.0, 28.0 - (3.0 * float(rank - 1))),
+                    )
+                    evidence_page_ids.add(target_page_id)
+
+        scores: Dict[str, float] = defaultdict(float)
+        candidate_page_ids = {
+            page_id for values in lane_scores.values() for page_id in values
+        }
+        for page_id in candidate_page_ids:
+            direct_score = (
+                lane_scores["page_card"].get(page_id, 0.0)
+                + lane_scores["action"].get(page_id, 0.0)
+            )
+            weak_score = (
+                lane_scores["source"].get(page_id, 0.0)
+                + lane_scores["chunk"].get(page_id, 0.0)
+            )
+            # Repeated chunks or evidence-pack items from one page are useful
+            # corroboration, but must not overturn direct Page Card/action
+            # retrieval.  When no direct lane resolved the page, retain the
+            # full weak score for graph traversal fallback.
+            scores[page_id] = direct_score + (
+                min(8.0, weak_score) if direct_score > 0.0 else weak_score
+            )
+            if page_id in page_card_ranks and page_id in action_page_ranks:
+                scores[page_id] += max(
+                    8.0,
+                    24.0
+                    - float(page_card_ranks[page_id] - 1)
+                    - (3.0 * float(action_page_ranks[page_id] - 1)),
+                )
 
         # Traverse one cleaned graph hop, but require semantic agreement before
         # a linked page can outrank the page that supplied the evidence.
@@ -474,13 +958,15 @@ class GroundedNavigationPlanner:
             return [], evidence_page_ids
         for page_id in candidate_ids:
             page = self.pages_by_id[page_id]
-            page_tokens = _tokens(self._page_search_text(page))
+            page_search_text = self._page_search_text(page)
+            page_tokens = _tokens(page_search_text)
             overlap = len(query_tokens & page_tokens)
             if query_tokens:
                 scores[page_id] += 5.0 * overlap / float(len(query_tokens))
-            desired_actions = _ACTION_TYPES_BY_INTENT.get(intent, set())
-            if desired_actions and any(
-                _clean_text(action.get("action_type")) in desired_actions
+            scores[page_id] += _query_phrase_match_score(query, page_search_text)
+            scores[page_id] += _page_surface_constraint_score(query, page)
+            if any(
+                _action_satisfies_intent(action, intent)
                 for action in self.actions_by_page.get(page_id, [])
             ):
                 scores[page_id] += 3.5
@@ -499,21 +985,51 @@ class GroundedNavigationPlanner:
         )
 
     def _best_action(
-        self, *, query: str, page_id: str, intent: str
+        self,
+        *,
+        query: str,
+        page_id: str,
+        intent: str,
+        retrieved_action_ids: Sequence[str] = (),
     ) -> Dict[str, Any] | None:
-        desired = _ACTION_TYPES_BY_INTENT.get(intent, set())
-        if not desired:
+        if intent not in _ACTION_TYPES_BY_INTENT:
             return None
         query_tokens = _tokens(query)
+        required_contact_mechanism = ""
+        if intent == "contact":
+            if query_tokens & _TELEPHONE_CONTACT_QUERY_TERMS:
+                required_contact_mechanism = "telephone"
+            elif query_tokens & _EMAIL_CONTACT_QUERY_TERMS:
+                required_contact_mechanism = "email"
         relevance_tokens = (
             query_tokens - _CONTACT_INTENT_TERMS
             if intent == "contact"
             else query_tokens
         )
+        retrieved_ranks = {
+            _clean_text(action_id): rank
+            for rank, action_id in enumerate(retrieved_action_ids, start=1)
+            if _clean_text(action_id)
+        }
         scored: List[tuple[float, str, Dict[str, Any]]] = []
         for action in self.actions_by_page.get(page_id, []):
             action_type = _clean_text(action.get("action_type"))
-            if action_type not in desired or not _contact_action_is_semantic(action):
+            if not _action_satisfies_intent(action, intent):
+                continue
+            target_url = _clean_text(
+                action.get("canonical_target_url") or action.get("target_url")
+            ).casefold()
+            action_mechanism = (
+                "telephone"
+                if target_url.startswith("tel:")
+                else "email"
+                if target_url.startswith("mailto:")
+                else action_type
+            )
+            if (
+                required_contact_mechanism
+                and action_mechanism != required_contact_mechanism
+            ):
                 continue
             action_tokens = _tokens(
                 " ".join(
@@ -548,6 +1064,12 @@ class GroundedNavigationPlanner:
                 score += 4.0 * len(relevance_tokens & action_tokens) / float(
                     len(relevance_tokens)
                 )
+            retrieved_rank = retrieved_ranks.get(_clean_text(action.get("action_id")))
+            if retrieved_rank is not None:
+                # Preserve the vector lane's direct action evidence.  The
+                # semantic checks above still prevent an unrelated endpoint
+                # from being selected solely because it was retrieved.
+                score += max(2.0, 8.0 - float(retrieved_rank - 1))
             if action.get("source_section_id"):
                 score += 0.2
             scored.append((score, _clean_text(action.get("action_id")), action))
@@ -595,7 +1117,10 @@ class GroundedNavigationPlanner:
             )
 
         action = self._best_action(
-            query=query, page_id=page_id, intent=context["intent"]
+            query=query,
+            page_id=page_id,
+            intent=context["intent"],
+            retrieved_action_ids=result.get("dense_action_ids") or [],
         )
         plan_id = _stable_id(
             "navigation-plan",

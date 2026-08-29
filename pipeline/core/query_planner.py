@@ -77,33 +77,11 @@ def plan_query(
         per_request_delay_sec=per_request_delay_sec,
     )
     navigation_fallback = infer_navigation_context(query)
-    navigation_intent = str(payload.get("navigation_intent") or "none").strip().lower()
-    allowed_navigation_intents = {
-        "none",
-        "open_page",
-        "follow_steps",
-        "apply",
-        "register",
-        "contact",
-        "download",
-        "login",
-        "search",
-    }
-    try:
-        navigation_confidence = max(
-            0.0,
-            min(1.0, float(payload.get("navigation_confidence") or 0.0)),
-        )
-    except (TypeError, ValueError):
-        navigation_confidence = 0.0
-    if navigation_intent not in allowed_navigation_intents:
-        navigation_intent = str(navigation_fallback["intent"])
-        navigation_confidence = float(navigation_fallback["confidence"])
-    if navigation_intent == "none" and navigation_fallback["intent"] != "none":
-        navigation_intent = str(navigation_fallback["intent"])
-        navigation_confidence = max(
-            navigation_confidence, float(navigation_fallback["confidence"])
-        )
+    # Navigation is an action-bearing contract, so model output alone must not
+    # turn a factual reference to a page or website into a navigation command.
+    # The deterministic explicit-intent classifier is authoritative here.
+    navigation_intent = str(navigation_fallback["intent"])
+    navigation_confidence = float(navigation_fallback["confidence"])
     return {
         "query_type": str(payload.get("query_type") or fallback_query_type).strip().lower(),
         "vector_query": str(payload.get("vector_query") or query).strip() or query,
@@ -119,11 +97,7 @@ def plan_query(
             if str(value).strip()
         ],
         "navigation_intent": navigation_intent,
-        "navigation_goal": str(
-            payload.get("navigation_goal")
-            or navigation_fallback.get("goal")
-            or ""
-        ).strip()[:500],
+        "navigation_goal": str(navigation_fallback.get("goal") or "").strip()[:500],
         "navigation_confidence": navigation_confidence,
         "confidence": max(0.0, min(1.0, float(payload.get("confidence") or 0.0))),
     }

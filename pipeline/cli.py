@@ -515,6 +515,7 @@ def cmd_release_check(args: argparse.Namespace) -> int:
         answer_readiness_waiver_reason=args.answer_readiness_waiver_reason,
         query_cache_path=args.query_cache,
         retrieval_cache_path=args.retrieval_cache,
+        splits=args.split,
         parallelism=args.parallelism,
         skip_stage_validation=args.skip_stage_validation,
         progress_callback=progress_callback,
@@ -778,6 +779,7 @@ def cmd_eval_retrieval(args: argparse.Namespace) -> int:
         gates_path=args.gates,
         query_cache_path=args.query_cache,
         retrieval_cache_path=args.retrieval_cache,
+        splits=args.split,
         parallelism=args.parallelism,
         progress_callback=progress_callback,
     )
@@ -829,6 +831,8 @@ def cmd_eval_answer_readiness(args: argparse.Namespace) -> int:
         judge_timeout_seconds=args.judge_timeout_seconds,
         eval_request_mode=not args.disable_eval_request_mode,
         resume_predictions=args.resume_predictions,
+        splits=args.split,
+        example_ids=args.id,
         parallelism=args.parallelism,
         progress_callback=progress_callback,
     )
@@ -1275,6 +1279,13 @@ def main() -> int:
     p_eval_retrieval.add_argument("--gates", default=None, help="Optional JSON file with metric thresholds")
     p_eval_retrieval.add_argument("--query-cache", default=None, help="Optional persistent query-embedding cache JSON path")
     p_eval_retrieval.add_argument("--retrieval-cache", default=None, help="Optional persistent retrieval-result cache JSON path")
+    p_eval_retrieval.add_argument(
+        "--split",
+        action="append",
+        choices=("selection", "holdout", "regression"),
+        default=None,
+        help="Evaluate only one governed split; repeat to combine splits",
+    )
     p_eval_retrieval.add_argument("--parallelism", type=int, default=1, help="Number of retrieval worker threads for evaluation")
     p_eval_retrieval.add_argument("--output", default=None, help="Optional report JSON path")
     p_eval_retrieval.add_argument("--quiet-progress", action="store_true", help="Suppress progress logs on stderr")
@@ -1286,6 +1297,22 @@ def main() -> int:
     p_eval_answer.add_argument("--work-dir", required=True, help="Indexed run work directory")
     p_eval_answer.add_argument("--dataset", default=str(DEFAULT_RELEASE_ANSWER_DATASET), help="Answer readiness dataset JSON or JSONL path")
     p_eval_answer.add_argument("--gates", default=str(DEFAULT_RELEASE_ANSWER_GATES), help="Answer readiness gates JSON path")
+    p_eval_answer.add_argument(
+        "--split",
+        action="append",
+        choices=("selection", "holdout", "regression"),
+        default=None,
+        help="Evaluate only one governed split; repeat to combine splits",
+    )
+    p_eval_answer.add_argument(
+        "--id",
+        action="append",
+        default=None,
+        help=(
+            "Evaluate only this query ID after governed split filtering; "
+            "repeat to select multiple queries"
+        ),
+    )
     p_eval_answer.add_argument("--mode", choices=["local", "http", "websocket"], default="websocket", help="Use local indexing answer generation, HTTP chat, or the production WebSocket chat endpoint")
     p_eval_answer.add_argument("--endpoint", default=None, help="Chat endpoint for --mode=http/websocket")
     p_eval_answer.add_argument("--auth-token", default=None, help="Optional operations/telegram token for HTTP mode")

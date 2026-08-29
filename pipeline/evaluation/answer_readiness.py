@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 
 from pipeline.core.google_genai import import_genai
 from pipeline.core.io import atomic_write_json
@@ -33,6 +33,7 @@ _OPENAI_JUDGE_CLIENT_CONFIG: tuple[str, float, int] | None = None
 
 
 _NO_ANSWER_MARKERS = (
+    "no relevant information found",
     "insufficient evidence",
     "not enough evidence",
     "could not verify",
@@ -189,6 +190,63 @@ _ACRONYM_SYNONYMS = {
     "msc": ("master of science", "m.sc", "m sc"),
     "phd": ("doctor of philosophy", "ph.d", "ph d"),
     "nlp": ("natural language processing",),
+    # Governed cross-lingual equivalents used when the source visual retains
+    # English labels but the evaluation question and surrounding answer are
+    # Arabic. These are direct terminology matches, not fuzzy paraphrases.
+    "تصفية": ("filtering",),
+    "تصفي": ("filtering",),
+    "ترشيح": ("filtering",),
+    "شريحة": ("chip",),
+    "معالج": ("processor",),
+}
+
+_MONTH_TOKEN_ALIASES = {
+    "january": "month01",
+    "jan": "month01",
+    "يناير": "month01",
+    "february": "month02",
+    "feb": "month02",
+    "فبراير": "month02",
+    "march": "month03",
+    "mar": "month03",
+    "مارس": "month03",
+    "april": "month04",
+    "apr": "month04",
+    "أبريل": "month04",
+    "ابريل": "month04",
+    "may": "month05",
+    "مايو": "month05",
+    "june": "month06",
+    "jun": "month06",
+    "يونيو": "month06",
+    "july": "month07",
+    "jul": "month07",
+    "يوليو": "month07",
+    "august": "month08",
+    "aug": "month08",
+    "أغسطس": "month08",
+    "اغسطس": "month08",
+    "september": "month09",
+    "sep": "month09",
+    "sept": "month09",
+    "سبتمبر": "month09",
+    "october": "month10",
+    "oct": "month10",
+    "أكتوبر": "month10",
+    "اكتوبر": "month10",
+    "november": "month11",
+    "nov": "month11",
+    "نوفمبر": "month11",
+    "december": "month12",
+    "dec": "month12",
+    "ديسمبر": "month12",
+}
+
+_ARABIC_DURATION_TOKEN_ALIASES = {
+    "سنتان": "two_years",
+    "سنتين": "two_years",
+    "عامان": "two_years",
+    "عامين": "two_years",
 }
 
 _ARABIC_DIACRITICS_RE = re.compile(
@@ -227,13 +285,39 @@ _ARABIC_MATCH_TRANSLATION = str.maketrans(
 
 def _normalize_arabic_for_match(value: str) -> str:
     value = value.translate(_ARABIC_MATCH_TRANSLATION).replace("ـ", "")
+    # Accusative tanween is commonly written as root + fathatan + supporting
+    # alif (for example, "مخصصًا"). Remove that grammatical ending before the
+    # general diacritic pass so it matches the uninflected benchmark term.
+    value = value.replace("\u064b\u0627", "").replace("\u0627\u064b", "")
     return _ARABIC_DIACRITICS_RE.sub("", value)
 
 
 def _normalize_for_term_match(value: Any) -> str:
     text = unicodedata.normalize("NFKC", _text(value)).casefold()
     text = _normalize_arabic_for_match(text)
+    # Thousands separators are formatting, not part of the numeric fact.
+    # Keep decimal commas intact by requiring a three-digit group.
+    text = re.sub(r"(?<=\d)[,\u066c](?=\d{3}(?:\D|$))", "", text)
+    text = re.sub(r"[\u2010-\u2015\u2212]", "-", text)
+    spelling_equivalents = {
+        "analyze": "analyse",
+        "analyzed": "analysed",
+        "analyzes": "analyses",
+        "analyzing": "analysing",
+    }
+    text = re.sub(
+        r"\b(?:analyze|analyzed|analyzes|analyzing)\b",
+        lambda match: spelling_equivalents[match.group(0)],
+        text,
+    )
     text = text.replace("&", " and ")
+    # Hyphenation is a presentation choice, not a semantic distinction for
+    # required prose terms (for example, "generative-AI" vs "generative AI").
+    text = re.sub(
+        r"(?<=[a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff])-(?=[a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff])",
+        " ",
+        text,
+    )
     text = _normalize_temporal_tokens(text)
     text = re.sub(r"(?<=\b[a-z])\.(?=[a-z]\b)", "", text)
     text = re.sub(r"[^a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff@._%+\-/]+", " ", text)
@@ -319,6 +403,16 @@ def _all_clock_aliases_supported(response_tokens: set[str], response_blob: str, 
 
 def _term_tokens(value: Any) -> List[str]:
     normalized = _normalize_for_term_match(value)
+    # A slash inside prose is often a compact coordination mark rather than a
+    # semantic token boundary (for example, "شريحة/معالج"). Split these
+    # compounds for token coverage. Required terms that intentionally express
+    # alternatives ("login/start page") are handled before tokenization by
+    # ``_required_term_supported``.
+    normalized = re.sub(
+        r"(?<=[a-z\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff])/(?=[a-z\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff])",
+        " ",
+        normalized,
+    )
     tokens = re.findall(
         r"[a-z0-9\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff@._%+\-/]+",
         normalized,
@@ -328,20 +422,135 @@ def _term_tokens(value: Any) -> List[str]:
         if token in _TERM_STOPWORDS:
             continue
         if "@" not in token:
-            token = token.strip("._-/")
+            token = token.strip("._-/،؛؟")
         if re.fullmatch(r"[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]+", token):
             if token.startswith("وال") and len(token) > 5:
                 token = token[3:]
+            elif token.startswith(("بال", "كال", "فال")) and len(token) > 5:
+                token = token[3:]
+            elif token.startswith("لل") and len(token) > 4:
+                token = token[2:]
+            elif token.startswith("ل") and len(token) > 4:
+                token = token[1:]
+            elif token.startswith("و") and len(token) > 4:
+                token = token[1:]
             elif token.startswith("ال") and len(token) > 4:
                 token = token[2:]
+            if token.endswith(("يون", "يين")) and len(token) > 5:
+                token = f"{token[:-3]}ي"
+            elif token.endswith("ية") and len(token) > 4:
+                token = f"{token[:-2]}ي"
         if len(token) > 4 and token.endswith("s") and "@" not in token:
             token = token[:-1]
+        token = _MONTH_TOKEN_ALIASES.get(token, token)
+        token = _ARABIC_DURATION_TOKEN_ALIASES.get(token, token)
         if token:
             output.append(token)
     return output
 
 
+_ARABIC_TERM_TOKEN_RE = re.compile(
+    r"^[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]+$"
+)
+
+
+def _arabic_term_token_variants(token: str) -> set[str]:
+    """Return conservative light-morphology variants for answer scoring.
+
+    Arabic clitics and attached pronouns are orthographic, not factual,
+    differences. Keep the original token and add only common one-step forms;
+    this avoids turning deterministic scoring into unrestricted fuzzy match.
+    """
+
+    value = str(token or "").strip()
+    variants = {value} if value else set()
+    if not value or not _ARABIC_TERM_TOKEN_RE.fullmatch(value):
+        return variants
+
+    for prefix in ("ب", "ك", "و"):
+        minimum_root_length = 3 if prefix == "و" else 4
+        if value.startswith(prefix) and len(value) - len(prefix) >= minimum_root_length:
+            variants.add(value[len(prefix) :])
+    if value.startswith("ي") and len(value) >= 6:
+        # Imperfect verbs such as "يتعاون" should match their lexical
+        # concept "تعاون", while short nouns remain untouched.
+        variants.add(value[1:])
+    if value in {"ذوو", "ذوي"}:
+        variants.add("ذو")
+    if value in {"مساهمة", "اسهام"}:
+        variants.add("ساهم")
+    if len(value) >= 6 and value.endswith(("ون", "ين")):
+        # Sound masculine plural case endings do not change the underlying
+        # entity or qualification (for example باحثون / باحثين).
+        variants.add(value[:-2])
+    for suffix in ("نا", "هم", "هن", "كم", "كن", "ها"):
+        if value.endswith(suffix) and len(value) - len(suffix) >= 3:
+            base = value[: -len(suffix)]
+            variants.add(base)
+            # Taa marbuta is written as taa before an attached possessive
+            # pronoun: مكانة -> مكانتها. Preserve that grammatical identity.
+            if base.endswith("ت"):
+                variants.add(f"{base[:-1]}ة")
+    return variants
+
+
+def _english_term_token_variants(token: str) -> set[str]:
+    """Return conservative English inflection variants for scoring only."""
+
+    value = str(token or "").strip()
+    variants = {value} if value else set()
+    if not re.fullmatch(r"[a-z]+", value):
+        return variants
+    if value.endswith("ing") and len(value) > 6:
+        stem = value[:-3]
+        variants.add(stem)
+        if stem and not stem.endswith("e"):
+            variants.add(f"{stem}e")
+    if value in {"interpret", "interpretable", "interpretation"}:
+        variants.add("interpret")
+    return variants
+
+
+def _term_token_supported(
+    token: str,
+    response_tokens: set[str],
+    normalized_response: str,
+) -> bool:
+    synonyms = _ACRONYM_SYNONYMS.get(token, ())
+    if (
+        token in response_tokens
+        or f" {token} " in normalized_response
+        or any(synonym in normalized_response for synonym in synonyms)
+    ):
+        return True
+    if _ARABIC_TERM_TOKEN_RE.fullmatch(token):
+        token_variants = _arabic_term_token_variants(token)
+        return any(
+            token_variants & _arabic_term_token_variants(response_token)
+            for response_token in response_tokens
+        )
+    if re.fullmatch(r"[a-z]+", token):
+        token_variants = _english_term_token_variants(token)
+        return any(
+            token_variants & _english_term_token_variants(response_token)
+            for response_token in response_tokens
+        )
+    return False
+
+
 def _required_term_supported(response: str, term: str) -> bool:
+    slash_alternative = re.search(
+        r"\b([a-z]+)\s*/\s*([a-z]+)\b",
+        _text(term).casefold(),
+    )
+    if slash_alternative:
+        prefix = _text(term)[: slash_alternative.start()]
+        suffix = _text(term)[slash_alternative.end() :]
+        return any(
+            _required_term_supported(response, f"{prefix}{alternative}{suffix}")
+            for alternative in slash_alternative.groups()
+        )
+
     normalized_response = _normalize_for_term_match(response)
     normalized_term = _normalize_for_term_match(term)
     if not normalized_term:
@@ -362,8 +571,7 @@ def _required_term_supported(response: str, term: str) -> bool:
             return True
         non_clock_matches = 0
         for token in non_clock_tokens:
-            synonyms = _ACRONYM_SYNONYMS.get(token, ())
-            if token in response_tokens or f" {token} " in response_blob or any(synonym in normalized_response for synonym in synonyms):
+            if _term_token_supported(token, response_tokens, response_blob):
                 non_clock_matches += 1
         return non_clock_matches / float(len(non_clock_tokens)) >= 0.75
 
@@ -378,8 +586,7 @@ def _required_term_supported(response: str, term: str) -> bool:
 
     matched = 0
     for token in term_tokens:
-        synonyms = _ACRONYM_SYNONYMS.get(token, ())
-        if token in response_tokens or f" {token} " in response_blob or any(synonym in normalized_response for synonym in synonyms):
+        if _term_token_supported(token, response_tokens, response_blob):
             matched += 1
     coverage = matched / float(len(term_tokens))
     if len(term_tokens) <= 2:
@@ -388,10 +595,21 @@ def _required_term_supported(response: str, term: str) -> bool:
 
 
 def _required_terms_result(response: str, terms: Sequence[str], metadata: Mapping[str, Any]) -> tuple[List[str], float]:
-    if not terms:
+    alternative_groups = _metadata_term_groups(
+        metadata,
+        "answer_must_include_any_groups",
+    )
+    if not terms and not alternative_groups:
         return [], 1.0
     missing = [term for term in terms if not _required_term_supported(response, term)]
-    coverage = (len(terms) - len(missing)) / float(len(terms))
+    missing_groups = [
+        group
+        for group in alternative_groups
+        if not any(_required_term_supported(response, alternative) for alternative in group)
+    ]
+    total_requirements = len(terms) + len(alternative_groups)
+    supported_requirements = total_requirements - len(missing) - len(missing_groups)
+    coverage = supported_requirements / float(total_requirements)
     try:
         minimum = float(metadata.get("answer_must_include_min_coverage", 1.0))
     except (TypeError, ValueError):
@@ -399,6 +617,7 @@ def _required_terms_result(response: str, terms: Sequence[str], metadata: Mappin
     minimum = min(1.0, max(0.0, minimum))
     if coverage >= minimum:
         return [], coverage
+    missing.extend(" OR ".join(group) for group in missing_groups)
     return missing, coverage
 
 
@@ -411,6 +630,30 @@ def _metadata_list(metadata: Mapping[str, Any], key: str) -> List[str]:
     if isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
         return [_text(item) for item in value if _text(item)]
     return [_text(value)] if _text(value) else []
+
+
+def _metadata_term_groups(metadata: Mapping[str, Any], key: str) -> List[List[str]]:
+    """Load groups where satisfying any one term satisfies that group.
+
+    This is intentionally distinct from ``answer_must_include`` (all terms
+    required). It supports translated or synonymous gold expressions without
+    lowering the required coverage for independent facts.
+    """
+
+    value = metadata.get(key)
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        return []
+    groups: List[List[str]] = []
+    for raw_group in value:
+        if isinstance(raw_group, str):
+            group = [_text(raw_group)] if _text(raw_group) else []
+        elif isinstance(raw_group, Sequence) and not isinstance(raw_group, (bytes, bytearray)):
+            group = [_text(item) for item in raw_group if _text(item)]
+        else:
+            group = []
+        if group:
+            groups.append(list(dict.fromkeys(group)))
+    return groups
 
 
 def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
@@ -441,6 +684,11 @@ def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
             "i cannot find",
             "i can’t find",
             "i can't find",
+            "i do not have any information",
+            "i don't have any information",
+            "i have no information",
+            "the available sources do not show",
+            "the sources do not show",
             "there is insufficient evidence",
             "insufficient evidence",
             "not enough evidence",
@@ -456,12 +704,62 @@ def _looks_like_no_answer(response: str, response_kind: str = "") -> bool:
     )
 
 
+def _explicitly_denies_unsupported_premise(response: str) -> bool:
+    """Recognize direct premise denials for benchmark no-answer examples.
+
+    This is intentionally separate from ``_looks_like_no_answer``. A supported
+    negative fact can be a perfectly valid answer to an answerable question, so
+    broadening the generic detector would incorrectly reject those responses.
+    The scorer invokes this helper only when the gold example is explicitly
+    marked as no-answer.
+    """
+
+    normalized = _normalize_for_term_match(response)
+    if not normalized:
+        return False
+    explicit_denials = (
+        "do not have any information",
+        "don't have any information",
+        "does not have any information",
+        "doesn't have any information",
+        "do not have any information showing",
+        "don't have any information showing",
+        "does not have any information showing",
+        "doesn't have any information showing",
+        "does not have",
+        "doesn't have",
+        "does not operate",
+        "doesn't operate",
+        "has no",
+        "there is no",
+        "لا يوجد",
+        "لا توجد",
+        "لا يملك",
+        "لا تملك",
+        "لا يشغل",
+        "لا تشغل",
+    )
+    return any(
+        _normalize_for_term_match(marker) in normalized for marker in explicit_denials
+    )
+
+
 def _inline_citation_present(response: str) -> bool:
     return bool(re.search(r"\[(?:\d+|source\s+\d+)(?:\s*,\s*\d+)*\]", response or "", re.IGNORECASE))
 
 
 def _normalize_url_for_match(value: Any) -> str:
-    text = _text(value).casefold()
+    # Browsers and clients may surface the same Unicode URL either literally or
+    # percent-encoded. Some legacy citations were encoded twice, so decode a
+    # small bounded number of times rather than treating `%25D8...` as a
+    # different official page.
+    text = _text(value)
+    for _ in range(3):
+        decoded = unquote(text)
+        if decoded == text:
+            break
+        text = decoded
+    text = text.casefold()
     if not text:
         return ""
     text = re.sub(r"#.*$", "", text)
@@ -855,6 +1153,7 @@ def _response_component_payload(row: Mapping[str, Any]) -> Dict[str, Any]:
             or []
         ),
         "response_contract": row.get("response_contract") or metadata.get("response_contract") or {},
+        "navigation_plan": row.get("navigation_plan") or metadata.get("navigation_plan") or {},
         "evidence_pack": row.get("evidence_pack") or metadata.get("evidence_pack") or {},
         "retrieval_trace": row.get("retrieval_trace") or metadata.get("retrieval_trace") or {},
         "retrieval_confidence": row.get("retrieval_confidence") or metadata.get("retrieval_confidence"),
@@ -875,6 +1174,10 @@ def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
         "notes": example.notes,
         "expected_response_structure": _text(example_metadata.get("expected_response_structure")),
         "expected_answer_must_include": _metadata_list(example_metadata, "answer_must_include"),
+        "expected_answer_must_include_any_groups": _metadata_term_groups(
+            example_metadata,
+            "answer_must_include_any_groups",
+        ),
         "expected_answer_must_not_include": _metadata_list(example_metadata, "answer_must_not_include"),
         "answer_should_cover": _metadata_list(example_metadata, "answer_should_cover"),
         "expected_source_hints": _metadata_list(example_metadata, "expected_source_hints"),
@@ -1242,7 +1545,11 @@ def _score_answer_row(
     must_not_include_pass = 1.0 if not forbidden_found else 0.0
     no_answer_pass = 1.0
     if example.no_answer:
-        no_answer_pass = 1.0 if response and _looks_like_no_answer(response, response_kind) and not forbidden_found else 0.0
+        recognized_no_answer = _looks_like_no_answer(
+            response,
+            response_kind,
+        ) or _explicitly_denies_unsupported_premise(response)
+        no_answer_pass = 1.0 if response and recognized_no_answer and not forbidden_found else 0.0
 
     if example.no_answer:
         passed = response_non_empty and no_answer_pass and must_not_include_pass and not error
@@ -1444,6 +1751,7 @@ def _run_local_answer_predictions(
         model=model,
         timeout_seconds=timeout_seconds,
         resume_predictions=resume_predictions,
+        examples=examples,
     )
     examples_by_id = {example.id: example for example in examples}
     rows = []
@@ -1580,6 +1888,7 @@ def _chat_prediction_row_from_payload(
         "retrieval_diagnostics": payload.get("retrieval_diagnostics") if isinstance(payload.get("retrieval_diagnostics"), dict) else {},
         "evidence_pack": payload.get("evidence_pack") if isinstance(payload.get("evidence_pack"), dict) else {},
         "response_contract": payload.get("response_contract") if isinstance(payload.get("response_contract"), dict) else {},
+        "navigation_plan": payload.get("navigation_plan") if isinstance(payload.get("navigation_plan"), dict) else {},
         "response_kind": payload.get("response_kind"),
         "status": payload.get("status"),
         "metadata": metadata,
@@ -2223,11 +2532,69 @@ def evaluate_answer_readiness(
     probe_mode: bool = False,
     eval_request_mode: bool = True,
     resume_predictions: bool = False,
+    splits: Sequence[str] | None = None,
+    example_ids: Sequence[str] | None = None,
     parallelism: int = 1,
     progress_callback: AnswerProgressCallback | None = None,
 ) -> Dict[str, Any]:
     resolved_dataset = Path(dataset_path).expanduser().resolve()
     examples = load_eval_examples(resolved_dataset)
+    requested_splits = list(
+        dict.fromkeys(
+            str(value or "").strip().lower()
+            for value in (splits or [])
+            if str(value or "").strip()
+        )
+    )
+    unknown_splits = sorted(
+        set(requested_splits) - {"selection", "holdout", "regression"}
+    )
+    if unknown_splits:
+        raise ValueError(
+            "Unknown answer-readiness split(s): " + ", ".join(unknown_splits)
+        )
+    if requested_splits:
+        examples = [
+            example
+            for example in examples
+            if str((example.metadata or {}).get("split") or "").strip().lower()
+            in requested_splits
+        ]
+        if not examples:
+            raise ValueError(
+                "No answer-readiness examples matched split(s): "
+                + ", ".join(requested_splits)
+            )
+    requested_example_ids = list(
+        dict.fromkeys(
+            str(value or "").strip()
+            for value in (example_ids or [])
+            if str(value or "").strip()
+        )
+    )
+    if requested_example_ids:
+        available_example_ids = {example.id for example in examples}
+        unknown_example_ids = [
+            example_id
+            for example_id in requested_example_ids
+            if example_id not in available_example_ids
+        ]
+        if unknown_example_ids:
+            selected_scope = (
+                "selected governed split(s) " + ", ".join(requested_splits)
+                if requested_splits
+                else "the evaluation dataset"
+            )
+            raise ValueError(
+                "Answer-readiness example ID(s) not present in "
+                + selected_scope
+                + ": "
+                + ", ".join(unknown_example_ids)
+            )
+        requested_example_id_set = set(requested_example_ids)
+        examples = [
+            example for example in examples if example.id in requested_example_id_set
+        ]
     dataset_fingerprint = _dataset_fingerprint(examples)
     mode = str(mode or "local").strip().lower()
     endpoint = endpoint or os.environ.get("MBZUAI_CHAT_EVAL_ENDPOINT") or os.environ.get("CHATBOT_EVAL_ENDPOINT")
@@ -2376,6 +2743,8 @@ def evaluate_answer_readiness(
         "report_version": _ANSWER_READINESS_REPORT_VERSION,
         "dataset_path": str(resolved_dataset),
         "dataset_fingerprint": dataset_fingerprint,
+        "requested_splits": requested_splits,
+        "requested_example_ids": requested_example_ids,
         "work_dir": str(Path(work_dir).expanduser().resolve()),
         "config_name": str(config_name),
         "backend": backend,

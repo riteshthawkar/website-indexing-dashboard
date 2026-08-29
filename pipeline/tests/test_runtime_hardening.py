@@ -323,6 +323,56 @@ def test_retrieval_service_cache_separates_planner_handoff_mode(tmp_path, monkey
     assert handoff_cached.json()["service_cache_hit"] is True
 
 
+def test_retrieval_service_forwards_original_query_and_separates_cache(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    class OriginalQueryAwareRetriever:
+        supports_shared_parallel_retrieval = True
+
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, query, *, original_query=None):
+            self.calls.append((query, original_query))
+            return {
+                "query": query,
+                "original_query": original_query or query,
+                "abstained": True,
+                "retrieval_documents": [],
+            }
+
+    retriever = OriginalQueryAwareRetriever()
+    monkeypatch.setattr(
+        "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+        lambda **_kwargs: retriever,
+    )
+    app = create_retrieval_service_app(config_name="cfg", work_dir=tmp_path)
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/retrieve",
+            json={"query": "rewritten query", "original_query": "original Arabic query"},
+        )
+        cached = client.post(
+            "/retrieve",
+            json={"query": "rewritten query", "original_query": "original Arabic query"},
+        )
+        different_original = client.post(
+            "/retrieve",
+            json={"query": "rewritten query", "original_query": "different original query"},
+        )
+
+    assert retriever.calls == [
+        ("rewritten query", "original Arabic query"),
+        ("rewritten query", "different original query"),
+    ]
+    assert first.json()["service_original_query_forwarded"] is True
+    assert cached.json()["service_cache_hit"] is True
+    assert different_original.json()["service_cache_hit"] is False
+
+
 def test_retrieval_service_forwards_navigation_context_and_separates_cache(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 
@@ -561,6 +611,97 @@ def test_evidence_adjudicator_timeout_retains_bounded_capacity(monkeypatch):
         retriever.close()
 
 
+def test_premise_grounding_fallback_rejects_generic_scoped_evidence():
+    from pipeline.core.evidence_adjudicator import (
+        heuristic_adjudicate_factual_evidence,
+    )
+
+    result = heuristic_adjudicate_factual_evidence(
+        query="ما رقم هاتف مكتب جامعة محمد بن زايد للذكاء الاصطناعي في سنغافورة؟",
+        intent_summary={
+            "answer_types": ["phone"],
+            "requested_roles": [],
+            "subject_tokens": [],
+            "subject_phrases": [],
+            "strict_answer_required": True,
+        },
+        answer_documents=[
+            {
+                "id": "generic-phone",
+                "answer_type": "phone",
+                "value": "+971 2 811 3333",
+                "text": "The general MBZUAI phone number is +971 2 811 3333.",
+            }
+        ],
+        fact_documents=[],
+        retrieval_documents=[],
+    )
+
+    assert result["abstain"] is True
+    assert result["reason"] == "presupposed_entity_or_scope_not_supported"
+
+
+def test_premise_grounding_routes_non_fact_queries(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    calls = []
+
+    def adjudicate(**kwargs):
+        calls.append(kwargs)
+        return {
+            "used": True,
+            "method": "openai",
+            "abstain": True,
+            "selected_answer_ids": [],
+            "selected_fact_ids": [],
+            "selected_chunk_ids": [],
+            "reason": "offering_not_supported",
+            "confidence": 0.94,
+        }
+
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", adjudicate)
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.selective_adjudication_enabled = True
+    retriever.evidence_adjudicator_model = "gpt-5-nano"
+    retriever.evidence_adjudicator_reasoning_effort = "minimal"
+    retriever.evidence_adjudicator_min_confidence = 0.58
+    retriever.evidence_adjudicator_max_completion_tokens = 100
+    retriever.evidence_adjudicator_retries = 1
+    retriever.evidence_adjudicator_retry_delay_sec = 0.0
+    retriever.evidence_adjudicator_per_request_delay_sec = 0.0
+    retriever.evidence_adjudicator_timeout_sec = 1.0
+    retriever.evidence_adjudicator_provider_timeout_sec = 0.8
+    retriever.evidence_adjudicator_max_workers = 1
+    retriever.evidence_adjudicator_answer_limit = 2
+    retriever.evidence_adjudicator_fact_limit = 2
+    retriever.evidence_adjudicator_chunk_limit = 2
+
+    try:
+        result = retriever._apply_evidence_adjudication(
+            "What are the admission requirements for MBZUAI's veterinary medicine degree?",
+            {
+                "mode": "scoped",
+                "abstained": False,
+                "retrieval_confidence": 0.95,
+                "selected_chunk_ids": ["chunk-1"],
+                "answer_documents": [],
+                "fact_documents": [],
+                "retrieval_documents": [
+                    {"id": "chunk-1", "text": "General graduate admission requirements."}
+                ],
+            },
+        )
+    finally:
+        retriever.close()
+
+    assert len(calls) == 1
+    assert result["premise_grounding_required"] is True
+    assert result["abstained"] is True
+    assert result["adjudication_reason"] == "offering_not_supported"
+
+
 def test_openai_client_uses_explicit_provider_deadline(monkeypatch):
     import sys
     from types import SimpleNamespace
@@ -585,6 +726,66 @@ def test_openai_client_uses_explicit_provider_deadline(monkeypatch):
 
     assert first is second
     assert captured == [3.5]
+
+
+def test_navigation_catalog_rescue_skips_text_only_adjudication(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("navigation catalog evidence must not use text adjudication")
+
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", fail_if_called)
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+
+    result = retriever._apply_evidence_adjudication(
+        "Where can I apply for this position?",
+        {
+            "mode": "fact",
+            "abstained": False,
+            "navigation_evidence_rescued": True,
+            "retrieval_documents": [{"id": "unrelated-text"}],
+        },
+    )
+
+    assert result["premise_grounding_required"] is False
+    assert result["abstained"] is False
+    assert result["adjudication_used"] is False
+    assert result["verification_status"] == "verified_navigation_catalog"
+    assert result["adjudication_reason"] == "grounded_navigation_evidence"
+
+
+def test_verified_media_evidence_skips_text_only_adjudication(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("verified media evidence must not use text adjudication")
+
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", fail_if_called)
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.vector = SimpleNamespace(
+        _has_grounded_media_candidates=lambda **_kwargs: True,
+    )
+
+    result = retriever._apply_evidence_adjudication(
+        "What does the image on page 10 show?",
+        {
+            "query_rewritten": "What does the image on page 10 show? visual figure",
+            "mode": "fact",
+            "abstained": False,
+            "selected_media_ids": ["media-page-10"],
+            "dense_media_ids": ["media-page-10"],
+            "media": [{"id": "media-page-10"}],
+            "retrieval_documents": [{"id": "weak-context", "text": "Program context."}],
+        },
+    )
+
+    assert result["abstained"] is False
+    assert result["adjudication_used"] is False
+    assert result["media_evidence_verified"] is True
+    assert result["verification_status"] == "verified_media_evidence"
+    assert result["adjudication_reason"] == "grounded_media_evidence"
 
 
 def test_adaptive_retrieval_uses_request_local_timing_diagnostics():
@@ -637,3 +838,124 @@ def test_adaptive_retrieval_uses_request_local_timing_diagnostics():
     assert lanes["chunk_dense_ids"] == ["dense-chunk"]
     assert set(diagnostics["lane_latency_ms"]) == {"chunk_dense_ids"}
     assert not hasattr(retriever, "_last_lane_latency_ms")
+
+
+def test_navigation_candidates_can_rescue_text_abstention_only_when_grounded():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.page_card_map = {
+        "page:profile": {"id": "page:profile"},
+        "page:other": {"id": "page:other"},
+    }
+    retriever.action_map = {
+        "action:email": {
+            "id": "action:email",
+            "page_card_ids": ["page:profile"],
+            "title": "person@mbzuai.ac.ae",
+            "raw_text": "person@mbzuai.ac.ae profile email",
+            "metadata": {"action_type": "email"},
+        },
+        "action:download": {
+            "id": "action:download",
+            "page_card_id": "page:other",
+            "action_type": "download",
+            "label": "Download",
+        },
+    }
+
+    assert retriever._has_grounded_navigation_candidates(
+        query="What contact email is linked from the profile?",
+        page_card_ids=["page:profile"],
+        action_ids=["action:email"],
+    )
+    assert not retriever._has_grounded_navigation_candidates(
+        query="What contact email is linked from the profile?",
+        page_card_ids=["page:profile"],
+        action_ids=["action:download"],
+    )
+    assert not retriever._has_grounded_navigation_candidates(
+        query="What does the profile say?",
+        page_card_ids=["page:profile"],
+        action_ids=["action:email"],
+    )
+
+
+def test_local_fact_lane_bounds_expensive_rescoring_to_posting_limit():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    fact_ids = [f"fact:{index:04d}" for index in range(1000)]
+    retriever.fact_map = {
+        fact_id: {"id": fact_id, "text": "campus information"}
+        for fact_id in fact_ids
+    }
+    retriever.fact_token_index = {"campus": fact_ids}
+    retriever.fact_tokens_by_id = {
+        fact_id: ["campus", "information"] for fact_id in fact_ids
+    }
+    retriever.local_index_max_postings_per_token = 64
+    retriever._informative_query_tokens = lambda _query: ["campus"]
+    retriever._source_query_bonus = lambda *_args, **_kwargs: 0.0
+    scored: list[str] = []
+
+    def fact_bonus(_query: str, fact_text: str) -> float:
+        scored.append(fact_text)
+        return 0.1
+
+    retriever._fact_query_bonus = fact_bonus
+
+    result = retriever._local_fact_query_ids("campus", top_k=8)
+
+    assert len(result) == 8
+    assert len(scored) == 64
+
+
+def test_graph_assertion_lane_scores_only_indexed_candidates():
+    from pipeline.retrieval.graph_rag import GraphRAGRetriever
+
+    retriever = GraphRAGRetriever.__new__(GraphRAGRetriever)
+    retriever.local_graph_available = True
+    retriever._local_graph_loaded = True
+    retriever.graph_relation_local_candidate_limit = 12
+    retriever.assertion_map = {
+        f"assertion:{index:04d}": {"id": f"assertion:{index:04d}"}
+        for index in range(1000)
+    }
+    retriever.base = SimpleNamespace(
+        namespace_assertions="assertions",
+        _lexical_query_ids=lambda *_args, **_kwargs: ["assertion:0042"],
+    )
+    retriever._expanded_relation_query = lambda query, _plan: query
+    scored: list[str] = []
+
+    def score(_query, _plan, node):
+        scored.append(node["id"])
+        return 1.0
+
+    retriever._score_relation_assertion_candidate = score
+
+    result = retriever._local_relation_assertion_candidates(
+        "Where is MBZUAI located?",
+        SimpleNamespace(alias_tokens=()),
+    )
+
+    assert result == [("assertion:0042", 1.0)]
+    assert scored == ["assertion:0042"]
+
+
+def test_person_name_detection_does_not_treat_program_names_as_people():
+    from pipeline.retrieval.adaptive_hybrid import (
+        _person_name_tokens,
+        _support_query_intents,
+    )
+
+    visitor_query = (
+        "What does the MBZUAI Visitor Program say visitors can get hands-on access to?"
+    )
+
+    assert _person_name_tokens(visitor_query) == []
+    assert "faculty_person" not in _support_query_intents(visitor_query)
+    assert _person_name_tokens(
+        "What is the email address linked to Mark Juan in the directory listing?"
+    ) == ["mark", "juan"]

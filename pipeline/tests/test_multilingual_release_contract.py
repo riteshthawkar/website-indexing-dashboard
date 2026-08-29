@@ -51,6 +51,27 @@ def test_release_gates_require_arabic_coverage_and_latency_metrics():
     assert answer_gates["overall"]["p95_latency_ms"]["max"] == 60000
 
 
+def test_multilingual_v2_selection_gate_covers_production_dimensions():
+    gates = json.loads(
+        (
+            REPO_ROOT
+            / "eval"
+            / "gates"
+            / "retrieval_gate.multilingual_v2_selection.json"
+        ).read_text(encoding="utf-8")
+    )
+
+    overall = gates["overall"]
+    assert overall["query_count"]["min"] == 96
+    assert overall["retrieval_error_count"]["max"] == 0
+    assert overall["no_answer_violation_rate"]["max"] == 0.0
+    assert overall["document_hit_at_10"]["min"] >= 0.90
+    assert overall["exact_media_hit_at_5"]["min"] >= 0.70
+    assert overall["navigation_action_hit_at_5"]["min"] == 1.0
+    assert overall["backend_latency_p95_ms"]["max"] <= 12000
+    assert gates["by_language"]["Arabic"]["query_count"]["min"] == 48
+
+
 def test_metric_gates_enforce_language_slices():
     failures = check_metric_gates(
         {

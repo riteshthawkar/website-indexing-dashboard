@@ -12,7 +12,10 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
 from urllib.parse import unquote, urlparse
 
-from pipeline.core.config import load_config
+from pipeline.core.config import (
+    load_config,
+    production_serving_contract_fingerprint,
+)
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.evaluation.dataset import EvalExample, load_eval_examples
 from pipeline.evaluation.dataset_tools import validate_eval_examples
@@ -20,8 +23,8 @@ from pipeline.evaluation.multilingual_v2 import normalize_evidence_text
 from pipeline.retrieval import AdaptiveHybridRetriever
 from pipeline.retrieval.adaptive_hybrid import apply_vector_upload_manifest_config
 
-_RETRIEVAL_RESULT_CACHE_VERSION = 7
-_RETRIEVAL_RESULT_CACHE_ENTRY_VERSION = 7
+_RETRIEVAL_RESULT_CACHE_VERSION = 8
+_RETRIEVAL_RESULT_CACHE_ENTRY_VERSION = 8
 EvalProgressCallback = Callable[[str, Mapping[str, Any]], None]
 
 
@@ -973,6 +976,12 @@ def _retrieval_cache_config_payload(config_payload: Dict[str, Any] | None) -> Di
     normalized: Dict[str, Any] = {
         "retrieval": retrieval_cfg,
         "embedder": relevant_embedder,
+        # The serving fingerprint includes routing, ranking, evidence packing,
+        # and vector-store implementation hashes. A code change must never
+        # silently reuse results produced by an older retrieval behavior.
+        "serving_contract_fingerprint": production_serving_contract_fingerprint(
+            payload
+        ),
     }
     retriever_backend = str(retrieval_cfg.get("retriever_backend") or "vector").strip().lower()
     if retriever_backend != "vector":
@@ -1103,6 +1112,7 @@ def _score_query(
     evidence_representation_ids = _evidence_representation_ids(result)
     selected_document_revision_ids = _unique_in_order(
         [
+            *[str(value) for value in result.get("selected_document_revision_ids") or []],
             *_identity_values_for_records(
                 representation_ids,
                 "document_revision_ids",
@@ -1113,6 +1123,7 @@ def _score_query(
     )
     selected_page_card_ids = _unique_in_order(
         [
+            *[str(value) for value in result.get("selected_page_card_ids") or []],
             *_identity_values_for_records(
                 representation_ids,
                 "page_card_ids",
@@ -1123,6 +1134,7 @@ def _score_query(
     )
     broad_selected_section_ids = _unique_in_order(
         [
+            *[str(value) for value in result.get("selected_section_ids") or []],
             *_identity_values_for_records(
                 representation_ids,
                 "section_ids",
@@ -1133,6 +1145,7 @@ def _score_query(
     )
     selected_section_ids = _unique_in_order(
         [
+            *[str(value) for value in result.get("selected_section_ids") or []],
             *_identity_values_for_records(
                 evidence_representation_ids,
                 "section_ids",
@@ -1991,6 +2004,7 @@ def evaluate_retrieval_dataset(
     gates_path: str | Path | None = None,
     query_cache_path: str | Path | None = None,
     retrieval_cache_path: str | Path | None = None,
+    splits: Sequence[str] | None = None,
     parallelism: int = 1,
     progress_callback: EvalProgressCallback | None = None,
     progress_interval: int = 1,
@@ -2014,6 +2028,25 @@ def evaluate_retrieval_dataset(
             ],
             "warnings": [],
         }
+    requested_splits = list(
+        dict.fromkeys(
+            str(value or "").strip().lower()
+            for value in (splits or [])
+            if str(value or "").strip()
+        )
+    )
+    if requested_splits:
+        examples = [
+            example
+            for example in examples
+            if str(example.metadata.get("split") or "").strip().lower()
+            in requested_splits
+        ]
+        if not examples:
+            raise ValueError(
+                "No evaluation examples matched split(s): "
+                + ", ".join(requested_splits)
+            )
     _emit_progress(
         progress_callback,
         "retrieval_eval_start",
@@ -2328,9 +2361,16 @@ def evaluate_retrieval_dataset(
     if retrieval_cache_dirty:
         _save_retrieval_result_cache(retrieval_cache_file, retrieval_cache)
 
+    overall_metrics = _aggregate_scores(scores)
+    overall_metrics["retrieval_error_count"] = float(len(retrieval_errors))
+    overall_metrics["successful_query_count"] = float(
+        len(scores) - len(retrieval_errors)
+    )
+
     report = {
         "dataset_path": str(Path(dataset_path).resolve()),
         "dataset_fingerprint": dataset_fingerprint,
+        "requested_splits": requested_splits,
         "work_dir": str(Path(work_dir).resolve()),
         "config_name": str(config_name),
         "config_fingerprint": config_fingerprint,
@@ -2362,7 +2402,7 @@ def evaluate_retrieval_dataset(
             "legacy_hit_count": legacy_retrieval_cache_hits,
             "size": len(retrieval_cache),
         },
-        "overall": _aggregate_scores(scores),
+        "overall": overall_metrics,
         "by_query_type": _slice_scores(scores, "query_type"),
         "by_source_type": _slice_scores(scores, "source_type"),
         "by_language": _slice_scores(scores, "language"),
