@@ -258,6 +258,10 @@ retrieval:
   serving_contract_revision: "mbzuai-routed-hybrid-v3"
   retriever_backend: "routed_hybrid"
   routed_graph_required: true
+  # The release bundle carries an attested, immutable graph snapshot. Serving
+  # from that snapshot avoids remote Neo4j latency and keeps graph traversal
+  # bound to the same corpus revision as the vector and lexical indexes.
+  graph_query_backend: "local"
   query_planner_enabled: true
   navigation_plan_enabled: true
   navigation_plan_required: true

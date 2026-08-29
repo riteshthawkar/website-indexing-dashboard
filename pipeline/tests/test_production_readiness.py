@@ -252,6 +252,15 @@ def test_canonical_production_rejects_downgraded_crawl_contract(monkeypatch):
     )
 
 
+def test_canonical_production_serves_the_attested_local_graph():
+    from pipeline.core.config import load_config
+
+    config = load_config("mbzuai_production")
+
+    assert config["retrieval"]["routed_graph_required"] is True
+    assert config["retrieval"]["graph_query_backend"] == "local"
+
+
 def test_canonical_production_crawl_contract_is_satisfied(monkeypatch):
     from pipeline.core.config import load_config
     from pipeline.core.preflight import assess_production_readiness
