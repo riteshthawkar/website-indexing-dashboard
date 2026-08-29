@@ -137,6 +137,13 @@ def test_arabic_answer_matching_accepts_governed_lexical_equivalents():
     assert _required_term_supported("تشرف لجان المجلس والإدارة على شؤون الجامعة.", "لجان إدارية")
 
 
+def test_arabic_answer_matching_handles_feminine_plural_with_attached_pronoun():
+    assert _required_term_supported(
+        "رقم الهاتف المنشور لهذا الاستفسار هو +971 (0) 2 811 3203.",
+        "استفساراتكم",
+    )
+
+
 def test_judge_prompt_uses_explicit_dubai_reference_datetime(monkeypatch):
     monkeypatch.setenv("ANSWER_READINESS_REFERENCE_DATETIME", "2026-08-29T12:30:00+04:00")
 

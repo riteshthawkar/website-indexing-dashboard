@@ -510,10 +510,16 @@ def _arabic_term_token_variants(token: str) -> set[str]:
         if value.endswith(suffix) and len(value) - len(suffix) >= 3:
             base = value[: -len(suffix)]
             variants.add(base)
+            if base.endswith("ات") and len(base) - 2 >= 3:
+                # Sound feminine plurals keep the same lexical fact after an
+                # attached pronoun: استفساراتكم -> استفسارات -> استفسار.
+                variants.add(base[:-2])
             # Taa marbuta is written as taa before an attached possessive
             # pronoun: مكانة -> مكانتها. Preserve that grammatical identity.
             if base.endswith("ت"):
                 variants.add(f"{base[:-1]}ة")
+    if value.endswith("ات") and len(value) - 2 >= 3:
+        variants.add(value[:-2])
     return variants
 
 
