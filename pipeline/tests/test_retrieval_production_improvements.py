@@ -1943,6 +1943,19 @@ def test_routed_required_page_backfill_bridges_page_alias_to_shared_chunks():
         _score_text_match=lambda query, text: 1.0,
     )
     retriever._coverage_page_records = retriever._build_coverage_page_records()
+    retriever._coverage_page_records_by_url = {
+        page["normalized_url"]: page
+        for page in retriever._coverage_page_records
+    }
+    retriever._coverage_record_indexes = retriever._build_coverage_record_indexes()
+    assert [
+        record["id"]
+        for record in retriever._coverage_candidates_for_required_page(
+            record_type="chunks",
+            required_page=requested_url,
+            source_map=retriever.vector.chunk_map,
+        )
+    ] == [chunk_id]
     payload = {
         "selected_chunk_ids": [],
         "selected_fact_ids": [],
@@ -7429,6 +7442,45 @@ def test_selective_adjudication_skips_high_confidence_single_answer():
             "answer_documents": [{"id": "a1", "text": "The answer is weak."}],
         }
     )
+    assert not retriever._should_run_evidence_adjudication(
+        {
+            "retrieval_confidence": 0.72,
+            "answer_documents": [],
+            "fact_documents": [{"id": "fact-1", "text": "A supported fact."}],
+        }
+    )
+    assert retriever._should_run_evidence_adjudication(
+        {
+            "retrieval_confidence": 0.60,
+            "answer_documents": [],
+            "fact_documents": [{"id": "fact-1", "text": "A weak fact."}],
+        }
+    )
+
+
+def test_verified_media_evidence_skips_heuristic_required_page_inference():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._coverage_intent = lambda _query, _mode: "scoped"
+    retriever._infer_coverage_requirements = lambda *_args: (_ for _ in ()).throw(
+        AssertionError("verified media must not infer unrelated text pages")
+    )
+
+    plan = retriever._coverage_plan_for_result(
+        query="What does the image on page 10 say?",
+        payload={
+            "media_evidence_verified": True,
+            "selected_media_ids": ["media-page-10"],
+            "selected_chunk_ids": ["chunk-page-10"],
+        },
+        mode=QueryMode.SCOPED,
+    )
+
+    assert plan["required_pages"] == []
+    assert plan["required_pages_source"] == "verified_media_evidence"
+    assert plan["coverage_status"] == "complete"
 
 
 def test_lookup_profile_preserves_contact_types_for_hours_plus_contact_query():

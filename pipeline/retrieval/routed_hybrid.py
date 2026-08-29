@@ -195,6 +195,18 @@ class RoutedHybridRetriever:
             )
         self.evidence_adjudicator_enabled = bool(retrieval_cfg.get("evidence_adjudicator_enabled", False))
         self.selective_adjudication_enabled = bool(retrieval_cfg.get("selective_adjudication_enabled", True))
+        self.selective_adjudication_fact_min_confidence = max(
+            0.0,
+            min(
+                1.0,
+                float(
+                    retrieval_cfg.get(
+                        "selective_adjudication_fact_min_confidence",
+                        0.65,
+                    )
+                ),
+            ),
+        )
         self.evidence_adjudicator_model = str(retrieval_cfg.get("evidence_adjudicator_model") or "gpt-5-nano")
         self.evidence_adjudicator_reasoning_effort = str(
             retrieval_cfg.get("evidence_adjudicator_reasoning_effort") or "minimal"
@@ -280,6 +292,7 @@ class RoutedHybridRetriever:
             for page in self._coverage_page_records
             if str(page.get("normalized_url") or "")
         }
+        self._coverage_record_indexes = self._build_coverage_record_indexes()
 
         self.graph: GraphRAGRetriever | None = None
         self.graph_init_error: str | None = None
@@ -738,6 +751,10 @@ class RoutedHybridRetriever:
         ):
             payload.setdefault("adjudication_used", False)
             payload.setdefault("verification_status", "skipped_high_confidence")
+            payload.setdefault(
+                "adjudication_reason",
+                "retrieval_confidence_sufficient",
+            )
             return payload
 
         answer_documents = [
@@ -905,13 +922,29 @@ class RoutedHybridRetriever:
         if premise_grounding_required:
             return True
         confidence = float(payload.get("retrieval_confidence") or 0.0)
-        if confidence <= 0.55:
+        fact_confidence_floor = float(
+            getattr(
+                self,
+                "selective_adjudication_fact_min_confidence",
+                0.65,
+            )
+        )
+        if confidence < fact_confidence_floor:
             return True
         answer_documents = [
             doc for doc in (payload.get("answer_documents") or []) if isinstance(doc, dict)
         ]
         if not answer_documents:
-            return True
+            fact_documents = [
+                doc
+                for doc in (payload.get("fact_documents") or [])
+                if isinstance(doc, dict) and str(doc.get("id") or "")
+            ]
+            # High-confidence fact lanes already passed dense/local fusion and
+            # deterministic ranking. Calling the provider with no structured
+            # answer candidates usually returns the same heuristic selection
+            # after a network round trip, adding latency and nondeterminism.
+            return not fact_documents
         answer_values = {
             str(doc.get("value") or doc.get("text") or "").strip().casefold()
             for doc in answer_documents
@@ -945,7 +978,19 @@ class RoutedHybridRetriever:
         mode: QueryMode,
     ) -> Dict[str, Any]:
         intent = self._coverage_intent(query, mode)
-        inferred = self._infer_coverage_requirements(query, intent)
+        if payload.get("media_evidence_verified"):
+            # The media verifier already established a source-backed visual
+            # match (OCR/caption plus dense or sparse evidence). Heuristically
+            # inferring unrelated text pages here both dilutes the media pack
+            # and triggers unnecessary required-page corpus scans.
+            inferred = {
+                "required_entities": [],
+                "required_pages": [],
+                "required_sections": [],
+                "required_pages_source": "verified_media_evidence",
+            }
+        else:
+            inferred = self._infer_coverage_requirements(query, intent)
         required_entities = [
             str(value)
             for value in (payload.get("required_entities") or inferred.get("required_entities") or [])
@@ -1270,6 +1315,116 @@ class RoutedHybridRetriever:
             if str(page.get("normalized_url") or "") == normalized:
                 return page
         return None
+
+    def _build_coverage_record_indexes(
+        self,
+    ) -> Dict[str, Dict[str, Dict[str, List[tuple[int, Dict[str, Any]]]]]]:
+        """Build immutable lookup tables for required-page evidence backfill.
+
+        Required-page selection used to scan every fact and evidence span for
+        every inferred page. The records are immutable for a serving process,
+        so indexing their URL/revision/chunk identities once preserves the
+        exact candidate set and stable source-map order without request-time
+        corpus scans.
+        """
+
+        record_maps = {
+            "evidence_spans": getattr(self.vector, "evidence_span_map", {}),
+            "facts": getattr(self.vector, "fact_map", {}),
+            "chunks": getattr(self.vector, "chunk_map", {}),
+            "parents": getattr(self.vector, "parent_map", {}),
+        }
+        indexes: Dict[
+            str,
+            Dict[str, Dict[str, List[tuple[int, Dict[str, Any]]]]],
+        ] = {}
+        for record_type, source_map in record_maps.items():
+            index: Dict[str, Dict[str, List[tuple[int, Dict[str, Any]]]]] = {
+                "url": {},
+                "revision": {},
+                "chunk": {},
+            }
+            if not isinstance(source_map, Mapping):
+                indexes[record_type] = index
+                continue
+            for order, record in enumerate(source_map.values()):
+                if not isinstance(record, dict):
+                    continue
+                entry = (order, record)
+                normalized_url = self._normalize_source_url(
+                    self._source_url_from_record(record)
+                )
+                if normalized_url:
+                    index["url"].setdefault(normalized_url, []).append(entry)
+                metadata = (
+                    record.get("metadata")
+                    if isinstance(record.get("metadata"), Mapping)
+                    else {}
+                )
+                revision_id = str(
+                    record.get("document_revision_id")
+                    or metadata.get("document_revision_id")
+                    or ""
+                ).strip()
+                if revision_id:
+                    index["revision"].setdefault(revision_id, []).append(entry)
+                chunk_ids = {
+                    str(value).strip()
+                    for value in [
+                        record.get("id")
+                        if str(record.get("id") or "").startswith("chunk:")
+                        else "",
+                        record.get("chunk_id"),
+                        *(record.get("linked_chunk_ids") or []),
+                    ]
+                    if str(value or "").strip()
+                }
+                for chunk_id in chunk_ids:
+                    index["chunk"].setdefault(chunk_id, []).append(entry)
+            indexes[record_type] = index
+        return indexes
+
+    def _coverage_candidates_for_required_page(
+        self,
+        *,
+        record_type: str,
+        required_page: str,
+        source_map: Mapping[str, Any] | None,
+    ) -> List[Dict[str, Any]]:
+        indexes = getattr(self, "_coverage_record_indexes", None)
+        record_index = indexes.get(record_type) if isinstance(indexes, Mapping) else None
+        if not isinstance(record_index, Mapping):
+            return [
+                record
+                for record in (source_map or {}).values()
+                if isinstance(record, dict)
+            ]
+
+        page_record = self._coverage_page_record_for_url(required_page) or {}
+        entries: Dict[str, tuple[int, Dict[str, Any]]] = {}
+
+        def add_candidates(values: Sequence[tuple[int, Dict[str, Any]]]) -> None:
+            for order, record in values:
+                record_key = str(record.get("id") or f"record-order:{order}")
+                current = entries.get(record_key)
+                if current is None or order < current[0]:
+                    entries[record_key] = (order, record)
+
+        normalized_url = self._normalize_source_url(required_page)
+        add_candidates((record_index.get("url") or {}).get(normalized_url, []))
+        for revision_id in page_record.get("document_revision_ids") or set():
+            add_candidates(
+                (record_index.get("revision") or {}).get(str(revision_id), [])
+            )
+        for chunk_id in page_record.get("linked_chunk_ids") or set():
+            add_candidates(
+                (record_index.get("chunk") or {}).get(str(chunk_id), [])
+            )
+        return [
+            record
+            for _order, record in sorted(entries.values(), key=lambda item: item[0])
+            if self._record_matches_required_page(record, required_page)
+        ]
 
     def _coverage_pages_share_representation(self, left: Any, right: Any) -> bool:
         left_page = self._coverage_page_record_for_url(left)
@@ -2343,7 +2498,12 @@ class RoutedHybridRetriever:
 
     def _best_required_page_spans(self, query: str, required_page: str, *, limit: int = 2) -> List[Dict[str, Any]]:
         scored: List[tuple[float, Dict[str, Any]]] = []
-        for span in getattr(self.vector, "evidence_span_map", {}).values():
+        evidence_span_map = getattr(self.vector, "evidence_span_map", {})
+        for span in self._coverage_candidates_for_required_page(
+            record_type="evidence_spans",
+            required_page=required_page,
+            source_map=evidence_span_map,
+        ):
             if not isinstance(span, dict):
                 continue
             if not self._record_matches_required_page(span, required_page):
@@ -2377,7 +2537,12 @@ class RoutedHybridRetriever:
 
     def _best_required_page_facts(self, query: str, required_page: str, *, limit: int = 1) -> List[Dict[str, Any]]:
         scored: List[tuple[float, Dict[str, Any]]] = []
-        for fact in getattr(self.vector, "fact_map", {}).values():
+        fact_map = getattr(self.vector, "fact_map", {})
+        for fact in self._coverage_candidates_for_required_page(
+            record_type="facts",
+            required_page=required_page,
+            source_map=fact_map,
+        ):
             if not isinstance(fact, dict):
                 continue
             if not self._record_matches_required_page(fact, required_page):
@@ -2407,16 +2572,10 @@ class RoutedHybridRetriever:
     ) -> List[Dict[str, Any]]:
         scored: List[tuple[float, Dict[str, Any]]] = []
         chunk_map = getattr(self.vector, "chunk_map", {})
-        required_record = self._coverage_page_record_for_url(required_page) or {}
-        linked_chunk_ids = [
-            str(value)
-            for value in required_record.get("linked_chunk_ids") or []
-            if str(value)
-        ]
-        candidate_chunks = (
-            [chunk_map[chunk_id] for chunk_id in linked_chunk_ids if chunk_id in chunk_map]
-            if linked_chunk_ids
-            else list(chunk_map.values())
+        candidate_chunks = self._coverage_candidates_for_required_page(
+            record_type="chunks",
+            required_page=required_page,
+            source_map=chunk_map,
         )
         for chunk in candidate_chunks:
             if not isinstance(chunk, dict) or not self._record_matches_required_page(
@@ -2464,8 +2623,14 @@ class RoutedHybridRetriever:
         if not _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or "")):
             return None
         scored: List[tuple[float, Dict[str, Any]]] = []
-        for parent_id, parent in getattr(self.vector, "parent_map", {}).items():
-            if not isinstance(parent, dict) or not str(parent_id or "").endswith(":page"):
+        parent_map = getattr(self.vector, "parent_map", {})
+        for parent in self._coverage_candidates_for_required_page(
+            record_type="parents",
+            required_page=required_page,
+            source_map=parent_map,
+        ):
+            parent_id = str(parent.get("id") or "")
+            if not isinstance(parent, dict) or not parent_id.endswith(":page"):
                 continue
             if not self._record_matches_required_page(parent, required_page):
                 continue

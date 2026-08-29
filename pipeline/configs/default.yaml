@@ -562,6 +562,7 @@ retrieval:
   hyde_min_confidence: 0.55
   hyde_max_chars: 600
   selective_adjudication_enabled: true
+  selective_adjudication_fact_min_confidence: 0.65
   namespace_evidence_spans: "evidence_spans"
   evidence_budget_items: 8
   evidence_budget_chars: 8000
