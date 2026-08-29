@@ -61,6 +61,7 @@ DEFAULT_RELEASE_ANSWER_GATES = (
     PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.multilingual_v2_release.json"
 )
 LEGACY_ONLY_VALIDATION_PLUGINS = {"mbzuai_legacy_vectorstores", "mbzuai_legacy_pinecone"}
+RELEASE_MUTATING_VALIDATION_PLUGINS = {"gemini_pgvector"}
 ReleaseProgressCallback = Callable[[str, Mapping[str, Any]], None]
 PROMOTION_ATTESTATION_SCHEMA_VERSION = 1
 PROMOTION_ATTESTATION_MAX_AGE_SECONDS = 120.0
@@ -505,15 +506,20 @@ def _validation_config_for_release(config: Dict[str, Any], work_dir: Path) -> Di
         work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json",
         {},
     ) or {}
-    if not isinstance(modern_manifest, dict) or not str(modern_manifest.get("index_name") or "").strip():
-        return payload
+    modern_release = isinstance(modern_manifest, dict) and bool(
+        str(modern_manifest.get("index_name") or "").strip()
+    )
+    skipped_plugins = set(RELEASE_MUTATING_VALIDATION_PLUGINS)
+    if modern_release:
+        skipped_plugins.update(LEGACY_ONLY_VALIDATION_PLUGINS)
 
     stages = []
     for stage in payload.get("stages") or []:
         if not isinstance(stage, dict):
             stages.append(stage)
             continue
-        if str(stage.get("plugin") or "") in LEGACY_ONLY_VALIDATION_PLUGINS:
+        plugin = str(stage.get("plugin") or "")
+        if plugin in skipped_plugins:
             continue
         stages.append(stage)
     payload["stages"] = stages

@@ -17,12 +17,20 @@ from pipeline.core.release_policy import (
 
 
 def test_release_stage_validation_uses_release_purpose_without_mutating_config(tmp_path) -> None:
-    config = {"pipeline": {"production_profile": True}, "stages": []}
+    config = {
+        "pipeline": {"production_profile": True},
+        "stages": [
+            {"id": "verify", "plugin": "verify_selected_profile"},
+            {"id": "upload", "plugin": "gemini_pgvector"},
+        ],
+    }
 
     release_config = _validation_config_for_release(config, tmp_path)
 
     assert release_config["pipeline"]["validation_purpose"] == "release"
+    assert [stage["id"] for stage in release_config["stages"]] == ["verify"]
     assert "validation_purpose" not in config["pipeline"]
+    assert [stage["id"] for stage in config["stages"]] == ["verify", "upload"]
 
 
 def test_committed_production_evaluation_policy_matches_pinned_hashes() -> None:
