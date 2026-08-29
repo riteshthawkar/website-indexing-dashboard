@@ -3207,11 +3207,19 @@ class RoutedHybridRetriever:
                     raise
         backend_latency_ms = (time.perf_counter() - backend_started) * 1000.0
 
+        postprocess_started = time.perf_counter()
+        postprocess_stage_latency_ms: Dict[str, float] = {}
+
+        stage_started = time.perf_counter()
         payload = dict(result or {})
         preliminary_confidence, preliminary_factors = score_retrieval_confidence(payload)
         payload["retrieval_confidence"] = preliminary_confidence
         payload["confidence_factors"] = preliminary_factors
         payload = self._apply_evidence_adjudication(coverage_query, payload)
+        postprocess_stage_latency_ms["evidence_adjudication_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
         payload["query"] = query
         payload["original_query"] = coverage_query
         payload["query_rewritten"] = rewrites.vector_query
@@ -3252,6 +3260,7 @@ class RoutedHybridRetriever:
         confidence, factors = score_retrieval_confidence(payload)
         payload["retrieval_confidence"] = confidence
         payload["confidence_factors"] = factors
+        stage_started = time.perf_counter()
         coverage_plan = self._coverage_plan_for_result(
             query=coverage_query,
             payload=payload,
@@ -3270,11 +3279,21 @@ class RoutedHybridRetriever:
                 payload=payload,
                 mode=mode,
             )
+        postprocess_stage_latency_ms["coverage_planning_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         self._prioritize_required_page_evidence(
             query=coverage_query,
             payload=payload,
             coverage_plan=coverage_plan,
         )
+        postprocess_stage_latency_ms["required_page_prioritization_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         dense_page_card_ids_before_fusion = [
             str(value)
             for value in payload.get("dense_page_card_ids") or []
@@ -3295,6 +3314,11 @@ class RoutedHybridRetriever:
             payload.get("dense_page_card_ids")
             != dense_page_card_ids_before_fusion
         )
+        postprocess_stage_latency_ms["page_card_fusion_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         selected_parent_ids = [
             str(value)
             for value in (payload.get("selected_parent_ids") or [])
@@ -3306,6 +3330,11 @@ class RoutedHybridRetriever:
                 selected_parent_ids,
                 limit=len(selected_parent_ids),
             )
+        postprocess_stage_latency_ms["parent_diversification_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         if self.navigation_plan_enabled:
             payload["navigation_plan"] = self.navigation_planner.plan(
                 query=coverage_query,
@@ -3344,6 +3373,11 @@ class RoutedHybridRetriever:
                 payload,
                 payload["navigation_plan"],
             )
+        postprocess_stage_latency_ms["navigation_plan_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         representation_identities = self.navigation_planner.representation_identities(
             payload,
             query=coverage_query,
@@ -3356,6 +3390,11 @@ class RoutedHybridRetriever:
             "page_card_ids"
         ]
         payload["selected_section_ids"] = representation_identities["section_ids"]
+        postprocess_stage_latency_ms["representation_identity_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         budget_items, budget_chars, budget_max_per_source = self._evidence_budget_for_plan(coverage_plan)
         payload["evidence_pack"] = build_evidence_pack(
             query=coverage_query,
@@ -3370,6 +3409,14 @@ class RoutedHybridRetriever:
         payload["missing_required_entities"] = payload["evidence_pack"].get("missing_required_entities") or []
         payload["missing_required_pages"] = payload["evidence_pack"].get("missing_required_pages") or []
         payload["missing_required_sections"] = payload["evidence_pack"].get("missing_required_sections") or []
+        postprocess_stage_latency_ms["evidence_pack_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        postprocess_stage_latency_ms["total_ms"] = round(
+            (time.perf_counter() - postprocess_started) * 1000.0,
+            3,
+        )
         payload["retrieval_trace"] = {
             "backend": decision.backend,
             "reason": decision.reason,
@@ -3396,6 +3443,7 @@ class RoutedHybridRetriever:
             "graph_context_latency_ms": payload.get("graph_context_latency_ms") or 0.0,
             "graph_augment_latency_ms": payload.get("graph_augment_latency_ms") or 0.0,
             "stage_latency_ms": payload.get("stage_latency_ms") if isinstance(payload.get("stage_latency_ms"), dict) else {},
+            "postprocess_stage_latency_ms": postprocess_stage_latency_ms,
             "graph_available": bool(decision.graph_available),
             "graph_error": graph_error or "",
             "candidate_counts": {

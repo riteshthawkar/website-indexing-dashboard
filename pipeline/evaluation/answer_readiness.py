@@ -1834,6 +1834,11 @@ def _chat_prediction_row_from_payload(
 ) -> Dict[str, Any]:
     response_text = str(payload.get("response") or payload.get("message") or "")
     error = str(payload.get("error") or transport_error or "")
+    timings_ms = (
+        dict(payload.get("timings_ms") or {})
+        if isinstance(payload.get("timings_ms"), Mapping)
+        else {}
+    )
     payload_status = str(payload.get("status") or "").strip().lower()
     preserve_error = bool(error) and (
         status_code >= 400
@@ -1854,6 +1859,7 @@ def _chat_prediction_row_from_payload(
         "citation_mode": payload.get("citation_mode"),
         "partial": payload.get("partial"),
         "finish_reason": payload.get("finish_reason"),
+        "timings_ms": timings_ms,
         "error": error if preserve_error else "",
     }
     if status_code:
@@ -1894,6 +1900,7 @@ def _chat_prediction_row_from_payload(
         "metadata": metadata,
         "latency_ms": latency_ms,
         "first_content_latency_ms": metadata["first_content_latency_ms"],
+        "timings_ms": timings_ms,
         "error": metadata["error"],
     }
 

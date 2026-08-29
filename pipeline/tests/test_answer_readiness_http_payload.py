@@ -223,6 +223,37 @@ def test_answer_prediction_preserves_structured_navigation_plan():
     assert row["navigation_plan"] == navigation_plan
 
 
+def test_answer_prediction_preserves_backend_phase_timings():
+    timings_ms = {
+        "query_rewrite": 1250.0,
+        "retrieval": 3400.5,
+        "draft_generation": 725.25,
+        "time_to_first_chunk": 5400.0,
+        "time_to_final": 5600.0,
+    }
+    row = _chat_prediction_row_from_payload(
+        payload={
+            "response": "MBZUAI is in Abu Dhabi [1].",
+            "sources": [{"url": "https://mbzuai.ac.ae/about/"}],
+            "timings_ms": timings_ms,
+        },
+        example=EvalExample(
+            id="timed-row",
+            query="Where is MBZUAI?",
+            query_type="fact",
+        ),
+        backend="production_chat_websocket",
+        endpoint="ws://127.0.0.1:8000/chat",
+        latency_ms=5610.0,
+        first_content_latency_ms=5410.0,
+        eval_request_mode=True,
+        terminal_event="final",
+    )
+
+    assert row["timings_ms"] == timings_ms
+    assert row["metadata"]["timings_ms"] == timings_ms
+
+
 def test_websocket_answer_prediction_reports_receive_timeout(monkeypatch):
     import websockets
 
