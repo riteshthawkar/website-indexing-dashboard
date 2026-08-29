@@ -501,6 +501,138 @@ def test_evidence_pack_keeps_complete_job_requirements_chunk_within_source_cap()
     assert "minimum of 5 years" in packed_text
 
 
+def test_evidence_pack_treats_experience_lookup_as_contiguous_detail_query():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/academic-appointments-partner"
+    pack = build_evidence_pack(
+        query="How much experience is required for the Academic Appointments Partner role?",
+        result={
+            "fact_documents": [
+                {
+                    "id": "liaison-fact",
+                    "text": "Serve as the primary liaison for candidates during recruitment.",
+                    "source_url": source_url,
+                },
+                {
+                    "id": "appointments-fact",
+                    "text": "Administer academic appointment documentation and reappointments.",
+                    "source_url": source_url,
+                },
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "chunk:academic-appointments-partner",
+                    "text": (
+                        "Academic Appointments Partner. Professional Experience: Essential. "
+                        "At least 5 years of experience in academic administration, HR "
+                        "operations, or related roles in higher education."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Academic Appointments Partner",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    assert any(item["id"] == "chunk:academic-appointments-partner" for item in pack["items"])
+    assert "At least 5 years" in " ".join(item["text"] for item in pack["items"])
+
+
+def test_evidence_pack_keeps_all_same_page_process_stages_for_detail_query():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://research.mbzuai.ac.ae/partnerships-and-engagements"
+    stage_rows = [
+        ("exploration", "Exploration: Brainstorming use-cases based on industry challenges."),
+        ("refinement", "Refinement: Down-selection of use-cases based on priorities."),
+        ("proposal", "High level proposal: Identify resources and contributions from each entity."),
+        ("sign-off", "Engagement agreement sign-off: Full proposal generation and project start."),
+    ]
+    pack = build_evidence_pack(
+        query="How does MBZUAI engage with industry and capture value across the process stages?",
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "parent:partnerships",
+                    "text": "How we engage and capture value across a four-stage industry process.",
+                    "source_url": source_url,
+                    "document_title": "Partnerships and Engagements",
+                    "coverage_aggregate": True,
+                },
+                *[
+                {
+                    "id": f"chunk:{stage_id}",
+                    "text": (
+                        "How we engage and capture value. " + stage_text
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Partnerships and Engagements",
+                }
+                for stage_id, stage_text in stage_rows
+                ],
+            ],
+            "fact_documents": [
+                {
+                    "id": "generic-industry-fact",
+                    "text": "MBZUAI develops real-world AI systems for industry needs.",
+                    "source_url": source_url,
+                }
+            ],
+        },
+        max_items=6,
+        max_chars=8000,
+        max_per_source=2,
+    )
+
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert all(stage_text in packed_text for _stage_id, stage_text in stage_rows)
+
+
+def test_evidence_pack_treats_arabic_program_list_as_structured_detail_query():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://mbzuai.ac.ae/ar/news/fall-2026"
+    pack = build_evidence_pack(
+        query="ما البرامج التي تفتح الجامعة باب القبول لها في خريف 2026؟",
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:fall-intro",
+                    "text": "فتح باب القبول في خريف 2026 لبرامج البكالوريوس والدراسات العليا.",
+                    "source_url": source_url,
+                },
+                {
+                    "id": "chunk:fall-program-list",
+                    "text": (
+                        "البرامج المتاحة: بكالوريوس العلوم في الذكاء الاصطناعي، "
+                        "وماجستير الذكاء الاصطناعي التطبيقي، وماجستير علوم الحاسوب، "
+                        "ودكتوراه علوم الحاسوب."
+                    ),
+                    "source_url": source_url,
+                },
+            ],
+            "evidence_span_documents": [
+                {
+                    "id": "unrelated-fall-span",
+                    "text": "تنطلق فعالية بحثية أخرى في خريف 2026.",
+                    "source_url": "https://mbzuai.ac.ae/ar/news/other-event",
+                }
+            ],
+        },
+        max_items=3,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "ماجستير الذكاء الاصطناعي التطبيقي" in packed_text
+    assert "دكتوراه علوم الحاسوب" in packed_text
+
+
 def test_arabic_qualification_query_keeps_english_requirements_span():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 

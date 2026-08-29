@@ -233,8 +233,17 @@ def _candidate_stream(result: Dict[str, Any]) -> Iterable[Tuple[str, Dict[str, A
         yield "fact", doc
     for doc in _coerce_docs(result.get("evidence_span_documents") or []):
         yield "evidence_span", doc
+    retrieval_rank = 0
     for doc in _coerce_docs(result.get("retrieval_documents") or []):
-        yield "evidence_span" if doc.get("span_type") else "chunk", doc
+        if doc.get("span_type"):
+            yield "evidence_span", doc
+            continue
+        ranked_doc = dict(doc)
+        record_id = _doc_id(ranked_doc)
+        if record_id.startswith(("chunk:", "parent:")):
+            ranked_doc.setdefault("retrieval_rank", retrieval_rank)
+            retrieval_rank += 1
+        yield "chunk", ranked_doc
     for doc in _media_documents(result.get("media") or []):
         yield "media", doc
 
@@ -782,10 +791,12 @@ _KIND_BASE_SCORE = {
 
 _MULTI_DETAIL_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|qualification|academic qualification|roles|positions|responsibilities|steps|"
-    r"features|benefits|differences|criteria|items|articles|entries|sections|categories|stages|process|"
+    r"features|benefits|differences|criteria|items|articles|entries|sections|categories|stages|process|programs?|"
+    r"experience|professional experience|"
     r"support|services|use|uses|using|options|focus areas|research interests|hands-on access|offerings|committees|industry engagement)\b"
     r"|(?:المتطلبات|المؤهلات|المؤهل الأكاديمي|المؤهل|المناصب|الأدوار|المسؤوليات|الخطوات|المزايا|الفروقات|"
-    r"المعايير|العناصر|المقالات|أقسام|اقسام|فئات|مراحل|عملية|الدعم|دعم|الخدمات|خدمات|استخدامات|خيارات|"
+    r"المعايير|العناصر|المقالات|أقسام|اقسام|فئات|مراحل|عملية|البرنامج|برنامج|البرامج|برامج|المدة|مدة|"
+    r"المنح|منح|الشروط|شروط|الخبرة|خبرة|الخبرات|الدعم|دعم|الخدمات|خدمات|استخدامات|خيارات|"
     r"المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
     r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
@@ -819,6 +830,92 @@ def _multi_detail_chunk_coverage_bonus(query: str, item_blob: str, kind: str) ->
     if coverage < 0.55:
         return 0.0
     return min(58.0, 18.0 + (42.0 * coverage))
+
+
+def _structured_facet_coverage_bonus(query: str, text: str) -> float:
+    """Reward evidence that covers the specific facets named by the user.
+
+    Representation headers repeat broad terms such as MBZUAI, program, and
+    page title across every child chunk. Multi-aspect selection therefore
+    needs a body-level signal for the actual requested facets (duration,
+    scholarship, requirements, stages, and so on), otherwise a generic child
+    can outrank the adjacent answer-bearing block.
+    """
+
+    query_text = _clean_text(query).casefold()
+    body_lines = [
+        line
+        for line in str(text or "").splitlines()
+        if not re.match(
+            r"^\s*(?:TITLE|TYPE|SECTION|SOURCE_URL|PARENT_TYPE)\s*:",
+            line,
+            flags=re.IGNORECASE,
+        )
+    ]
+    body_text = _clean_text(" ".join(body_lines)).casefold()
+    facet_contracts = (
+        (
+            r"\b(?:duration|how long|study length)\b|(?:مدة|المدة)",
+            r"\b(?:year|years|duration|semester|semesters)\b|(?:سنة|سنوات|فصل|فصول)",
+        ),
+        (
+            r"\b(?:scholarship|scholarships|financial aid)\b|(?:منحة|منح|المنح)",
+            r"\b(?:scholarship|scholarships|financial aid|tuition support)\b|(?:منحة|منح|المنح)",
+        ),
+        (
+            r"\b(?:requirements|eligibility|admission conditions)\b|(?:شروط|الشروط|متطلبات|المتطلبات)",
+            r"\b(?:requirements|eligibility|secondary school|gpa)\b|(?:شروط|الشروط|متطلبات|المتطلبات|الثانوية|90%)",
+        ),
+        (
+            r"\bprograms?\b|(?:البرامج|برامج)",
+            r"\b(?:program|programs|bachelor|master|msc|phd|doctorate)\b|(?:برنامج|برامج|بكالوريوس|ماجستير|دكتوراه)",
+        ),
+        (
+            r"\b(?:hands-on|hands on|practical access)\b|(?:تجارب عملية|وصول عملي)",
+            r"\b(?:hands-on|hands on|research experience|personalized demo|personalised demo)\b|(?:تجارب عملية|وصول عملي)",
+        ),
+        (
+            r"\b(?:stages|process stages|engages? with industry|captures? value)\b|(?:مراحل|المراحل)",
+            r"\b(?:exploration|refinement|proposal|sign-off|sign off|project start)\b|(?:استكشاف|تنقيح|مقترح|بدء المشروع)",
+        ),
+        (
+            r"\b(?:experience|required experience|professional experience)\b|(?:خبرة|الخبرة|الخبرات)",
+            r"\b(?:experience|years?)\b|(?:خبرة|الخبرة|سنوات)",
+        ),
+    )
+    requested = 0
+    matched = 0
+    for query_pattern, evidence_pattern in facet_contracts:
+        if not re.search(query_pattern, query_text, flags=re.IGNORECASE):
+            continue
+        requested += 1
+        if re.search(evidence_pattern, body_text, flags=re.IGNORECASE):
+            matched += 1
+    if not requested:
+        return 0.0
+    bonus = -12.0 if not matched else min(72.0, 26.0 * matched)
+    scoped_subject_contracts = (
+        (
+            r"\b(?:undergraduate|bachelor|bsc)\b|(?:بكالوريوس|البكالوريوس)",
+            r"\b(?:undergraduate|bachelor|bsc)\b|(?:بكالوريوس|البكالوريوس)",
+        ),
+        (
+            r"\bvisitor program\b|(?:برنامج الزوار)",
+            r"\bvisitor program\b|(?:برنامج الزوار)",
+        ),
+        (
+            r"\blibrary\b|(?:المكتبة|مكتبة)",
+            r"\blibrary\b|(?:المكتبة|مكتبة)",
+        ),
+    )
+    for query_pattern, evidence_pattern in scoped_subject_contracts:
+        if re.search(query_pattern, query_text, flags=re.IGNORECASE) and not re.search(
+            evidence_pattern,
+            body_text,
+            flags=re.IGNORECASE,
+        ):
+            bonus -= 64.0
+    return bonus
 
 
 def _query_specific_bonus(query: str, item_blob: str, normalized_source: str) -> float:
@@ -925,7 +1022,8 @@ def _candidate_score(
     required_pages: Sequence[str],
     required_entities: Sequence[str],
 ) -> float:
-    text = _doc_text(doc)
+    raw_text = str(doc.get("text") or doc.get("value") or _doc_metadata(doc).get("context") or "")
+    text = _clean_text(raw_text)
     source = _source_url(doc)
     item_blob = _item_search_text(
         {
@@ -940,6 +1038,17 @@ def _candidate_score(
     score = 112.0 if kind == "media" and explicit_media_query else _KIND_BASE_SCORE.get(kind, 1.0)
     if kind == "media" and not explicit_media_query:
         score -= 40.0
+    if kind == "chunk" and doc.get("retrieval_rank") is not None:
+        try:
+            retrieval_rank = max(0, int(doc.get("retrieval_rank") or 0))
+        except (TypeError, ValueError):
+            retrieval_rank = 0
+        # The adaptive retriever has already fused dense, sparse, graph, fact,
+        # page-card, and parent evidence. Keep that ordering meaningful so the
+        # evidence packer does not replace the first answer-bearing chunks with
+        # a semantically generic chunk merely because both share page headers.
+        rank_after_primary_pair = max(0, retrieval_rank - 1)
+        score += max(0.0, 18.0 - (0.3 * (rank_after_primary_pair ** 2)))
     if _is_official_mbzuai_url(source):
         score += 18.0
     elif not source:
@@ -994,6 +1103,7 @@ def _candidate_score(
         heading=_clean_text(doc.get("section_heading") or doc.get("heading")),
     )
     score += _multi_detail_chunk_coverage_bonus(query, item_blob, kind)
+    score += _structured_facet_coverage_bonus(query, raw_text)
     score += _query_specific_bonus(query, item_blob, normalized_source)
     if bool(doc.get("coverage_aggregate")):
         # A bounded complete-page parent is deliberately injected for a
@@ -1122,6 +1232,12 @@ def build_evidence_pack(
         source = _source_url(doc) or "local"
         normalized_source = _normalize_url_for_match(source)
         source_cap = max_per_source
+        if structured_detail_query and kind != "media":
+            # Multi-aspect answers commonly span adjacent sections on one
+            # official page. The default two-items-per-source diversity cap
+            # can retain the page parent plus only the first leaf, silently
+            # dropping later stages, requirements, or list entries.
+            source_cap = max(source_cap, 6)
         if normalized_source in required_page_set:
             source_cap = max(source_cap, 4 if specific_required_page_mode else 3)
         if source_counts.get(source, 0) >= source_cap:
@@ -1202,6 +1318,48 @@ def build_evidence_pack(
             _append_candidate(kind, doc)
             if sum(1 for item in items if item.get("kind") == "media") >= media_reserve:
                 break
+
+    if structured_detail_query and not explicit_media_query:
+        # Coverage planning cannot always resolve a named role or page to an
+        # explicit required URL. Reserve the best contiguous leaf and, when
+        # available, its adjacent continuation so facts do not consume the
+        # whole evidence budget before a split list or requirements block is
+        # considered.
+        reserved_leaf_docs: List[Dict[str, Any]] = []
+        for _score, kind, doc in candidates:
+            if kind == "chunk" and _doc_id(doc).startswith("chunk:"):
+                if _append_candidate(kind, doc):
+                    reserved_leaf_docs.append(doc)
+                break
+        if reserved_leaf_docs and max_items >= 3:
+            anchor = reserved_leaf_docs[0]
+            anchor_id = _doc_id(anchor)
+            anchor_match = re.search(r":(\d{5}):[^:]+$", anchor_id)
+            anchor_source = _normalize_url_for_match(_source_url(anchor))
+            adjacent_candidates: List[Tuple[int, int, float, Dict[str, Any]]] = []
+            if anchor_match and anchor_source:
+                anchor_index = int(anchor_match.group(1))
+                for score, kind, doc in candidates:
+                    if kind != "chunk" or not _doc_id(doc).startswith("chunk:"):
+                        continue
+                    if _normalize_url_for_match(_source_url(doc)) != anchor_source:
+                        continue
+                    match = re.search(r":(\d{5}):[^:]+$", _doc_id(doc))
+                    if not match:
+                        continue
+                    candidate_index = int(match.group(1))
+                    distance = abs(candidate_index - anchor_index)
+                    if distance != 1:
+                        continue
+                    adjacent_candidates.append(
+                        (distance, 0 if candidate_index > anchor_index else 1, -score, doc)
+                    )
+            for _distance, _direction, _negative_score, doc in sorted(
+                adjacent_candidates,
+                key=lambda item: (item[0], item[1], item[2], _doc_id(item[3])),
+            ):
+                if _append_candidate("chunk", doc):
+                    break
 
     for required_page in required_pages:
         for _score, kind, doc in candidates:
