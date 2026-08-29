@@ -978,11 +978,13 @@ class RoutedHybridRetriever:
         mode: QueryMode,
     ) -> Dict[str, Any]:
         intent = self._coverage_intent(query, mode)
-        if payload.get("media_evidence_verified"):
+        explicit_page_markers = self._explicit_required_page_markers(query)
+        if payload.get("media_evidence_verified") and not explicit_page_markers:
             # The media verifier already established a source-backed visual
-            # match (OCR/caption plus dense or sparse evidence). Heuristically
-            # inferring unrelated text pages here both dilutes the media pack
-            # and triggers unnecessary required-page corpus scans.
+            # match (OCR/caption plus dense or sparse evidence). Heuristic page
+            # inference would dilute the media pack and trigger unnecessary
+            # corpus scans. Explicit named-page requirements remain binding:
+            # a coincidental image result must not erase the user's scope.
             inferred = {
                 "required_entities": [],
                 "required_pages": [],

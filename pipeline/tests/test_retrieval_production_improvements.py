@@ -7483,6 +7483,39 @@ def test_verified_media_evidence_skips_heuristic_required_page_inference():
     assert plan["coverage_status"] == "complete"
 
 
+def test_verified_media_evidence_preserves_explicit_named_page_requirements():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://library.mbzuai.ac.ae/newest-technology"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._coverage_intent = lambda _query, _mode: "scoped"
+    retriever._explicit_required_page_markers = lambda _query: ["/newest-technology"]
+    retriever._infer_coverage_requirements = lambda _query, _intent: {
+        "required_entities": [],
+        "required_pages": [page_url],
+        "required_sections": [],
+        "required_pages_source": "explicit_markers",
+    }
+    retriever._selected_source_urls = lambda _payload: {
+        retriever._normalize_source_url(page_url)
+    }
+
+    plan = retriever._coverage_plan_for_result(
+        query="On the News on AI and Technology page, what items are shown?",
+        payload={
+            "media_evidence_verified": True,
+            "selected_media_ids": ["unrelated-media"],
+            "selected_chunk_ids": ["named-page-chunk"],
+        },
+        mode=QueryMode.SCOPED,
+    )
+
+    assert plan["required_pages"] == [page_url]
+    assert plan["required_pages_source"] == "explicit_markers"
+    assert plan["coverage_status"] == "complete"
+
+
 def test_lookup_profile_preserves_contact_types_for_hours_plus_contact_query():
     from pipeline.retrieval.adaptive_hybrid import _lookup_query_profile
 
