@@ -542,37 +542,89 @@ def test_evidence_pack_treats_experience_lookup_as_contiguous_detail_query():
     assert "At least 5 years" in " ".join(item["text"] for item in pack["items"])
 
 
+def test_evidence_pack_preserves_fused_promoted_assertion_for_exact_role_fact():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/academic-appointments-partner"
+    pack = build_evidence_pack(
+        query="How much experience is required for the Academic Appointments Partner role?",
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:c650:document-revision:role:00000:overview",
+                    "text": (
+                        "Academic Appointments Partner. Job purpose and responsibilities. "
+                        "Professional Experience:"
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Academic Appointments Partner",
+                },
+                {
+                    "id": "chunk:c650:document-revision:other:00000:other-role",
+                    "text": "Another role requires a minimum of four years of experience.",
+                    "source_url": "https://careers.mbzuai.ac.ae/careers/another-role",
+                },
+                {
+                    "id": "assertion:academic-appointments-minimum-years",
+                    "text": (
+                        "Academic Appointments Partner minimum_years At least 5 years "
+                        "of experience in academic administration, HR operations, or "
+                        "related roles in higher education."
+                    ),
+                    "source_url": "",
+                },
+            ],
+        },
+        max_items=2,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    assertion_items = [item for item in pack["items"] if item["kind"] == "assertion"]
+    assert [item["id"] for item in assertion_items] == [
+        "assertion:academic-appointments-minimum-years"
+    ]
+    assert "At least 5 years" in assertion_items[0]["text"]
+    assert all(item["id"] != "chunk:c650:document-revision:other:00000:other-role" for item in pack["items"])
+
+
 def test_evidence_pack_keeps_all_same_page_process_stages_for_detail_query():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 
     source_url = "https://research.mbzuai.ac.ae/partnerships-and-engagements"
     stage_rows = [
-        ("exploration", "Exploration: Brainstorming use-cases based on industry challenges."),
-        ("refinement", "Refinement: Down-selection of use-cases based on priorities."),
-        ("proposal", "High level proposal: Identify resources and contributions from each entity."),
-        ("sign-off", "Engagement agreement sign-off: Full proposal generation and project start."),
+        (10, "exploration", "Exploration: Brainstorming use-cases based on industry challenges."),
+        (11, "refinement", "Refinement: Down-selection of use-cases based on priorities."),
+        (12, "proposal", "High level proposal: Identify resources and contributions from each entity."),
+        (13, "sign-off", "Engagement agreement sign-off: Full proposal generation and project start."),
     ]
     pack = build_evidence_pack(
         query="How does MBZUAI engage with industry and capture value across the process stages?",
         result={
             "retrieval_documents": [
                 {
-                    "id": "parent:partnerships",
-                    "text": "How we engage and capture value across a four-stage industry process.",
+                    "id": "parent:c650:document-revision:partnerships:page",
+                    "text": (
+                        "How we engage and capture value across a four-stage industry process. "
+                        + " ".join("Background context" for _ in range(180))
+                    ),
                     "source_url": source_url,
                     "document_title": "Partnerships and Engagements",
                     "coverage_aggregate": True,
                 },
                 *[
                 {
-                    "id": f"chunk:{stage_id}",
+                    "id": (
+                        "chunk:c650:document-revision:partnerships:"
+                        f"{stage_index:05d}:{stage_id}"
+                    ),
                     "text": (
                         "How we engage and capture value. " + stage_text
                     ),
                     "source_url": source_url,
                     "document_title": "Partnerships and Engagements",
                 }
-                for stage_id, stage_text in stage_rows
+                for stage_index, stage_id, stage_text in stage_rows
                 ],
             ],
             "fact_documents": [
@@ -584,12 +636,12 @@ def test_evidence_pack_keeps_all_same_page_process_stages_for_detail_query():
             ],
         },
         max_items=6,
-        max_chars=8000,
+        max_chars=4200,
         max_per_source=2,
     )
 
     packed_text = " ".join(item["text"] for item in pack["items"])
-    assert all(stage_text in packed_text for _stage_id, stage_text in stage_rows)
+    assert all(stage_text in packed_text for _index, _stage_id, stage_text in stage_rows)
 
 
 def test_evidence_pack_treats_arabic_program_list_as_structured_detail_query():

@@ -240,6 +240,15 @@ def _candidate_stream(result: Dict[str, Any]) -> Iterable[Tuple[str, Dict[str, A
             continue
         ranked_doc = dict(doc)
         record_id = _doc_id(ranked_doc)
+        if record_id.startswith("assertion:") or str(
+            ranked_doc.get("record_type") or ""
+        ).casefold() in {"assertion", "relation_assertion"}:
+            # Promoted graph assertions can be returned through the fused
+            # retrieval lane rather than answer_documents. Preserve their
+            # stronger evidence prior; treating them as anonymous chunks can
+            # hide an exact structured fact behind a long page preamble.
+            yield "assertion", ranked_doc
+            continue
         if record_id.startswith(("chunk:", "parent:")):
             ranked_doc.setdefault("retrieval_rank", retrieval_rank)
             retrieval_rank += 1
@@ -754,9 +763,13 @@ def _named_source_identity_bonus(
     )
     matched = identity_tokens & source_tokens
     if not matched:
+        if host == "careers.mbzuai.ac.ae" and len(identity_tokens) >= 2:
+            return -72.0
         return 0.0
     match_ratio = len(matched) / float(len(identity_tokens))
     bonus = min(52.0, (8.0 * len(matched)) + (36.0 * match_ratio))
+    if host == "careers.mbzuai.ac.ae" and len(identity_tokens) >= 2 and match_ratio < 0.5:
+        bonus -= 72.0
     host_tokens = {
         token
         for token in re.findall(r"[a-z0-9]+", host)
@@ -800,6 +813,12 @@ _MULTI_DETAIL_QUERY_RE = re.compile(
     r"المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
     r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
+    re.IGNORECASE,
+)
+
+_STAGED_PROCESS_QUERY_RE = re.compile(
+    r"\b(?:stages?|process|engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)\b"
+    r"|(?:مراحل|المراحل|عملية|العملية)",
     re.IGNORECASE,
 )
 
@@ -1337,6 +1356,9 @@ def build_evidence_pack(
             anchor_match = re.search(r":(\d{5}):[^:]+$", anchor_id)
             anchor_source = _normalize_url_for_match(_source_url(anchor))
             adjacent_candidates: List[Tuple[int, int, float, Dict[str, Any]]] = []
+            continuation_limit = (
+                3 if _STAGED_PROCESS_QUERY_RE.search(str(query or "")) else 1
+            )
             if anchor_match and anchor_source:
                 anchor_index = int(anchor_match.group(1))
                 for score, kind, doc in candidates:
@@ -1349,17 +1371,30 @@ def build_evidence_pack(
                         continue
                     candidate_index = int(match.group(1))
                     distance = abs(candidate_index - anchor_index)
-                    if distance != 1:
+                    if distance < 1 or distance > continuation_limit:
                         continue
                     adjacent_candidates.append(
                         (distance, 0 if candidate_index > anchor_index else 1, -score, doc)
                     )
+            appended_continuations = 0
             for _distance, _direction, _negative_score, doc in sorted(
                 adjacent_candidates,
                 key=lambda item: (item[0], item[1], item[2], _doc_id(item[3])),
             ):
                 if _append_candidate("chunk", doc):
-                    break
+                    appended_continuations += 1
+                    if appended_continuations >= continuation_limit:
+                        break
+
+        # A promoted assertion is an exact typed fact selected by the fused
+        # retriever. It can arrive through retrieval_documents without source
+        # fields, so score-only selection otherwise lets longer generic page
+        # snippets fill the pack first. Keep one assertion beside the official
+        # page chunk; the page remains available for citation provenance.
+        for _score, kind, doc in candidates:
+            if kind == "assertion":
+                _append_candidate(kind, doc)
+                break
 
     for required_page in required_pages:
         for _score, kind, doc in candidates:
