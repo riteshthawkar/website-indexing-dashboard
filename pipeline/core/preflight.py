@@ -242,8 +242,13 @@ def assess_production_readiness(
     *,
     config_name: str = "",
     validation_errors: Optional[Mapping[str, List[str]]] = None,
+    purpose: str = "indexing",
 ) -> Dict[str, Any]:
-    """Return structured CLI preflight results for a production indexing run."""
+    """Return production preflight results for indexing or immutable release validation."""
+
+    normalized_purpose = str(purpose or "indexing").strip().lower()
+    if normalized_purpose not in {"indexing", "release"}:
+        raise ValueError("production readiness purpose must be 'indexing' or 'release'")
 
     checks: List[PreflightCheck] = []
     stage_ids = _stage_ids(config)
@@ -994,13 +999,19 @@ def assess_production_readiness(
         try:
             from pipeline.vectorstores.pgvector_store import PgVectorSettings
 
-            settings = PgVectorSettings.from_config(config, purpose="write")
+            target_purpose = "read" if normalized_purpose == "release" else "write"
+            settings = PgVectorSettings.from_config(config, purpose=target_purpose)
         except (RuntimeError, ValueError) as exc:
             _add(
                 checks,
                 "pgvector_target",
                 "error",
-                "The pgvector writer target is missing or unsafe.",
+                (
+                    "The pgvector reader target is missing or unsafe."
+                    if normalized_purpose == "release"
+                    else "The pgvector writer target is missing or unsafe."
+                ),
+                purpose=target_purpose,
                 error=str(exc),
             )
         else:
@@ -1008,7 +1019,12 @@ def assess_production_readiness(
                 checks,
                 "pgvector_target",
                 "ok",
-                "The dedicated TLS pgvector writer target is configured.",
+                (
+                    "The least-privilege TLS pgvector reader target is configured."
+                    if normalized_purpose == "release"
+                    else "The dedicated TLS pgvector writer target is configured."
+                ),
+                purpose=target_purpose,
                 schema=settings.schema,
                 records_table=settings.records_table,
                 dimensions=settings.dimensions,
@@ -1212,6 +1228,7 @@ def assess_production_readiness(
     warning_count = sum(1 for check in checks if check.status == "warn")
     return {
         "config": config_name,
+        "purpose": normalized_purpose,
         "ok": error_count == 0,
         "error_count": error_count,
         "warning_count": warning_count,

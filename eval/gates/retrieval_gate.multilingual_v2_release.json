@@ -1,0 +1,157 @@
+{
+  "overall": {
+    "query_count": {"min": 160},
+    "answerable_query_count": {"min": 136},
+    "no_answer_query_count": {"min": 24},
+    "retrieval_error_count": {"max": 0},
+    "successful_query_count": {"min": 160},
+    "no_answer_violation_rate": {"max": 0.0},
+    "unsupported_abstention_rate": {"min": 1.0},
+    "answerable_accept_accuracy": {"min": 0.975},
+    "abstention_balanced_accuracy": {"min": 0.985},
+    "chunk_source_hit_at_10": {"min": 0.7},
+    "chunk_source_ndcg_at_10": {"min": 0.52},
+    "parent_hit_at_5": {"min": 0.7},
+    "document_hit_at_10": {"min": 0.9},
+    "page_card_hit_at_5": {"min": 0.82},
+    "section_hit_at_10": {"min": 0.5},
+    "source_identity_recall_at_10": {"min": 0.9},
+    "evidence_quote_coverage_at_10": {"min": 0.6},
+    "media_hit_at_5": {"min": 0.65},
+    "exact_media_hit_at_5": {"min": 0.7},
+    "multi_page_coverage_rate": {"min": 1.0},
+    "navigation_action_hit_at_5": {"min": 1.0},
+    "navigation_page_hit_at_1": {"min": 1.0},
+    "backend_latency_p50_ms": {"max": 6000},
+    "backend_latency_p95_ms": {"max": 12000},
+    "backend_latency_max_ms": {"max": 25000},
+    "vector_backend_latency_p95_ms": {"max": 9000},
+    "routing_latency_p95_ms": {"max": 5000},
+    "graph_augment_latency_p95_ms": {"max": 5000}
+  },
+  "by_language": {
+    "Arabic": {
+      "query_count": {"min": 80},
+      "answerable_query_count": {"min": 68},
+      "no_answer_query_count": {"min": 12},
+      "no_answer_violation_rate": {"max": 0.0},
+      "unsupported_abstention_rate": {"min": 1.0},
+      "answerable_accept_accuracy": {"min": 0.975},
+      "chunk_source_hit_at_10": {"min": 0.6},
+      "parent_hit_at_5": {"min": 0.65},
+      "document_hit_at_10": {"min": 0.875},
+      "page_card_hit_at_5": {"min": 0.82},
+      "section_hit_at_10": {"min": 0.3},
+      "source_identity_recall_at_10": {"min": 0.85},
+      "evidence_quote_coverage_at_10": {"min": 0.54}
+    },
+    "English": {
+      "query_count": {"min": 80},
+      "answerable_query_count": {"min": 68},
+      "no_answer_query_count": {"min": 12},
+      "no_answer_violation_rate": {"max": 0.0},
+      "unsupported_abstention_rate": {"min": 1.0},
+      "answerable_accept_accuracy": {"min": 0.975},
+      "chunk_source_hit_at_10": {"min": 0.75},
+      "parent_hit_at_5": {"min": 0.7},
+      "document_hit_at_10": {"min": 0.9},
+      "page_card_hit_at_5": {"min": 0.75},
+      "section_hit_at_10": {"min": 0.58},
+      "source_identity_recall_at_10": {"min": 0.9},
+      "evidence_quote_coverage_at_10": {"min": 0.63}
+    }
+  },
+  "by_query_type": {
+    "fact": {
+      "query_count": {"min": 76},
+      "chunk_source_hit_at_10": {"min": 0.72},
+      "document_hit_at_10": {"min": 0.9},
+      "evidence_quote_coverage_at_10": {"min": 0.65}
+    },
+    "scoped": {
+      "query_count": {"min": 40},
+      "parent_hit_at_5": {"min": 0.7},
+      "document_hit_at_10": {"min": 0.95},
+      "page_card_hit_at_5": {"min": 0.95},
+      "section_hit_at_10": {"min": 0.6},
+      "navigation_action_hit_at_5": {"min": 1.0},
+      "navigation_page_hit_at_1": {"min": 1.0}
+    },
+    "synthesis": {
+      "query_count": {"min": 20},
+      "chunk_source_hit_at_10": {"min": 0.75},
+      "document_hit_at_10": {"min": 0.95},
+      "page_card_hit_at_5": {"min": 0.9},
+      "source_identity_recall_at_10": {"min": 0.9},
+      "multi_page_coverage_rate": {"min": 1.0}
+    },
+    "multimodal": {
+      "query_count": {"min": 24},
+      "document_hit_at_10": {"min": 0.75},
+      "source_identity_recall_at_10": {"min": 0.75},
+      "media_hit_at_5": {"min": 0.7},
+      "exact_media_hit_at_5": {"min": 0.7},
+      "evidence_quote_coverage_at_10": {"min": 0.5}
+    }
+  },
+  "by_source_type": {
+    "none": {
+      "query_count": {"min": 24},
+      "no_answer_violation_rate": {"max": 0.0},
+      "unsupported_abstention_rate": {"min": 1.0}
+    },
+    "webpage": {
+      "query_count": {"min": 108},
+      "document_hit_at_10": {"min": 0.95},
+      "page_card_hit_at_5": {"min": 0.85},
+      "source_identity_recall_at_10": {"min": 0.94}
+    },
+    "mixed": {
+      "query_count": {"min": 4},
+      "document_hit_at_10": {"min": 0.75},
+      "source_identity_recall_at_10": {"min": 0.75}
+    },
+    "image": {
+      "query_count": {"min": 12},
+      "document_hit_at_10": {"min": 0.8},
+      "media_hit_at_5": {"min": 0.8},
+      "exact_media_hit_at_5": {"min": 0.8}
+    },
+    "pdf": {
+      "query_count": {"min": 12},
+      "document_hit_at_10": {"min": 0.75},
+      "media_hit_at_5": {"min": 0.65},
+      "exact_media_hit_at_5": {"min": 0.6}
+    }
+  },
+  "by_benchmark_tag": {
+    "mbzuai_multilingual_v2": {
+      "query_count": {"min": 160},
+      "document_hit_at_10": {"min": 0.9},
+      "source_identity_recall_at_10": {"min": 0.9}
+    },
+    "navigation": {
+      "query_count": {"min": 16},
+      "document_hit_at_10": {"min": 1.0},
+      "navigation_action_hit_at_5": {"min": 1.0},
+      "navigation_page_hit_at_1": {"min": 1.0}
+    },
+    "cross_lingual": {
+      "query_count": {"min": 18},
+      "chunk_source_hit_at_10": {"min": 0.5},
+      "document_hit_at_10": {"min": 0.75},
+      "source_identity_recall_at_10": {"min": 0.75}
+    },
+    "subdomain": {
+      "query_count": {"min": 59},
+      "document_hit_at_10": {"min": 0.9},
+      "page_card_hit_at_5": {"min": 0.8},
+      "source_identity_recall_at_10": {"min": 0.9}
+    },
+    "abstention": {
+      "query_count": {"min": 24},
+      "no_answer_violation_rate": {"max": 0.0},
+      "unsupported_abstention_rate": {"min": 1.0}
+    }
+  }
+}

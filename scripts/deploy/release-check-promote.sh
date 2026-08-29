@@ -17,10 +17,10 @@ ANSWER_MODEL="${ANSWER_MODEL:-gemini-2.5-flash}"
 PARALLELISM="${RELEASE_CHECK_PARALLELISM:-2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CANONICAL_RELEASE_DATASET="$PROJECT_ROOT/eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl"
-CANONICAL_RELEASE_GATES="$PROJECT_ROOT/eval/gates/retrieval_gate.v5_span_strict.json"
+CANONICAL_RELEASE_DATASET="$PROJECT_ROOT/eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl"
+CANONICAL_RELEASE_GATES="$PROJECT_ROOT/eval/gates/retrieval_gate.multilingual_v2_release.json"
 CANONICAL_ANSWER_DATASET="$CANONICAL_RELEASE_DATASET"
-CANONICAL_ANSWER_GATES="$PROJECT_ROOT/eval/gates/answer_readiness_gate.llm_generated_v1.json"
+CANONICAL_ANSWER_GATES="$PROJECT_ROOT/eval/gates/answer_readiness_gate.multilingual_v2_release.json"
 PYTHON_BIN="${PYTHON:-python}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python3 >/dev/null 2>&1; then

@@ -29,6 +29,8 @@ from pipeline.core.runtime_contract import (
     validate_runtime_artifact_contract,
 )
 from pipeline.core.release_policy import (
+    PRODUCTION_MIN_ANSWER_QUERIES,
+    PRODUCTION_MIN_RETRIEVAL_QUERIES,
     production_answer_judge_manifest_metadata,
     production_eval_manifest_metadata,
 )
@@ -633,12 +635,12 @@ def test_current_release_promotion_revalidates_snapshot_vector_bundle_and_graph(
         "audit": {"ok": True},
         "evaluation": {
             **production_eval_manifest_metadata(answer=False),
-            "query_count": 65,
+            "query_count": PRODUCTION_MIN_RETRIEVAL_QUERIES,
             "gates": {"passed": True},
         },
         "answer_evaluation": {
             **production_eval_manifest_metadata(answer=True),
-            "query_count": 65,
+            "query_count": PRODUCTION_MIN_ANSWER_QUERIES,
             "llm_judge": production_answer_judge_manifest_metadata(),
             "gates": {"passed": True},
             "skipped": False,

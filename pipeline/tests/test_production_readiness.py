@@ -192,6 +192,45 @@ def test_canonical_production_name_cannot_use_downgraded_effective_config(monkey
     assert "pipeline.production_profile must be true" in contract["details"]["errors"]
 
 
+def test_release_preflight_validates_pgvector_reader_without_writer(monkeypatch):
+    from pipeline.core.config import load_config
+    from pipeline.core.preflight import assess_production_readiness
+
+    monkeypatch.setenv("OPENAI_API_KEY", "test-openai")
+    monkeypatch.setenv("GEMINI_API_KEY", "test-gemini")
+    monkeypatch.setenv(
+        "PGVECTOR_DSN",
+        "postgresql://mbzuai_retriever:reader-password@pgvector.internal/vectors?sslmode=require",
+    )
+    monkeypatch.delenv("PGVECTOR_INGEST_DSN", raising=False)
+    config = load_config("mbzuai_production")
+
+    indexing_report = assess_production_readiness(
+        config,
+        config_name="mbzuai_production",
+        validation_errors={},
+    )
+    release_report = assess_production_readiness(
+        config,
+        config_name="mbzuai_production",
+        validation_errors={},
+        purpose="release",
+    )
+    indexing_target = next(
+        check for check in indexing_report["checks"] if check["name"] == "pgvector_target"
+    )
+    release_target = next(
+        check for check in release_report["checks"] if check["name"] == "pgvector_target"
+    )
+
+    assert indexing_report["purpose"] == "indexing"
+    assert indexing_target["status"] == "error"
+    assert indexing_target["details"]["purpose"] == "write"
+    assert release_report["purpose"] == "release"
+    assert release_target["status"] == "ok"
+    assert release_target["details"]["purpose"] == "read"
+
+
 def test_canonical_production_rejects_downgraded_crawl_contract(monkeypatch):
     from pipeline.core.config import load_config
     from pipeline.core.preflight import assess_production_readiness

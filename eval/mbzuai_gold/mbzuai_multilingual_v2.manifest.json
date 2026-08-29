@@ -1,0 +1,229 @@
+{
+  "schema_version": 2,
+  "suite": "mbzuai_multilingual_v2",
+  "candidate_independent_gold": true,
+  "generation": {
+    "provider": "openai",
+    "model": "gpt-5.4-mini",
+    "prompt_revision": "mbzuai-multilingual-eval-v2-source-grounded-20260822",
+    "temperature": "provider_default",
+    "web_search_enabled": false,
+    "repair_rounds": 2,
+    "usage": {
+      "prompt_tokens": 350971,
+      "completion_tokens": 46740,
+      "total_tokens": 397711
+    },
+    "manual_corrections": [
+      {
+        "date": "2026-08-29",
+        "example_id": "mlv2-ar-synthesis-001-168375e6",
+        "field": "reference_answer",
+        "reason": "Removed an unsupported claim that scholarships cover up to 100% of tuition and attendance costs; neither frozen evidence quote states that coverage level."
+      }
+    ]
+  },
+  "source_snapshot": {
+    "representation_bundle": "runs/mbzuai_representation_v2/mbzuai-representation-v2-20260821-v2/stage_outputs/extract_page_cards_and_actions/representation_v2_bundle.json",
+    "representation_bundle_sha256": "8d46c453c8f53525af50efd6b5b38be126117c40f7f2547a7356ca5c04232430",
+    "representation_schema_version": "mbzuai.representation.v2",
+    "media_manifest": "runs/mbzuai_corpus_preparation/mbzuai-corpus-preparation-20260821-v4/stage_outputs/prepare_corpus_boundary/prepared_media_manifest.json",
+    "media_manifest_sha256": "578f356e2f3fbe4668be9cb2df9c8f9caf111528a588835c136054ab0a66372d",
+    "media_manifest_version": 2,
+    "navigation_catalog": "runs/mbzuai_page_graph_bridge/mbzuai-page-graph-bridge-20260822-v4/stage_outputs/bridge_page_graph/page_graph_navigation_catalog.json",
+    "navigation_catalog_sha256": "a720dc921637a65d61f811d4ca227d0de1b18e827757fab41ef6d88229f48165"
+  },
+  "dataset": {
+    "path": "eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl",
+    "sha256": "fa400a69bcb9f1a61b6cdb9c8033fed3b16426d2d58b8cec1b427fe097499ac8",
+    "coverage": {
+      "query_count": 160,
+      "language_counts": {
+        "Arabic": 80,
+        "English": 80
+      },
+      "query_type_counts": {
+        "fact": 76,
+        "multimodal": 24,
+        "scoped": 40,
+        "synthesis": 20
+      },
+      "source_type_counts": {
+        "image": 12,
+        "mixed": 4,
+        "none": 24,
+        "pdf": 12,
+        "webpage": 108
+      },
+      "split_counts": {
+        "holdout": 38,
+        "regression": 26,
+        "selection": 96
+      },
+      "answerability_counts": {
+        "answerable": 136,
+        "no_answer": 24
+      },
+      "benchmark_tag_counts": {
+        "abstention": 24,
+        "adversarial_no_answer": 24,
+        "cross_lingual": 18,
+        "easy": 96,
+        "fact": 52,
+        "hard": 3,
+        "image": 12,
+        "mbzuai_multilingual_v2": 160,
+        "medium": 37,
+        "mixed": 4,
+        "multi_source": 20,
+        "multilingual": 160,
+        "multimodal": 24,
+        "navigation": 16,
+        "pdf": 16,
+        "scoped": 40,
+        "source_grounded": 160,
+        "subdomain": 59,
+        "synthesis": 20,
+        "webpage": 108
+      },
+      "source_host_counts": {
+        "ai-nexus.mbzuai.ac.ae": 8,
+        "careers.mbzuai.ac.ae": 14,
+        "hpp.mbzuai.ac.ae": 3,
+        "ifm.ai": 5,
+        "library.mbzuai.ac.ae": 12,
+        "mbzuai.ac.ae": 68,
+        "metaverse.mbzuai.ac.ae": 9,
+        "research.mbzuai.ac.ae": 8,
+        "staticcdn.mbzuai.ac.ae": 14
+      },
+      "with_evidence_quotes": 136,
+      "with_page_cards": 124,
+      "with_sections": 108,
+      "with_actions": 16,
+      "with_media": 24,
+      "source_connected_group_count": 122,
+      "source_group_split_leak_count": 0
+    }
+  },
+  "validation": {
+    "dataset": {
+      "dataset_path": "eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl",
+      "work_dir": null,
+      "summary": {
+        "query_count": 160,
+        "query_type_counts": {
+          "fact": 76,
+          "multimodal": 24,
+          "scoped": 40,
+          "synthesis": 20
+        },
+        "source_type_counts": {
+          "image": 12,
+          "mixed": 4,
+          "none": 24,
+          "pdf": 12,
+          "webpage": 108
+        },
+        "no_answer_count": 24,
+        "answerable_count": 136,
+        "with_gold_chunks": 0,
+        "with_gold_parents": 0,
+        "with_gold_media": 24,
+        "with_gold_documents": 136,
+        "with_gold_page_cards": 124,
+        "with_gold_sections": 108,
+        "with_gold_actions": 16
+      },
+      "ok": true,
+      "errors": [],
+      "warnings": []
+    },
+    "source_ids": {
+      "ok": true,
+      "errors": []
+    },
+    "coverage": {
+      "ok": true,
+      "summary": {
+        "query_count": 160,
+        "language_counts": {
+          "Arabic": 80,
+          "English": 80
+        },
+        "query_type_counts": {
+          "fact": 76,
+          "multimodal": 24,
+          "scoped": 40,
+          "synthesis": 20
+        },
+        "source_type_counts": {
+          "image": 12,
+          "mixed": 4,
+          "none": 24,
+          "pdf": 12,
+          "webpage": 108
+        },
+        "split_counts": {
+          "holdout": 38,
+          "regression": 26,
+          "selection": 96
+        },
+        "answerability_counts": {
+          "answerable": 136,
+          "no_answer": 24
+        },
+        "benchmark_tag_counts": {
+          "abstention": 24,
+          "adversarial_no_answer": 24,
+          "cross_lingual": 18,
+          "easy": 96,
+          "fact": 52,
+          "hard": 3,
+          "image": 12,
+          "mbzuai_multilingual_v2": 160,
+          "medium": 37,
+          "mixed": 4,
+          "multi_source": 20,
+          "multilingual": 160,
+          "multimodal": 24,
+          "navigation": 16,
+          "pdf": 16,
+          "scoped": 40,
+          "source_grounded": 160,
+          "subdomain": 59,
+          "synthesis": 20,
+          "webpage": 108
+        },
+        "source_host_counts": {
+          "ai-nexus.mbzuai.ac.ae": 8,
+          "careers.mbzuai.ac.ae": 14,
+          "hpp.mbzuai.ac.ae": 3,
+          "ifm.ai": 5,
+          "library.mbzuai.ac.ae": 12,
+          "mbzuai.ac.ae": 68,
+          "metaverse.mbzuai.ac.ae": 9,
+          "research.mbzuai.ac.ae": 8,
+          "staticcdn.mbzuai.ac.ae": 14
+        },
+        "with_evidence_quotes": 136,
+        "with_page_cards": 124,
+        "with_sections": 108,
+        "with_actions": 16,
+        "with_media": 24,
+        "source_connected_group_count": 122,
+        "source_group_split_leak_count": 0
+      },
+      "errors": [],
+      "warnings": []
+    }
+  },
+  "experimental_policy": {
+    "selection_split_may_be_used_for_model_selection": true,
+    "regression_split_is_a_non_regression_gate": true,
+    "holdout_split_must_remain_sealed_until_finalists_are_frozen": true,
+    "source_connected_examples_must_remain_in_one_split": true,
+    "split_assignment": "exact language/query_type/answerability stratification with source-id and canonical-page connected groups",
+    "production_promotion_authorized": true
+  }
+}

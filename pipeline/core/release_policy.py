@@ -10,29 +10,29 @@ from pipeline.core.io import sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v2"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v3"
 PRODUCTION_RETRIEVAL_DATASET = (
-    PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_llm_generated_v1.jsonl"
+    PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
 )
 PRODUCTION_RETRIEVAL_GATES = (
-    PROJECT_ROOT / "eval" / "gates" / "retrieval_gate.v5_span_strict.json"
+    PROJECT_ROOT / "eval" / "gates" / "retrieval_gate.multilingual_v2_release.json"
 )
 PRODUCTION_ANSWER_DATASET = PRODUCTION_RETRIEVAL_DATASET
 PRODUCTION_ANSWER_GATES = (
-    PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.llm_generated_v1.json"
+    PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.multilingual_v2_release.json"
 )
 PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
-    "cd9c4d7835f244347a174f2321399d77bb020593b64654173de8f7d0d0bcf42e"
+    "fa400a69bcb9f1a61b6cdb9c8033fed3b16426d2d58b8cec1b427fe097499ac8"
 )
 PRODUCTION_RETRIEVAL_GATES_SHA256 = (
-    "7361ce23bf3cf4e4de807925791dc9b4021c7c0f058cef426a9431f3103c1c80"
+    "ba221e2d2507582d1566270f5116e423fefce21639cfb23c5773819bfad91128"
 )
 PRODUCTION_ANSWER_DATASET_SHA256 = PRODUCTION_RETRIEVAL_DATASET_SHA256
 PRODUCTION_ANSWER_GATES_SHA256 = (
-    "1e66930369c7d009672b683c08f2cdc50aa10fcc9d2ea7b48dbe04920cc7e64e"
+    "94fd1df2f00eef43f1fa957bb82147fb08be896f1a474f91b8837b74c92913eb"
 )
-PRODUCTION_MIN_RETRIEVAL_QUERIES = 65
-PRODUCTION_MIN_ANSWER_QUERIES = 65
+PRODUCTION_MIN_RETRIEVAL_QUERIES = 160
+PRODUCTION_MIN_ANSWER_QUERIES = 160
 PRODUCTION_ANSWER_JUDGE_PROVIDER = "gemini"
 PRODUCTION_ANSWER_JUDGE_MODEL = "gemini-2.5-flash"
 

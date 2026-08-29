@@ -484,10 +484,18 @@ class GeminiPgVectorEmbedder(EmbedderStage):
         errors: List[str] = []
         embedder = config.get("embedder") if isinstance(config.get("embedder"), dict) else {}
         vector_store = config.get("vector_store") if isinstance(config.get("vector_store"), dict) else {}
+        pipeline = config.get("pipeline") if isinstance(config.get("pipeline"), dict) else {}
+        validation_purpose = str(pipeline.get("validation_purpose") or "indexing").strip().lower()
         if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
             errors.append("GOOGLE_API_KEY or GEMINI_API_KEY is required for Gemini embeddings")
-        if not os.getenv(str(vector_store.get("ingest_dsn_env") or "PGVECTOR_INGEST_DSN")):
-            errors.append("PGVECTOR_INGEST_DSN is required for pgvector indexing")
+        if validation_purpose == "release":
+            reader_env = str(vector_store.get("dsn_env") or "PGVECTOR_DSN")
+            if not os.getenv(reader_env):
+                errors.append(f"{reader_env} is required for pgvector release validation")
+        else:
+            writer_env = str(vector_store.get("ingest_dsn_env") or "PGVECTOR_INGEST_DSN")
+            if not os.getenv(writer_env):
+                errors.append(f"{writer_env} is required for pgvector indexing")
         if str(vector_store.get("provider") or "").strip().lower() != "pgvector":
             errors.append("vector_store.provider must be pgvector")
         if bool(embedder.get("enable_sparse", False)):

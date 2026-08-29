@@ -440,6 +440,62 @@ def test_answer_readiness_forwards_parallelism_to_network_runners(
     }
 
 
+def test_llm_judge_honors_bounded_parallelism_and_preserves_dataset_order(monkeypatch):
+    from pipeline.evaluation import answer_readiness
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    active = 0
+    max_active = 0
+    progress_events = []
+    examples = [
+        EvalExample(id=f"q{index}", query=f"Question {index}", query_type="fact")
+        for index in range(4)
+    ]
+
+    def fake_judge_answer_row(*, example, **kwargs):
+        nonlocal active, max_active
+        with lock:
+            active += 1
+            max_active = max(max_active, active)
+        if example.id in {"q0", "q1"}:
+            barrier.wait(timeout=2.0)
+        time.sleep(0.01)
+        with lock:
+            active -= 1
+        return {
+            "verdict": "pass",
+            "overall": 1.0,
+            "judge_provider": "gemini",
+            "judge_model": "gemini-test",
+        }
+
+    monkeypatch.setenv("ANSWER_READINESS_JUDGE_MAX_PARALLELISM", "2")
+    monkeypatch.setattr(answer_readiness, "_make_judge_client", object)
+    monkeypatch.setattr(answer_readiness, "_judge_answer_row", fake_judge_answer_row)
+
+    judged = answer_readiness._run_llm_judge(
+        examples=examples,
+        rows_by_id={example.id: {"response": "answer"} for example in examples},
+        model="gemini-test",
+        timeout_seconds=5.0,
+        allow_openai_fallback=False,
+        parallelism=8,
+        progress_callback=lambda event, payload: progress_events.append((event, payload)),
+    )
+
+    row_events = [
+        payload
+        for event, payload in progress_events
+        if event == "answer_readiness_judge_row_done"
+    ]
+    assert max_active == 2
+    assert list(judged) == [example.id for example in examples]
+    assert sorted(payload["id"] for payload in row_events) == [example.id for example in examples]
+    assert sorted(payload["completed"] for payload in row_events) == [1, 2, 3, 4]
+    assert all(result["judge_provider"] == "gemini" for result in judged.values())
+
+
 def test_openai_judge_fallback_can_be_disabled(monkeypatch):
     from pipeline.evaluation import answer_readiness
 

@@ -30,10 +30,11 @@ LANES = (
 )
 CONTRACT_FINGERPRINT = "a" * 64
 SERVING_CONTRACT_FINGERPRINT = "b" * 64
-EVAL_POLICY_ID = "mbzuai-production-eval-v2"
-RETRIEVAL_DATASET_SHA256 = "cd9c4d7835f244347a174f2321399d77bb020593b64654173de8f7d0d0bcf42e"
-RETRIEVAL_GATES_SHA256 = "7361ce23bf3cf4e4de807925791dc9b4021c7c0f058cef426a9431f3103c1c80"
-ANSWER_GATES_SHA256 = "1e66930369c7d009672b683c08f2cdc50aa10fcc9d2ea7b48dbe04920cc7e64e"
+EVAL_POLICY_ID = "mbzuai-production-eval-v3"
+EVAL_MIN_QUERY_COUNT = 160
+RETRIEVAL_DATASET_SHA256 = "fa400a69bcb9f1a61b6cdb9c8033fed3b16426d2d58b8cec1b427fe097499ac8"
+RETRIEVAL_GATES_SHA256 = "ba221e2d2507582d1566270f5116e423fefce21639cfb23c5773819bfad91128"
+ANSWER_GATES_SHA256 = "94fd1df2f00eef43f1fa957bb82147fb08be896f1a474f91b8837b74c92913eb"
 ANSWER_RUNTIME_COMMIT_SHA = "e" * 40
 INDEXING_BUILD = {
     "commit_sha": "f" * 40,
@@ -471,16 +472,16 @@ def _manifest_payload(
             "policy_id": EVAL_POLICY_ID,
             "dataset_sha256": RETRIEVAL_DATASET_SHA256,
             "gates_sha256": RETRIEVAL_GATES_SHA256,
-            "minimum_query_count": 65,
-            "query_count": 65,
+            "minimum_query_count": EVAL_MIN_QUERY_COUNT,
+            "query_count": EVAL_MIN_QUERY_COUNT,
             "gates": {"passed": True},
         },
         "answer_evaluation": {
             "policy_id": EVAL_POLICY_ID,
             "dataset_sha256": RETRIEVAL_DATASET_SHA256,
             "gates_sha256": ANSWER_GATES_SHA256,
-            "minimum_query_count": 65,
-            "query_count": 0 if waived else 65,
+            "minimum_query_count": EVAL_MIN_QUERY_COUNT,
+            "query_count": 0 if waived else EVAL_MIN_QUERY_COUNT,
             "llm_judge": {
                 "enabled": True,
                 "providers": ["gemini"],
@@ -490,7 +491,7 @@ def _manifest_payload(
                 "openai_fallback_allowed": False,
                 "identity_mismatch_count": 0,
                 "error_count": 0,
-                "judged_count": 65,
+                "judged_count": EVAL_MIN_QUERY_COUNT,
             },
             "gates": {"passed": not waived},
             "skipped": waived,
@@ -920,7 +921,7 @@ def test_active_release_rejects_zero_answer_queries(tmp_path: Path) -> None:
     result = _resolve(pointer_path, runs_root)
 
     assert result.returncode != 0
-    assert "answer evaluation query_count must be at least 65" in result.stderr
+    assert f"answer evaluation query_count must be at least {EVAL_MIN_QUERY_COUNT}" in result.stderr
 
 
 def test_active_release_rejects_unpinned_evaluation_policy(tmp_path: Path) -> None:
@@ -947,7 +948,7 @@ def test_active_release_rejects_unpinned_evaluation_policy(tmp_path: Path) -> No
     result = _resolve(pointer_path, runs_root)
 
     assert result.returncode != 0
-    assert "retrieval evaluation dataset_sha256 does not match mbzuai-production-eval-v2" in result.stderr
+    assert f"retrieval evaluation dataset_sha256 does not match {EVAL_POLICY_ID}" in result.stderr
 
 
 def test_candidate_rejects_static_namespaces(tmp_path: Path) -> None:

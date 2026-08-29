@@ -52,10 +52,14 @@ from pipeline.retrieval.adaptive_hybrid import apply_vector_upload_manifest_conf
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_RELEASE_DATASET = PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_llm_generated_v1.jsonl"
-DEFAULT_RELEASE_GATES = PROJECT_ROOT / "eval" / "gates" / "retrieval_gate.v5_span_strict.json"
+DEFAULT_RELEASE_DATASET = PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
+DEFAULT_RELEASE_GATES = (
+    PROJECT_ROOT / "eval" / "gates" / "retrieval_gate.multilingual_v2_release.json"
+)
 DEFAULT_RELEASE_ANSWER_DATASET = DEFAULT_RELEASE_DATASET
-DEFAULT_RELEASE_ANSWER_GATES = PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.llm_generated_v1.json"
+DEFAULT_RELEASE_ANSWER_GATES = (
+    PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.multilingual_v2_release.json"
+)
 LEGACY_ONLY_VALIDATION_PLUGINS = {"mbzuai_legacy_vectorstores", "mbzuai_legacy_pinecone"}
 ReleaseProgressCallback = Callable[[str, Mapping[str, Any]], None]
 PROMOTION_ATTESTATION_SCHEMA_VERSION = 1
@@ -493,14 +497,17 @@ def _validate_promotion_attestation(
 
 def _validation_config_for_release(config: Dict[str, Any], work_dir: Path) -> Dict[str, Any]:
     """Return a config suitable for release validation of the uploaded contract."""
+    payload = deepcopy(config or {})
+    pipeline = dict(payload.get("pipeline") or {})
+    pipeline["validation_purpose"] = "release"
+    payload["pipeline"] = pipeline
     modern_manifest = load_json_safe(
         work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json",
         {},
     ) or {}
     if not isinstance(modern_manifest, dict) or not str(modern_manifest.get("index_name") or "").strip():
-        return config
+        return payload
 
-    payload = deepcopy(config or {})
     stages = []
     for stage in payload.get("stages") or []:
         if not isinstance(stage, dict):
@@ -1566,6 +1573,7 @@ def build_release_manifest(
         retrieval_contract_config,
         config_name=config_name,
         validation_errors=validation_errors,
+        purpose="release",
     )
     _emit_progress(
         progress_callback,

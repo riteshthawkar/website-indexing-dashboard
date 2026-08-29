@@ -1432,6 +1432,8 @@ def _run_llm_judge(
     model: str,
     timeout_seconds: float,
     allow_openai_fallback: bool = True,
+    parallelism: int = 1,
+    progress_callback: AnswerProgressCallback | None = None,
 ) -> Dict[str, Dict[str, Any]]:
     fallback_model = _openai_judge_fallback_model() if allow_openai_fallback else ""
     primary_error = ""
@@ -1442,9 +1444,22 @@ def _run_llm_judge(
             raise
         client = None
         primary_error = str(exc)
-    judged: Dict[str, Dict[str, Any]] = {}
-    for example in examples:
-        judged[example.id] = _judge_answer_row(
+    requested_parallelism = max(1, int(parallelism or 1))
+    parallelism_cap = _env_int(
+        "ANSWER_READINESS_JUDGE_MAX_PARALLELISM",
+        4,
+        minimum=1,
+    )
+    effective_parallelism = min(
+        requested_parallelism,
+        parallelism_cap,
+        max(1, len(examples)),
+    )
+    judged_by_id: Dict[str, Dict[str, Any]] = {}
+
+    def judge_one(example: EvalExample) -> tuple[str, Dict[str, Any], float]:
+        started = time.perf_counter()
+        result = _judge_answer_row(
             client=client,
             model=model,
             fallback_model=fallback_model,
@@ -1453,7 +1468,37 @@ def _run_llm_judge(
             row=rows_by_id.get(example.id, {"error": "missing_prediction"}),
             timeout_seconds=timeout_seconds,
         )
-    return judged
+        return example.id, result, round((time.perf_counter() - started) * 1000.0, 3)
+
+    def record_result(example_id: str, result: Dict[str, Any], elapsed_ms: float) -> None:
+        judged_by_id[example_id] = result
+        _emit_progress(
+            progress_callback,
+            "answer_readiness_judge_row_done",
+            id=example_id,
+            completed=len(judged_by_id),
+            query_count=len(examples),
+            elapsed_ms=elapsed_ms,
+            error=_text(result.get("error")),
+        )
+
+    if effective_parallelism <= 1:
+        for example in examples:
+            record_result(*judge_one(example))
+    else:
+        with ThreadPoolExecutor(
+            max_workers=effective_parallelism,
+            thread_name_prefix="answer-readiness-judge",
+        ) as executor:
+            futures = [executor.submit(judge_one, example) for example in examples]
+            for future in as_completed(futures):
+                record_result(*future.result())
+
+    return {
+        example.id: judged_by_id[example.id]
+        for example in examples
+        if example.id in judged_by_id
+    }
 
 
 @dataclass
@@ -2701,6 +2746,8 @@ def evaluate_answer_readiness(
                 model=judge_model,
                 timeout_seconds=judge_timeout_seconds,
                 allow_openai_fallback=allow_openai_judge_fallback,
+                parallelism=parallelism,
+                progress_callback=progress_callback,
             )
             _emit_progress(
                 progress_callback,
@@ -2774,6 +2821,20 @@ def evaluate_answer_readiness(
             "model": str(judge_model or ""),
             "prompt_version": _JUDGE_PROMPT_VERSION,
             "timeout_seconds": float(judge_timeout_seconds or 0.0),
+            "parallelism_requested": max(1, int(parallelism or 1)),
+            "parallelism_effective": (
+                min(
+                    max(1, int(parallelism or 1)),
+                    _env_int(
+                        "ANSWER_READINESS_JUDGE_MAX_PARALLELISM",
+                        4,
+                        minimum=1,
+                    ),
+                    max(1, len(examples)),
+                )
+                if judge_enabled
+                else 0
+            ),
             "judged_count": judged_count,
             "error_count": judge_error_count,
             "providers": judge_providers,

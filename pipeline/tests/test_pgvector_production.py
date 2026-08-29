@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 import json
 from pathlib import Path
@@ -14,6 +15,7 @@ from pipeline.retrieval.adaptive_hybrid import (
     apply_vector_upload_manifest_config,
 )
 from pipeline.service.retrieval_api import _run_startup_probe
+from pipeline.stages.embedders.gemini_pgvector_embedder import GeminiPgVectorEmbedder
 from pipeline.vectorstores.pgvector_store import (
     PGVECTOR_SCHEMA_VERSION,
     PgVectorConfigurationError,
@@ -71,6 +73,23 @@ def test_pgvector_settings_require_tls_and_dedicated_writer(monkeypatch: pytest.
     )
     writer = PgVectorSettings.from_config(_base_config(), purpose="write")
     assert writer.purpose == "write"
+
+
+def test_pgvector_release_validation_requires_reader_not_ingest_credential(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = _base_config()
+    config["pipeline"]["validation_purpose"] = "release"
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-key")
+    monkeypatch.setenv(
+        "PGVECTOR_DSN",
+        "postgresql://reader:strong-password@pgvector.internal/vectors?sslmode=require",
+    )
+    monkeypatch.delenv("PGVECTOR_INGEST_DSN", raising=False)
+
+    errors = asyncio.run(GeminiPgVectorEmbedder().validate_config(config))
+
+    assert errors == []
 
 
 def test_pgvector_settings_reject_plaintext_production_dsn(monkeypatch: pytest.MonkeyPatch) -> None:

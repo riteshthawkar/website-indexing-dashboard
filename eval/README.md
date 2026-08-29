@@ -71,13 +71,13 @@ Run the stricter `v4` gate:
 
 ## Release Readiness Evaluation
 
-Production promotion uses the governed LLM-generated v1 suite and strict gates by default:
+Production promotion uses the governed multilingual V2 suite and release gates by default:
 
-- `eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl`
-- `eval/gates/retrieval_gate.v5_span_strict.json`
-- `eval/gates/answer_readiness_gate.llm_generated_v1.json`
+- `eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl`
+- `eval/gates/retrieval_gate.multilingual_v2_release.json`
+- `eval/gates/answer_readiness_gate.multilingual_v2_release.json`
 
-Production policy `mbzuai-production-eval-v2` requires all 65 governed retrieval queries and 65 judged answers: 57 English cases and eight Arabic cases. The release-readiness v2 suite remains available as a supplemental regression set for PDF-derived, multi-document, and multimodal coverage, but it is not the promotion policy.
+Production policy `mbzuai-production-eval-v3` requires all 160 governed retrieval queries and 160 Gemini-judged answers: 80 English and 80 Arabic cases, including 24 sealed no-answer checks and explicit multimodal, navigation, cross-lingual, and subdomain coverage. Its 96-row selection and 26-row regression splits may be used before release; the 38-row holdout remains sealed until a final candidate is frozen.
 
 The v2 suite is generated from the internal v4 gold set with:
 
@@ -138,18 +138,18 @@ To exercise the exact live widget/chatbot WebSocket path, start the backend agai
 
 The evaluator does not send `X-Health-Probe` by default because probe mode can intentionally bypass normal user-facing responses. Use `--answer-probe-mode` only when you explicitly want a health-probe style check instead of production answer grading.
 
-To grade the governed 65-query multilingual suite, use its matching answer gate:
+To grade the governed 160-query multilingual suite, use its matching answer gate:
 
 ```bash
 ./env/bin/python -m pipeline eval-answer-readiness \
   --config pipeline/configs/default.yaml \
   --work-dir runs/mbzuai_indexing/<run_id> \
-  --dataset eval/mbzuai_gold/mbzuai_llm_generated_v1.jsonl \
-  --gates eval/gates/answer_readiness_gate.llm_generated_v1.json \
+  --dataset eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl \
+  --gates eval/gates/answer_readiness_gate.multilingual_v2_release.json \
   --mode websocket \
   --endpoint ws://127.0.0.1:8000/chat \
   --parallelism 2 \
-  --output eval/reports/answer_readiness_llm_generated_v1_report.json
+  --output eval/reports/answer_readiness_multilingual_v2_release_report.json
 ```
 
 For local deterministic dry runs only, you can skip the LLM judge, but the default production answer gate will still fail because it requires judge metrics. Use a non-LLM gate file for deterministic-only checks:
