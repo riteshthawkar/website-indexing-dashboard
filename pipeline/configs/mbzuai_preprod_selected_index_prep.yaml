@@ -75,19 +75,19 @@ formatter:
     minimum_source_count: 1
     source_runs:
       - role: "prepared_corpus"
-        run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260830-v2"
+        run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260831-v4"
         project_name: "mbzuai_preprod_corpus_preparation"
         required_stage_ids:
           - "prepare_corpus_boundary"
         evidence:
-          pipeline_state_sha256: "d632f2a7503e8d6d630cfead862fa8c68f8e84af46e9d29bd001284687d26695"
-          artifact_catalog_sha256: "1cf6eaba69c76932186a99bed1ede2e99df09fcadc135f5f8b3e0fa5f3e53b09"
-          run_audit_sha256: "ad9342a1e2cf3b65aa872d9f1e3d458ade64e04741c781f13aebda1c4fc13451"
-          resolved_config_sha256: "850f9217591509549175eb91cfcce0f35520c7ea5706b252fc3ae83d0c3abd72"
+          pipeline_state_sha256: "8b7750d5465262c26914ce5e7a9827abc91e9dabbce81e48de054bfbc00e5fa1"
+          artifact_catalog_sha256: "456f5762a1334400d935eac4d25c1838169ae90793adb0327b36d677c3d5fda0"
+          run_audit_sha256: "f26d6883967ee20577076800e8696a7efa9f910cc472aed590c1e649cf66d2ef"
+          resolved_config_sha256: "1034e089cfb347574426006d51ed5cbf337b2a7747a4487f7c1ebd90c9e8f0af"
 
   page_graph_bridge:
-    source_representation_run_dir: "runs/mbzuai_preprod_representation_v2/mbzuai-preprod-representation-v2-20260830-v1"
-    source_corpus_run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260830-v2"
+    source_representation_run_dir: "runs/mbzuai_preprod_representation_v2/mbzuai-preprod-representation-v2-20260831-v2"
+    source_corpus_run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260831-v4"
     require_chunk_index: true
     derive_document_sections: true
 

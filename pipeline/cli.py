@@ -181,9 +181,19 @@ def setup_logging(verbose: bool = False) -> None:
 
 def cmd_run(args: argparse.Namespace) -> int:
     """Run the pipeline, optionally stopping at an intentional stage checkpoint."""
-    should_resume = args.resume or bool(args.restart_from_stage)
+    migrate_incomplete_config = bool(
+        getattr(args, "migrate_incomplete_config", False)
+    )
+    should_resume = (
+        args.resume
+        or bool(args.restart_from_stage)
+        or migrate_incomplete_config
+    )
+    if migrate_incomplete_config and not args.run_id:
+        print("\n--migrate-incomplete-config requires an explicit --run-id")
+        return 1
     config = load_config(args.config)
-    if should_resume and args.run_id:
+    if should_resume and args.run_id and not migrate_incomplete_config:
         run_work_dir = (
             Path(config.get("work_dir", "./runs"))
             / str(config.get("project_name", "default"))
@@ -249,10 +259,15 @@ def cmd_run(args: argparse.Namespace) -> int:
             return 1
 
     async def _run():
+        run_kwargs = {
+            "resume": should_resume,
+            "restart_from": args.restart_from_stage,
+            "stop_after_stage": stop_after_stage,
+        }
+        if migrate_incomplete_config:
+            run_kwargs["migrate_incomplete_config"] = True
         return await orchestrator.run(
-            resume=should_resume,
-            restart_from=args.restart_from_stage,
-            stop_after_stage=stop_after_stage,
+            **run_kwargs,
         )
 
     try:
@@ -1078,6 +1093,14 @@ def main() -> int:
     p_run = subparsers.add_parser("run", help="Run the full pipeline")
     p_run.add_argument("--config", default="default", help="Config name or path")
     p_run.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    p_run.add_argument(
+        "--migrate-incomplete-config",
+        action="store_true",
+        help=(
+            "Explicitly migrate an unfinished non-production run to the current "
+            "config while preserving its active-stage checkpoint"
+        ),
+    )
     p_run.add_argument(
         "--restart-from-stage",
         default=None,

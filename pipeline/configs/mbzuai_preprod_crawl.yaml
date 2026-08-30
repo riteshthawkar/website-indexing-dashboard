@@ -70,6 +70,104 @@ crawler:
   seed_inventory_fetch_attempts: 3
   seed_inventory_retry_backoff_sec: 0.75
 
+  # Client-rendered directories expose only their first state to ordinary link
+  # extraction.  These contracts walk the actual pagination controls first,
+  # compare unique cards with the count displayed by the page, and seed every
+  # discovered same-host detail URL into the required crawl frontier.
+  require_complete_dynamic_collections: true
+  dynamic_collections:
+    - id: "faculty_directory_en"
+      url: "https://preprod.mbzuai.ac.ae/study/faculty-directory"
+      item_selector: "main article"
+      next_selector: 'button[aria-label="Next Page"]'
+      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
+      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/faculty-directory/[^/?#]+/?$'
+      require_item_urls: true
+      minimum_items: 1
+      max_states: 30
+      augment_listing_page: true
+      required: true
+
+    # The localized directory currently lives on its legacy Drupal node route
+    # and exposes a slightly different faculty cohort.  Its union with the
+    # English directory prevents either locale from masking missing profiles.
+    - id: "faculty_directory_ar"
+      url: "https://preprod.mbzuai.ac.ae/ar/node/598"
+      item_selector: "main article"
+      next_selector: 'button[aria-label="Next Page"]'
+      expected_count_pattern: 'عرض النتائج من\s+\d+\s+إلى\s+\d+\s+من أصل\s+([\d,]+)'
+      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/faculty-directory/[^/?#]+/?$'
+      require_item_urls: true
+      # This legacy localized listing currently publishes thirteen stale Arabic-
+      # slug aliases that return HTTP 404. Preserve and report every card/link,
+      # while keeping every other Arabic-only profile hard-required.
+      allowed_terminal_item_urls:
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/ayan-mathywz"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/ayma-kantwyl"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/albrwfyswr-ayran-syghal"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/aldktwr-rmzy-bn-wghrm"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/dyfyd-shw"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/haiyan-huang"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/he-dr-mohamed-abdelhameed-al-askar"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/hsny-ghdyrt"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/maly-mr-bn-sltan-allma"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/professor-alexander-gasnikov"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/shy-haw-hangh"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/wan-ly-myn"
+        - "https://preprod.mbzuai.ac.ae/faculty-directory/ywanzy-ly"
+      minimum_items: 1
+      max_states: 30
+      augment_listing_page: true
+      required: true
+
+    - id: "news_the_node"
+      url: "https://preprod.mbzuai.ac.ae/the-node"
+      item_selector: "main article"
+      next_selector: 'button[aria-label="Next Page"]'
+      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
+      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/knowledge-center/the-node/[^/?#]+/?$'
+      require_item_urls: true
+      minimum_items: 1
+      max_states: 120
+      augment_listing_page: false
+      required: true
+
+    - id: "events"
+      url: "https://preprod.mbzuai.ac.ae/the-node/events"
+      item_selector: "main article"
+      next_selector: 'button[aria-label="Next Page"]'
+      expected_count_pattern: 'Showing\s+\d+\s+of\s+([\d,]+)\s+results'
+      require_item_urls: true
+      minimum_items: 1
+      max_states: 10
+      augment_listing_page: true
+      required: true
+
+    - id: "research_project_hub"
+      url: "https://preprod.mbzuai.ac.ae/research/project-hub"
+      item_selector: "main article"
+      next_selector: 'button[aria-label="Next Page"]'
+      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
+      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/research/projects-hub/[^/?#]+/?$'
+      require_item_urls: true
+      minimum_items: 1
+      max_states: 10
+      augment_listing_page: true
+      required: true
+
+    # Some startup cards intentionally contain no detail link.  Card text is
+    # therefore the item identity and is appended to the saved listing page.
+    - id: "startup_showcase"
+      url: "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
+      item_selector: "main article"
+      next_selector: 'button[aria-label="Next Page"]'
+      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
+      require_item_urls: false
+      minimum_items: 1
+      max_states: 10
+      augment_listing_page: true
+      required: true
+
   allowed_domains:
     - "preprod.mbzuai.ac.ae"
   allowed_hosts:

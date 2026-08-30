@@ -14,10 +14,10 @@ pipeline:
 
 formatter:
   representation_v2:
-    source_corpus_run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260830-v2"
-    expected_document_count: 1682
-    expected_page_count: 1790
-    expected_web_document_count: 1672
+    source_corpus_run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260831-v4"
+    expected_document_count: 1697
+    expected_page_count: 1809
+    expected_web_document_count: 1687
     maximum_workers: 4
     maximum_topics_per_page: 24
     template_minimum_page_count: 20

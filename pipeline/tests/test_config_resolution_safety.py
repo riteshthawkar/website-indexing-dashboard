@@ -14,6 +14,7 @@ from pipeline.core.config import (
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.orchestrator import PipelineOrchestrator, RunConfigMismatchError
 from pipeline.core.release import default_active_release_path
+from pipeline.core.state import PipelineState, StageState, save_state
 
 
 def _write_yaml(path: Path, payload: dict) -> None:
@@ -96,6 +97,106 @@ def test_production_resume_requires_recorded_snapshot_fingerprint(tmp_path: Path
 
     with pytest.raises(RunConfigMismatchError, match="recorded indexing fingerprint is missing"):
         PipelineOrchestrator(config, work_dir=work_dir, run_id="run-1")._validate_resume_config_snapshot()
+
+
+def test_explicit_incomplete_nonproduction_migration_preserves_audit(tmp_path: Path) -> None:
+    work_root = tmp_path / "runs"
+    work_dir = work_root / "mbzuai_main" / "run-1"
+    work_dir.mkdir(parents=True)
+    saved_config = _production_config(chunk_size=800, work_root=work_root)
+    saved_config["pipeline"]["production_profile"] = False
+    current_config = _production_config(chunk_size=900, work_root=work_root)
+    current_config["pipeline"]["production_profile"] = False
+    saved_hashes = {"stages/crawlers/crawl4ai_crawler.py": "saved-build"}
+    atomic_write_json(
+        work_dir / "resolved_config.json",
+        {
+            "run_id": "run-1",
+            "project_name": "mbzuai_main",
+            "production_indexing_contract_fingerprint": (
+                production_indexing_contract_fingerprint(
+                    saved_config,
+                    implementation_hashes=saved_hashes,
+                )
+            ),
+            "indexing_build": {"implementation_sha256": saved_hashes},
+            "config": saved_config,
+        },
+    )
+    save_state(
+        PipelineState(
+            run_id="run-1",
+            project_name="mbzuai_main",
+            status="running",
+            stages=[
+                StageState(
+                    name="crawl4ai",
+                    stage_type="crawler",
+                    stage_id="crawl",
+                    status="running",
+                    checkpoint={"runtime_state_file": "checkpoint.json"},
+                )
+            ],
+        ),
+        work_dir,
+    )
+    orchestrator = PipelineOrchestrator(
+        current_config,
+        work_dir=work_dir,
+        run_id="run-1",
+    )
+    orchestrator._build_stages()
+
+    orchestrator._migrate_incomplete_config_snapshot()
+
+    migrations = load_json_safe(work_dir / "config_migrations.json", [])
+    assert len(migrations) == 1
+    assert migrations[0]["saved_fingerprint"] != migrations[0]["requested_fingerprint"]
+    assert migrations[0]["reason"] == "explicit_incomplete_run_config_migration"
+
+
+def test_incomplete_config_migration_rejects_completed_stage(tmp_path: Path) -> None:
+    work_root = tmp_path / "runs"
+    work_dir = work_root / "mbzuai_main" / "run-1"
+    work_dir.mkdir(parents=True)
+    config = _production_config(chunk_size=800, work_root=work_root)
+    config["pipeline"]["production_profile"] = False
+    saved_hashes = {"stages/crawlers/crawl4ai_crawler.py": "saved-build"}
+    atomic_write_json(
+        work_dir / "resolved_config.json",
+        {
+            "run_id": "run-1",
+            "production_indexing_contract_fingerprint": (
+                production_indexing_contract_fingerprint(
+                    config,
+                    implementation_hashes=saved_hashes,
+                )
+            ),
+            "indexing_build": {"implementation_sha256": saved_hashes},
+            "config": config,
+        },
+    )
+    save_state(
+        PipelineState(
+            run_id="run-1",
+            project_name="mbzuai_main",
+            status="completed",
+            stages=[
+                StageState(
+                    name="crawl4ai",
+                    stage_type="crawler",
+                    stage_id="crawl",
+                    status="completed",
+                )
+            ],
+        ),
+        work_dir,
+    )
+    orchestrator = PipelineOrchestrator(config, work_dir=work_dir, run_id="run-1")
+    orchestrator._build_stages()
+
+    with pytest.raises(RunConfigMismatchError, match="after any stage has completed"):
+        orchestrator._migrate_incomplete_config_snapshot()
 
 
 def test_resolved_config_snapshot_and_fingerprint_exclude_embedded_secrets(tmp_path: Path) -> None:

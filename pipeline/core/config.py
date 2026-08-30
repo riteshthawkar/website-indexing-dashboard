@@ -16,7 +16,7 @@ import re
 import subprocess
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import yaml
 
@@ -243,7 +243,11 @@ def indexing_build_identity() -> Dict[str, Any]:
     }
 
 
-def production_indexing_contract_payload(config: Dict[str, Any]) -> Dict[str, Any]:
+def production_indexing_contract_payload(
+    config: Dict[str, Any],
+    *,
+    implementation_hashes: Optional[Mapping[str, str]] = None,
+) -> Dict[str, Any]:
     """Return the immutable configuration that determines indexed artifacts.
 
     Retrieval routing and serving limits are intentionally excluded: they may
@@ -256,7 +260,11 @@ def production_indexing_contract_payload(config: Dict[str, Any]) -> Dict[str, An
     payload: Dict[str, Any] = {
         "project_name": safe_config.get("project_name"),
         "stages": safe_config.get("stages") or [],
-        "implementation_sha256": indexing_implementation_hashes(),
+        "implementation_sha256": dict(
+            implementation_hashes
+            if implementation_hashes is not None
+            else indexing_implementation_hashes()
+        ),
     }
     for section in _INDEXING_CONTRACT_SECTIONS:
         value = safe_config.get(section)
@@ -276,9 +284,16 @@ def production_indexing_contract_payload(config: Dict[str, Any]) -> Dict[str, An
     return payload
 
 
-def production_indexing_contract_fingerprint(config: Dict[str, Any]) -> str:
+def production_indexing_contract_fingerprint(
+    config: Dict[str, Any],
+    *,
+    implementation_hashes: Optional[Mapping[str, str]] = None,
+) -> str:
     raw = json.dumps(
-        production_indexing_contract_payload(config),
+        production_indexing_contract_payload(
+            config,
+            implementation_hashes=implementation_hashes,
+        ),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),

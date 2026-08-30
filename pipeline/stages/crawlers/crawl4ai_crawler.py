@@ -35,6 +35,11 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 from pipeline.core.base import CrawlerStage, StageContext, StageResult
+from pipeline.core.dynamic_collections import (
+    PlaywrightDynamicCollectionBrowser,
+    dynamic_collection_specs_fingerprint,
+    normalize_dynamic_collection_specs,
+)
 from pipeline.core.media import dedupe_media_items
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe, safe_filename
 from pipeline.core.registry import register_stage
@@ -304,6 +309,7 @@ RUNTIME_STATE_FILENAME = "crawler_checkpoint.json"
 SITEMAP_STATE_FILENAME = "sitemap_discovery.json"
 SITEMAP_COHORT_VERIFICATION_FILENAME = "sitemap_cohort_verification.json"
 SEED_INVENTORY_FILENAME = "seed_inventory.json"
+DYNAMIC_COLLECTION_INVENTORY_FILENAME = "dynamic_collection_inventory.json"
 
 
 class _RedirectEgressPolicyError(RuntimeError):
@@ -2550,8 +2556,33 @@ class Crawl4AICrawler(CrawlerStage):
             if normalized
         }
         unmapped_inventory_urls = sorted(inventory_urls - mapped_urls)
+        dynamic_inventory_urls = {
+            normalized
+            for value in (
+                (
+                    (getattr(self, "dynamic_collection_inventory", {}) or {}).get(
+                        "required_success_urls"
+                    )
+                    or (getattr(self, "dynamic_collection_inventory", {}) or {}).get(
+                        "urls"
+                    )
+                )
+                or []
+            )
+            if (normalized := _normalize_http_url(value))
+        }
+        unmapped_dynamic_urls = sorted(dynamic_inventory_urls - mapped_urls)
+        failed_dynamic_urls = sorted(
+            url
+            for url in dynamic_inventory_urls & mapped_urls
+            if str((getattr(self, "url_mapping", {}) or {}).get(url) or "").startswith(
+                "SKIPPED"
+            )
+        )
         self.stats["frontier_pending_remaining"] = len(pending)
         self.stats["seed_inventory_urls_unmapped"] = len(unmapped_inventory_urls)
+        self.stats["dynamic_collection_urls_unmapped"] = len(unmapped_dynamic_urls)
+        self.stats["dynamic_collection_urls_failed"] = len(failed_dynamic_urls)
 
         errors: List[str] = []
         if pending and bool(self.config.get("fail_on_incomplete_frontier", False)):
@@ -2566,6 +2597,25 @@ class Crawl4AICrawler(CrawlerStage):
                 "Seed inventory contains URLs with no durable crawl outcome: "
                 f"unmapped={len(unmapped_inventory_urls)} "
                 f"sample={unmapped_inventory_urls[:10]}"
+            )
+        require_dynamic = bool(
+            getattr(
+                self,
+                "require_complete_dynamic_collections",
+                self.config.get("require_complete_dynamic_collections", False),
+            )
+        )
+        if require_dynamic and unmapped_dynamic_urls:
+            errors.append(
+                "Dynamic collection inventory contains URLs with no durable crawl outcome: "
+                f"unmapped={len(unmapped_dynamic_urls)} "
+                f"sample={unmapped_dynamic_urls[:10]}"
+            )
+        if require_dynamic and failed_dynamic_urls:
+            errors.append(
+                "Dynamic collection detail URLs were not successfully captured: "
+                f"failed={len(failed_dynamic_urls)} "
+                f"sample={failed_dynamic_urls[:10]}"
             )
         return errors
 
@@ -2658,6 +2708,21 @@ class Crawl4AICrawler(CrawlerStage):
                         raise ValueError
                 except (TypeError, ValueError):
                     errors.append(f"{label}.{key} must be an integer >= {minimum}")
+
+        dynamic_specs, dynamic_errors = normalize_dynamic_collection_specs(
+            crawler.get("dynamic_collections"),
+            start_url=str(start_url or ""),
+            allowed_hosts=sorted(allowed_hosts),
+            require_https=bool(crawler.get("require_https", True)),
+        )
+        errors.extend(dynamic_errors)
+        if dynamic_specs:
+            try:
+                import playwright.async_api  # noqa: F401
+            except ImportError:
+                errors.append(
+                    "playwright is required when crawler.dynamic_collections is configured"
+                )
 
         robots_unknown_host_policy = str(
             crawler.get("robots_unknown_host_policy", "allow") or "allow"
@@ -2973,6 +3038,22 @@ class Crawl4AICrawler(CrawlerStage):
             0.0,
             float(self.config.get("seed_inventory_retry_backoff_sec", 0.75)),
         )
+        self.dynamic_collection_specs, dynamic_collection_errors = (
+            normalize_dynamic_collection_specs(
+                self.config.get("dynamic_collections"),
+                start_url=self.start_url,
+                allowed_hosts=sorted(self.allowed_hosts),
+                require_https=self.require_https,
+            )
+        )
+        if dynamic_collection_errors:
+            raise ValueError("; ".join(dynamic_collection_errors))
+        self.require_complete_dynamic_collections = bool(
+            self.config.get("require_complete_dynamic_collections", True)
+        )
+        self.dynamic_collection_specs_sha256 = dynamic_collection_specs_fingerprint(
+            self.dynamic_collection_specs
+        )
         self.known_empty_sitemap_cohorts, cohort_errors = (
             _normalize_known_empty_cohort_policies(
                 self.config.get("known_empty_sitemap_cohorts"),
@@ -3027,6 +3108,9 @@ class Crawl4AICrawler(CrawlerStage):
         self.runtime_state_file = ctx.work_dir / RUNTIME_STATE_FILENAME
         self.sitemap_state_file = ctx.work_dir / SITEMAP_STATE_FILENAME
         self.seed_inventory_file = ctx.work_dir / SEED_INVENTORY_FILENAME
+        self.dynamic_collection_inventory_file = (
+            ctx.work_dir / DYNAMIC_COLLECTION_INVENTORY_FILENAME
+        )
         self.sitemap_cohort_verification_file = (
             ctx.work_dir / SITEMAP_COHORT_VERIFICATION_FILENAME
         )
@@ -3052,6 +3136,14 @@ class Crawl4AICrawler(CrawlerStage):
             "seed_inventory_pages_fetched": 0,
             "seed_inventory_urls_discovered": 0,
             "seed_inventory_urls_unmapped": 0,
+            "dynamic_collections_configured": len(self.dynamic_collection_specs),
+            "dynamic_collections_completed": 0,
+            "dynamic_collection_states_traversed": 0,
+            "dynamic_collection_items_discovered": 0,
+            "dynamic_collection_urls_discovered": 0,
+            "dynamic_collection_pages_augmented": 0,
+            "dynamic_collection_urls_unmapped": 0,
+            "dynamic_collection_urls_failed": 0,
             "frontier_pending_remaining": 0,
             "verified_empty_urls": 0,
             "sitemap_batches_completed": 0,
@@ -3074,6 +3166,10 @@ class Crawl4AICrawler(CrawlerStage):
         self.crawl_state: Dict[str, Any] = {}
         self.discovered_sitemaps: Dict[str, Any] = {"sources": [], "urls": []}
         self.seed_inventory: Dict[str, Any] = {"endpoints": [], "urls": []}
+        self.dynamic_collection_inventory: Dict[str, Any] = {
+            "collections": [],
+            "urls": [],
+        }
         self.sitemap_cohort_verification: Optional[Dict[str, Any]] = None
         self.verified_empty_urls: Dict[str, str] = {}
         self._last_flush_at = 0.0
@@ -3107,6 +3203,7 @@ class Crawl4AICrawler(CrawlerStage):
             if not self._allow_frontier_url(self.start_url):
                 raise ValueError("crawler.start_url is excluded from the crawl frontier")
 
+            dynamic_collection_urls = await self._discover_dynamic_collection_urls()
             if not _has_resumable_crawl_state(self.crawl_state):
                 sitemap_urls = []
                 if self.config.get("sitemap_enabled", True):
@@ -3131,12 +3228,50 @@ class Crawl4AICrawler(CrawlerStage):
                 )
                 self.crawl_state = _build_initial_crawl_state(
                     self.start_url,
-                    [*sitemap_urls, *seed_inventory_urls],
+                    [*sitemap_urls, *seed_inventory_urls, *dynamic_collection_urls],
                     self.max_pages,
                     frontier_seed_limit=self.config.get("sitemap_frontier_seed_limit"),
-                    priority_urls=self.priority_seed_urls,
+                    priority_urls=[
+                        *(spec.url for spec in self.dynamic_collection_specs),
+                        *self.priority_seed_urls,
+                    ],
                 )
                 self._flush_runtime_state(force=True)
+            elif dynamic_collection_urls:
+                visited = {
+                    normalized
+                    for value in (self.crawl_state.get("visited") or [])
+                    if (normalized := _normalize_http_url(value))
+                }
+                pending = self.crawl_state.setdefault("pending", [])
+                pending_urls = {
+                    normalized
+                    for item in pending
+                    for value in [item.get("url") if isinstance(item, dict) else item]
+                    if (normalized := _normalize_http_url(value))
+                }
+                missing_dynamic_urls = [
+                    url
+                    for url in dynamic_collection_urls
+                    if url not in visited and url not in pending_urls
+                ]
+                scheduled_count = len(visited) + len(pending_urls)
+                if scheduled_count + len(missing_dynamic_urls) > self.max_pages:
+                    raise RuntimeError(
+                        "Dynamic collection URLs exceed the remaining crawl frontier budget: "
+                        f"scheduled={scheduled_count} required_new={len(missing_dynamic_urls)} "
+                        f"max_pages={self.max_pages}"
+                    )
+                depths = self.crawl_state.setdefault("depths", {})
+                for url in missing_dynamic_urls:
+                    pending.append({"url": url, "parent_url": self.start_url})
+                    depths[url] = 1
+                if missing_dynamic_urls:
+                    logger.info(
+                        "Added %d dynamic collection URL(s) to resumed crawl frontier",
+                        len(missing_dynamic_urls),
+                    )
+                    self._flush_runtime_state(force=True)
 
             browser_config = self._build_browser_config()
             run_config = self._build_run_config()
@@ -3227,6 +3362,32 @@ class Crawl4AICrawler(CrawlerStage):
                             )
                         ]
                         if self.seed_inventory_file.exists()
+                        else []
+                    ),
+                    *(
+                        [
+                            ctx.make_artifact(
+                                self.dynamic_collection_inventory_file,
+                                artifact_type="dynamic_collection_inventory",
+                                role="client_rendered_collection_inventory",
+                                metadata={
+                                    "collections": len(
+                                        self.dynamic_collection_inventory.get(
+                                            "collections", []
+                                        )
+                                    ),
+                                    "items": int(
+                                        self.dynamic_collection_inventory.get(
+                                            "discovered_item_count", 0
+                                        )
+                                    ),
+                                    "eligible_urls": len(
+                                        self.dynamic_collection_inventory.get("urls", [])
+                                    ),
+                                },
+                            )
+                        ]
+                        if self.dynamic_collection_inventory_file.exists()
                         else []
                     ),
                     *(
@@ -3653,6 +3814,17 @@ class Crawl4AICrawler(CrawlerStage):
             dict(seed_inventory)
             if isinstance(seed_inventory, dict)
             else {"endpoints": [], "urls": []}
+        )
+        dynamic_collection_inventory = state.get("dynamic_collection_inventory")
+        if not isinstance(dynamic_collection_inventory, dict):
+            dynamic_collection_inventory = load_json_safe(
+                self.dynamic_collection_inventory_file,
+                {},
+            ) or {}
+        self.dynamic_collection_inventory = (
+            dict(dynamic_collection_inventory)
+            if isinstance(dynamic_collection_inventory, dict)
+            else {"collections": [], "urls": []}
         )
         cohort_evidence = state.get("sitemap_cohort_verification")
         if not isinstance(cohort_evidence, dict) and self.crawl_state:
@@ -4479,6 +4651,285 @@ class Crawl4AICrawler(CrawlerStage):
         atomic_write_json(self.seed_inventory_file, self.seed_inventory)
         return deduped
 
+    async def _discover_dynamic_collection_urls(self) -> List[str]:
+        """Enumerate configured SPA collections and persist fail-closed evidence."""
+
+        specs = list(getattr(self, "dynamic_collection_specs", []) or [])
+        if not specs:
+            self.dynamic_collection_inventory = {
+                "version": 1,
+                "generated_at": time.time(),
+                "config_sha256": self.dynamic_collection_specs_sha256,
+                "collections": [],
+                "urls": [],
+            }
+            return []
+
+        existing = getattr(self, "dynamic_collection_inventory", {}) or {}
+        existing_collections = existing.get("collections") or []
+        reusable = (
+            existing.get("config_sha256") == self.dynamic_collection_specs_sha256
+            and len(existing_collections) == len(specs)
+            and all(
+                isinstance(record, dict)
+                and (
+                    bool(record.get("complete"))
+                    or not bool(record.get("required", True))
+                )
+                for record in existing_collections
+            )
+        )
+        if reusable:
+            urls = sorted(
+                {
+                    normalized
+                    for value in (existing.get("urls") or [])
+                    if (normalized := _normalize_http_url(value))
+                }
+            )
+            self.stats["dynamic_collections_completed"] = sum(
+                1 for record in existing_collections if record.get("complete")
+            )
+            self.stats["dynamic_collection_states_traversed"] = sum(
+                int(record.get("states_traversed") or 0)
+                for record in existing_collections
+            )
+            self.stats["dynamic_collection_items_discovered"] = sum(
+                int(record.get("discovered_item_count") or 0)
+                for record in existing_collections
+            )
+            self.stats["dynamic_collection_urls_discovered"] = len(urls)
+            logger.info(
+                "Reusing complete dynamic collection inventory: collections=%d urls=%d",
+                len(existing_collections),
+                len(urls),
+            )
+            return urls
+
+        def progress(event: Dict[str, Any]) -> None:
+            state = int(event.get("state") or 0)
+            total = int(event.get("total_unique_items") or 0)
+            expected = event.get("expected_count")
+            if state <= 3 or state % 10 == 0 or (expected and total >= int(expected)):
+                logger.info(
+                    "Dynamic collection progress: id=%s state=%d items=%d expected=%s new=%d",
+                    event.get("collection_id"),
+                    state,
+                    total,
+                    expected if expected is not None else "unknown",
+                    int(event.get("new_items") or 0),
+                )
+
+        results: List[Dict[str, Any]] = []
+        browser_kwargs = {
+            "headless": self.headless,
+            "timeout_sec": self.timeout,
+            "user_agent": str(self.config.get("user_agent") or ""),
+            "headers": self.config.get("headers") or {},
+            "ignore_https_errors": self.ignore_https_errors,
+            "viewport": self.config.get("viewport"),
+            "proxy": self.proxy,
+            "storage_state": self.config.get("storage_state"),
+        }
+        async with PlaywrightDynamicCollectionBrowser(**browser_kwargs) as browser:
+            for spec in specs:
+                if not self._url_allowed_for_fetch(spec.url):
+                    raise RuntimeError(
+                        "Dynamic collection URL is outside crawler egress policy: "
+                        f"{spec.url}"
+                    )
+                logger.info(
+                    "Discovering dynamic collection: id=%s url=%s",
+                    spec.collection_id,
+                    spec.url,
+                )
+                try:
+                    record = await browser.discover(spec, progress_callback=progress)
+                except Exception as exc:
+                    record = {
+                        "version": 1,
+                        "collection_id": spec.collection_id,
+                        "configured_url": spec.url,
+                        "final_url": spec.url,
+                        "required": spec.required,
+                        "require_successful_item_urls": (
+                            spec.require_successful_item_urls
+                        ),
+                        "allowed_terminal_item_urls": list(
+                            spec.allowed_terminal_item_urls
+                        ),
+                        "augment_listing_page": spec.augment_listing_page,
+                        "expected_count": None,
+                        "discovered_item_count": 0,
+                        "discovered_url_count": 0,
+                        "items_without_urls": 0,
+                        "states_traversed": 0,
+                        "termination_reason": "browser_error",
+                        "complete": False,
+                        "errors": [f"{type(exc).__name__}: {exc}"],
+                        "states": [],
+                        "items": [],
+                        "urls": [],
+                        "started_at": time.time(),
+                        "finished_at": time.time(),
+                    }
+
+                final_url = _normalize_http_url(record.get("final_url"), spec.url)
+                if not final_url or not self._url_allowed_for_fetch(final_url):
+                    record["complete"] = False
+                    record.setdefault("errors", []).append(
+                        "collection redirected outside crawler egress policy"
+                    )
+
+                rejected_urls: set[str] = set()
+                collection_urls: set[str] = set()
+                required_success_urls: set[str] = set()
+                if final_url and self._allow_frontier_url(final_url):
+                    collection_urls.add(final_url)
+                    required_success_urls.add(final_url)
+                if self._allow_frontier_url(spec.url):
+                    collection_urls.add(spec.url)
+                    required_success_urls.add(spec.url)
+
+                items_without_crawl_urls = 0
+                for item in record.get("items") or []:
+                    crawl_urls: List[str] = []
+                    for value in item.get("urls") or []:
+                        normalized = _normalize_http_url(value, final_url or spec.url)
+                        if (
+                            normalized
+                            and self._url_allowed_for_fetch(normalized)
+                            and self._allow_frontier_url(normalized)
+                            and self._robots_allows_url(normalized)
+                        ):
+                            if normalized not in crawl_urls:
+                                crawl_urls.append(normalized)
+                                collection_urls.add(normalized)
+                                if (
+                                    spec.require_successful_item_urls
+                                    and normalized
+                                    not in spec.allowed_terminal_item_urls
+                                ):
+                                    required_success_urls.add(normalized)
+                        elif normalized:
+                            rejected_urls.add(normalized)
+                    item["crawl_urls"] = crawl_urls
+                    if spec.require_item_urls and not crawl_urls:
+                        items_without_crawl_urls += 1
+
+                if items_without_crawl_urls:
+                    record["complete"] = False
+                    record.setdefault("errors", []).append(
+                        f"{items_without_crawl_urls} item(s) have no eligible crawl URL"
+                    )
+                observed_item_urls = {
+                    value
+                    for item in (record.get("items") or [])
+                    for value in (item.get("crawl_urls") or [])
+                }
+                unused_allowed_terminal_urls = sorted(
+                    set(spec.allowed_terminal_item_urls) - observed_item_urls
+                )
+                if unused_allowed_terminal_urls:
+                    record["complete"] = False
+                    record.setdefault("errors", []).append(
+                        "configured terminal item URLs were not present in the "
+                        f"live collection: {unused_allowed_terminal_urls}"
+                    )
+                record["eligible_url_count"] = len(collection_urls)
+                record["eligible_urls"] = sorted(collection_urls)
+                record["required_success_url_count"] = len(required_success_urls)
+                record["required_success_urls"] = sorted(required_success_urls)
+                record["allowed_terminal_item_urls"] = list(
+                    spec.allowed_terminal_item_urls
+                )
+                record["unused_allowed_terminal_item_urls"] = (
+                    unused_allowed_terminal_urls
+                )
+                record["rejected_url_count"] = len(rejected_urls)
+                record["rejected_urls"] = sorted(rejected_urls)
+                results.append(record)
+                logger.info(
+                    "Dynamic collection result: id=%s complete=%s items=%d expected=%s states=%d crawl_urls=%d",
+                    spec.collection_id,
+                    bool(record.get("complete")),
+                    int(record.get("discovered_item_count") or 0),
+                    record.get("expected_count"),
+                    int(record.get("states_traversed") or 0),
+                    len(collection_urls),
+                )
+
+        urls = sorted(
+            {
+                value
+                for record in results
+                for value in (record.get("eligible_urls") or [])
+            }
+        )
+        required_success_urls = sorted(
+            {
+                value
+                for record in results
+                for value in (record.get("required_success_urls") or [])
+            }
+        )
+        allowed_terminal_urls = sorted(
+            {
+                value
+                for spec in specs
+                for value in spec.allowed_terminal_item_urls
+            }
+        )
+        self.dynamic_collection_inventory = {
+            "version": 1,
+            "generated_at": time.time(),
+            "config_sha256": self.dynamic_collection_specs_sha256,
+            "collection_count": len(results),
+            "completed_collection_count": sum(
+                1 for record in results if record.get("complete")
+            ),
+            "expected_item_count": sum(
+                int(record.get("expected_count") or 0) for record in results
+            ),
+            "discovered_item_count": sum(
+                int(record.get("discovered_item_count") or 0) for record in results
+            ),
+            "eligible_url_count": len(urls),
+            "required_success_url_count": len(required_success_urls),
+            "allowed_terminal_url_count": len(allowed_terminal_urls),
+            "collections": results,
+            "urls": urls,
+            "required_success_urls": required_success_urls,
+            "allowed_terminal_urls": allowed_terminal_urls,
+        }
+        self.stats["dynamic_collections_completed"] = int(
+            self.dynamic_collection_inventory["completed_collection_count"]
+        )
+        self.stats["dynamic_collection_states_traversed"] = sum(
+            int(record.get("states_traversed") or 0) for record in results
+        )
+        self.stats["dynamic_collection_items_discovered"] = int(
+            self.dynamic_collection_inventory["discovered_item_count"]
+        )
+        self.stats["dynamic_collection_urls_discovered"] = len(urls)
+        atomic_write_json(
+            self.dynamic_collection_inventory_file,
+            self.dynamic_collection_inventory,
+        )
+
+        failures = [
+            record
+            for record in results
+            if bool(record.get("required", True)) and not bool(record.get("complete"))
+        ]
+        if failures and self.require_complete_dynamic_collections:
+            details = "; ".join(
+                f"{record.get('collection_id')}: {', '.join(record.get('errors') or ['incomplete'])}"
+                for record in failures
+            )
+            raise RuntimeError(f"Dynamic collection coverage gate failed: {details}")
+        return urls
+
     async def _discover_sitemap_urls(self) -> List[str]:
         if not self._session:
             return []
@@ -5144,6 +5595,80 @@ class Crawl4AICrawler(CrawlerStage):
         host = (urlparse(normalized).hostname or "").lower()
         return self._host_allowed(host)
 
+    def _dynamic_collection_record_for_url(self, page_url: str) -> Optional[Dict[str, Any]]:
+        normalized_page = _normalize_http_url(page_url)
+        if not normalized_page:
+            return None
+        for record in (
+            (getattr(self, "dynamic_collection_inventory", {}) or {}).get("collections")
+            or []
+        ):
+            if not isinstance(record, dict) or not record.get("augment_listing_page"):
+                continue
+            aliases = {
+                normalized
+                for value in (
+                    record.get("configured_url"),
+                    record.get("final_url"),
+                )
+                if (normalized := _normalize_http_url(value))
+            }
+            if normalized_page in aliases:
+                return record
+        return None
+
+    def _augment_dynamic_collection_html(
+        self,
+        page_url: str,
+        html: str,
+    ) -> Tuple[str, bool]:
+        record = self._dynamic_collection_record_for_url(page_url)
+        if not record or not html:
+            return html, False
+
+        soup = BeautifulSoup(html, "html.parser")
+        collection_id = str(record.get("collection_id") or "dynamic-collection")
+        if soup.find(attrs={"data-crawl-dynamic-collection": collection_id}):
+            return html, False
+
+        section = soup.new_tag("section")
+        section["data-crawl-dynamic-collection"] = collection_id
+        section["aria-label"] = f"Complete {collection_id} collection"
+        heading = soup.new_tag("h2")
+        heading.string = f"Complete {collection_id.replace('_', ' ')} listing"
+        section.append(heading)
+        summary = soup.new_tag("p")
+        expected = record.get("expected_count")
+        discovered = int(record.get("discovered_item_count") or 0)
+        summary.string = (
+            f"Collected {discovered} of {expected} listed items across "
+            f"{int(record.get('states_traversed') or 0)} client-rendered states."
+            if expected is not None
+            else f"Collected {discovered} listed items across client-rendered states."
+        )
+        section.append(summary)
+        listing = soup.new_tag("ul")
+        for item in record.get("items") or []:
+            text = " ".join(str(item.get("text") or "").split())
+            if not text:
+                continue
+            list_item = soup.new_tag("li")
+            crawl_urls = item.get("crawl_urls") or []
+            if crawl_urls:
+                anchor = soup.new_tag("a", href=str(crawl_urls[0]))
+                anchor.string = text
+                list_item.append(anchor)
+            else:
+                list_item.string = text
+            listing.append(list_item)
+        section.append(listing)
+        target = soup.find("main") or soup.body or soup
+        target.append(section)
+        self.stats["dynamic_collection_pages_augmented"] = int(
+            self.stats.get("dynamic_collection_pages_augmented") or 0
+        ) + 1
+        return str(soup), True
+
     async def _process_result(self, result: Any, *, mark_failure: bool = True) -> bool:
         page_url = _normalize_http_url(getattr(result, "url", None))
         if not page_url:
@@ -5250,6 +5775,10 @@ class Crawl4AICrawler(CrawlerStage):
             self._flush_runtime_state()
             return False
 
+        html, dynamic_collection_augmented = self._augment_dynamic_collection_html(
+            page_url,
+            html,
+        )
         html_path = self.html_dir / f"{_url_digest(page_url)}.html"
         html_path.write_text(html, encoding="utf-8")
         self.url_mapping[page_url] = str(html_path)
@@ -5273,6 +5802,7 @@ class Crawl4AICrawler(CrawlerStage):
             page_url=page_url,
             rendered_markdown=rendered_markdown,
             capture_source=capture_source,
+            prefer_html=dynamic_collection_augmented,
         )
         if md_text:
             md_path = self.md_dir / f"{html_path.stem}.md"
@@ -5483,8 +6013,15 @@ class Crawl4AICrawler(CrawlerStage):
         page_url: str,
         rendered_markdown: str = "",
         capture_source: str = "rendered",
+        prefer_html: bool = False,
     ) -> Tuple[str, str, str]:
-        crawl_markdown = rendered_markdown if rendered_markdown else self._extract_crawl4ai_markdown(result)
+        crawl_markdown = ""
+        if not prefer_html:
+            crawl_markdown = (
+                rendered_markdown
+                if rendered_markdown
+                else self._extract_crawl4ai_markdown(result)
+            )
         crawl_reason = _markdown_quality_reason(crawl_markdown, page_url, html=html) if crawl_markdown else "empty_markdown"
         if crawl_markdown and capture_source == "rendered" and not crawl_reason:
             return crawl_markdown, "crawl4ai", ""
@@ -6063,6 +6600,15 @@ class Crawl4AICrawler(CrawlerStage):
         seed_inventory_file = getattr(self, "seed_inventory_file", None)
         if seed_inventory_file is not None and seed_inventory_file.exists():
             outputs["seed_inventory_file"] = str(seed_inventory_file)
+        dynamic_inventory_file = getattr(
+            self,
+            "dynamic_collection_inventory_file",
+            None,
+        )
+        if dynamic_inventory_file is not None and dynamic_inventory_file.exists():
+            outputs["dynamic_collection_inventory_file"] = str(
+                dynamic_inventory_file
+            )
         if self.sitemap_cohort_verification:
             outputs["sitemap_cohort_verification_file"] = str(
                 self.sitemap_cohort_verification_file
@@ -6091,6 +6637,11 @@ class Crawl4AICrawler(CrawlerStage):
                 self,
                 "seed_inventory",
                 {"endpoints": [], "urls": []},
+            ),
+            "dynamic_collection_inventory": getattr(
+                self,
+                "dynamic_collection_inventory",
+                {"collections": [], "urls": []},
             ),
             "stats": self.stats,
             "updated_at": time.time(),
@@ -6125,6 +6676,12 @@ class Crawl4AICrawler(CrawlerStage):
         seed_inventory = getattr(self, "seed_inventory", {}) or {}
         if seed_inventory.get("endpoints") or seed_inventory.get("urls"):
             atomic_write_json(self.seed_inventory_file, seed_inventory)
+        dynamic_inventory = getattr(self, "dynamic_collection_inventory", {}) or {}
+        if dynamic_inventory.get("collections") or dynamic_inventory.get("urls"):
+            atomic_write_json(
+                self.dynamic_collection_inventory_file,
+                dynamic_inventory,
+            )
         if self.sitemap_cohort_verification:
             atomic_write_json(
                 self.sitemap_cohort_verification_file,

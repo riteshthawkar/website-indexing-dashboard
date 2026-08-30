@@ -405,6 +405,115 @@ class PipelineOrchestrator:
                 f"(saved={actual_fingerprint}, requested={requested_fingerprint}); create a new run ID"
             )
 
+    def _migrate_incomplete_config_snapshot(self) -> None:
+        """Audit and migrate an unfinished non-production run to current config.
+
+        This deliberately does not permit completed stages or production runs:
+        those artifacts are immutable and must use a fresh run ID.  The narrow
+        migration path exists for a checkpointed development crawl whose active
+        stage needs a corrected contract without discarding already captured raw
+        artifacts.
+        """
+
+        snapshot_path = self.work_dir / "resolved_config.json"
+        snapshot = load_json_safe(snapshot_path, None)
+        state = load_state(self.work_dir)
+        if not isinstance(snapshot, dict) or state is None:
+            raise RunConfigMismatchError(
+                "Cannot migrate incomplete run config without a valid snapshot and pipeline state"
+            )
+        snapshot_config = snapshot.get("config")
+        if not isinstance(snapshot_config, dict):
+            raise RunConfigMismatchError(
+                "Cannot migrate incomplete run config because the saved config is invalid"
+            )
+        saved_pipeline_value = snapshot_config.get("pipeline")
+        saved_pipeline = (
+            saved_pipeline_value if isinstance(saved_pipeline_value, dict) else {}
+        )
+        current_pipeline = self._pipeline_config()
+        if bool(saved_pipeline.get("production_profile", False)) or bool(
+            current_pipeline.get("production_profile", False)
+        ):
+            raise RunConfigMismatchError(
+                "Cannot migrate an incomplete production run; create a new run ID"
+            )
+        if str(snapshot.get("run_id") or self.run_id) != self.run_id:
+            raise RunConfigMismatchError(
+                "Cannot migrate incomplete run config for a different run ID"
+            )
+        if any(stage.status == "completed" for stage in state.stages):
+            raise RunConfigMismatchError(
+                "Cannot migrate run config after any stage has completed; create a new run ID"
+            )
+        if len(state.stages) != len(self._stages):
+            raise RunConfigMismatchError(
+                "Cannot migrate incomplete run config with a different stage layout"
+            )
+        for index, (stage_type, plugin_name, stage_id, _definition, _instance) in enumerate(
+            self._stages
+        ):
+            saved_stage = state.stages[index]
+            actual = (
+                saved_stage.stage_type,
+                saved_stage.name,
+                saved_stage.stage_id or stage_id,
+            )
+            expected = (stage_type, plugin_name, stage_id)
+            if actual != expected:
+                raise RunConfigMismatchError(
+                    "Cannot migrate incomplete run config with a different stage layout "
+                    f"at index {index}: saved={actual}, requested={expected}"
+                )
+
+        recorded_fingerprint = str(
+            snapshot.get("production_indexing_contract_fingerprint") or ""
+        ).strip()
+        saved_build = snapshot.get("indexing_build")
+        saved_hashes = (
+            saved_build.get("implementation_sha256")
+            if isinstance(saved_build, dict)
+            else None
+        )
+        if recorded_fingerprint:
+            if not isinstance(saved_hashes, dict) or not saved_hashes:
+                raise RunConfigMismatchError(
+                    "Cannot verify the saved run fingerprint because its implementation hashes are missing"
+                )
+            verified_saved_fingerprint = production_indexing_contract_fingerprint(
+                snapshot_config,
+                implementation_hashes=saved_hashes,
+            )
+            if verified_saved_fingerprint != recorded_fingerprint:
+                raise RunConfigMismatchError(
+                    "Cannot migrate incomplete run config because its saved snapshot failed integrity validation"
+                )
+
+        requested_fingerprint = production_indexing_contract_fingerprint(self.config)
+        migrations_path = self.work_dir / "config_migrations.json"
+        migrations = load_json_safe(migrations_path, [])
+        if not isinstance(migrations, list):
+            raise RunConfigMismatchError(
+                "Cannot migrate incomplete run config because its migration audit is invalid"
+            )
+        migrations.append(
+            {
+                "migrated_at": now_iso(),
+                "run_id": self.run_id,
+                "state_status": state.status,
+                "current_stage_index": state.current_stage_index,
+                "saved_fingerprint": recorded_fingerprint,
+                "requested_fingerprint": requested_fingerprint,
+                "reason": "explicit_incomplete_run_config_migration",
+            }
+        )
+        atomic_write_json(migrations_path, migrations)
+        self._log(
+            "warning",
+            "Migrating unfinished non-production run %s to a new audited config fingerprint",
+            self.run_id,
+        )
+
     def _validate_fresh_production_run_directory(self) -> None:
         if not bool(self._pipeline_config().get("production_profile", False)):
             return
@@ -509,6 +618,7 @@ class PipelineOrchestrator:
         resume: bool = False,
         restart_from: Optional[str] = None,
         stop_after_stage: Optional[str] = None,
+        migrate_incomplete_config: bool = False,
     ) -> PipelineState:
         """Execute the pipeline, optionally pausing after a selected stage.
 
@@ -550,6 +660,8 @@ class PipelineOrchestrator:
             if not resume and not restart_from:
                 self._validate_fresh_production_run_directory()
                 self._raise_if_active_upload_would_run(state=None)
+            elif migrate_incomplete_config:
+                self._migrate_incomplete_config_snapshot()
             else:
                 self._validate_resume_config_snapshot()
 

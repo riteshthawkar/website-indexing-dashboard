@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run a resumable PP-OCRv5 Arabic+English scene-text batch on one GPU."""
+"""Run a resumable PP-OCRv5 Arabic+English scene-text batch on one device."""
 
 from __future__ import annotations
 
@@ -41,6 +41,11 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--all", action="store_true", help="Benchmark every item, ignoring its route.")
     parser.add_argument("--line-confidence", type=float, default=0.0)
     parser.add_argument("--recognition-batch-size", type=int, default=32)
+    parser.add_argument(
+        "--device",
+        default="gpu:0",
+        help="Paddle execution device, for example gpu:0 or cpu.",
+    )
     return parser.parse_args()
 
 
@@ -126,7 +131,7 @@ def main() -> int:
         use_textline_orientation=False,
         text_rec_score_thresh=max(0.0, min(1.0, args.line_confidence)),
         text_recognition_batch_size=max(1, args.recognition_batch_size),
-        device="gpu:0",
+        device=str(args.device),
     )
     model_load_ms = round((time.monotonic() - started) * 1000, 3)
     output: Dict[str, Any] = {
@@ -139,7 +144,9 @@ def main() -> int:
         "model_revision": MODEL_REVISION,
         "paddle_version": paddle.__version__,
         "language": "Arabic+English",
+        "execution_device": str(args.device),
         "model_load_ms": model_load_ms,
+        "result_reuse": existing.get("result_reuse") or {},
         "results": results,
     }
     for index, item in enumerate(items, start=1):

@@ -28,17 +28,17 @@ formatter:
     # while the captioned processing run supplies Markdown and local assets.
     source_runs:
       - role: "ocr_overlay"
-        run_dir: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-20260830-v1"
+        run_dir: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-20260831-v2"
         project_name: "mbzuai_preprod_hybrid_ocr"
         required_stage_ids:
           - "enrich_exact_ocr"
         evidence:
-          pipeline_state_sha256: "d3f993d85be375692d0a4bd729130ff9a70153e18721fb9d995bc1b4b6f6425e"
-          artifact_catalog_sha256: "809e00ae167cc682038b3c9b27d9417f1fab709cf48925038c6acbfbfd37edc4"
-          run_audit_sha256: "bb2c9199d37db06d800d8785a41358033a4a184c7279ee4c8872452856d612ce"
-          resolved_config_sha256: "1acc70027c6478ebdc442b83aa73abc896be8cad3bb60629c384faa941632edf"
+          pipeline_state_sha256: "3aea1e67ccc283c1c9e2795b2db2eb7748d92e8782f72bf1429a30f8d721013b"
+          artifact_catalog_sha256: "4c1e573a686690c66e6922cd5c2dd8abc332ae8d12a69bc564334cdeb416f4a9"
+          run_audit_sha256: "ff0dd45f08704eb5bcd18c551a163a412c33908ea83d7fa39db8d2bea09fc34f"
+          resolved_config_sha256: "83e0d731bd66d9a62d6d111b581819a67bfb705071261bfc695c7ca5109cd314"
       - role: "captioned_corpus"
-        run_dir: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3"
+        run_dir: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260831-v4"
         project_name: "mbzuai_preprod_processing"
         required_stage_ids:
           - "convert_documents"
@@ -46,20 +46,20 @@ formatter:
           - "enrich_media"
           - "annotate_media"
         evidence:
-          pipeline_state_sha256: "6b0560a17e23f6c3812814e2149a7e857bdafd990878eed6a11097ed994666fa"
-          artifact_catalog_sha256: "024967f33cee0055b521341f7aa2b4e66dd737cbe00a808c512ef02f9e1e464b"
-          run_audit_sha256: "b799e5c9dde01f342423be5d22dccb69d3efdc3c6d0f33fb8657c7faa9850bb7"
-          resolved_config_sha256: "a1a479c4316ecf38ec853e0504fce1470c7830375acfd8fe0cf0d15c967d6043"
+          pipeline_state_sha256: "b09565b61826fe84602a77364962708e18e61468b6f8c610e7678c997b0d1ac7"
+          artifact_catalog_sha256: "b8d64431e398c9c4458577719e2ece13ceabbe3a08eaa750bb4eaaa3a62704ed"
+          run_audit_sha256: "19952a61c40a454a63d16cb8c1ca040b8d33142a7410913ed0ebc609228237dc"
+          resolved_config_sha256: "dd2232db7c0bab89092ad3759d6e4409a18bee96ced5a3111b59f4a989743412"
 
   corpus_preparation:
-    # The audited dedup pass removed 78 byte-identical, same-language aliases
-    # from 1,760 inputs, leaving this exact representation-neutral inventory.
+    # Do not permit the corrected snapshot to regress below the prior audited
+    # corpus boundary; the new run records its larger exact inventory.
     minimum_document_count: 1682
-    minimum_unique_media_assets: 2117
+    minimum_unique_media_assets: 2127
     maximum_missing_media_files: 0
     maximum_unbound_media_assets: 0
-    minimum_semantically_annotated_visuals: 2117
-    minimum_ocr_adjudicated_visuals: 327
+    minimum_semantically_annotated_visuals: 2127
+    minimum_ocr_adjudicated_visuals: 331
 
 stages:
   - id: merge_corpora
