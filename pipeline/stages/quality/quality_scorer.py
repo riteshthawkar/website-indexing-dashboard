@@ -140,7 +140,11 @@ ERROR_PAGE_RESPONSE = re.compile(
 )
 
 _WALL_DOMINANT_MAX_CHARS = 1200
-_NON_CONTENT_CONTAINERS = {"aside", "footer", "header", "nav"}
+# HTML5 ``header`` is not necessarily site chrome. The MBZUAI Nuxt frontend
+# places a page's complete hero/profile body in a top-level header and leaves
+# its main element empty. Navigation descendants are removed independently,
+# so retaining content-bearing headers avoids silently rejecting those pages.
+_NON_CONTENT_CONTAINERS = {"aside", "footer", "nav"}
 
 
 def _has_generic_access_marker(text: str) -> bool:
@@ -270,12 +274,22 @@ def _plain_text_quality_signals(text: str) -> tuple[bool, bool]:
 
 
 def _primary_content(soup: BeautifulSoup) -> Any:
-    return (
-        soup.find("main")
-        or soup.find(attrs={"role": re.compile(r"^main$", re.IGNORECASE)})
-        or soup.body
-        or soup
+    candidates = [*soup.find_all("main")]
+    candidates.extend(
+        element
+        for element in soup.find_all(
+            attrs={"role": re.compile(r"^main$", re.IGNORECASE)}
+        )
+        if element not in candidates
     )
+    if candidates:
+        primary = max(candidates, key=lambda element: len(_normalized_text(element)))
+        # Client-rendered sites can leave an empty semantic <main> while
+        # placing the resolved page body in a content-bearing hero <header>.
+        # Fall back to the pruned body only when every main candidate is empty.
+        if _normalized_text(primary):
+            return primary
+    return soup.body or soup
 
 
 def _visible_text_and_quality_signals(text: str) -> tuple[str, bool, bool]:

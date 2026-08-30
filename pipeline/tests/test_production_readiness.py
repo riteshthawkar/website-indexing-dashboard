@@ -3105,6 +3105,29 @@ class TestQualityScorer:
 
         assert _check_quality(text, 300, True) is None
 
+    def test_content_bearing_page_header_survives_empty_spa_main(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><header class="page-hero">
+        <nav>Information for Log in Apply About Research</nav>
+        <section><h1>Dr. Example Researcher</h1>
+        <p>{content}</p></section></header><main id="main-content"></main>
+        <footer>University footer links</footer></body></html>""".format(
+            content="Substantive public faculty biography and research information. " * 12
+        )
+
+        assert _check_quality(text, 100, True) is None
+
+    def test_empty_spa_main_does_not_make_short_hero_substantive(self):
+        from pipeline.stages.quality.quality_scorer import _check_quality
+
+        text = """<html><body><header class="page-hero">
+        <nav>Information for Log in Apply About Research</nav>
+        <h1>Empty placeholder</h1></header><main id="main-content"></main>
+        <footer>University footer links</footer></body></html>"""
+
+        assert _check_quality(text, 100, True) == "too_short"
+
     def test_detects_error_page_500(self):
         from pipeline.stages.quality.quality_scorer import _check_quality
         text = "# 500 Internal Server Error\n\nPlease try again later."
