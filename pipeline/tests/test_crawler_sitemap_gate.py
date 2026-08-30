@@ -227,6 +227,36 @@ def test_json_seed_inventory_extracts_only_configured_result_items():
     ) == "https://preprod.mbzuai.ac.ae/api/drupal-ce/search?lang=en&page=2"
 
 
+def test_completion_gate_rejects_pending_or_unmapped_inventory_urls():
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.config = {
+        "fail_on_incomplete_frontier": True,
+        "require_complete_seed_inventory": True,
+    }
+    crawler.max_pages = 100
+    crawler.crawl_state = {
+        "pending": [{"url": "https://preprod.mbzuai.ac.ae/pending"}]
+    }
+    crawler.seed_inventory = {
+        "urls": [
+            "https://preprod.mbzuai.ac.ae/captured",
+            "https://preprod.mbzuai.ac.ae/unmapped",
+        ]
+    }
+    crawler.url_mapping = {
+        "https://preprod.mbzuai.ac.ae/captured": "/tmp/captured.html"
+    }
+    crawler.stats = {}
+
+    errors = crawler._crawl_completion_errors()
+
+    assert len(errors) == 2
+    assert "pending=1" in errors[0]
+    assert "unmapped=1" in errors[1]
+    assert crawler.stats["frontier_pending_remaining"] == 1
+    assert crawler.stats["seed_inventory_urls_unmapped"] == 1
+
+
 def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     crawler = crawler_module.Crawl4AICrawler()
     crawler.stats = {"pages_failed": 0, "skipped_urls": 0}

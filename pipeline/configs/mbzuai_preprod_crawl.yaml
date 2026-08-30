@@ -29,6 +29,8 @@ crawler:
   download_concurrency: 8
   timeout: 45
   fail_on_empty_result: true
+  fail_on_incomplete_frontier: true
+  require_complete_seed_inventory: true
   require_https: true
   ignore_https_errors: false
 

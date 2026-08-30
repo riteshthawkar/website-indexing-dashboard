@@ -2513,6 +2513,44 @@ class Crawl4AICrawler(CrawlerStage):
             ]
         )
 
+    def _crawl_completion_errors(self) -> List[str]:
+        pending = [
+            item
+            for item in (self.crawl_state.get("pending") or [])
+            if isinstance(item, dict) and item.get("url")
+        ]
+        inventory_urls = {
+            normalized
+            for value in ((getattr(self, "seed_inventory", {}) or {}).get("urls") or [])
+            for normalized in [_normalize_http_url(value)]
+            if normalized
+        }
+        mapped_urls = {
+            normalized
+            for value in (getattr(self, "url_mapping", {}) or {})
+            for normalized in [_normalize_http_url(value)]
+            if normalized
+        }
+        unmapped_inventory_urls = sorted(inventory_urls - mapped_urls)
+        self.stats["frontier_pending_remaining"] = len(pending)
+        self.stats["seed_inventory_urls_unmapped"] = len(unmapped_inventory_urls)
+
+        errors: List[str] = []
+        if pending and bool(self.config.get("fail_on_incomplete_frontier", False)):
+            errors.append(
+                "Crawler frontier is incomplete after reaching a terminal condition: "
+                f"pending={len(pending)} max_pages={self.max_pages}"
+            )
+        if unmapped_inventory_urls and bool(
+            self.config.get("require_complete_seed_inventory", False)
+        ):
+            errors.append(
+                "Seed inventory contains URLs with no durable crawl outcome: "
+                f"unmapped={len(unmapped_inventory_urls)} "
+                f"sample={unmapped_inventory_urls[:10]}"
+            )
+        return errors
+
     async def validate_config(self, config: Dict[str, Any]) -> List[str]:
         errors: list[str] = []
         crawler = config.get("crawler", {})
@@ -2995,6 +3033,8 @@ class Crawl4AICrawler(CrawlerStage):
             "sitemap_urls_discovered": 0,
             "seed_inventory_pages_fetched": 0,
             "seed_inventory_urls_discovered": 0,
+            "seed_inventory_urls_unmapped": 0,
+            "frontier_pending_remaining": 0,
             "verified_empty_urls": 0,
             "sitemap_batches_completed": 0,
             "frontier_urls_discovered": 0,
@@ -3114,6 +3154,11 @@ class Crawl4AICrawler(CrawlerStage):
                         raise
 
             self._flush_runtime_state(force=True)
+
+            completion_errors = self._crawl_completion_errors()
+            self._flush_runtime_state(force=True)
+            if completion_errors:
+                raise RuntimeError("; ".join(completion_errors))
 
             self._enforce_host_minimums(
                 self.page_metadata.keys(),
