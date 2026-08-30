@@ -309,11 +309,10 @@ def canonicalize_page_metadata(
         declared_robots_directives = robots_directives(raw_metadata)
         robots_noindex = has_robots_noindex(raw_metadata)
         source_marked_non_indexable = raw_metadata.get("indexable") is False
-        noindex_overridden = bool(
-            robots_noindex
-            and override_reason
-            and url_host(source_url) in authorized_hosts
+        noindex_authorized = bool(
+            override_reason and url_host(source_url) in authorized_hosts
         )
+        noindex_overridden = bool(robots_noindex and noindex_authorized)
         if page_type == "redirect_alias":
             indexable = False
             exclusion_reason = "homepage_redirect_alias"
@@ -342,7 +341,11 @@ def canonicalize_page_metadata(
                 "index_exclusion_reason": exclusion_reason,
                 "robots_directives": declared_robots_directives,
                 "robots_noindex": robots_noindex,
+                "robots_noindex_authorized": noindex_authorized,
                 "robots_noindex_overridden": noindex_overridden,
+                "robots_noindex_authorization_reason": (
+                    override_reason if noindex_authorized else ""
+                ),
                 "indexability_override_reason": (
                     override_reason if noindex_overridden else ""
                 ),

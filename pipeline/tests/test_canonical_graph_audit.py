@@ -257,12 +257,41 @@ def test_canonical_metadata_records_exact_host_noindex_authorization():
     authorized = canonical["https://preprod.mbzuai.ac.ae/about-us"]
     assert authorized["indexable"] is True
     assert authorized["robots_noindex"] is True
+    assert authorized["robots_noindex_authorized"] is True
     assert authorized["robots_noindex_overridden"] is True
+    assert authorized["robots_noindex_authorization_reason"].startswith(
+        "Explicit site-owner"
+    )
     assert authorized["indexability_override_reason"].startswith("Explicit site-owner")
 
     unauthorized = canonical["https://other.mbzuai.ac.ae/private-preview"]
     assert unauthorized["indexable"] is False
+    assert unauthorized["robots_noindex_authorized"] is False
     assert unauthorized["robots_noindex_overridden"] is False
+
+
+def test_canonical_metadata_records_host_authorization_without_claiming_observation():
+    from pipeline.core.mbzuai_indexing import canonicalize_page_metadata
+
+    canonical = canonicalize_page_metadata(
+        {
+            "https://preprod.mbzuai.ac.ae/research": {
+                "url": "https://preprod.mbzuai.ac.ae/research",
+            }
+        },
+        authorized_noindex_hosts=["preprod.mbzuai.ac.ae"],
+        noindex_override_reason="Explicit site-owner authorization for complete indexing.",
+    )
+
+    record = canonical["https://preprod.mbzuai.ac.ae/research"]
+    assert record["indexable"] is True
+    assert record["robots_noindex"] is False
+    assert record["robots_noindex_authorized"] is True
+    assert record["robots_noindex_overridden"] is False
+    assert record["indexability_override_reason"] == ""
+    assert record["robots_noindex_authorization_reason"].startswith(
+        "Explicit site-owner"
+    )
 
 
 def test_coverage_gate_accepts_authorized_noindex_critical_route(tmp_path):

@@ -27,7 +27,7 @@ import xml.etree.ElementTree as ET
 from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from urllib.robotparser import RobotFileParser
 
@@ -1762,6 +1762,7 @@ def _extract_page_metadata(
     page_url: str,
     *,
     status_code: Any = None,
+    response_headers: Optional[Mapping[str, Any]] = None,
     html_path: str = "",
     markdown_path: str = "",
     depth: Any = None,
@@ -1784,6 +1785,18 @@ def _extract_page_metadata(
         content = tag.get("content")
         if key and content:
             _append_meta_value(meta_tags, str(key), str(content))
+
+    # Preserve only the response header that affects corpus indexability.  Do
+    # not persist the complete header map because it may include cookies or
+    # other request-specific values that do not belong in crawl artifacts.
+    http_robots: Dict[str, Any] = {}
+    if isinstance(response_headers, Mapping):
+        for key, value in response_headers.items():
+            if str(key or "").strip().casefold() != "x-robots-tag":
+                continue
+            values = value if isinstance(value, (list, tuple, set)) else [value]
+            for item in values:
+                _append_meta_value(http_robots, "x-robots-tag", str(item or ""))
 
     canonical_url = ""
     canonical_tag = soup.find("link", rel=lambda value: value and "canonical" in str(value).lower())
@@ -1822,6 +1835,8 @@ def _extract_page_metadata(
             json_ld.append(compact)
 
     parsed = urlparse(page_url)
+    robots_meta = meta_tags.get("robots") or ""
+    robots_http = http_robots.get("x-robots-tag") or ""
     return {
         "url": page_url,
         "status_code": status_code,
@@ -1832,7 +1847,10 @@ def _extract_page_metadata(
         "description": meta_tags.get("description") or meta_tags.get("og:description") or "",
         "canonical_url": canonical_url,
         "language": str((soup.html or {}).get("lang") or ""),
-        "robots": meta_tags.get("robots") or "",
+        "robots": robots_meta,
+        "robots_meta": robots_meta,
+        "robots_http": robots_http,
+        "x-robots-tag": robots_http,
         "meta_tags": meta_tags,
         "alternate_urls": alternate_urls,
         "headings": headings,
@@ -5331,6 +5349,7 @@ class Crawl4AICrawler(CrawlerStage):
                 html,
                 page_url,
                 status_code=status_code,
+                response_headers=getattr(result, "response_headers", None),
                 html_path=str(html_path),
                 markdown_path=str(md_path) if md_path else "",
                 depth=depth,

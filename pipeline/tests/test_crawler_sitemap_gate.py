@@ -34,6 +34,28 @@ def _context(work_dir, *, minimum_sitemap_seed_count=3):
     )
 
 
+def test_page_metadata_preserves_only_indexability_response_header():
+    metadata = crawler_module._extract_page_metadata(
+        "<html lang='en'><head><meta name='robots' content='index, follow'></head></html>",
+        "https://preprod.mbzuai.ac.ae/about-us",
+        response_headers={
+            "Content-Type": "text/html",
+            "Set-Cookie": "must-not-be-persisted=secret",
+            "X-Robots-Tag": ["noindex, nofollow", "noimageindex, noarchive"],
+        },
+    )
+
+    assert metadata["robots"] == "index, follow"
+    assert metadata["robots_meta"] == "index, follow"
+    assert metadata["robots_http"] == [
+        "noindex, nofollow",
+        "noimageindex, noarchive",
+    ]
+    assert metadata["x-robots-tag"] == metadata["robots_http"]
+    assert "Content-Type" not in metadata
+    assert "Set-Cookie" not in metadata
+
+
 def test_sitemap_coverage_gate_fails_before_browser_start(tmp_path, monkeypatch):
     browser_started = False
 
