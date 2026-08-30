@@ -1070,6 +1070,47 @@ def _prediction_row_matches_current_eval(
     return all(metadata.get(key) == value for key, value in expected.items())
 
 
+def _prediction_row_is_complete(row: Mapping[str, Any]) -> bool:
+    """Return whether a cached prediction is safe to reuse.
+
+    Production chat can return a useful-looking response prefix together with
+    an explicit partial/error completion contract.  Reusing that row merely
+    because its evaluation identity still matches would turn a transient
+    provider interruption into a durable release result.
+    """
+
+    metadata = row.get("metadata") if isinstance(row.get("metadata"), Mapping) else {}
+    response_contract = (
+        row.get("response_contract")
+        if isinstance(row.get("response_contract"), Mapping)
+        else {}
+    )
+    if _text(row.get("error")) or _text(metadata.get("error")):
+        return False
+    if any(
+        value is True
+        for value in (
+            row.get("partial"),
+            metadata.get("partial"),
+            response_contract.get("partial"),
+        )
+    ):
+        return False
+    if any(
+        value is False
+        for value in (
+            row.get("completed"),
+            metadata.get("completed"),
+            response_contract.get("completed"),
+        )
+    ):
+        return False
+    finish_reason = _text(row.get("finish_reason") or metadata.get("finish_reason")).casefold()
+    if finish_reason in {"error", "stream_error", "timeout", "cancelled", "canceled"}:
+        return False
+    return bool(_text(row.get("response")))
+
+
 def _filter_resumable_prediction_file(
     *,
     predictions_path: str | Path,
@@ -1106,7 +1147,7 @@ def _filter_resumable_prediction_file(
             endpoint=endpoint,
             eval_request_mode=eval_request_mode,
             probe_mode=probe_mode,
-        ):
+        ) and _prediction_row_is_complete(row):
             kept.append(dict(row))
         else:
             discarded_ids.append(row_id)

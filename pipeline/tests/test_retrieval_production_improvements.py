@@ -5489,6 +5489,83 @@ def test_answer_readiness_filters_stale_resume_predictions(tmp_path, monkeypatch
     assert rows[0]["metadata"]["eval_example_fingerprint"]
 
 
+def test_answer_readiness_filters_partial_resume_predictions(tmp_path, monkeypatch):
+    from pipeline.evaluation import answer_readiness
+
+    dataset = tmp_path / "readiness.jsonl"
+    dataset.write_text(
+        json.dumps(
+            {
+                "id": "q1",
+                "query": "What support do funded students receive?",
+                "query_type": "fact",
+                "source_type": "webpage",
+                "reference_answer": "Funded students receive tuition and stipend support.",
+                "metadata": {"answer_must_include": ["tuition", "stipend"]},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    gates = tmp_path / "gates.json"
+    gates.write_text(
+        json.dumps({"overall": {"pass_rate": {"min": 1.0}}}),
+        encoding="utf-8",
+    )
+    predictions = tmp_path / "predictions.jsonl"
+    examples = answer_readiness.load_eval_examples(dataset)
+    dataset_fingerprint = answer_readiness._dataset_fingerprint(examples)
+    partial_row = answer_readiness._stamp_prediction_row(
+        {
+            "id": "q1",
+            "response": "Funded students receive tuition",
+            "partial": True,
+            "finish_reason": "stream_error",
+            "response_contract": {"completed": False, "partial": True},
+        },
+        example=examples[0],
+        dataset_fingerprint=dataset_fingerprint,
+        config_name="default",
+        work_dir=tmp_path,
+        backend="local_indexing_answer_generation",
+        mode="local",
+    )
+    predictions.write_text(json.dumps(partial_row) + "\n", encoding="utf-8")
+    state = {}
+
+    def fake_generate_answer_predictions(**kwargs):
+        state["partial_file_was_filtered"] = not Path(kwargs["output_path"]).read_text(
+            encoding="utf-8"
+        ).strip()
+        Path(kwargs["output_path"]).write_text(
+            json.dumps(
+                {
+                    "id": "q1",
+                    "response": "Funded students receive tuition and stipend support.",
+                    "retrieved_contexts": ["Funded students receive tuition and stipend support."],
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(answer_readiness, "generate_answer_predictions", fake_generate_answer_predictions)
+
+    report = answer_readiness.evaluate_answer_readiness(
+        config_name="default",
+        work_dir=tmp_path,
+        dataset_path=dataset,
+        gates_path=gates,
+        predictions_path=predictions,
+        resume_predictions=True,
+        judge_enabled=False,
+    )
+
+    assert state["partial_file_was_filtered"] is True
+    assert report["prediction_integrity"]["ok"] is True
+    assert report["gates"]["passed"] is True
+
+
 def test_answer_readiness_websocket_mode_uses_production_chat_frames(tmp_path, monkeypatch):
     from pipeline.evaluation import answer_readiness
 
