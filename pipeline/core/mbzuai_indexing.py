@@ -256,8 +256,25 @@ def page_content_hash(metadata: Mapping[str, Any] | None, *, max_bytes: int = 2_
     return sha1_text("|".join(str(part or "") for part in fallback_parts), length=None)
 
 
-def canonicalize_page_metadata(page_metadata: Mapping[str, Any] | None) -> Dict[str, Dict[str, Any]]:
-    """Return metadata keyed by normalized source URL with canonical identity fields."""
+def canonicalize_page_metadata(
+    page_metadata: Mapping[str, Any] | None,
+    *,
+    authorized_noindex_hosts: Sequence[str] | None = None,
+    noindex_override_reason: str = "",
+) -> Dict[str, Dict[str, Any]]:
+    """Return metadata keyed by normalized source URL with canonical identity fields.
+
+    ``noindex`` remains fail-closed by default.  A caller may override it only
+    for exact, explicitly authorized hosts and only with a recorded reason.
+    The source directive is retained in the resulting evidence either way.
+    """
+
+    authorized_hosts = {
+        str(value or "").strip().lower().strip(".")
+        for value in (authorized_noindex_hosts or [])
+        if str(value or "").strip()
+    }
+    override_reason = clean_text(noindex_override_reason)
     output: Dict[str, Dict[str, Any]] = {}
     family_to_variants: Dict[str, List[str]] = {}
 
@@ -292,13 +309,18 @@ def canonicalize_page_metadata(page_metadata: Mapping[str, Any] | None) -> Dict[
         declared_robots_directives = robots_directives(raw_metadata)
         robots_noindex = has_robots_noindex(raw_metadata)
         source_marked_non_indexable = raw_metadata.get("indexable") is False
+        noindex_overridden = bool(
+            robots_noindex
+            and override_reason
+            and url_host(source_url) in authorized_hosts
+        )
         if page_type == "redirect_alias":
             indexable = False
             exclusion_reason = "homepage_redirect_alias"
-        elif robots_noindex:
+        elif robots_noindex and not noindex_overridden:
             indexable = False
             exclusion_reason = "robots_noindex"
-        elif source_marked_non_indexable:
+        elif source_marked_non_indexable and not noindex_overridden:
             indexable = False
             exclusion_reason = clean_text(raw_metadata.get("index_exclusion_reason")) or "source_marked_non_indexable"
         else:
@@ -320,6 +342,10 @@ def canonicalize_page_metadata(page_metadata: Mapping[str, Any] | None) -> Dict[
                 "index_exclusion_reason": exclusion_reason,
                 "robots_directives": declared_robots_directives,
                 "robots_noindex": robots_noindex,
+                "robots_noindex_overridden": noindex_overridden,
+                "indexability_override_reason": (
+                    override_reason if noindex_overridden else ""
+                ),
                 "url_identity_version": 1,
             }
         )
@@ -355,6 +381,14 @@ def build_url_identity_map(page_metadata: Mapping[str, Mapping[str, Any]]) -> Di
                 "page_type": metadata.get("page_type") or "",
                 "indexable": bool(metadata.get("indexable", True)),
                 "index_exclusion_reason": metadata.get("index_exclusion_reason") or "",
+                "robots_noindex": bool(metadata.get("robots_noindex", False)),
+                "robots_noindex_overridden": bool(
+                    metadata.get("robots_noindex_overridden", False)
+                ),
+                "indexability_override_reason": metadata.get(
+                    "indexability_override_reason"
+                )
+                or "",
                 "locale_variant_urls": metadata.get("locale_variant_urls") or [],
             }
         )

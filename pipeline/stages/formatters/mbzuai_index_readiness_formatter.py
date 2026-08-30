@@ -103,7 +103,8 @@ def _critical_url_health(
     robots_noindex = bool(metadata.get("robots_noindex")) or has_robots_noindex(metadata)
     indexable = bool(metadata.get("indexable", True))
     exclusion_reason = str(metadata.get("index_exclusion_reason") or "")
-    if robots_noindex:
+    robots_noindex_overridden = bool(metadata.get("robots_noindex_overridden"))
+    if robots_noindex and not robots_noindex_overridden:
         reasons.append("robots_noindex")
     elif not indexable:
         reasons.append("non_indexable")
@@ -118,6 +119,10 @@ def _critical_url_health(
         "indexable": indexable,
         "index_exclusion_reason": exclusion_reason,
         "robots_noindex": robots_noindex,
+        "robots_noindex_overridden": robots_noindex_overridden,
+        "indexability_override_reason": str(
+            metadata.get("indexability_override_reason") or ""
+        ),
         "semantic_evidence_required": semantic_evidence_required,
         "markdown_path": str(metadata.get("markdown_path") or ""),
         "reasons": reasons,
@@ -520,6 +525,36 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
                         errors.append(
                             f"formatter.critical_url_patterns[{index}] is invalid: {exc}"
                         )
+        authorized_noindex_hosts = formatter_config.get(
+            "authorized_noindex_hosts"
+        ) or []
+        if not isinstance(authorized_noindex_hosts, list):
+            errors.append("formatter.authorized_noindex_hosts must be a list")
+        else:
+            allowed_hosts = {
+                str(value or "").strip().lower().strip(".")
+                for value in ((config.get("crawler") or {}).get("allowed_hosts") or [])
+                if str(value or "").strip()
+            }
+            for index, host in enumerate(authorized_noindex_hosts):
+                normalized = str(host or "").strip().lower().strip(".")
+                if (
+                    not normalized
+                    or "://" in str(host)
+                    or "/" in str(host)
+                    or normalized not in allowed_hosts
+                ):
+                    errors.append(
+                        "formatter.authorized_noindex_hosts"
+                        f"[{index}] must be an exact crawler.allowed_hosts hostname"
+                    )
+            if authorized_noindex_hosts and not str(
+                formatter_config.get("noindex_override_reason") or ""
+            ).strip():
+                errors.append(
+                    "formatter.noindex_override_reason is required when "
+                    "authorized_noindex_hosts is configured"
+                )
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
@@ -532,7 +567,16 @@ class MBZUAIIndexReadinessFormatter(FormatterStage):
         if not isinstance(raw_page_metadata, dict) or not raw_page_metadata:
             return StageResult.failure("page_metadata_file is empty or invalid")
 
-        canonical_metadata = canonicalize_page_metadata(raw_page_metadata)
+        canonical_metadata = canonicalize_page_metadata(
+            raw_page_metadata,
+            authorized_noindex_hosts=ctx.formatter_config.get(
+                "authorized_noindex_hosts"
+            )
+            or [],
+            noindex_override_reason=str(
+                ctx.formatter_config.get("noindex_override_reason") or ""
+            ),
+        )
         if not canonical_metadata:
             return StageResult.failure("Canonical page metadata is empty")
 

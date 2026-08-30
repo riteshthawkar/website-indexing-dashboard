@@ -235,6 +235,68 @@ def test_canonical_metadata_honors_top_level_x_robots_tag():
     assert record["index_exclusion_reason"] == "robots_noindex"
 
 
+def test_canonical_metadata_records_exact_host_noindex_authorization():
+    from pipeline.core.mbzuai_indexing import canonicalize_page_metadata
+
+    canonical = canonicalize_page_metadata(
+        {
+            "https://preprod.mbzuai.ac.ae/about-us": {
+                "url": "https://preprod.mbzuai.ac.ae/about-us",
+                "x-robots-tag": "noindex, nofollow",
+                "indexable": False,
+            },
+            "https://other.mbzuai.ac.ae/private-preview": {
+                "url": "https://other.mbzuai.ac.ae/private-preview",
+                "x-robots-tag": "noindex, nofollow",
+            },
+        },
+        authorized_noindex_hosts=["preprod.mbzuai.ac.ae"],
+        noindex_override_reason="Explicit site-owner authorization for preproduction indexing.",
+    )
+
+    authorized = canonical["https://preprod.mbzuai.ac.ae/about-us"]
+    assert authorized["indexable"] is True
+    assert authorized["robots_noindex"] is True
+    assert authorized["robots_noindex_overridden"] is True
+    assert authorized["indexability_override_reason"].startswith("Explicit site-owner")
+
+    unauthorized = canonical["https://other.mbzuai.ac.ae/private-preview"]
+    assert unauthorized["indexable"] is False
+    assert unauthorized["robots_noindex_overridden"] is False
+
+
+def test_coverage_gate_accepts_authorized_noindex_critical_route(tmp_path):
+    markdown_path = tmp_path / "about-us.md"
+    markdown_path.write_text(
+        " ".join(["Official university history leadership and mission information."] * 30),
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://preprod.mbzuai.ac.ae/about-us": {
+                "indexable": True,
+                "robots": "noindex, nofollow",
+                "robots_noindex": True,
+                "robots_noindex_overridden": True,
+                "indexability_override_reason": "Explicit site-owner authorization.",
+                "markdown_path": str(markdown_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={"critical_url_patterns": [r"/about-us/?$"]},
+    )
+
+    assert gate["missing_critical_count"] == 0
+    assert gate["unhealthy_critical_count"] == 0
+    assert gate["ok"] is True
+
+
 def test_coverage_gate_distinguishes_missing_from_unhealthy_critical_route(tmp_path):
     pattern = r"/student-resources/?$"
     failure_manifest = {
