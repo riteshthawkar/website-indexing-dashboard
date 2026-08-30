@@ -1,0 +1,141 @@
+# Derived processing profile for the immutable 2026-08-30 preproduction crawl.
+# Stage zero is bootstrapped from mbzuai-preprod-crawl-20260830-v4; this run
+# never rewrites or re-downloads the raw crawl artifacts.
+_inherit: mbzuai_preprod_crawl.yaml
+
+project_name: "mbzuai_preprod_processing"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+quality:
+  target_languages:
+    - en
+    - ar
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.70
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+
+cleaner:
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.75
+  minimum_host_retention_ratio: 0.50
+  minimum_host_input_count: 5
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+  require_critical_url_survival: true
+
+formatter:
+  # The site owner explicitly authorized complete indexing on 2026-08-30.
+  # This exact-host authorization applies to robots.txt, HTML robots metadata,
+  # and X-Robots-Tag noindex/nofollow directives while retaining those source
+  # directives and the reason in downstream canonical metadata.
+  authorized_noindex_hosts:
+    - "preprod.mbzuai.ac.ae"
+  noindex_override_reason: >-
+    Explicit site-owner authorization received 2026-08-30 to crawl and index
+    every public page and asset on the MBZUAI preproduction website regardless
+    of robots.txt, robots metadata, or X-Robots-Tag directives.
+
+  # The search inventory supplied 1,506 URLs and rendered-link traversal found
+  # another 495. Ten document downloads are tracked separately. The 216 hard
+  # failures are the audited 204 HTTP 404, 10 HTTP 500, one terminal redirect
+  # failure, and one pseudo-route HTTP 404 observed in the immutable crawl.
+  expected_site_inventory_count: 2006
+  minimum_inventory_coverage_ratio: 0.89
+  maximum_hard_failure_count: 220
+  fail_on_critical_coverage: true
+  fail_on_inventory_gap: true
+  fail_on_hard_failure_gap: true
+  require_critical_url_markdown_evidence: true
+  critical_url_min_markdown_words: 80
+  critical_url_min_markdown_characters: 400
+  critical_url_min_substantive_words: 40
+  critical_url_navigation_min_links: 8
+  # Leadership is a legitimate, link-rich directory (observed ratio 0.678).
+  critical_url_max_link_word_ratio: 0.75
+  critical_url_patterns:
+    - "/about-us/?$"
+    - "/about-us/leadership/?$"
+    - "/about-us/contact-us/?$"
+    - "/research/?$"
+    - "/admissions/?$"
+    - "/admissions/undergraduate-admissions/?$"
+    - "/graduate-masters-admissions/?$"
+    - "/admissions/graduate-phd-admissions/?$"
+    - "/study/undergraduate-program/?$"
+    - "/study/msc-programs/?$"
+    - "/study/phd-programs/?$"
+  official_source_host_suffixes:
+    - "preprod.mbzuai.ac.ae"
+  exclude_non_official_sources: true
+
+  media_enrichment:
+    download_web_images: true
+    extract_pdf_figures: true
+    allowed_media_hosts:
+      - "preprod.mbzuai.ac.ae"
+      - "i.ytimg.com"
+    download_concurrency: 8
+    per_host_concurrency: 4
+    minimum_accepted_assets: 100
+    maximum_download_failure_ratio: 0.25
+
+  media_semantics:
+    mode: "gemini"
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    enable_escalation: true
+    escalation_confidence_threshold: 0.72
+    prompt_revision: "mbzuai-media-semantics-v2-section-context"
+    context_before_blocks: 1
+    context_after_blocks: 2
+    context_max_chars: 1200
+    context_following_heading_max_distance: 4
+    context_html_fallback: true
+    max_reference_contexts_per_annotation: 12
+    concurrency: 4
+    request_timeout_sec: 90
+    retry_attempts: 3
+    retry_backoff_sec: 1.0
+    retry_max_delay_sec: 12.0
+    cache_flush_every: 10
+    max_output_tokens: 1200
+    image_max_side: 1600
+    image_max_pixels: 1800000
+    max_images: 0
+    require_complete: true
+    minimum_completion_ratio: 1.0
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: prepare_mbzuai_index
+    type: formatter
+    plugin: mbzuai_index_readiness
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: enrich_media
+    type: formatter
+    plugin: media_enrichment
+  - id: annotate_media
+    type: formatter
+    plugin: media_semantics
