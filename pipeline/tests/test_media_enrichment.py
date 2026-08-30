@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections import Counter
 from io import BytesIO
 from pathlib import Path
 
@@ -13,6 +15,7 @@ from pipeline.core.media import normalize_media_item
 from pipeline.core.media_context import build_media_reference_contexts
 from pipeline.core.unlimited_ocr import image_regions, normalized_bbox_to_pixels
 from pipeline.stages.formatters.media_enrichment_formatter import (
+    _download_image_bounded,
     _extract_pdf_figures,
     _image_inspection,
 )
@@ -98,6 +101,67 @@ def test_image_inspection_accepts_avif_content_images():
     assert reason == ""
     assert content and content["extension"] == ".avif"
     assert content["mime_type"] == "image/avif"
+
+
+def test_web_download_queue_is_bounded_before_request_timeout(monkeypatch, tmp_path):
+    from urllib.parse import urlsplit
+
+    import pipeline.stages.formatters.media_enrichment_formatter as module
+
+    active_global = 0
+    active_by_host: Counter[str] = Counter()
+    maximum_global = 0
+    maximum_by_host: Counter[str] = Counter()
+
+    async def fake_download(
+        session,
+        *,
+        url,
+        output_dir,
+        allowed_hosts,
+        dns_cache,
+        config,
+    ):
+        nonlocal active_global, maximum_global
+        host = urlsplit(url).hostname or ""
+        active_global += 1
+        active_by_host[host] += 1
+        maximum_global = max(maximum_global, active_global)
+        maximum_by_host[host] = max(maximum_by_host[host], active_by_host[host])
+        await asyncio.sleep(0.01)
+        active_by_host[host] -= 1
+        active_global -= 1
+        return {"url": url, "status": "accepted", "reason": ""}
+
+    monkeypatch.setattr(module, "_download_image", fake_download)
+
+    async def exercise_queue():
+        global_semaphore = asyncio.Semaphore(3)
+        host_semaphores = {}
+        urls = [f"https://one.example/image-{index}.jpg" for index in range(8)]
+        urls += [f"https://two.example/image-{index}.jpg" for index in range(8)]
+        return await asyncio.gather(
+            *(
+                _download_image_bounded(
+                    object(),
+                    url=url,
+                    output_dir=tmp_path,
+                    allowed_hosts={"one.example", "two.example"},
+                    dns_cache={},
+                    config={},
+                    global_semaphore=global_semaphore,
+                    host_semaphores=host_semaphores,
+                    per_host_concurrency=2,
+                )
+                for url in urls
+            )
+        )
+
+    results = asyncio.run(exercise_queue())
+
+    assert len(results) == 16
+    assert maximum_global == 3
+    assert maximum_by_host == {"one.example": 2, "two.example": 2}
 
 
 def test_media_normalization_preserves_multimodal_provenance():

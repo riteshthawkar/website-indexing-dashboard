@@ -296,6 +296,44 @@ async def _download_image(
     return {"url": url, "status": "failed", "reason": last_reason}
 
 
+async def _download_image_bounded(
+    session: aiohttp.ClientSession,
+    *,
+    url: str,
+    output_dir: Path,
+    allowed_hosts: set[str],
+    dns_cache: MutableMapping[str, bool],
+    config: Mapping[str, Any],
+    global_semaphore: asyncio.Semaphore,
+    host_semaphores: MutableMapping[str, asyncio.Semaphore],
+    per_host_concurrency: int,
+) -> Dict[str, Any]:
+    """Start the request timeout only after bounded queue admission.
+
+    aiohttp's total timeout includes time spent waiting for a connector slot.
+    Creating thousands of unbounded ``session.get`` calls therefore makes the
+    queued requests expire before they ever reach the server.  The explicit
+    gates keep queue wait outside the request timeout and retain separate
+    global/per-host limits.
+    """
+
+    host = (urlsplit(_normalize_https_url(url)).hostname or "").lower()
+    host_semaphore = host_semaphores.get(host)
+    if host_semaphore is None:
+        host_semaphore = asyncio.Semaphore(max(1, int(per_host_concurrency)))
+        host_semaphores[host] = host_semaphore
+    async with global_semaphore:
+        async with host_semaphore:
+            return await _download_image(
+                session,
+                url=url,
+                output_dir=output_dir,
+                allowed_hosts=allowed_hosts,
+                dns_cache=dns_cache,
+                config=config,
+            )
+
+
 def _reuse_download_result(result: Mapping[str, Any]) -> bool:
     return (
         result.get("status") == "accepted"
@@ -780,9 +818,11 @@ class MediaEnrichmentFormatter(FormatterStage):
 
         if bool(config.get("download_web_images", True)) and to_download:
             timeout = aiohttp.ClientTimeout(total=max(1.0, float(config.get("request_timeout_sec", 45.0))))
+            download_concurrency = max(1, int(config.get("download_concurrency", 8)))
+            per_host_concurrency = max(1, int(config.get("per_host_concurrency", 4)))
             connector = aiohttp.TCPConnector(
-                limit=max(1, int(config.get("download_concurrency", 8))),
-                limit_per_host=max(1, int(config.get("per_host_concurrency", 4))),
+                limit=download_concurrency,
+                limit_per_host=per_host_concurrency,
                 ttl_dns_cache=60,
                 ssl=ssl.create_default_context(cafile=certifi.where()),
             )
@@ -803,15 +843,20 @@ class MediaEnrichmentFormatter(FormatterStage):
                 headers=headers,
                 trust_env=False,
             ) as session:
+                global_semaphore = asyncio.Semaphore(download_concurrency)
+                host_semaphores: Dict[str, asyncio.Semaphore] = {}
                 tasks = [
                     asyncio.create_task(
-                        _download_image(
+                        _download_image_bounded(
                             session,
                             url=url,
                             output_dir=web_images_dir,
                             allowed_hosts=allowed_hosts,
                             dns_cache=dns_cache,
                             config=config,
+                            global_semaphore=global_semaphore,
+                            host_semaphores=host_semaphores,
+                            per_host_concurrency=per_host_concurrency,
                         )
                     )
                     for url in to_download
