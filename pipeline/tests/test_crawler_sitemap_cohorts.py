@@ -358,6 +358,7 @@ def test_stage_outputs_omit_unconfigured_cohort_evidence(tmp_path):
         "page_link_graph_file": "page_link_graph.json",
         "runtime_state_file": "crawler_checkpoint.json",
         "sitemap_state_file": "sitemap_discovery.json",
+        "seed_inventory_file": "seed_inventory.json",
         "images_dir": "downloaded_page_images",
         "url_to_md_mapping_file": "url_to_markdown.json",
     }.items():
@@ -366,11 +367,17 @@ def test_stage_outputs_omit_unconfigured_cohort_evidence(tmp_path):
     crawler.sitemap_cohort_verification = None
     outputs = crawler._build_stage_outputs()
 
+    assert "sitemap_discovery_file" not in outputs
+    assert "seed_inventory_file" not in outputs
     assert "sitemap_cohort_verification_file" not in outputs
 
+    crawler.sitemap_state_file.write_text("{}", encoding="utf-8")
+    crawler.seed_inventory_file.write_text("{}", encoding="utf-8")
     crawler.sitemap_cohort_verification = {"evidence_sha256": "proof"}
     outputs = crawler._build_stage_outputs()
 
+    assert outputs["sitemap_discovery_file"] == str(crawler.sitemap_state_file)
+    assert outputs["seed_inventory_file"] == str(crawler.seed_inventory_file)
     assert outputs["sitemap_cohort_verification_file"] == str(
         crawler.sitemap_cohort_verification_file
     )

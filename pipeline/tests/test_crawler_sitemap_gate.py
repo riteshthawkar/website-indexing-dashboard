@@ -175,6 +175,58 @@ def test_bounded_link_discovery_stays_on_the_approved_source_host(monkeypatch):
     assert all(item["parent_url"] == source_url for item in discovered)
 
 
+def test_no_sitemap_link_discovery_uses_bounded_seed_batches():
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.sitemap_batch_crawl = True
+    crawler.sitemap_crawl_batch_size = 40
+    crawler.crawl_state = {
+        "pending": [{"url": "https://preprod.mbzuai.ac.ae/", "parent_url": None}]
+    }
+    crawler.stats = {"sitemap_urls_seeded": 0}
+    crawler.config = {"sitemap_enabled": False}
+    crawler.link_discovery_hosts = {"preprod.mbzuai.ac.ae"}
+
+    assert crawler._should_use_seed_batch_crawl() is True
+
+    crawler.link_discovery_hosts = set()
+    assert crawler._should_use_seed_batch_crawl() is False
+
+
+def test_json_seed_inventory_extracts_only_configured_result_items():
+    payload = {
+        "navigation": {"url": "/about-us"},
+        "view": {
+            "pager": {"totalPages": 3, "current": 0},
+            "rows": [
+                {
+                    "element": "search-result",
+                    "props": {"url": "/research/one"},
+                },
+                {
+                    "element": "search-result",
+                    "props": {"url": "/study/two"},
+                },
+            ],
+        },
+    }
+
+    assert crawler_module._seed_inventory_total_pages(payload, "totalPages") == 3
+    assert crawler_module._extract_seed_inventory_urls(
+        payload,
+        base_url="https://preprod.mbzuai.ac.ae/",
+        url_keys=["url"],
+        item_element="search-result",
+    ) == [
+        "https://preprod.mbzuai.ac.ae/research/one",
+        "https://preprod.mbzuai.ac.ae/study/two",
+    ]
+    assert crawler_module._url_with_query_param(
+        "https://preprod.mbzuai.ac.ae/api/drupal-ce/search?lang=en",
+        "page",
+        2,
+    ) == "https://preprod.mbzuai.ac.ae/api/drupal-ce/search?lang=en&page=2"
+
+
 def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     crawler = crawler_module.Crawl4AICrawler()
     crawler.stats = {"pages_failed": 0, "skipped_urls": 0}

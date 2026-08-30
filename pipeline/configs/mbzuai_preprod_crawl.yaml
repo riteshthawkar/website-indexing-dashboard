@@ -1,0 +1,135 @@
+# Immutable raw-artifact crawl for the redesigned MBZUAI preproduction site.
+#
+# The preproduction frontend intentionally publishes no XML sitemap and sends
+# an X-Robots-Tag noindex header.  The site owner has explicitly authorized a
+# complete crawl that ignores robots directives; the downstream noindex
+# override is recorded separately in the derived processing profile.
+_inherit: default.yaml
+
+project_name: "mbzuai_preprod_crawl"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+
+crawler:
+  start_url: "https://preprod.mbzuai.ac.ae/"
+  max_pages: 5000
+  max_depth: 8
+  fetch_concurrency: 4
+  download_concurrency: 8
+  timeout: 45
+  fail_on_empty_result: true
+  require_https: true
+  ignore_https_errors: false
+
+  # No sitemap exists on this Nuxt/Drupal preproduction frontend. Discovery
+  # combines the public Drupal search inventory with rendered same-host links
+  # and is bounded by both max_pages and this exact-host budget.
+  sitemap_enabled: false
+  minimum_sitemap_seed_count: 0
+  sitemap_origins: []
+  sitemap_entry_urls: []
+  minimum_sitemap_urls_by_host: {}
+  link_discovery_hosts:
+    - "preprod.mbzuai.ac.ae"
+  link_discovery_max_pages_by_host:
+    "preprod.mbzuai.ac.ae": 5000
+  minimum_crawled_pages_by_host:
+    "preprod.mbzuai.ac.ae": 1
+
+  # The navigation graph exposes only a subset of published content. The
+  # public search view is a bounded content inventory (156 pages / 1,506
+  # unique URLs on 2026-08-30). It is used only to seed underlying pages; the
+  # result pages themselves are not admitted to the crawl frontier or corpus.
+  seed_inventory_endpoints:
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/search"
+      page_param: "page"
+      page_start: 0
+      total_pages_key: "totalPages"
+      item_element: "search-result"
+      url_keys:
+        - "url"
+      max_pages: 250
+      minimum_urls: 1400
+      required: true
+      require_all_pages: true
+  seed_inventory_fetch_concurrency: 8
+  seed_inventory_max_response_bytes: 2097152
+  seed_inventory_fetch_attempts: 3
+  seed_inventory_retry_backoff_sec: 0.75
+
+  allowed_domains:
+    - "preprod.mbzuai.ac.ae"
+  allowed_hosts:
+    - "preprod.mbzuai.ac.ae"
+  excluded_subdomains: []
+  include_external: false
+  allow_query_urls: false
+  allowed_query_param_names: []
+  excluded_path_prefixes:
+    - "/_nuxt/"
+    - "/api/"
+    - "/ce-api"
+    - "/nuxt-component-preview"
+    - "/content/media/"
+
+  # Explicit owner authorization recorded 2026-08-30: crawl every content page
+  # regardless of robots.txt and nofollow declarations on this preprod host.
+  respect_robots_txt: false
+  robots_user_agent: "MBZUAIKnowledgeIndexer"
+  robots_unknown_host_policy: "allow"
+  robots_origins: []
+  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+  headers:
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    Accept-Language: "en-US,en;q=0.9,ar;q=0.8"
+    X-Crawler-Name: "MBZUAIKnowledgeIndexer"
+    X-Crawler-Purpose: "authorized-preproduction-search-index"
+
+  # These routes anchor every major information architecture branch even if a
+  # client-rendered menu or listing fails to expose one during a crawl.
+  priority_seed_urls:
+    - "https://preprod.mbzuai.ac.ae/"
+    - "https://preprod.mbzuai.ac.ae/ar"
+    - "https://preprod.mbzuai.ac.ae/about-us"
+    - "https://preprod.mbzuai.ac.ae/about-us/office-the-president"
+    - "https://preprod.mbzuai.ac.ae/about-us/leadership"
+    - "https://preprod.mbzuai.ac.ae/about-us/contact-us"
+    - "https://preprod.mbzuai.ac.ae/research"
+    - "https://preprod.mbzuai.ac.ae/research/our-divisions"
+    - "https://preprod.mbzuai.ac.ae/research/projects-hub"
+    - "https://preprod.mbzuai.ac.ae/study"
+    - "https://preprod.mbzuai.ac.ae/study/undergraduate-program"
+    - "https://preprod.mbzuai.ac.ae/study/msc-programs"
+    - "https://preprod.mbzuai.ac.ae/study/phd-programs"
+    - "https://preprod.mbzuai.ac.ae/study/faculty-directory"
+    - "https://preprod.mbzuai.ac.ae/admissions"
+    - "https://preprod.mbzuai.ac.ae/admissions/undergraduate-admissions"
+    - "https://preprod.mbzuai.ac.ae/graduate-masters-admissions"
+    - "https://preprod.mbzuai.ac.ae/admissions/graduate-phd-admissions"
+    - "https://preprod.mbzuai.ac.ae/innovation-partnerships"
+    - "https://preprod.mbzuai.ac.ae/campus-community"
+    - "https://preprod.mbzuai.ac.ae/news-events"
+    - "https://preprod.mbzuai.ac.ae/the-node"
+    - "https://preprod.mbzuai.ac.ae/events"
+
+  validate_source_html: true
+  validate_source_html_mode: "always"
+  parse_source_html_for_media: true
+  extract_images: true
+  download_page_images: false
+  max_images_per_page: 30
+  extract_videos: true
+  max_videos_per_page: 10
+  fetch_video_transcripts: true
+  max_video_transcript_kb: 128

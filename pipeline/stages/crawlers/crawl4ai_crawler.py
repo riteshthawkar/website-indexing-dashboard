@@ -303,6 +303,7 @@ URL_TO_MD_FILENAME = "url_to_md_mapping.json"
 RUNTIME_STATE_FILENAME = "crawler_checkpoint.json"
 SITEMAP_STATE_FILENAME = "sitemap_discovery.json"
 SITEMAP_COHORT_VERIFICATION_FILENAME = "sitemap_cohort_verification.json"
+SEED_INVENTORY_FILENAME = "seed_inventory.json"
 
 
 class _RedirectEgressPolicyError(RuntimeError):
@@ -1208,6 +1209,71 @@ def _parse_sitemap_xml(
                     page_urls.append(child.text.strip())
 
     return (sitemap_urls, page_urls)
+
+
+def _iter_json_objects(value: Any) -> Iterable[Dict[str, Any]]:
+    if isinstance(value, dict):
+        yield value
+        for child in value.values():
+            yield from _iter_json_objects(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _iter_json_objects(child)
+
+
+def _seed_inventory_total_pages(payload: Any, key: str) -> Optional[int]:
+    values: List[int] = []
+    for item in _iter_json_objects(payload):
+        value = item.get(key)
+        if isinstance(value, bool):
+            continue
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            values.append(parsed)
+    return max(values) if values else None
+
+
+def _extract_seed_inventory_urls(
+    payload: Any,
+    *,
+    base_url: str,
+    url_keys: Sequence[str],
+    item_element: str = "",
+) -> List[str]:
+    normalized_keys = {str(value).strip() for value in url_keys if str(value).strip()}
+    normalized_element = str(item_element or "").strip()
+    urls: List[str] = []
+    seen: set[str] = set()
+
+    for item in _iter_json_objects(payload):
+        if normalized_element and str(item.get("element") or "") != normalized_element:
+            continue
+        candidates = _iter_json_objects(item) if normalized_element else (item,)
+        for candidate in candidates:
+            for key in normalized_keys:
+                value = candidate.get(key)
+                if not isinstance(value, str):
+                    continue
+                normalized = _normalize_http_url(value, base_url)
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    urls.append(normalized)
+
+    return urls
+
+
+def _url_with_query_param(url: str, key: str, value: int) -> str:
+    parsed = urlparse(url)
+    query = [
+        (name, item)
+        for name, item in parse_qsl(parsed.query, keep_blank_values=True)
+        if name != key
+    ]
+    query.append((key, str(value)))
+    return urlunparse(parsed._replace(query=urlencode(query, doseq=True)))
 
 
 def _build_initial_crawl_state(
@@ -2504,6 +2570,39 @@ class Crawl4AICrawler(CrawlerStage):
                 )
                 break
 
+        seed_inventory_endpoints = crawler.get("seed_inventory_endpoints") or []
+        if not isinstance(seed_inventory_endpoints, list):
+            errors.append("crawler.seed_inventory_endpoints must be a list")
+            seed_inventory_endpoints = []
+        for index, endpoint in enumerate(seed_inventory_endpoints):
+            label = f"crawler.seed_inventory_endpoints[{index}]"
+            if not isinstance(endpoint, dict):
+                errors.append(f"{label} must be a mapping")
+                continue
+            normalized = _normalize_http_url(endpoint.get("url"))
+            parsed = urlparse(normalized or "")
+            if not normalized or (
+                bool(crawler.get("require_https", True)) and parsed.scheme != "https"
+            ):
+                errors.append(f"{label}.url must be a valid HTTPS URL")
+            elif allowed_hosts and (parsed.hostname or "").lower() not in allowed_hosts:
+                errors.append(f"{label}.url must use crawler.allowed_hosts")
+            page_param = str(endpoint.get("page_param") or "page").strip()
+            if not re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", page_param):
+                errors.append(f"{label}.page_param contains unsupported characters")
+            url_keys = endpoint.get("url_keys") or ["url"]
+            if not isinstance(url_keys, list) or not all(
+                isinstance(value, str) and value.strip() for value in url_keys
+            ):
+                errors.append(f"{label}.url_keys must be a non-empty list of strings")
+            for key, minimum in (("max_pages", 1), ("minimum_urls", 0)):
+                value = endpoint.get(key, 250 if key == "max_pages" else 0)
+                try:
+                    if int(value) < minimum:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(f"{label}.{key} must be an integer >= {minimum}")
+
         robots_unknown_host_policy = str(
             crawler.get("robots_unknown_host_policy", "allow") or "allow"
         ).strip().lower()
@@ -2563,6 +2662,9 @@ class Crawl4AICrawler(CrawlerStage):
             "robots_max_response_bytes",
             "sitemap_max_response_bytes",
             "sitemap_max_sources",
+            "seed_inventory_fetch_concurrency",
+            "seed_inventory_max_response_bytes",
+            "seed_inventory_fetch_attempts",
         ):
             value = crawler.get(key)
             if value is None:
@@ -2789,6 +2891,32 @@ class Crawl4AICrawler(CrawlerStage):
         self.link_discovery_max_pages_by_host = self._resolve_host_minimums(
             "link_discovery_max_pages_by_host"
         )
+        self.seed_inventory_endpoints = [
+            dict(value)
+            for value in (self.config.get("seed_inventory_endpoints") or [])
+            if isinstance(value, dict)
+        ]
+        self.seed_inventory_fetch_concurrency = max(
+            1,
+            int(
+                self.config.get(
+                    "seed_inventory_fetch_concurrency",
+                    self.fetch_concurrency,
+                )
+            ),
+        )
+        self.seed_inventory_max_response_bytes = max(
+            1,
+            int(self.config.get("seed_inventory_max_response_bytes", 2 * 1024 * 1024)),
+        )
+        self.seed_inventory_fetch_attempts = max(
+            1,
+            int(self.config.get("seed_inventory_fetch_attempts", 3)),
+        )
+        self.seed_inventory_retry_backoff = max(
+            0.0,
+            float(self.config.get("seed_inventory_retry_backoff_sec", 0.75)),
+        )
         self.known_empty_sitemap_cohorts, cohort_errors = (
             _normalize_known_empty_cohort_policies(
                 self.config.get("known_empty_sitemap_cohorts"),
@@ -2842,6 +2970,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.crawl_state_file = ctx.work_dir / CRAWL_STATE_FILENAME
         self.runtime_state_file = ctx.work_dir / RUNTIME_STATE_FILENAME
         self.sitemap_state_file = ctx.work_dir / SITEMAP_STATE_FILENAME
+        self.seed_inventory_file = ctx.work_dir / SEED_INVENTORY_FILENAME
         self.sitemap_cohort_verification_file = (
             ctx.work_dir / SITEMAP_COHORT_VERIFICATION_FILENAME
         )
@@ -2864,6 +2993,8 @@ class Crawl4AICrawler(CrawlerStage):
             "bytes_downloaded": 0,
             "sitemap_urls_seeded": 0,
             "sitemap_urls_discovered": 0,
+            "seed_inventory_pages_fetched": 0,
+            "seed_inventory_urls_discovered": 0,
             "verified_empty_urls": 0,
             "sitemap_batches_completed": 0,
             "frontier_urls_discovered": 0,
@@ -2884,6 +3015,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.recoverable_skip_exhausted_urls: set[str] = set()
         self.crawl_state: Dict[str, Any] = {}
         self.discovered_sitemaps: Dict[str, Any] = {"sources": [], "urls": []}
+        self.seed_inventory: Dict[str, Any] = {"endpoints": [], "urls": []}
         self.sitemap_cohort_verification: Optional[Dict[str, Any]] = None
         self.verified_empty_urls: Dict[str, str] = {}
         self._last_flush_at = 0.0
@@ -2922,6 +3054,7 @@ class Crawl4AICrawler(CrawlerStage):
                 if self.config.get("sitemap_enabled", True):
                     sitemap_urls = await self._discover_sitemap_urls()
                     self.stats["sitemap_urls_seeded"] = len(sitemap_urls)
+                seed_inventory_urls = await self._discover_seed_inventory_urls()
                 minimum_sitemap_seed_count = max(
                     0,
                     int(self.config.get("minimum_sitemap_seed_count") or 0),
@@ -2940,7 +3073,7 @@ class Crawl4AICrawler(CrawlerStage):
                 )
                 self.crawl_state = _build_initial_crawl_state(
                     self.start_url,
-                    sitemap_urls,
+                    [*sitemap_urls, *seed_inventory_urls],
                     self.max_pages,
                     frontier_seed_limit=self.config.get("sitemap_frontier_seed_limit"),
                     priority_urls=self.priority_seed_urls,
@@ -3013,6 +3146,25 @@ class Crawl4AICrawler(CrawlerStage):
                             "nodes": len(self.page_metadata),
                             "edges": sum(len(links) for links in self.page_links.values()),
                         },
+                    ),
+                    *(
+                        [
+                            ctx.make_artifact(
+                                self.seed_inventory_file,
+                                artifact_type="seed_inventory",
+                                role="bounded_content_inventory",
+                                metadata={
+                                    "endpoints": len(
+                                        self.seed_inventory.get("endpoints", [])
+                                    ),
+                                    "eligible_urls": len(
+                                        self.seed_inventory.get("urls", [])
+                                    ),
+                                },
+                            )
+                        ]
+                        if self.seed_inventory_file.exists()
+                        else []
                     ),
                     *(
                         [
@@ -3430,6 +3582,14 @@ class Crawl4AICrawler(CrawlerStage):
             dict(sitemap_state)
             if isinstance(sitemap_state, dict)
             else {"sources": [], "urls": []}
+        )
+        seed_inventory = state.get("seed_inventory")
+        if not isinstance(seed_inventory, dict):
+            seed_inventory = load_json_safe(self.seed_inventory_file, {}) or {}
+        self.seed_inventory = (
+            dict(seed_inventory)
+            if isinstance(seed_inventory, dict)
+            else {"endpoints": [], "urls": []}
         )
         cohort_evidence = state.get("sitemap_cohort_verification")
         if not isinstance(cohort_evidence, dict) and self.crawl_state:
@@ -4049,6 +4209,213 @@ class Crawl4AICrawler(CrawlerStage):
         )
         return [url for url in urls if url not in verified]
 
+    async def _discover_seed_inventory_urls(self) -> List[str]:
+        """Expand bounded JSON inventories into crawl seeds with audit evidence."""
+
+        endpoints = list(getattr(self, "seed_inventory_endpoints", []) or [])
+        if not endpoints:
+            self.seed_inventory = {"endpoints": [], "urls": []}
+            return []
+        if not self._session:
+            raise RuntimeError("Seed inventory discovery requires an open HTTP session")
+
+        semaphore = asyncio.Semaphore(self.seed_inventory_fetch_concurrency)
+
+        async def _fetch_page(
+            endpoint_url: str,
+            page_param: str,
+            page_index: int,
+        ) -> Tuple[Optional[Any], Dict[str, Any]]:
+            request_url = _url_with_query_param(endpoint_url, page_param, page_index)
+            last_error_type = ""
+            last_status: Optional[int] = None
+            for attempt in range(1, self.seed_inventory_fetch_attempts + 1):
+                try:
+                    async with semaphore:
+                        async with self._get_with_safe_redirects(
+                            session=self._session,
+                            url=request_url,
+                            enforce_allowed_domain=True,
+                            enforce_robots=self.respect_robots_txt,
+                        ) as response:
+                            last_status = int(response.status)
+                            if response.status != 200:
+                                raise RuntimeError(
+                                    f"seed inventory returned HTTP {response.status}"
+                                )
+                            raw_payload = await _read_bounded_response(
+                                response,
+                                self.seed_inventory_max_response_bytes,
+                            )
+                    payload = json.loads(raw_payload.decode("utf-8"))
+                    return payload, {
+                        "page": page_index,
+                        "status": last_status,
+                        "payload_sha256": hashlib.sha256(raw_payload).hexdigest(),
+                        "payload_bytes": len(raw_payload),
+                        "attempts": attempt,
+                    }
+                except Exception as exc:
+                    last_error_type = type(exc).__name__
+                    if attempt < self.seed_inventory_fetch_attempts:
+                        await asyncio.sleep(self.seed_inventory_retry_backoff * attempt)
+            return None, {
+                "page": page_index,
+                "status": last_status,
+                "error_type": last_error_type or "UnknownError",
+                "attempts": self.seed_inventory_fetch_attempts,
+            }
+
+        collected_urls: List[str] = []
+        endpoint_evidence: List[Dict[str, Any]] = []
+        for raw_endpoint in endpoints:
+            endpoint_url = _normalize_http_url(raw_endpoint.get("url"))
+            if not endpoint_url or not self._url_allowed_for_fetch(endpoint_url):
+                raise RuntimeError(
+                    "Seed inventory endpoint is outside the crawler egress policy: "
+                    f"{raw_endpoint.get('url')}"
+                )
+
+            page_param = str(raw_endpoint.get("page_param") or "page").strip()
+            page_start = int(raw_endpoint.get("page_start", 0))
+            max_pages = max(1, int(raw_endpoint.get("max_pages", 250)))
+            total_pages_key = str(
+                raw_endpoint.get("total_pages_key") or "totalPages"
+            ).strip()
+            url_keys = list(raw_endpoint.get("url_keys") or ["url"])
+            item_element = str(raw_endpoint.get("item_element") or "").strip()
+            required = bool(raw_endpoint.get("required", True))
+            require_all_pages = bool(raw_endpoint.get("require_all_pages", True))
+            minimum_urls = max(0, int(raw_endpoint.get("minimum_urls", 0)))
+
+            first_payload, first_record = await _fetch_page(
+                endpoint_url,
+                page_param,
+                page_start,
+            )
+            if first_payload is None:
+                if required:
+                    raise RuntimeError(
+                        "Required seed inventory endpoint could not be fetched: "
+                        f"{endpoint_url} ({first_record.get('error_type')})"
+                    )
+                endpoint_evidence.append(
+                    {
+                        "url": endpoint_url,
+                        "required": False,
+                        "page_fetches": [first_record],
+                        "urls": [],
+                    }
+                )
+                continue
+
+            discovered_total_pages = (
+                _seed_inventory_total_pages(first_payload, total_pages_key) or 1
+            )
+            if discovered_total_pages > max_pages:
+                raise RuntimeError(
+                    "Seed inventory page count exceeds its configured fail-closed limit: "
+                    f"endpoint={endpoint_url} discovered={discovered_total_pages} "
+                    f"limit={max_pages}"
+                )
+
+            page_indices = list(
+                range(page_start, page_start + discovered_total_pages)
+            )
+            remaining_indices = [
+                page_index for page_index in page_indices if page_index != page_start
+            ]
+            remaining_results = await asyncio.gather(
+                *(
+                    _fetch_page(endpoint_url, page_param, page_index)
+                    for page_index in remaining_indices
+                )
+            )
+            payloads_by_page: Dict[int, Any] = {page_start: first_payload}
+            page_fetches = [first_record]
+            for page_index, (payload, record) in zip(
+                remaining_indices,
+                remaining_results,
+            ):
+                page_fetches.append(record)
+                if payload is not None:
+                    payloads_by_page[page_index] = payload
+
+            failed_pages = sorted(set(page_indices) - set(payloads_by_page))
+            if failed_pages and required and require_all_pages:
+                raise RuntimeError(
+                    "Required seed inventory is incomplete after retries: "
+                    f"endpoint={endpoint_url} failed_pages={failed_pages[:20]} "
+                    f"failed_count={len(failed_pages)}"
+                )
+
+            endpoint_urls: List[str] = []
+            for page_index in sorted(payloads_by_page):
+                endpoint_urls.extend(
+                    _extract_seed_inventory_urls(
+                        payloads_by_page[page_index],
+                        base_url=self.start_url,
+                        url_keys=url_keys,
+                        item_element=item_element,
+                    )
+                )
+            eligible_urls = sorted(
+                {url for url in endpoint_urls if self._allow_frontier_url(url)}
+            )
+            if len(eligible_urls) < minimum_urls:
+                raise RuntimeError(
+                    "Seed inventory coverage gate failed: "
+                    f"endpoint={endpoint_url} discovered={len(eligible_urls)} "
+                    f"required={minimum_urls}"
+                )
+
+            collected_urls.extend(eligible_urls)
+            endpoint_evidence.append(
+                {
+                    "url": endpoint_url,
+                    "page_param": page_param,
+                    "page_start": page_start,
+                    "total_pages_key": total_pages_key,
+                    "discovered_total_pages": discovered_total_pages,
+                    "fetched_pages": len(payloads_by_page),
+                    "failed_pages": failed_pages,
+                    "required": required,
+                    "require_all_pages": require_all_pages,
+                    "minimum_urls": minimum_urls,
+                    "eligible_url_count": len(eligible_urls),
+                    "eligible_url_counts_by_host": self._count_urls_by_host(
+                        eligible_urls
+                    ),
+                    "urls": eligible_urls,
+                    "page_fetches": sorted(
+                        page_fetches,
+                        key=lambda value: int(value.get("page") or 0),
+                    ),
+                }
+            )
+            logger.info(
+                "Seed inventory discovered %d eligible URLs across %d page(s): %s",
+                len(eligible_urls),
+                len(payloads_by_page),
+                endpoint_url,
+            )
+
+        deduped = sorted(set(collected_urls))
+        self.seed_inventory = {
+            "version": 1,
+            "generated_at": time.time(),
+            "endpoints": endpoint_evidence,
+            "eligible_url_count": len(deduped),
+            "eligible_url_counts_by_host": self._count_urls_by_host(deduped),
+            "urls": deduped,
+        }
+        self.stats["seed_inventory_pages_fetched"] = sum(
+            int(item.get("fetched_pages") or 0) for item in endpoint_evidence
+        )
+        self.stats["seed_inventory_urls_discovered"] = len(deduped)
+        atomic_write_json(self.seed_inventory_file, self.seed_inventory)
+        return deduped
+
     async def _discover_sitemap_urls(self) -> List[str]:
         if not self._session:
             return []
@@ -4429,6 +4796,12 @@ class Crawl4AICrawler(CrawlerStage):
         if not self.sitemap_batch_crawl:
             return False
         pending = self.crawl_state.get("pending") or []
+        # Exact-host link discovery is implemented by the bounded seed loop,
+        # not by Crawl4AI's opaque deep-crawl result buffer.  Always use that
+        # loop for approved no-sitemap hosts, including a single root seed, so
+        # every rendered result is durably processed before expanding links.
+        if self.link_discovery_hosts and pending:
+            return True
         if len(pending) <= self.sitemap_crawl_batch_size:
             return False
         if self.stats.get("sitemap_urls_seeded", 0) > 0:
@@ -4539,7 +4912,7 @@ class Crawl4AICrawler(CrawlerStage):
         batch_config = run_config.clone(deep_crawl_strategy=None, stream=False)
 
         logger.info(
-            "Using bounded sitemap seed crawl: pending=%d batch_size=%d fetch_concurrency=%d",
+            "Using bounded seed crawl: pending=%d batch_size=%d fetch_concurrency=%d",
             len(pending),
             self.sitemap_crawl_batch_size,
             self.fetch_concurrency,
@@ -5618,10 +5991,14 @@ class Crawl4AICrawler(CrawlerStage):
             "page_link_graph_file": str(self.page_link_graph_file),
             "runtime_state_file": str(self.runtime_state_file),
             "crawler_runtime_state_file": str(self.runtime_state_file),
-            "sitemap_discovery_file": str(self.sitemap_state_file),
             "images_dir": str(self.images_dir),
             "md_mapping_file": str(self.url_to_md_mapping_file),
         }
+        if self.sitemap_state_file.exists():
+            outputs["sitemap_discovery_file"] = str(self.sitemap_state_file)
+        seed_inventory_file = getattr(self, "seed_inventory_file", None)
+        if seed_inventory_file is not None and seed_inventory_file.exists():
+            outputs["seed_inventory_file"] = str(seed_inventory_file)
         if self.sitemap_cohort_verification:
             outputs["sitemap_cohort_verification_file"] = str(
                 self.sitemap_cohort_verification_file
@@ -5646,6 +6023,11 @@ class Crawl4AICrawler(CrawlerStage):
             ),
             "sitemap_cohort_verification": self.sitemap_cohort_verification,
             "discovered_sitemaps": self.discovered_sitemaps,
+            "seed_inventory": getattr(
+                self,
+                "seed_inventory",
+                {"endpoints": [], "urls": []},
+            ),
             "stats": self.stats,
             "updated_at": time.time(),
         }
@@ -5676,6 +6058,9 @@ class Crawl4AICrawler(CrawlerStage):
         )
         if self.discovered_sitemaps.get("sources") or self.discovered_sitemaps.get("urls"):
             atomic_write_json(self.sitemap_state_file, self.discovered_sitemaps)
+        seed_inventory = getattr(self, "seed_inventory", {}) or {}
+        if seed_inventory.get("endpoints") or seed_inventory.get("urls"):
+            atomic_write_json(self.seed_inventory_file, seed_inventory)
         if self.sitemap_cohort_verification:
             atomic_write_json(
                 self.sitemap_cohort_verification_file,
