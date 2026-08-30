@@ -1,0 +1,30 @@
+_inherit: mbzuai_preprod_selected_index_prep.yaml
+
+# Immutable, offline release assembly for the selected c650 profile over the
+# new MBZUAI preproduction snapshot. Every input is pinned by SHA-256 and this
+# run performs no provider calls, database writes, or release promotion.
+project_name: "mbzuai_preprod_selected_release_assembly"
+
+formatter:
+  selected_release_assembly:
+    checkpoint_run_dir: "runs/mbzuai_preprod_selected_index_prep/mbzuai-preprod-selected-index-prep-20260830-v1"
+    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-c650-selected-20260830-v1/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "9b6e708b493530be4286ea6d87be6d34f81c1f62df49196085aa83376d7100ab"
+    candidate_records_file: "runs/evaluation/mbzuai-preprod-c650-selected-20260830-v1/candidates/c650/records.jsonl"
+    candidate_records_sha256: "8d190417507cd42fd9e4420a0e8e633468401ac1b848d23ee0e724d30d2ce22e"
+    checkpoint_evidence:
+      pipeline_state_sha256: "c16f08e3a818b54711740f9955eecb0e5877e524e6ed8a00db5243026f024e95"
+      artifact_catalog_sha256: "1db1b60466425d2b74d45521f632b357a2d10422cd25bcaf1f485805dfd8891b"
+      run_audit_sha256: "b0d21b8be2043417c788d733d5bcbd1d6d2b6907894f560e2b907677bd047582"
+      resolved_config_sha256: "1eda63bc491985acd245165d75e9cbe31367e7e43b1a8f7a67923100e1e29faf"
+      chunk_index_sha256: "e2c85bb49d9965fcb32b961ec686049d7c38fee19a471bbfe73555f991d68e3d"
+      page_graph_bridge_sha256: "baf98899b1f4ce0f4617344d8bb3d158fcb1779db5926e3203bf63d26570bc2a"
+      navigation_catalog_sha256: "c01469b66482065b3a759da921a686adc2226997b61b49f57d1a22c47f58e50b"
+
+stages:
+  - id: verify_selected_profile
+    type: formatter
+    plugin: selected_profile_guard
+  - id: assemble_selected_release
+    type: formatter
+    plugin: selected_release_assembly

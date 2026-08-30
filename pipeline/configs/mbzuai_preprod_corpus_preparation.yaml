@@ -1,0 +1,73 @@
+# Representation-neutral handoff for the authorized MBZUAI preproduction
+# snapshot. It merges the completed semantic-caption corpus with the immutable
+# exact-OCR overlay, deduplicates only Markdown evidence, and performs no
+# chunking, embedding, database writes, or release promotion.
+
+project_name: "mbzuai_preprod_corpus_preparation"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+quality:
+  dedup_threshold: 0.85
+  dedup_num_perm: 128
+  dedup_ngram_size: 5
+  preserve_duplicate_source_media: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 2
+    # Ordering is intentional: the OCR overlay wins media-sidecar collisions,
+    # while the captioned processing run supplies Markdown and local assets.
+    source_runs:
+      - role: "ocr_overlay"
+        run_dir: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-20260830-v1"
+        project_name: "mbzuai_preprod_hybrid_ocr"
+        required_stage_ids:
+          - "enrich_exact_ocr"
+        evidence:
+          pipeline_state_sha256: "d3f993d85be375692d0a4bd729130ff9a70153e18721fb9d995bc1b4b6f6425e"
+          artifact_catalog_sha256: "809e00ae167cc682038b3c9b27d9417f1fab709cf48925038c6acbfbfd37edc4"
+          run_audit_sha256: "bb2c9199d37db06d800d8785a41358033a4a184c7279ee4c8872452856d612ce"
+          resolved_config_sha256: "1acc70027c6478ebdc442b83aa73abc896be8cad3bb60629c384faa941632edf"
+      - role: "captioned_corpus"
+        run_dir: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3"
+        project_name: "mbzuai_preprod_processing"
+        required_stage_ids:
+          - "convert_documents"
+          - "convert_html"
+          - "enrich_media"
+          - "annotate_media"
+        evidence:
+          pipeline_state_sha256: "6b0560a17e23f6c3812814e2149a7e857bdafd990878eed6a11097ed994666fa"
+          artifact_catalog_sha256: "024967f33cee0055b521341f7aa2b4e66dd737cbe00a808c512ef02f9e1e464b"
+          run_audit_sha256: "b799e5c9dde01f342423be5d22dccb69d3efdc3c6d0f33fb8657c7faa9850bb7"
+          resolved_config_sha256: "a1a479c4316ecf38ec853e0504fce1470c7830375acfd8fe0cf0d15c967d6043"
+
+  corpus_preparation:
+    # The audited dedup pass removed 78 byte-identical, same-language aliases
+    # from 1,760 inputs, leaving this exact representation-neutral inventory.
+    minimum_document_count: 1682
+    minimum_unique_media_assets: 2117
+    maximum_missing_media_files: 0
+    maximum_unbound_media_assets: 0
+    minimum_semantically_annotated_visuals: 2117
+    minimum_ocr_adjudicated_visuals: 327
+
+stages:
+  - id: merge_corpora
+    type: formatter
+    plugin: corpus_merge
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: prepare_corpus_boundary
+    type: formatter
+    plugin: corpus_preparation

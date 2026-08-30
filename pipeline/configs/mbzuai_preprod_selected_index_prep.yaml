@@ -1,0 +1,106 @@
+# Pre-embedding checkpoint for the previously selected controlled A/B winner,
+# applied to the new MBZUAI preproduction corpus. It verifies the profile,
+# imports the audited corpus, performs lossless c650 chunking, and bridges the
+# real chunk index to the page graph. No provider or database mutation occurs.
+
+project_name: "mbzuai_preprod_selected_index_prep"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+selected_profile:
+  variant_id: "c650__gemini2_1536__dense_graph"
+  decision_file: "runs/evaluation/mbzuai-multilingual-controlled-ab-v1/results/final_selection.json"
+  decision_sha256: "52826eda7fd57ff0d0042f9850d900cd0c932396fd68366c8cd550f38fc458b2"
+  pre_embedding_only: true
+  record_kinds:
+    - "chunk"
+    - "parent"
+    - "parent_section"
+    - "media"
+    - "page_card"
+    - "action"
+
+chunker:
+  strategy: "hybrid"
+  use_docling_native: true
+  include_section_headings: true
+  always_emit_headings: false
+  target_tokens: 650
+  max_tokens: 900
+  overlap_tokens: 100
+  min_chunk_tokens: 160
+  max_chunks_per_document: 0
+
+embedder:
+  engine: "gemini"
+  model: "gemini-embedding-2"
+  output_dimensionality: 1536
+  enable_sparse: false
+  enable_sparse_evidence_spans: false
+  use_sparse_embeddings: false
+  query_format: "task: search result | query: {query}"
+  document_format: "title: {title} | text: {text}"
+  media_input: "caption_text"
+
+vector_store:
+  provider: "pgvector"
+  schema: "mbzuai_retrieval"
+  records_table: "embedding_records"
+  releases_table: "releases"
+  dimensions: 1536
+  schema_version: 2
+  dsn_env: "PGVECTOR_DSN"
+  ingest_dsn_env: "PGVECTOR_INGEST_DSN"
+  reader_role: "mbzuai_retriever"
+  writer_role: "mbzuai_indexer"
+  require_ssl: true
+  require_active_release: false
+
+retrieval:
+  index_mode: "dense_graph"
+  enable_sparse: false
+  navigation_plan_enabled: true
+  navigation_plan_required: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 1
+    source_runs:
+      - role: "prepared_corpus"
+        run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260830-v2"
+        project_name: "mbzuai_preprod_corpus_preparation"
+        required_stage_ids:
+          - "prepare_corpus_boundary"
+        evidence:
+          pipeline_state_sha256: "d632f2a7503e8d6d630cfead862fa8c68f8e84af46e9d29bd001284687d26695"
+          artifact_catalog_sha256: "1cf6eaba69c76932186a99bed1ede2e99df09fcadc135f5f8b3e0fa5f3e53b09"
+          run_audit_sha256: "ad9342a1e2cf3b65aa872d9f1e3d458ade64e04741c781f13aebda1c4fc13451"
+          resolved_config_sha256: "850f9217591509549175eb91cfcce0f35520c7ea5706b252fc3ae83d0c3abd72"
+
+  page_graph_bridge:
+    source_representation_run_dir: "runs/mbzuai_preprod_representation_v2/mbzuai-preprod-representation-v2-20260830-v1"
+    source_corpus_run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260830-v2"
+    require_chunk_index: true
+    derive_document_sections: true
+
+stages:
+  - id: verify_selected_profile
+    type: formatter
+    plugin: selected_profile_guard
+  - id: import_prepared_corpus
+    type: formatter
+    plugin: corpus_merge
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+  - id: bridge_page_graph
+    type: formatter
+    plugin: page_graph_bridge

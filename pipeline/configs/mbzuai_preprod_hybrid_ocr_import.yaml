@@ -1,0 +1,54 @@
+# Immutable exact-OCR overlay for the authorized 2026-08-30 MBZUAI
+# preproduction crawl. The GPU batch is content-hash pinned and adjudicated
+# locally before this stage is allowed to enrich the completed caption corpus.
+
+project_name: "mbzuai_preprod_hybrid_ocr"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  media_ocr:
+    provider: "batch_manifest"
+    model: "PP-OCRv5 + baidu/Unlimited-OCR"
+    model_revision: "paddleocr-3.7.0/paddle-3.2.0 + 07dea832e22aefee32ad281d4b80551282e1c168"
+    provider_revision: "paddleocr-3.7.0 + transformers-direct"
+    quality_revision: "hybrid-exact-ocr-quality-v1"
+    batch_contract_sha256: "ae79078a5e28a3a8026c8e6697ba1f9254bbe82f1ae3b8802eef280e4bb4dbd2"
+    batch_results:
+      path: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-20260830-v1/results/adjudicated.json"
+      sha256: "af35d7c91b87d5497c1b6972a52d945753afd0322b1743dd1bf147b1ca8de679"
+    input_artifacts:
+      page_media_file:
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3/stage_outputs/annotate_media/semantically_annotated_page_media.json"
+        sha256: "4dfe1ebef1e2d4da0b6a49a07750f4a6437a74990d68cf5f0dc0e0c0a350a7a7"
+      page_images_file:
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3/stage_outputs/annotate_media/semantically_annotated_page_images.json"
+        sha256: "9ec4528517df4668c1299407b67a35fd7056cf34981f4fb608e5a36b8775e2ff"
+      extracted_images_index_file:
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3/stage_outputs/annotate_media/semantically_annotated_document_media.json"
+        sha256: "04401e0e64c8f03eb3539c20775750ed2d7f6a61458f65ba9c0375dc3ed5a2e5"
+      media_manifest_file:
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
+        sha256: "93d289327865b0ff1d9c99a907f4c2a8652ec893a95918cc5bd376e5a2da0974"
+    scope: "all"
+    needs_ocr_only: true
+    concurrency: 1
+    retry_attempts: 1
+    request_timeout_sec: 1
+    primary_mode: "gundam"
+    retry_mode: "base"
+    max_images: 0
+    minimum_usable_text_ratio: 0.55
+    maximum_rejected_ratio: 0.25
+    require_complete: true
+
+stages:
+  - id: enrich_exact_ocr
+    type: formatter
+    plugin: media_ocr
