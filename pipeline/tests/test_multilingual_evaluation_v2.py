@@ -108,6 +108,57 @@ def test_source_level_coverage_is_included_in_summary():
     assert summary["with_gold_actions"] == 1
 
 
+def test_eval_validator_checks_source_level_ids_against_retrieval_bundle(tmp_path):
+    dataset_path = tmp_path / "eval.jsonl"
+    write_eval_examples(
+        dataset_path,
+        [
+            EvalExample(
+                id="source-contract-001",
+                query="Where do I apply?",
+                query_type="scoped",
+                reference_answer="Use the official application page.",
+                gold_document_revision_ids=["document-revision:missing"],
+                gold_page_card_ids=["page-card:missing"],
+                gold_section_ids=["page-section:missing"],
+                gold_action_ids=["page-action:missing"],
+            )
+        ],
+    )
+    bundle_dir = tmp_path / "run" / "stage_outputs" / "format_retrieval"
+    bundle_dir.mkdir(parents=True)
+    (bundle_dir / "retrieval_bundle.json").write_text(
+        json.dumps(
+            {
+                "chunk_records": [
+                    {
+                        "id": "chunk:1",
+                        "document_revision_id": "document-revision:present",
+                        "page_card_ids": ["page-card:present"],
+                        "section_ids": ["page-section:present"],
+                    }
+                ],
+                "evidence_span_records": [],
+                "parent_records": [],
+                "media_records": [],
+                "page_card_records": [{"id": "page-card:present"}],
+                "action_records": [{"id": "page-action:present"}],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = validate_eval_examples(dataset_path, work_dir=tmp_path / "run")
+
+    assert report["ok"] is False
+    assert {error["field"] for error in report["errors"]} == {
+        "gold_document_revision_ids",
+        "gold_page_card_ids",
+        "gold_section_ids",
+        "gold_action_ids",
+    }
+
+
 def test_evidence_quote_matching_normalizes_unicode_and_whitespace():
     assert contains_evidence_quote("الذكاءُ  الاصطناعي\nفي أبوظبي", "الذكاءُ الاصطناعي في أبوظبي")
     assert not contains_evidence_quote("Grounded source text", "invented claim")

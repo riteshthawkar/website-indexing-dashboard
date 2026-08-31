@@ -48,11 +48,44 @@ def _load_retrieval_bundle_ids(work_dir: str | Path) -> Dict[str, Set[str]]:
     if not bundle_path.exists():
         raise FileNotFoundError(bundle_path)
     payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+
+    record_groups = {
+        name: [item for item in payload.get(name, []) if isinstance(item, dict)]
+        for name in (
+            "chunk_records",
+            "evidence_span_records",
+            "parent_records",
+            "media_records",
+            "page_card_records",
+            "action_records",
+        )
+    }
+    all_records = [item for records in record_groups.values() for item in records]
+
+    def values(records: Iterable[Dict[str, Any]], *field_names: str) -> Set[str]:
+        output: Set[str] = set()
+        for record in records:
+            for field_name in field_names:
+                value = record.get(field_name)
+                items = value if isinstance(value, list) else [value]
+                output.update(str(item).strip() for item in items if str(item or "").strip())
+        return output
+
     return {
-        "gold_chunk_ids": {str(item.get("id")) for item in payload.get("chunk_records", []) if str(item.get("id") or "")},
-        "gold_span_ids": {str(item.get("id")) for item in payload.get("evidence_span_records", []) if str(item.get("id") or "")},
-        "gold_parent_ids": {str(item.get("id")) for item in payload.get("parent_records", []) if str(item.get("id") or "")},
-        "gold_media_ids": {str(item.get("id")) for item in payload.get("media_records", []) if str(item.get("id") or "")},
+        "gold_chunk_ids": values(record_groups["chunk_records"], "id"),
+        "gold_span_ids": values(record_groups["evidence_span_records"], "id"),
+        "gold_parent_ids": values(record_groups["parent_records"], "id"),
+        "gold_media_ids": values(record_groups["media_records"], "id"),
+        "gold_document_revision_ids": values(all_records, "document_revision_id"),
+        "gold_page_card_ids": {
+            *values(record_groups["page_card_records"], "id", "page_card_id"),
+            *values(all_records, "page_card_ids"),
+        },
+        "gold_section_ids": values(all_records, "section_id", "section_ids"),
+        "gold_action_ids": {
+            *values(record_groups["action_records"], "id", "action_id"),
+            *values(all_records, "action_id"),
+        },
     }
 
 
