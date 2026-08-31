@@ -1209,8 +1209,14 @@ def build_evidence_pack(
     max_chars = max(800, int(max_chars or 8000))
     max_per_source = max(1, int(max_per_source or 2))
     explicit_media_query = _is_explicit_media_query(query)
-    structured_detail_query = bool(_MULTI_DETAIL_QUERY_RE.search(str(query or "")))
     normalized_query = str(query or "").casefold()
+    english_question_facets = set(
+        re.findall(r"\b(?:what|when|where|who|which|how)\b", normalized_query)
+    )
+    structured_detail_query = bool(
+        _MULTI_DETAIL_QUERY_RE.search(str(query or ""))
+        or len(english_question_facets) >= 3
+    )
     relational_person_query = bool(
         re.search(r"\b(?:who|whom)\b", normalized_query)
         and re.search(r"\b(?:speaker|host|hosted|hosting)\b", normalized_query)
@@ -1409,12 +1415,32 @@ def build_evidence_pack(
         # whole evidence budget before a split list or requirements block is
         # considered.
         reserved_leaf_docs: List[Dict[str, Any]] = []
-        for _score, kind, doc in candidates:
-            if kind == "chunk" and _doc_id(doc).startswith("chunk:"):
-                if _append_candidate(kind, doc):
-                    reserved_leaf_docs.append(doc)
-                break
-        if reserved_leaf_docs and max_items >= 3:
+        if required_pages:
+            # A compound answer spanning several explicitly resolved pages
+            # needs one contiguous child from each page. Otherwise precise
+            # facts from the first page can exhaust the item budget while a
+            # truncated span from the second page drops the requested list.
+            for required_page in required_pages[:3]:
+                for _score, kind, doc in candidates:
+                    if (
+                        kind == "chunk"
+                        and _doc_id(doc).startswith("chunk:")
+                        and _candidate_matches_requirement(
+                            doc,
+                            required_page,
+                            page=True,
+                        )
+                    ):
+                        if _append_candidate(kind, doc):
+                            reserved_leaf_docs.append(doc)
+                        break
+        else:
+            for _score, kind, doc in candidates:
+                if kind == "chunk" and _doc_id(doc).startswith("chunk:"):
+                    if _append_candidate(kind, doc):
+                        reserved_leaf_docs.append(doc)
+                    break
+        if len(reserved_leaf_docs) == 1 and max_items >= 3:
             anchor = reserved_leaf_docs[0]
             anchor_id = _doc_id(anchor)
             anchor_match = re.search(r":(\d{5}):[^:]+$", anchor_id)

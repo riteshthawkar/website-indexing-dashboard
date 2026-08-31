@@ -3424,6 +3424,68 @@ def test_evidence_pack_scopes_single_required_page_even_for_aggregation_intent()
     assert [item["source_url"] for item in pack["items"]] == [target_url]
 
 
+def test_evidence_pack_reserves_each_required_page_chunk_for_compound_question():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    visitor_url = "https://library.mbzuai.ac.ae/visitor-information"
+    borrowing_url = "https://library.mbzuai.ac.ae/Borrowing_Information"
+    result = {
+        "fact_documents": [
+            {
+                "id": f"generic-{index}",
+                "text": "MBZUAI Library provides resources and services.",
+                "source_url": visitor_url if index % 2 else borrowing_url,
+            }
+            for index in range(6)
+        ],
+        "retrieval_documents": [
+            {
+                "id": "chunk:c650:document-revision:visitor:00000:details",
+                "text": (
+                    "TITLE: Visitor Information\nTYPE: webpage\n"
+                    f"SOURCE_URL: {visitor_url}\n\n"
+                    "A request should state the full name, copy of the Emirates ID, "
+                    "reason for the visit, and date and time of the visit. Visitors "
+                    "are received Monday to Thursday from 9am to 5pm."
+                ),
+                "source_url": visitor_url,
+            },
+            {
+                "id": "chunk:c650:document-revision:borrowing:00000:details",
+                "text": (
+                    "TITLE: Access and Borrowing Information\nTYPE: webpage\n"
+                    f"SOURCE_URL: {borrowing_url}\n\n"
+                    "Enrolled students, current faculty, and staff may borrow materials. "
+                    "Physical resources are discoverable in the main search box."
+                ),
+                "source_url": borrowing_url,
+            },
+        ],
+    }
+
+    pack = build_evidence_pack(
+        query=(
+            "What access is available, what must I send, when can visitors arrive, "
+            "who may borrow, and where are physical resources discoverable?"
+        ),
+        result=result,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [borrowing_url, visitor_url],
+        },
+        max_items=4,
+        max_chars=4000,
+        max_per_source=2,
+    )
+
+    chunk_items = [item for item in pack["items"] if item["kind"] == "chunk"]
+    assert {item["source_url"] for item in chunk_items} == {
+        borrowing_url,
+        visitor_url,
+    }
+    assert "Emirates ID" in " ".join(item["text"] for item in chunk_items)
+
+
 @pytest.mark.parametrize(
     ("query", "relation_text", "expected_label"),
     [
