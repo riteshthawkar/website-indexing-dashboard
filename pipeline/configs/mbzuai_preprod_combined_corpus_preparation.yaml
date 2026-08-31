@@ -1,0 +1,83 @@
+# Representation-neutral handoff for the refreshed preproduction main site
+# plus the last audited supplemental MBZUAI subdomain and document corpus.
+# The legacy source is allowlisted by host/prefix so superseded mbzuai.ac.ae
+# webpages cannot leak back into the refreshed index.
+
+project_name: "mbzuai_preprod_combined_corpus_preparation"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+quality:
+  dedup_threshold: 0.85
+  dedup_num_perm: 128
+  dedup_ngram_size: 5
+  preserve_duplicate_source_media: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 2
+    source_runs:
+      # This source is intentionally first so stable media occurrence IDs from
+      # the governed multilingual gold set survive exact content collisions.
+      - role: "supplemental_subdomains_and_documents"
+        run_dir: "runs/mbzuai_corpus_preparation/mbzuai-corpus-preparation-20260821-v4"
+        project_name: "mbzuai_corpus_preparation"
+        required_stage_ids:
+          - "prepare_corpus_boundary"
+        include_hosts:
+          - "careers.mbzuai.ac.ae"
+          - "research.mbzuai.ac.ae"
+          - "ai-nexus.mbzuai.ac.ae"
+          - "library.mbzuai.ac.ae"
+          - "metaverse.mbzuai.ac.ae"
+          - "buildit.mbzuai.ac.ae"
+          - "hpp.mbzuai.ac.ae"
+          - "ifm.mbzuai.ac.ae"
+          - "ifm.ai"
+          - "staticcdn.mbzuai.ac.ae"
+        include_url_prefixes:
+          - "https://mbzuai.ac.ae/wp-content/"
+        include_url_less_documents: true
+        preserve_media_ids_by_content_hash: true
+        evidence:
+          pipeline_state_sha256: "f13c64a15c2a0ef5ea3a31a530f089a385c969ba686179d4d9ec25ae0ca4a2b5"
+          artifact_catalog_sha256: "1d5ffeacfc47a2079a1c4700b1da3e762e5938555d5022b5ce514150fffb37c5"
+          run_audit_sha256: "a10fb89bba682972fa06c8ac678d3f4cc22658a76ec15b408fe78e86e6cce2ec"
+          resolved_config_sha256: "34210b98f44ebbd9351fdb09ea4e03ce235a17524286ba9fdf220aef92809a95"
+      - role: "refreshed_preproduction_main_site"
+        run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-preparation-20260831-v5"
+        project_name: "mbzuai_preprod_corpus_preparation"
+        required_stage_ids:
+          - "prepare_corpus_boundary"
+        evidence:
+          pipeline_state_sha256: "edbb4f3fe04993462b85941139e78949ef1b7b03f9f8f4904a4a81cc34129d78"
+          artifact_catalog_sha256: "485c2d2f04a490897f9302eabe6fec2588406ebaf8c67208bbad2466ed9a97d8"
+          run_audit_sha256: "33803f1ddc4ad76ec492461a161623c341d7aa95d760b45e86962ed07d13f807"
+          resolved_config_sha256: "3fd801e75b025ee4f9616f8971aa5795f8a9c52237b869367bc6351b8cef0755"
+
+  corpus_preparation:
+    minimum_document_count: 1800
+    minimum_unique_media_assets: 2300
+    maximum_missing_media_files: 0
+    maximum_unbound_media_assets: 0
+    minimum_semantically_annotated_visuals: 2300
+    minimum_ocr_adjudicated_visuals: 400
+
+stages:
+  - id: merge_corpora
+    type: formatter
+    plugin: corpus_merge
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: prepare_corpus_boundary
+    type: formatter
+    plugin: corpus_preparation

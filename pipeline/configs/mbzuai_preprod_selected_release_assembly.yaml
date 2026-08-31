@@ -1,25 +1,25 @@
-_inherit: mbzuai_preprod_selected_index_prep.yaml
+_inherit: mbzuai_preprod_combined_selected_index_prep.yaml
 
 # Immutable, offline release assembly for the selected c650 profile over the
 # new MBZUAI preproduction snapshot. Every input is pinned by SHA-256 and this
 # run performs no provider calls, database writes, or release promotion.
-project_name: "mbzuai_preprod_selected_release_assembly"
+project_name: "mbzuai_preprod_combined_selected_release_assembly"
 
 formatter:
   selected_release_assembly:
-    checkpoint_run_dir: "runs/mbzuai_preprod_selected_index_prep/mbzuai-preprod-selected-index-prep-20260831-v2"
-    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-c650-selected-20260831-v2/candidates/c650/manifest.json"
-    candidate_manifest_sha256: "98ec6cf11376a290680a6886c11e338b39e9a55654c1d5b9488a2e98f3e10402"
-    candidate_records_file: "runs/evaluation/mbzuai-preprod-c650-selected-20260831-v2/candidates/c650/records.jsonl"
-    candidate_records_sha256: "b723c2722239dc6c2be26dc3899f7ce0bb9aced48db56409ec7a2dcc1e178684"
+    checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep/mbzuai-preprod-combined-selected-index-prep-20260831-v2"
+    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-selected-20260831-v2/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "b09e06cbf3eacdcbd986b250040073b89378cc5ed442206b2ef66cc7d04e18c0"
+    candidate_records_file: "runs/evaluation/mbzuai-preprod-combined-c650-selected-20260831-v2/candidates/c650/records.jsonl"
+    candidate_records_sha256: "47fbb1b1a20733d5b937da45913c045c0679f4a410095b0ee6b0d237801ac556"
     checkpoint_evidence:
-      pipeline_state_sha256: "33c5960436dc9403c0cb02e70947bf50c53caa970cee5843d7790152fe8461ef"
-      artifact_catalog_sha256: "1042f394ed8943441d4e32cea3013dd25c2dfb843dbde677ec8bf8b865ab281b"
-      run_audit_sha256: "6db0c8eca94592a72ddb7a2259552d4ff7fbfc43d45a3631df858c0fece4f704"
-      resolved_config_sha256: "c88f81de4a672343fa47cb203fda489a1584d10eb122ec0c6b8b6297e48c1f5a"
-      chunk_index_sha256: "1e51aa6f7a5d0540e8de0f18f04cded00ce248fc48598261ffbc9fa0c49c9d13"
-      page_graph_bridge_sha256: "8a7e9341c28a24502cb293a3deed7554df7e3807a112c8dda79507cce816ef36"
-      navigation_catalog_sha256: "7f25c7d9c8d85119a1113890f44bbc8178f0e0e9b17c071665f55022bbaf0107"
+      pipeline_state_sha256: "222b22d4ca978dd6dcf2f3ae6dfc41e22c09bb68ebc0f7a72338d66dd2a67464"
+      artifact_catalog_sha256: "dd7c3a376008a2a69895076176b3e32c3b1fe44836048045d6ac677c2421c3d8"
+      run_audit_sha256: "050b2f970175d02a9eec76ba37eace61fb359500e8b3a0129e031810dad451c3"
+      resolved_config_sha256: "781923258cdcc2944f0c905ebaf380e8c2b659a89f8c32919e529cedfff558bf"
+      chunk_index_sha256: "03d741376c43135f50d6f6242137d0d42955ddd14d306601c090ffa25b15fc80"
+      page_graph_bridge_sha256: "b34cb560ee5e567f420f5e372f9f1aee5ff72fbbd69f961909c509c4b01dc011"
+      navigation_catalog_sha256: "8a19008f03faac749258a9ef844dbaefcf368c16b13826f98e72f0cf9cb41db3"
 
 stages:
   - id: verify_selected_profile

@@ -1,0 +1,30 @@
+# Page-aware Representation V2 over the sealed refreshed preproduction site
+# plus the audited MBZUAI supplemental subdomains and document corpus.
+# This stage creates document revisions, Page Cards, and typed actions only;
+# chunking, embeddings, database writes, and promotion remain downstream.
+
+project_name: "mbzuai_preprod_combined_representation_v2"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  representation_v2:
+    source_corpus_run_dir: "runs/mbzuai_preprod_combined_corpus_preparation/mbzuai-preprod-combined-corpus-20260831-v4"
+    expected_document_count: 1857
+    expected_page_count: 1959
+    expected_web_document_count: 1795
+    maximum_workers: 4
+    maximum_topics_per_page: 24
+    template_minimum_page_count: 20
+    template_minimum_page_ratio: 0.03
+
+stages:
+  - id: extract_page_cards_and_actions
+    type: formatter
+    plugin: representation_v2

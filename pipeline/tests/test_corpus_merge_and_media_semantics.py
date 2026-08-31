@@ -24,7 +24,10 @@ from pipeline.core.media import (
 )
 from pipeline.core.media_context import build_media_reference_contexts
 from pipeline.core.state import PipelineState, StageState, save_state
-from pipeline.stages.formatters.corpus_merge_formatter import CorpusMergeFormatter
+from pipeline.stages.formatters.corpus_merge_formatter import (
+    CorpusMergeFormatter,
+    _source_allows_record,
+)
 from pipeline.stages.formatters.media_semantics_formatter import (
     MediaSemanticsFormatter,
     _annotation_fields,
@@ -126,7 +129,15 @@ def test_media_chunk_match_uses_web_section_or_occurrence_context():
     assert unscoped == {"matched": False, "score": 0.0, "method": "unscoped"}
 
 
-def _write_source_run(root: Path, *, run_id: str, project: str, url: str, color: str) -> Path:
+def _write_source_run(
+    root: Path,
+    *,
+    run_id: str,
+    project: str,
+    url: str,
+    color: str,
+    media_source_url: str | None = None,
+) -> Path:
     root.mkdir(parents=True)
     markdown = root / f"{run_id}.md"
     markdown.write_text(f"# {run_id}\n\nUseful MBZUAI content for {url}.", encoding="utf-8")
@@ -137,7 +148,7 @@ def _write_source_run(root: Path, *, run_id: str, project: str, url: str, color:
             "type": "image",
             "id": f"image-{run_id}",
             "url": f"{url}/content.png",
-            "source_url": url,
+            "source_url": media_source_url or url,
             "source_type": "html",
             "local_path": str(image),
             "mime_type": "image/png",
@@ -304,6 +315,108 @@ def test_corpus_merge_materializes_immutable_sources(tmp_path: Path):
         for record in result.artifacts
         if getattr(record, "artifact_type", "") == "markdown"
     )
+
+
+def test_corpus_merge_filters_each_source_by_host(tmp_path: Path):
+    main = _write_source_run(
+        tmp_path / "source-main",
+        run_id="source-main",
+        project="main",
+        url="https://mbzuai.ac.ae/about",
+        color="orange",
+    )
+    careers = _write_source_run(
+        tmp_path / "source-careers",
+        run_id="source-careers",
+        project="subdomains",
+        url="https://careers.mbzuai.ac.ae/jobs",
+        color="orange",
+        media_source_url="https://mbzuai.ac.ae/legacy-careers-article",
+    )
+    work_dir = tmp_path / "combined-filtered"
+    context = StageContext(
+        run_id="combined-filtered",
+        project_name="combined-filtered",
+        config={
+            "formatter": {
+                "corpus_merge": {
+                    "use_current_artifacts": False,
+                    "source_runs": [
+                        {
+                            "run_dir": str(main),
+                            "project_name": "main",
+                            "required_stage_ids": ["enrich_media"],
+                            "include_hosts": ["careers.mbzuai.ac.ae"],
+                            "preserve_media_ids_by_content_hash": True,
+                        },
+                        {
+                            "run_dir": str(careers),
+                            "project_name": "subdomains",
+                            "required_stage_ids": ["enrich_media"],
+                            "include_hosts": ["careers.mbzuai.ac.ae"],
+                        },
+                    ],
+                    "require_source_audit_ok": True,
+                    "minimum_source_count": 2,
+                }
+            }
+        },
+        work_dir=work_dir,
+        previous_outputs={},
+        stage_definition={"id": "merge_corpora", "type": "formatter", "plugin": "corpus_merge"},
+        stage_id="merge_corpora",
+        artifact_catalog=ArtifactCatalog(records=[]),
+    )
+
+    result = asyncio.run(CorpusMergeFormatter().execute(context))
+
+    assert result.status == StageStatus.COMPLETED
+    assert result.metrics["markdown_artifacts"] == 1
+    assert result.metrics["unique_visual_content_hashes"] == 1
+    assert set(load_json_safe(result.outputs["md_mapping_file"])) == {
+        "https://careers.mbzuai.ac.ae/jobs"
+    }
+    assert set(load_json_safe(result.outputs["page_metadata_file"])) == {
+        "https://careers.mbzuai.ac.ae/jobs"
+    }
+    graph = load_json_safe(result.outputs["page_link_graph_file"])
+    assert [node["url"] for node in graph["nodes"]] == [
+        "https://careers.mbzuai.ac.ae/jobs"
+    ]
+    media_items = load_json_safe(result.outputs["media_manifest_file"])["items"]
+    assert len(media_items) == 1
+    assert media_items[0]["id"] == "image-source-main"
+    assert media_items[0]["source_url"] == "https://careers.mbzuai.ac.ae/jobs"
+    assert Path(media_items[0]["local_path"]).is_file()
+
+
+def test_corpus_merge_can_include_url_less_documents_without_web_leakage(tmp_path: Path):
+    (tmp_path / "document.md").write_text("document", encoding="utf-8")
+    (tmp_path / "webpage.md").write_text("webpage", encoding="utf-8")
+    document = build_artifact_record(
+        artifact_type="markdown",
+        role="content",
+        producer_stage="convert_documents",
+        uri=(tmp_path / "document.md").resolve().as_uri(),
+        local_path=tmp_path / "document.md",
+        metadata={"source_type": "pdf", "source_url": ""},
+    )
+    webpage = build_artifact_record(
+        artifact_type="markdown",
+        role="content",
+        producer_stage="convert_html",
+        uri=(tmp_path / "webpage.md").resolve().as_uri(),
+        local_path=tmp_path / "webpage.md",
+        metadata={"source_type": "webpage", "source_url": ""},
+    )
+    source = {
+        "include_hosts": ["careers.mbzuai.ac.ae"],
+        "include_url_prefixes": [],
+        "include_url_less_documents": True,
+    }
+
+    assert _source_allows_record(source, document) is True
+    assert _source_allows_record(source, webpage) is False
 
 
 def test_media_semantics_plan_deduplicates_by_content_hash_and_propagates(tmp_path: Path):

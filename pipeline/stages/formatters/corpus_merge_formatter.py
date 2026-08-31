@@ -43,6 +43,12 @@ _PATH_METADATA_KEYS = {
     "source_markdown_path",
 }
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_SOURCE_FILTER_KEYS = (
+    "include_hosts",
+    "include_url_prefixes",
+    "exclude_hosts",
+    "exclude_url_prefixes",
+)
 
 
 def _now_iso() -> str:
@@ -68,6 +74,195 @@ def _normalized_url(value: Any) -> str:
     if path != "/":
         path = path.rstrip("/")
     return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
+
+
+def _normalized_host(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    if "://" in raw:
+        try:
+            raw = (urlsplit(raw).hostname or "").lower()
+        except ValueError:
+            return ""
+    return raw.rstrip(".")
+
+
+def _normalized_source_filters(raw_spec: Mapping[str, Any]) -> Dict[str, List[str]]:
+    filters: Dict[str, List[str]] = {}
+    for key in _SOURCE_FILTER_KEYS:
+        values = raw_spec.get(key) or []
+        normalized: set[str] = set()
+        for value in values:
+            item = _normalized_host(value) if key.endswith("hosts") else _normalized_url(value)
+            if item:
+                normalized.add(item)
+        filters[key] = sorted(normalized)
+    return filters
+
+
+def _source_allows_url(source: Mapping[str, Any], value: Any) -> bool:
+    url = _normalized_url(value)
+    if not url:
+        return False
+    host = _normalized_host(url)
+    include_hosts = set(source.get("include_hosts") or [])
+    include_prefixes = tuple(source.get("include_url_prefixes") or [])
+    exclude_hosts = set(source.get("exclude_hosts") or [])
+    exclude_prefixes = tuple(source.get("exclude_url_prefixes") or [])
+    if host in exclude_hosts or any(url.startswith(prefix) for prefix in exclude_prefixes):
+        return False
+    if include_hosts or include_prefixes:
+        return host in include_hosts or any(url.startswith(prefix) for prefix in include_prefixes)
+    return True
+
+
+def _record_source_urls(record: ArtifactRecord) -> List[str]:
+    metadata = dict(record.metadata or {})
+    values: List[str] = []
+    for key in ("source_url", "canonical_url", "page_url"):
+        value = _normalized_url(metadata.get(key))
+        if value and value not in values:
+            values.append(value)
+    for raw in metadata.get("source_page_urls") or []:
+        value = _normalized_url(raw)
+        if value and value not in values:
+            values.append(value)
+    if record.artifact_type not in _IMAGE_ARTIFACT_TYPES:
+        value = _normalized_url(metadata.get("url"))
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def _source_allows_record(source: Mapping[str, Any], record: ArtifactRecord) -> bool:
+    if record.artifact_type in _IMAGE_ARTIFACT_TYPES:
+        content_hash = str((record.metadata or {}).get("content_hash") or "").lower()
+        if content_hash and content_hash in set(
+            source.get("allowed_page_media_hashes") or []
+        ):
+            return True
+    has_inclusions = bool(
+        source.get("include_hosts") or source.get("include_url_prefixes")
+    )
+    urls = _record_source_urls(record)
+    if not urls:
+        source_type = str((record.metadata or {}).get("source_type") or "").strip().lower()
+        if bool(source.get("include_url_less_documents", False)) and source_type not in {
+            "",
+            "html",
+            "web",
+            "webpage",
+        }:
+            return True
+        return not has_inclusions
+    return any(_source_allows_url(source, url) for url in urls)
+
+
+def _filtered_record_metadata(
+    source: Mapping[str, Any], metadata: Mapping[str, Any]
+) -> Dict[str, Any]:
+    filtered = dict(metadata)
+    page_urls = [
+        url
+        for raw in filtered.get("source_page_urls") or []
+        if (url := _normalized_url(raw)) and _source_allows_url(source, url)
+    ]
+    if "source_page_urls" in filtered:
+        filtered["source_page_urls"] = sorted(set(page_urls))
+    source_url = _normalized_url(filtered.get("source_url"))
+    if source_url and not _source_allows_url(source, source_url):
+        if page_urls:
+            filtered["source_url"] = sorted(set(page_urls))[0]
+        else:
+            content_hash = str(filtered.get("content_hash") or "").lower()
+            associated_urls = list(
+                (source.get("allowed_page_urls_by_media_hash") or {}).get(
+                    content_hash, []
+                )
+            )
+            if associated_urls:
+                filtered["source_url"] = associated_urls[0]
+                filtered["source_page_urls"] = associated_urls
+            else:
+                filtered.pop("source_url", None)
+    return filtered
+
+
+def _allowed_page_media_associations(
+    source: Mapping[str, Any],
+) -> Dict[str, List[str]]:
+    """Map media hashes to permitted pages before filtering shared assets.
+
+    A media manifest may choose a main-site occurrence as the canonical
+    ``source_url`` even when the same bytes are referenced by an allowed
+    subdomain page. Source selection is therefore based on page association,
+    not only on the manifest's representative occurrence.
+    """
+
+    path = (source.get("outputs") or {}).get("page_media_file")
+    payload = load_json_safe(path, {}) if path else {}
+    associations: Dict[str, set[str]] = defaultdict(set)
+    if not isinstance(payload, dict):
+        return {}
+    for raw_url, raw_items in payload.items():
+        page_url = _normalized_url(raw_url)
+        if not page_url or not _source_allows_url(source, page_url):
+            continue
+        for raw_item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(raw_item, dict):
+                continue
+            content_hash = str(raw_item.get("content_hash") or "").lower()
+            if content_hash:
+                associations[content_hash].add(page_url)
+    return {
+        content_hash: sorted(urls)
+        for content_hash, urls in sorted(associations.items())
+    }
+
+
+def _preferred_media_ids_by_content_hash(
+    sources: Sequence[Mapping[str, Any]],
+) -> Dict[str, str]:
+    """Load stable media identities from explicitly authorized source runs."""
+
+    preferred: Dict[str, str] = {}
+    id_to_hash: Dict[str, str] = {}
+    for source in sources:
+        if not bool(source.get("preserve_media_ids_by_content_hash", False)):
+            continue
+        path = (source.get("outputs") or {}).get("media_manifest_file")
+        payload = load_json_safe(path, {}) if path else {}
+        for item in load_media_manifest_items(payload):
+            content_hash = str(item.get("content_hash") or "").lower()
+            media_id = str(item.get("id") or "").strip()
+            if not content_hash or not media_id:
+                continue
+            conflicting_hash = id_to_hash.get(media_id)
+            if conflicting_hash and conflicting_hash != content_hash:
+                raise ValueError(
+                    f"Media identity {media_id!r} refers to multiple content hashes"
+                )
+            id_to_hash[media_id] = content_hash
+            preferred.setdefault(content_hash, media_id)
+    return preferred
+
+
+def _apply_preferred_media_ids(value: Any, preferred: Mapping[str, str]) -> int:
+    replacements = 0
+    collections = value.values() if isinstance(value, dict) else [value]
+    for raw_items in collections:
+        if not isinstance(raw_items, list):
+            continue
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            content_hash = str(item.get("content_hash") or "").lower()
+            media_id = preferred.get(content_hash)
+            if media_id and str(item.get("id") or "") != media_id:
+                item["id"] = media_id
+                replacements += 1
+    return replacements
 
 
 def _resolve_run_dir(value: Any) -> Path:
@@ -280,6 +475,8 @@ def _merge_scalar_mapping(
             continue
         for raw_key, raw_value in payload.items():
             key = _normalized_url(raw_key) or str(raw_key)
+            if not _source_allows_url(source, key):
+                continue
             value = _remap_paths(raw_value, path_map, key=output_key)
             if key in merged and merged[key] != value:
                 collisions += 1
@@ -334,6 +531,8 @@ def _merge_page_metadata(
             if not isinstance(raw_record, dict):
                 continue
             url = _normalized_url(raw_url) or str(raw_url)
+            if not _source_allows_url(source, url):
+                continue
             record = _canonicalize_page_record(url, raw_record, source["run_id"])
             record = _remap_paths(record, path_map)
             if url in merged and merged[url] != record:
@@ -368,6 +567,8 @@ def _merge_page_media(
             if not isinstance(raw_items, list):
                 continue
             page_url = _normalized_url(raw_url) or str(raw_url)
+            if not _source_allows_url(source, page_url):
+                continue
             for raw_item in raw_items:
                 if not isinstance(raw_item, dict):
                     continue
@@ -392,7 +593,25 @@ def _merge_media_manifest_items(
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
         for raw_item in load_media_manifest_items(payload):
-            item = normalize_media_item(_remap_paths(raw_item, path_map))
+            source_url = _normalized_url(raw_item.get("source_url"))
+            content_hash = str(raw_item.get("content_hash") or "").lower()
+            page_associated = content_hash in set(
+                source.get("allowed_page_media_hashes") or []
+            )
+            source_type = str(raw_item.get("source_type") or "").strip().lower()
+            url_less_document = bool(source.get("include_url_less_documents", False)) and (
+                not source_url
+                and source_type not in {"", "html", "web", "webpage"}
+            )
+            if not (
+                page_associated
+                or (source_url and _source_allows_url(source, source_url))
+                or url_less_document
+            ):
+                continue
+            item = normalize_media_item(
+                _remap_paths(_filtered_record_metadata(source, raw_item), path_map)
+            )
             item["corpus_source_run_id"] = source["run_id"]
             items.append(item)
     return items
@@ -410,7 +629,7 @@ def _merge_url_identity(
             if not isinstance(raw, dict):
                 continue
             url = _normalized_url(raw.get("source_url") or raw.get("url"))
-            if url:
+            if url and _source_allows_url(source, url):
                 records_by_url[url] = dict(raw)
 
     for url, metadata in page_metadata.items():
@@ -461,7 +680,7 @@ def _merge_graphs(sources: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     nodes_by_url: Dict[str, Dict[str, Any]] = {}
     node_id_to_url: Dict[str, str] = {}
     graph_paths: List[str] = []
-    raw_graphs: List[Dict[str, Any]] = []
+    raw_graphs: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
     used_ids: Dict[str, str] = {}
 
     for source in sources:
@@ -472,13 +691,13 @@ def _merge_graphs(sources: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         payload = load_json_safe(path, {}) if path else {}
         if not isinstance(payload, dict):
             continue
-        raw_graphs.append(payload)
+        raw_graphs.append((source, payload))
         graph_paths.append(str(path))
         for raw_node in payload.get("nodes") or []:
             if not isinstance(raw_node, dict):
                 continue
             url = _normalized_url(raw_node.get("url"))
-            if not url:
+            if not url or not _source_allows_url(source, url):
                 continue
             node_id = str(raw_node.get("id") or f"page:{_stable_token(url, length=24)}")
             if node_id in used_ids and used_ids[node_id] != url:
@@ -513,7 +732,7 @@ def _merge_graphs(sources: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                     existing[key] = value
 
     edges_by_key: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
-    for payload in raw_graphs:
+    for source, payload in raw_graphs:
         for raw_edge in payload.get("edges") or []:
             if not isinstance(raw_edge, dict):
                 continue
@@ -524,6 +743,10 @@ def _merge_graphs(sources: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 str(raw_edge.get("target_id") or ""), ""
             )
             if not source_url or not target_url:
+                continue
+            if not _source_allows_url(source, source_url) or not _source_allows_url(
+                source, target_url
+            ):
                 continue
             source_node = nodes_by_url.get(source_url)
             target_node = nodes_by_url.get(target_url)
@@ -585,7 +808,10 @@ def _merge_graphs(sources: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _select_richest_metadata(records: Sequence[Tuple[Dict[str, Any], ArtifactRecord]]) -> Dict[str, Any]:
-    candidates = [dict(record.metadata or {}) for _source, record in records]
+    candidates = [
+        _filtered_record_metadata(source, dict(record.metadata or {}))
+        for source, record in records
+    ]
     candidates.sort(
         key=lambda value: sum(len(str(value.get(key) or "")) for key in ("alt", "caption", "context", "description")),
         reverse=True,
@@ -594,7 +820,7 @@ def _select_richest_metadata(records: Sequence[Tuple[Dict[str, Any], ArtifactRec
     source_page_urls: set[str] = set()
     provenance: List[Dict[str, str]] = []
     for source, record in records:
-        metadata = dict(record.metadata or {})
+        metadata = _filtered_record_metadata(source, dict(record.metadata or {}))
         source_page_urls.update(str(url) for url in metadata.get("source_page_urls") or [] if str(url))
         if metadata.get("source_url"):
             source_page_urls.add(str(metadata["source_url"]))
@@ -676,6 +902,47 @@ class CorpusMergeFormatter(FormatterStage):
                                 f"formatter.corpus_merge.source_runs[{index}].evidence.{key} "
                                 "must be a supported SHA-256 digest"
                             )
+            for filter_key in _SOURCE_FILTER_KEYS:
+                values = raw.get(filter_key)
+                if values is not None and (
+                    not isinstance(values, list)
+                    or not all(isinstance(value, str) and value.strip() for value in values)
+                ):
+                    errors.append(
+                        f"formatter.corpus_merge.source_runs[{index}].{filter_key} "
+                        "must be a list of non-empty strings"
+                    )
+            if raw.get("include_url_less_documents") is not None and not isinstance(
+                raw.get("include_url_less_documents"), bool
+            ):
+                errors.append(
+                    f"formatter.corpus_merge.source_runs[{index}]."
+                    "include_url_less_documents must be a boolean"
+                )
+            if raw.get("preserve_media_ids_by_content_hash") is not None and not isinstance(
+                raw.get("preserve_media_ids_by_content_hash"), bool
+            ):
+                errors.append(
+                    f"formatter.corpus_merge.source_runs[{index}]."
+                    "preserve_media_ids_by_content_hash must be a boolean"
+                )
+            for prefix_key in ("include_url_prefixes", "exclude_url_prefixes"):
+                for value in raw.get(prefix_key) or []:
+                    normalized = _normalized_url(value)
+                    try:
+                        parsed = urlsplit(normalized)
+                    except ValueError:
+                        parsed = None
+                    if (
+                        not normalized
+                        or parsed is None
+                        or parsed.scheme not in {"http", "https"}
+                        or not parsed.netloc
+                    ):
+                        errors.append(
+                            f"formatter.corpus_merge.source_runs[{index}].{prefix_key} "
+                            "must contain absolute HTTP(S) URL prefixes"
+                        )
         if errors:
             return errors
         return []
@@ -719,8 +986,7 @@ class CorpusMergeFormatter(FormatterStage):
                 expected_project = str(raw_spec.get("project_name") or "").strip()
                 if expected_project:
                     spec_projects.add(expected_project)
-                sources.append(
-                    _load_source_descriptor(
+                descriptor = _load_source_descriptor(
                         run_dir,
                         required_stage_ids=[
                             str(value) for value in raw_spec.get("required_stage_ids") or []
@@ -736,7 +1002,17 @@ class CorpusMergeFormatter(FormatterStage):
                         else None,
                         source_role=str(raw_spec.get("role") or "corpus"),
                     )
+                descriptor.update(_normalized_source_filters(raw_spec))
+                descriptor["include_url_less_documents"] = bool(
+                    raw_spec.get("include_url_less_documents", False)
                 )
+                descriptor["preserve_media_ids_by_content_hash"] = bool(
+                    raw_spec.get("preserve_media_ids_by_content_hash", False)
+                )
+                allowed_page_media = _allowed_page_media_associations(descriptor)
+                descriptor["allowed_page_urls_by_media_hash"] = allowed_page_media
+                descriptor["allowed_page_media_hashes"] = sorted(allowed_page_media)
+                sources.append(descriptor)
 
             if bool(config.get("use_current_artifacts", True)):
                 sources.insert(
@@ -777,6 +1053,8 @@ class CorpusMergeFormatter(FormatterStage):
                         and record.producer_stage not in allowed_producers
                     ):
                         continue
+                    if not _source_allows_record(source, record):
+                        continue
                     if record.artifact_type not in _MATERIALIZED_ARTIFACT_TYPES or not record.local_path:
                         continue
                     source_path = Path(record.local_path).resolve()
@@ -784,7 +1062,7 @@ class CorpusMergeFormatter(FormatterStage):
                         raise ValueError(
                             f"Source artifact is missing: {source['run_id']} {record.artifact_id} {source_path}"
                         )
-                    metadata = dict(record.metadata or {})
+                    metadata = _filtered_record_metadata(source, dict(record.metadata or {}))
                     if record.artifact_type in _IMAGE_ARTIFACT_TYPES:
                         declared_hash = str(metadata.get("content_hash") or "").lower()
                         actual_hash = sha256_file(source_path)
@@ -831,7 +1109,10 @@ class CorpusMergeFormatter(FormatterStage):
                     continue
                 source_path = str(Path(record.local_path or "").resolve())
                 target_path = path_map[source_path]
-                metadata = _remap_paths(dict(record.metadata or {}), path_map)
+                metadata = _remap_paths(
+                    _filtered_record_metadata(source, dict(record.metadata or {})),
+                    path_map,
+                )
                 metadata.update(
                     {
                         "corpus_source_run_id": source["run_id"],
@@ -888,6 +1169,17 @@ class CorpusMergeFormatter(FormatterStage):
             )
             all_media = _merge_media_manifest_items(
                 sources, output_key="media_manifest_file", path_map=path_map
+            )
+            preferred_media_ids = _preferred_media_ids_by_content_hash(sources)
+            media_id_replacements = sum(
+                _apply_preferred_media_ids(value, preferred_media_ids)
+                for value in (
+                    page_media,
+                    page_images,
+                    page_videos,
+                    document_media,
+                    all_media,
+                )
             )
             url_identity = _merge_url_identity(sources, page_metadata)
             page_link_graph = _merge_graphs(sources)
@@ -947,6 +1239,18 @@ class CorpusMergeFormatter(FormatterStage):
                         "allowed_artifact_producer_stages": source.get(
                             "allowed_artifact_producer_stages"
                         ),
+                        "filters": {
+                            **{
+                                key: list(source.get(key) or [])
+                                for key in _SOURCE_FILTER_KEYS
+                            },
+                            "include_url_less_documents": bool(
+                                source.get("include_url_less_documents", False)
+                            ),
+                            "preserve_media_ids_by_content_hash": bool(
+                                source.get("preserve_media_ids_by_content_hash", False)
+                            ),
+                        },
                         "evidence": source.get("evidence") or {},
                     }
                     for source in sources
@@ -956,6 +1260,8 @@ class CorpusMergeFormatter(FormatterStage):
                     "source_artifact_count": len(selected_records),
                     "published_artifact_counts": dict(sorted(materialized_artifact_counts.items())),
                     "path_mapping_count": len(path_map),
+                    "preferred_media_identity_count": len(preferred_media_ids),
+                    "media_id_replacement_count": media_id_replacements,
                 },
                 "corpus": {
                     "html_mapping_count": len(mapping),

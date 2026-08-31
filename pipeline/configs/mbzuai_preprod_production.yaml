@@ -1,22 +1,23 @@
 _inherit: mbzuai_production.yaml
 
 # Production-contract build for the authorized 2026-08-31 MBZUAI
-# preproduction snapshot. The serving project remains mbzuai_main so this
+# preproduction snapshot plus audited supplemental subdomains. The serving
+# project remains mbzuai_main so this
 # candidate can be evaluated and promoted through the existing blue-green
 # release lifecycle; only the immutable selected-release inputs change.
 
 formatter:
   selected_release_assembly:
-    checkpoint_run_dir: "runs/mbzuai_preprod_selected_index_prep/mbzuai-preprod-selected-index-prep-20260831-v3"
-    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-c650-selected-20260831-v3/candidates/c650/manifest.json"
-    candidate_manifest_sha256: "44410f7f394047507d137ea6b78944a1e8a19c99a7dc292be96df243dc4326ee"
-    candidate_records_file: "runs/evaluation/mbzuai-preprod-c650-selected-20260831-v3/candidates/c650/records.jsonl"
-    candidate_records_sha256: "2d7ae77b9c129d8af376d04e7b0d69d317cdc66a613bce54e6213297abf965c1"
+    checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep/mbzuai-preprod-combined-selected-index-prep-20260831-v2"
+    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-selected-20260831-v2/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "b09e06cbf3eacdcbd986b250040073b89378cc5ed442206b2ef66cc7d04e18c0"
+    candidate_records_file: "runs/evaluation/mbzuai-preprod-combined-c650-selected-20260831-v2/candidates/c650/records.jsonl"
+    candidate_records_sha256: "47fbb1b1a20733d5b937da45913c045c0679f4a410095b0ee6b0d237801ac556"
     checkpoint_evidence:
-      pipeline_state_sha256: "2ffe8fee6b5b321bfdbff54cd7e8b47393db474acc604c6ad40c4b5c654c3005"
-      artifact_catalog_sha256: "7a28ae85d56175dcf961e40b04dbaa1472f5657cd21b2475eab4a262163c931b"
-      run_audit_sha256: "767043b2ac6c0cbaa4b7cc10d3de048aa3f9f9b5b2b9e079d049ebd54a85531b"
-      resolved_config_sha256: "2d50eea7da979ebd57acde0913c1db9a69b3a30054427410113512608cf18bd6"
-      chunk_index_sha256: "c9f9cd936d120ad210e6a27e1f521ebd6dad84ccec3278b5e5db54cd3127fe32"
-      page_graph_bridge_sha256: "cc2218e0eecdadb55ae85b8c7bfd1e7fdccf7c8d8978650fa0ad2ad2c15a2370"
-      navigation_catalog_sha256: "97eae0fc83815c9fd2821b6baa61e8e54b22a0f4759d88922429aa543d25bc1a"
+      pipeline_state_sha256: "222b22d4ca978dd6dcf2f3ae6dfc41e22c09bb68ebc0f7a72338d66dd2a67464"
+      artifact_catalog_sha256: "dd7c3a376008a2a69895076176b3e32c3b1fe44836048045d6ac677c2421c3d8"
+      run_audit_sha256: "050b2f970175d02a9eec76ba37eace61fb359500e8b3a0129e031810dad451c3"
+      resolved_config_sha256: "781923258cdcc2944f0c905ebaf380e8c2b659a89f8c32919e529cedfff558bf"
+      chunk_index_sha256: "03d741376c43135f50d6f6242137d0d42955ddd14d306601c090ffa25b15fc80"
+      page_graph_bridge_sha256: "b34cb560ee5e567f420f5e372f9f1aee5ff72fbbd69f961909c509c4b01dc011"
+      navigation_catalog_sha256: "8a19008f03faac749258a9ef844dbaefcf368c16b13826f98e72f0cf9cb41db3"
