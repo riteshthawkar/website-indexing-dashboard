@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from hashlib import sha256
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
+from pipeline.core.document_titles import looks_like_opaque_title, resolve_document_title
+
 
 REPRESENTATION_V2_SCHEMA_VERSION = "mbzuai.representation.v2"
 REPRESENTATION_V2_KIND = "page_aware_multimodal_representation"
@@ -460,6 +462,14 @@ def validate_representation_v2(
                 message="Invalid markdown_sha256",
                 record_id=revision_id,
             )
+        title = str(document.get("title") or "").strip()
+        if not title or looks_like_opaque_title(title):
+            _append_issue(
+                issues,
+                code="document_title_quality",
+                message="Document title is missing or exposes an opaque artifact identifier",
+                record_id=revision_id,
+            )
 
     for action in actions:
         action_id = str(action.get("action_id") or "")
@@ -671,6 +681,9 @@ def validate_representation_v2(
         "all_html_pages_represented": not expected_pages or actual_pages == expected_pages,
         "all_web_documents_linked": not expected_web or linked_web_revision_ids == expected_web,
         "unique_identifiers": not bool(issue_counts.get("duplicate_id") or issue_counts.get("missing_id")),
+        "document_titles_readable": not bool(
+            issue_counts.get("document_title_quality")
+        ),
         "page_fields_evidenced": not bool(
             issue_counts.get("page_field_evidence")
             or issue_counts.get("semantic_label_evidence")
@@ -718,11 +731,27 @@ def attach_page_links_to_documents(
     """Populate reciprocal Page Card links after all pages have been mapped."""
 
     page_ids_by_revision: Dict[str, List[str]] = defaultdict(list)
+    page_titles_by_revision: Dict[str, List[str]] = defaultdict(list)
     for page in page_cards:
         revision_id = str(page.get("document_revision_id") or "")
         page_id = str(page.get("page_card_id") or "")
         if revision_id and page_id:
             page_ids_by_revision[revision_id].append(page_id)
+            page_title = str(page.get("title") or "").strip()
+            if page_title and not looks_like_opaque_title(page_title):
+                page_titles_by_revision[revision_id].append(page_title)
     for document in documents:
         revision_id = str(document.get("document_revision_id") or "")
         document["page_card_ids"] = sorted(set(page_ids_by_revision.get(revision_id, [])))
+        linked_titles = sorted(set(page_titles_by_revision.get(revision_id, [])))
+        if linked_titles:
+            # A linked Page Card title is evidence-backed by the frozen HTML and
+            # is more authoritative than a download/crawl filename.
+            document["title"] = linked_titles[0]
+        else:
+            document["title"] = resolve_document_title(
+                document.get("title"),
+                source_url=document.get("source_url"),
+                source_file=document.get("source_file"),
+                source_locator=document.get("source_locator"),
+            )

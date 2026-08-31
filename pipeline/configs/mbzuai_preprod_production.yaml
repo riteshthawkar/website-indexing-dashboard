@@ -8,16 +8,16 @@ _inherit: mbzuai_production.yaml
 
 formatter:
   selected_release_assembly:
-    checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep/mbzuai-preprod-combined-selected-index-prep-20260831-v2"
-    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-selected-20260831-v2/candidates/c650/manifest.json"
-    candidate_manifest_sha256: "b09e06cbf3eacdcbd986b250040073b89378cc5ed442206b2ef66cc7d04e18c0"
-    candidate_records_file: "runs/evaluation/mbzuai-preprod-combined-c650-selected-20260831-v2/candidates/c650/records.jsonl"
-    candidate_records_sha256: "47fbb1b1a20733d5b937da45913c045c0679f4a410095b0ee6b0d237801ac556"
+    checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep_readable_titles/mbzuai-preprod-combined-selected-index-prep-readable-titles-20260831-v3"
+    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-readable-titles-20260831-v4/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "b049084bd36cd603ed13ec778cc0900c2fe8d2a5de3847e96f13d8d7f3bcee11"
+    candidate_records_file: "runs/evaluation/mbzuai-preprod-combined-c650-readable-titles-20260831-v4/candidates/c650/records.jsonl"
+    candidate_records_sha256: "bee4034155a5ef2c4b8ec5af5dbc5e19c345fdf8583bdb92818c21a5d94b8e66"
     checkpoint_evidence:
-      pipeline_state_sha256: "222b22d4ca978dd6dcf2f3ae6dfc41e22c09bb68ebc0f7a72338d66dd2a67464"
-      artifact_catalog_sha256: "dd7c3a376008a2a69895076176b3e32c3b1fe44836048045d6ac677c2421c3d8"
-      run_audit_sha256: "050b2f970175d02a9eec76ba37eace61fb359500e8b3a0129e031810dad451c3"
-      resolved_config_sha256: "781923258cdcc2944f0c905ebaf380e8c2b659a89f8c32919e529cedfff558bf"
-      chunk_index_sha256: "03d741376c43135f50d6f6242137d0d42955ddd14d306601c090ffa25b15fc80"
-      page_graph_bridge_sha256: "b34cb560ee5e567f420f5e372f9f1aee5ff72fbbd69f961909c509c4b01dc011"
-      navigation_catalog_sha256: "8a19008f03faac749258a9ef844dbaefcf368c16b13826f98e72f0cf9cb41db3"
+      pipeline_state_sha256: "7a93cb60a2c5d129e816948b79f3c6877e97524cdcf9e3fc403887eaa8ae5738"
+      artifact_catalog_sha256: "560ee124f994234949ebef973b4617d381b00d37f35799ea6e063f77d30fa6c3"
+      run_audit_sha256: "59e11465c9ab0112ac3b98dbae89510d7f001320f8987bac09c8bdd013f395eb"
+      resolved_config_sha256: "4352ebc97d1ba00db8b6d76de99506e72cb3b1580ab3222b4e710d743964b036"
+      chunk_index_sha256: "1f7d81b8769c6f5ad53e55ead55a15c975281940d2323c130bc89dc2a925f2fb"
+      page_graph_bridge_sha256: "c7d102764fb1ae6fa4751bbfdec1313e7811bd8f0610fac1f51cf3537670aadf"
+      navigation_catalog_sha256: "79d10f71f21f24a59ec57ae433294b6b2e958934418454deff3b71c31b32ce2c"

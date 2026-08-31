@@ -2013,6 +2013,43 @@ def test_routed_page_target_score_prefers_exact_page_identity():
     assert retriever._page_target_score(query, exact) > retriever._page_target_score(query, generic)
 
 
+def test_routed_admissions_workflow_prefers_canonical_page_over_intake_news():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    query = "How do I apply for a PhD at MBZUAI?"
+
+    def page(url: str, title: str, page_type: str) -> dict:
+        search_text = f"{title} PhD admissions application apply"
+        return {
+            "normalized_url": url,
+            "search_text": search_text.casefold(),
+            "tokens": set(_tokenize(search_text)),
+            "identity_text": title.casefold(),
+            "identity_tokens": set(_tokenize(title)),
+            "page_type": page_type,
+        }
+
+    canonical = page(
+        "https://preprod.mbzuai.ac.ae/admissions/graduate-phd-admissions",
+        "Graduate Ph.D. admissions",
+        "admissions_or_program",
+    )
+    news = page(
+        "https://preprod.mbzuai.ac.ae/knowledge-center/the-node/mbzuai-opens-admissions-fall-2026-intake",
+        "MBZUAI opens admissions for Fall 2026 intake",
+        "news_or_event",
+    )
+
+    assert retriever._explicit_required_page_markers(query)[0] == (
+        "/admissions/graduate-phd-admissions"
+    )
+    assert retriever._page_target_score(query, canonical) > retriever._page_target_score(
+        query, news
+    )
+
+
 def test_routed_coverage_disambiguates_projects_and_research_projects_pages():
     from pipeline.retrieval.adaptive_hybrid import _tokenize
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever

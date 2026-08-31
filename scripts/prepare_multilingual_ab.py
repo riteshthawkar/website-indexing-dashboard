@@ -21,6 +21,7 @@ from pipeline.core.chunking import (
     token_counting_method,
     window_text_to_token_budget,
 )
+from pipeline.core.document_titles import looks_like_opaque_title, resolve_document_title
 from pipeline.core.media import media_chunk_match
 from pipeline.evaluation.dataset import load_eval_examples
 from pipeline.stages.chunkers.common import docling_chunks_from_json, hybrid_markdown_chunks
@@ -31,7 +32,7 @@ from pipeline.stages.formatters.gemini_retrieval_formatter import (
 
 
 EXPERIMENT_SCHEMA = "mbzuai.multilingual.controlled_ab.v1"
-CANDIDATE_REPRESENTATION_REVISION = "multilingual-ab-grounded-media-v3"
+CANDIDATE_REPRESENTATION_REVISION = "multilingual-ab-grounded-media-v4-readable-titles"
 PARENT_EMBEDDING_TOKEN_BUDGET = 4096
 PARENT_SECTION_EMBEDDING_TOKEN_BUDGET = 4096
 DEFAULT_REPRESENTATION = (
@@ -293,6 +294,44 @@ def _record(
     }
 
 
+def _validate_candidate_title_quality(
+    records: Sequence[Mapping[str, Any]], *, config_id: str
+) -> Dict[str, Any]:
+    title_required_kinds = {
+        "chunk",
+        "parent",
+        "parent_section",
+        "media",
+        "page_card",
+        "action",
+    }
+    required_records = [
+        row for row in records if row.get("kind") in title_required_kinds
+    ]
+    missing_title_ids = [
+        str(row.get("id") or "")
+        for row in required_records
+        if not _clean(row.get("title"))
+    ]
+    opaque_title_ids = [
+        str(row.get("id") or "")
+        for row in required_records
+        if looks_like_opaque_title(row.get("title"))
+    ]
+    if missing_title_ids or opaque_title_ids:
+        raise RuntimeError(
+            f"{config_id} failed candidate title quality: "
+            f"missing={len(missing_title_ids)} opaque={len(opaque_title_ids)} "
+            f"samples={(missing_title_ids + opaque_title_ids)[:8]}"
+        )
+    return {
+        "required_record_count": len(required_records),
+        "missing_title_count": 0,
+        "opaque_title_count": 0,
+        "passed": True,
+    }
+
+
 def _load_structured_by_markdown(corpus_run: Path) -> Dict[str, Path]:
     catalog_path = corpus_run / "artifact_catalog.json"
     payload = _read_json(catalog_path)
@@ -384,7 +423,17 @@ def _prepare_media_records(
         page = pages_by_url.get(source_url)
         revision_id = str((document or {}).get("document_revision_id") or (page or {}).get("document_revision_id") or "")
         page_card_ids = [str((page or {}).get("page_card_id") or "")] if page else []
-        document_title = _clean((document or {}).get("title") or item.get("page_title") or item.get("title"))
+        document_title = resolve_document_title(
+            (document or {}).get("title"),
+            page_titles=[
+                (page or {}).get("title"),
+                item.get("page_title"),
+                item.get("title"),
+            ],
+            source_url=source_url or (document or {}).get("source_url"),
+            source_file=(document or {}).get("source_file"),
+            source_locator=(document or {}).get("source_locator"),
+        )
         normalized_item = dict(item)
         normalized_item["source_url"] = source_url
         media_text = _build_media_embedding_input(
@@ -685,11 +734,18 @@ def _chunk_records_for_config(
         pages = list(pages_by_revision.get(revision_id) or [])
         page_ids = [str(page.get("page_card_id")) for page in pages if page.get("page_card_id")]
         source_url = _normalize_url(document.get("source_url")) or source_url_by_markdown.get(str(markdown_path), "")
+        document_title = resolve_document_title(
+            document.get("title"),
+            page_titles=[page.get("title") for page in pages],
+            source_url=source_url,
+            source_file=document.get("source_file"),
+            source_locator=document.get("source_locator"),
+        )
         source_info = {
             "path": markdown_path,
             "source_url": source_url,
             "source_file": str(document.get("source_file") or ""),
-            "document_title": _clean(document.get("title")) or markdown_path.stem,
+            "document_title": document_title,
             "document_type": str(document.get("source_type") or ""),
             "source_backend": "docling" if str(markdown_path) in structured_by_markdown else "markdown",
         }
@@ -830,6 +886,7 @@ def _write_candidate(
         if row["id"] in seen:
             raise RuntimeError(f"Duplicate candidate record id: {row['id']}")
         seen.add(row["id"])
+    title_quality = _validate_candidate_title_quality(records, config_id=config_id)
     candidate_dir = output_dir / "candidates" / config_id
     records_path = candidate_dir / "records.jsonl"
     _write_jsonl(records_path, records)
@@ -849,6 +906,7 @@ def _write_candidate(
         "records_sha256": _sha256_file(records_path),
         "record_count": len(records),
         "record_kind_counts": dict(sorted(kind_counts.items())),
+        "title_quality": title_quality,
         "chunk_token_statistics": {
             "minimum": min(token_counts) if token_counts else 0,
             "maximum": max(token_counts) if token_counts else 0,

@@ -569,6 +569,82 @@ def test_navigation_planner_preserves_direct_page_and_action_evidence():
     assert plan["steps"][1]["action_type"] == "login"
 
 
+def test_navigation_planner_prefers_canonical_phd_workflow_over_action_rich_news():
+    catalog = build_navigation_catalog(_ready_bridge())
+    canonical_url = (
+        "https://preprod.mbzuai.ac.ae/admissions/graduate-phd-admissions"
+    )
+    news_url = (
+        "https://preprod.mbzuai.ac.ae/knowledge-center/the-node/"
+        "mbzuai-opens-admissions-fall-2026-intake"
+    )
+    catalog["pages"] = [
+        {
+            "page_card_id": "page:phd-admissions",
+            "document_revision_id": "revision:phd-admissions",
+            "source_url": canonical_url,
+            "canonical_url": canonical_url,
+            "canonical_family_url": canonical_url,
+            "title": "Graduate Ph.D. admissions",
+            "purpose_summary": "Canonical PhD requirements and application process.",
+            "language": "en",
+            "page_type": "admissions_or_program",
+            "topic_labels": ["Admissions"],
+            "audience_labels": ["Applicants"],
+            "sections": [],
+            "chunk_ids": [],
+            "outgoing_page_card_ids": [],
+            "action_ids": [],
+        },
+        {
+            "page_card_id": "page:intake-news",
+            "document_revision_id": "revision:intake-news",
+            "source_url": news_url,
+            "canonical_url": news_url,
+            "canonical_family_url": news_url,
+            "title": "MBZUAI opens admissions for Fall 2026 intake",
+            "purpose_summary": "A dated intake announcement.",
+            "language": "en",
+            "page_type": "news_or_event",
+            "topic_labels": ["Admissions"],
+            "audience_labels": ["Applicants"],
+            "sections": [],
+            "chunk_ids": [],
+            "outgoing_page_card_ids": [],
+            "action_ids": ["action:news-apply"],
+        },
+    ]
+    catalog["chunks"] = []
+    catalog["actions"] = [
+        {
+            "action_id": "action:news-apply",
+            "page_card_id": "page:intake-news",
+            "label": "Apply now",
+            "context_label": "Fall 2026 intake",
+            "source_section_heading": "Applications",
+            "action_type": "apply",
+            "target_url": "https://apply.mbzuai.ac.ae/",
+            "canonical_target_url": "https://apply.mbzuai.ac.ae/",
+            "target_kind": "official_subdomain",
+            "official_target": True,
+        }
+    ]
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="How do I apply for a PhD at MBZUAI?",
+        result={
+            "dense_page_card_ids": ["page:intake-news", "page:phd-admissions"],
+            "dense_action_ids": ["action:news-apply"],
+        },
+    )
+
+    assert plan["status"] == "partial"
+    assert plan["target_page"]["page_card_id"] == "page:phd-admissions"
+    assert plan["steps"][0]["target_url"] == canonical_url
+    assert plan["warnings"] == ["requested_action_not_grounded_on_target_page"]
+
+
 def test_navigation_planner_prefers_directory_action_context_over_profile_tie():
     catalog = build_navigation_catalog(_ready_bridge())
     catalog["pages"] = [

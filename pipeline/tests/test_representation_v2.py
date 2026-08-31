@@ -234,6 +234,28 @@ def test_document_revision_index_does_not_bind_ambiguous_canonical_urls(tmp_path
     assert second_url in url_index
 
 
+def test_document_revision_replaces_opaque_pdf_title_with_download_name(tmp_path: Path):
+    markdown_path = tmp_path / "ee72c8444780dd009b50.md"
+    markdown_path.write_text("# Admissions handbook", encoding="utf-8")
+    source = _inventory_document(
+        "",
+        markdown_path,
+        source_url="",
+        canonical_url="",
+        canonical_family_url="",
+        source_locator={
+            "kind": "file",
+            "value": str(tmp_path / "MBZUAI_Admissions_Handbook_993eed6e3bf8.pdf"),
+        },
+        source_file=str(tmp_path / "MBZUAI_Admissions_Handbook_993eed6e3bf8.pdf"),
+        title="ee72c8444780dd009b50",
+    )
+
+    documents, _url_index, _web_ids = build_document_revisions([source])
+
+    assert documents[0]["title"] == "MBZUAI Admissions Handbook"
+
+
 def test_representation_schema_is_valid_and_reserves_lossless_evidence_units():
     schema = representation_v2_json_schema()
     Draft202012Validator.check_schema(schema)

@@ -1,0 +1,10 @@
+# Immutable pre-embedding checkpoint for the readable-title Representation V2
+# rebuild. This derives from the already selected c650 / Gemini-1536 /
+# dense-graph profile and changes only the pinned representation input.
+_inherit: mbzuai_preprod_combined_selected_index_prep.yaml
+
+project_name: "mbzuai_preprod_combined_selected_index_prep_readable_titles"
+
+formatter:
+  page_graph_bridge:
+    source_representation_run_dir: "runs/mbzuai_preprod_combined_representation_v2/mbzuai-preprod-combined-representation-v2-20260831-v3"

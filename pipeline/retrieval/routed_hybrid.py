@@ -17,6 +17,10 @@ from pipeline.core.evidence_adjudicator import (
     heuristic_adjudicate_factual_evidence,
     query_requires_premise_grounding,
 )
+from pipeline.core.admissions_routing import (
+    admissions_surface_preference,
+    canonical_admissions_marker,
+)
 from pipeline.core.navigation_intent import normalize_navigation_context
 from pipeline.core.query_expansion import hyde_expansion
 from pipeline.core.query_planner import plan_query
@@ -65,7 +69,7 @@ def _with_retriever_backend(config: Dict[str, Any], backend: str) -> Dict[str, A
 
 
 def _looks_like_hash_title(value: Any) -> bool:
-    return bool(re.fullmatch(r"[a-f0-9]{24,64}", str(value or "").strip().casefold()))
+    return bool(re.fullmatch(r"[a-f0-9]{16,64}", str(value or "").strip().casefold()))
 
 
 def _title_from_source_url(source_url: str) -> str:
@@ -1769,12 +1773,21 @@ class RoutedHybridRetriever:
                 score += 0.35
             else:
                 score -= 0.30
+        score += 1.25 * admissions_surface_preference(
+            query,
+            source_url=url,
+            title=page.get("identity_text") or page.get("title"),
+            page_type=page.get("page_type"),
+        )
         return score
 
     def _explicit_required_page_markers(self, query: str) -> List[str]:
         lower = query.casefold()
         query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
         markers: List[str] = []
+        admissions_marker = canonical_admissions_marker(query)
+        if admissions_marker:
+            markers.append(admissions_marker)
         if any(
             phrase in lower
             for phrase in (

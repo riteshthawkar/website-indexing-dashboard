@@ -23,6 +23,7 @@ from pipeline.core.representation_v2 import (
     REPRESENTATION_V2_SCHEMA_VERSION,
     stable_representation_id,
 )
+from pipeline.core.document_titles import resolve_document_title
 
 
 _SPACE_RE = re.compile(r"\s+", flags=re.UNICODE)
@@ -1474,7 +1475,12 @@ def build_document_revisions(
             "revision_status": "current",
             "source_type": clean_text(source.get("source_type")),
             "language": clean_text(source.get("language")) or "und",
-            "title": clean_text(source.get("title")),
+            "title": resolve_document_title(
+                source.get("title"),
+                source_url=source.get("source_url"),
+                source_file=source.get("source_file"),
+                source_locator=source_locator,
+            ),
             "source_locator": {"kind": locator_kind, "value": locator_value},
             "source_url": clean_text(source.get("source_url")),
             "canonical_url": clean_text(source.get("canonical_url")),

@@ -15,6 +15,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import urlsplit
 
 from pipeline.core.io import load_json_safe
+from pipeline.core.admissions_routing import admissions_surface_preference
 from pipeline.core.navigation_intent import (
     infer_navigation_context,
     normalize_navigation_context,
@@ -965,6 +966,16 @@ class GroundedNavigationPlanner:
                 scores[page_id] += 5.0 * overlap / float(len(query_tokens))
             scores[page_id] += _query_phrase_match_score(query, page_search_text)
             scores[page_id] += _page_surface_constraint_score(query, page)
+            if page_id in evidence_page_ids:
+                # Canonical-surface routing may break ties among independently
+                # retrieved pages, but it must never let a graph-only neighbor
+                # replace an exact source URL supplied by retrieval.
+                scores[page_id] += 40.0 * admissions_surface_preference(
+                    query,
+                    source_url=page.get("source_url"),
+                    title=page.get("title"),
+                    page_type=page.get("page_type"),
+                )
             if any(
                 _action_satisfies_intent(action, intent)
                 for action in self.actions_by_page.get(page_id, [])
