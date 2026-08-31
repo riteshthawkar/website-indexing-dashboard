@@ -1482,7 +1482,16 @@ def build_evidence_pack(
         }
         specific_terms = _query_terms(query) - generic_relation_terms
         asks_for_host = bool(re.search(r"\b(?:host|hosted|hosting)\b", normalized_query))
-        for _score, kind, doc in candidates:
+        quoted_subject_match = re.search(
+            r"\b(?:titled|called|named)\s*[\"'“‘]([^\"'”’]{3,240})[\"'”’]",
+            str(query or ""),
+            flags=re.IGNORECASE,
+        )
+        quoted_subject_terms = _query_terms(
+            quoted_subject_match.group(1) if quoted_subject_match else ""
+        )
+        relation_candidates: List[Tuple[float, int, int, float, int, Dict[str, Any]]] = []
+        for score, kind, doc in candidates:
             if kind != "chunk" or not _doc_id(doc).startswith("chunk:"):
                 continue
             if required_page_set and not _candidate_matches_any_required_page(doc):
@@ -1507,19 +1516,56 @@ def build_evidence_pack(
                 )
             ).casefold()
             body_terms = _query_terms(body_text)
-            relation_present = (
-                bool(re.search(r"\bhost\s*:", body_text))
+            subject_terms = quoted_subject_terms or specific_terms
+            overlap_count = len(subject_terms & body_terms)
+            overlap_ratio = (
+                overlap_count / float(len(subject_terms)) if subject_terms else 0.0
+            )
+            explicit_role_marker = bool(
+                re.search(r"\bhost\s*:", body_text)
                 if asks_for_host
-                else (
-                    bool(re.search(r"\bspeaker\b", body_text))
-                    or (
-                        bool(specific_terms)
-                        and len(specific_terms & body_terms)
-                        >= min(3, len(specific_terms))
-                    )
+                else re.search(r"\bspeaker\s*:", body_text)
+            )
+            if asks_for_host:
+                relation_present = explicit_role_marker
+            elif quoted_subject_terms:
+                # The page title and URL repeat the requested talk title on
+                # every child. Score only the header-stripped body and require
+                # most of the quoted title so an unrelated current-event card
+                # cannot displace the exact speaker card.
+                relation_present = overlap_count >= max(
+                    2,
+                    (3 * len(quoted_subject_terms) + 4) // 5,
+                )
+            else:
+                relation_present = explicit_role_marker or (
+                    bool(specific_terms)
+                    and overlap_count >= min(3, len(specific_terms))
+                )
+            if not relation_present:
+                continue
+            relation_candidates.append(
+                (
+                    overlap_ratio,
+                    overlap_count,
+                    1 if explicit_role_marker else 0,
+                    score,
+                    -len(body_text),
+                    doc,
                 )
             )
-            if relation_present and _append_candidate(kind, doc):
+        relation_candidates.sort(
+            key=lambda item: (
+                -item[0],
+                -item[1],
+                -item[2],
+                -item[3],
+                -item[4],
+                _doc_id(item[5]),
+            )
+        )
+        for *_rank, doc in relation_candidates:
+            if _append_candidate("chunk", doc):
                 break
 
     for required_page in required_pages:

@@ -3483,6 +3483,61 @@ def test_evidence_pack_reserves_contiguous_person_relation_chunk(
     )
 
 
+def test_evidence_pack_prefers_exact_quoted_talk_card_over_page_preamble():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    target_url = (
+        "https://ai-nexus.mbzuai.ac.ae/distinguished-lecture-series/"
+        "applying-image-analysis-ai-to-cancer-metabolic-syndrome"
+    )
+    result = {
+        "retrieval_documents": [
+            {
+                "id": "chunk:c650:document-revision:event:00000:preamble",
+                "text": (
+                    "TITLE: Applying Image Analysis & AI to Cancer & Metabolic Syndrome\n"
+                    "TYPE: webpage\nSECTION: MBZUAI Nexus Speaker Series\n"
+                    f"SOURCE_URL: {target_url}\n\n"
+                    "## MBZUAI Nexus Speaker Series\nUpcoming AI Events\n"
+                    "Xiang Meng\nResearch Scientist at Dana-Farber Cancer Institute\n"
+                    "The talk studies survival analysis and clinical trials."
+                ),
+                "source_url": target_url,
+                "score": 0.99,
+            },
+            {
+                "id": "chunk:c650:document-revision:event:00058:exact",
+                "text": (
+                    "TITLE: Applying Image Analysis & AI to Cancer & Metabolic Syndrome\n"
+                    "TYPE: webpage\n"
+                    "SECTION: MBZUAI Nexus Speaker Series > Applying Image Analysis & AI "
+                    "to Cancer & Metabolic Syndrome\n"
+                    f"SOURCE_URL: {target_url}\n\n"
+                    "### Applying Image Analysis & AI to Cancer & Metabolic Syndrome\n"
+                    "* Sir Michael Brady - Emeritus Professor of Oncological Imaging"
+                ),
+                "source_url": target_url,
+                "score": 0.5,
+            },
+        ]
+    }
+
+    pack = build_evidence_pack(
+        query=(
+            'Who is the speaker for the MBZUAI Nexus talk titled '
+            '"Applying Image Analysis & AI to Cancer & Metabolic Syndrome"?'
+        ),
+        result=result,
+        coverage_plan={"intent": "exact_fact", "required_pages": [target_url]},
+        max_items=2,
+        max_chars=3000,
+        max_per_source=2,
+    )
+
+    assert pack["items"][0]["id"].endswith(":00058:exact")
+    assert "Sir Michael Brady" in pack["items"][0]["text"]
+
+
 def test_confidence_counts_official_authority_class_for_backfilled_spans():
     from pipeline.retrieval.evidence_packer import score_retrieval_confidence
 
