@@ -8393,7 +8393,10 @@ def test_failed_answer_facets_route_to_exact_official_pages():
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
     assert retriever._explicit_required_page_markers(
         "Who is the upcoming MBZUAI Nexus Speaker Series talk by Xiang Meng hosted by?"
-    ) == ["https://ai-nexus.mbzuai.ac.ae"]
+    ) == [
+        "https://ai-nexus.mbzuai.ac.ae",
+        "https://ai-nexus.mbzuai.ac.ae/previous-ai-talks",
+    ]
     assert retriever._explicit_required_page_markers(
         "Which MBZUAI careers page section lists vacancies for the Computing and Mathematical Sciences Division?"
     ) == ["https://careers.mbzuai.ac.ae"]
@@ -8424,6 +8427,29 @@ def test_policy_page_and_this_page_guidelines_use_media_evidence():
     assert _is_explicit_media_query(policy_query) is True
     assert _is_media_query(shown_query) is True
     assert _is_explicit_media_query(shown_query) is True
+
+
+def test_policy_media_excerpt_preserves_minimum_service_timing_rule():
+    from pipeline.retrieval.evidence_packer import _compact_media_evidence_text
+
+    filler = "Promotion review background and general policy context. " * 80
+    visible_text = (
+        f"{filler} By default, review is no later than the end of the seventh year, "
+        "or 3 years after promotion to Associate Professor. "
+        "A minimum service of two years in MBZUAI is also required before application."
+    )
+    compacted = _compact_media_evidence_text(
+        f"IMAGE: Policy page\nDOCUMENT: Faculty Policy\nVISIBLE_TEXT: {visible_text}",
+        query=(
+            "According to the policy page, what are the timing rules for promotion "
+            "from Associate to Full Professor?"
+        ),
+        max_chars=1200,
+    )
+
+    assert "end of the seventh year" in compacted
+    assert "3 years after promotion to Associate Professor" in compacted
+    assert "minimum service of two years" in compacted
 
 
 def test_arabic_research_board_query_gets_cross_lingual_nanda_aliases():

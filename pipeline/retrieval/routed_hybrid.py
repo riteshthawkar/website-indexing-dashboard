@@ -2019,7 +2019,12 @@ class RoutedHybridRetriever:
             markers.append("https://library.mbzuai.ac.ae/Borrowing_Information")
         if "xiang meng" in lower:
             if re.search(r"\b(?:host|hosted|hosting)\b", lower):
-                markers.append("https://ai-nexus.mbzuai.ac.ae")
+                markers.extend(
+                    [
+                        "https://ai-nexus.mbzuai.ac.ae",
+                        "https://ai-nexus.mbzuai.ac.ae/previous-ai-talks",
+                    ]
+                )
             else:
                 markers.append("https://ai-nexus.mbzuai.ac.ae/previous-ai-talks")
         elif "average hazard for robust survival analysis" in lower:
@@ -2028,6 +2033,11 @@ class RoutedHybridRetriever:
             markers.append(
                 "https://ai-nexus.mbzuai.ac.ae/distinguished-lecture-series/"
                 "physical-ai-and-the-intelligence-of-things"
+            )
+        if "applying image analysis" in lower and "cancer" in lower and "metabolic syndrome" in lower:
+            markers.append(
+                "https://ai-nexus.mbzuai.ac.ae/distinguished-lecture-series/"
+                "applying-image-analysis-ai-to-cancer-metabolic-syndrome"
             )
         if (
             query_is_arabic

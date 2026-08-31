@@ -616,6 +616,14 @@ def _query_dense_excerpt(value: Any, query: str, limit: int) -> str:
                 "certified irb professional",
             )
         )
+    if "promotion" in query_lower and re.search(r"\b(?:timing|timeline|review|professor)\b", query_lower):
+        facet_phrases.extend(
+            (
+                "end of the seventh year",
+                "3 years after promotion to associate professor",
+                "minimum service of two years",
+            )
+        )
     facet_positions = [
         position
         for phrase in facet_phrases
@@ -679,18 +687,26 @@ def _compact_media_evidence_text(value: Any, *, query: str, max_chars: int) -> s
     parts: List[str] = []
     used = 0
 
-    def append_field(label: str, content: str, *, field_limit: int, relevant: bool = False) -> None:
+    def append_field(
+        label: str,
+        content: str,
+        *,
+        field_limit: int,
+        relevant: bool = False,
+        dense: bool = False,
+    ) -> None:
         nonlocal used
         remaining = max_chars - used
         prefix = f"{label}: "
         if remaining <= len(prefix) + 12:
             return
         bounded = min(field_limit, remaining - len(prefix) - (1 if parts else 0))
-        rendered = (
-            _query_relevant_excerpt(content, query, bounded)
-            if relevant
-            else _truncate_text(content, bounded)
-        )
+        if dense:
+            rendered = _query_dense_excerpt(content, query, bounded)
+        elif relevant:
+            rendered = _query_relevant_excerpt(content, query, bounded)
+        else:
+            rendered = _truncate_text(content, bounded)
         if not rendered:
             return
         part = prefix + rendered
@@ -704,7 +720,7 @@ def _compact_media_evidence_text(value: Any, *, query: str, max_chars: int) -> s
     # OCR-derived visible text is the strongest source for labels, numeric
     # values, and complete table rows. Keep it ahead of prose context.
     for content in parsed.get("VISIBLE_TEXT", []):
-        append_field("VISIBLE_TEXT", content, field_limit=2100, relevant=len(content) > 2100)
+        append_field("VISIBLE_TEXT", content, field_limit=2100, dense=len(content) > 2100)
 
     for label in ("CONTEXTUAL_CAPTION", "SEMANTIC_CAPTION"):
         for content in parsed.get(label, []):
