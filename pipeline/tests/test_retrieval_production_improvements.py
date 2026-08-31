@@ -8428,11 +8428,80 @@ def test_policy_page_and_this_page_guidelines_use_media_evidence():
 
 def test_arabic_research_board_query_gets_cross_lingual_nanda_aliases():
     from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
-    aliases = _semantic_query_alias_tokens(
-        "أي نموذج مذكور في لوحة مشاريع البحث بوصفه نموذجاً هندياً للغات الكبيرة؟"
-    )
+    query = "أي نموذج مذكور في لوحة مشاريع البحث بوصفه نموذجاً هندياً للّغات الكبيرة؟"
+    aliases = _semantic_query_alias_tokens(query)
     assert aliases[:6] == ["NANDA", "Hindi", "LLM", "knowledge", "reasoning", "performance"]
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    assert retriever._explicit_required_page_markers(query) == [
+        "https://research.mbzuai.ac.ae/research-projects"
+    ]
+
+
+def test_required_page_card_is_bridged_into_answer_evidence():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    page_url = "https://research.mbzuai.ac.ae/research-projects"
+    page_card_id = "page-card:malaria-project"
+    page_card_text = (
+        "TITLE: Research Projects\nPURPOSE: The main objective is to set up a virtual "
+        "center of excellence anchored in Abu Dhabi for weather-informed malaria "
+        "prediction and planning using big data and AI."
+    )
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            page_card_id: {
+                "id": page_card_id,
+                "source_url": page_url,
+                "title": "Research Projects",
+                "text": page_card_text,
+            }
+        },
+        evidence_span_map={},
+        fact_map={},
+        summary_map={},
+        chunk_map={},
+        parent_map={},
+        _score_text_match=lambda query, text: 1.0,
+    )
+    retriever._coverage_page_records = retriever._build_coverage_page_records()
+    retriever._coverage_page_records_by_url = {
+        page["normalized_url"]: page
+        for page in retriever._coverage_page_records
+    }
+    retriever._coverage_record_indexes = retriever._build_coverage_record_indexes()
+    payload = {
+        "selected_chunk_ids": [],
+        "selected_parent_ids": [],
+        "selected_fact_ids": [],
+        "selected_evidence_span_ids": [],
+        "retrieval_documents": [],
+        "abstained": False,
+    }
+    query = "What is the main objective of the weather-informed malaria project?"
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query=query,
+        payload=payload,
+        coverage_plan={"intent": "exact_fact", "required_pages": [page_url]},
+    )
+    pack = build_evidence_pack(
+        query=query,
+        result=payload,
+        max_items=4,
+        max_chars=4000,
+        max_per_source=2,
+        coverage_plan={"intent": "exact_fact", "required_pages": [page_url]},
+    )
+
+    assert changed is True
+    assert payload["selected_page_card_ids"] == [page_card_id]
+    assert pack["items"][0]["kind"] == "evidence_span"
+    assert "virtual center of excellence" in pack["items"][0]["text"]
 
 
 def test_deictic_context_page_must_exist_in_frozen_corpus():
