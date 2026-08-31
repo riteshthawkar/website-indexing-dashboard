@@ -8363,6 +8363,78 @@ def test_digital_twin_required_page_distinguishes_research_from_publications():
     ) == ["/publications/digital-twin-lab"]
 
 
+def test_named_physical_ai_talk_routes_to_its_exact_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    assert retriever._explicit_required_page_markers(
+        "ما الفكرة الأساسية التي يشرحها ملخص فعالية «Physical AI and the Intelligence of Things»؟"
+    ) == [
+        "https://ai-nexus.mbzuai.ac.ae/distinguished-lecture-series/"
+        "physical-ai-and-the-intelligence-of-things"
+    ]
+
+
+def test_arabic_2025_commencement_program_routes_to_arabic_pdf():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    assert retriever._explicit_required_page_markers(
+        "في الصفحة 9 من برنامج حفل التخرج 2025 العربي، ماذا تُظهر صورة هوية الحدث؟"
+    ) == [
+        "https://staticcdn.mbzuai.ac.ae/mbzuaiwpprd01/2025/05/"
+        "Commencement-2025-Program-AR.pdf"
+    ]
+
+
+def test_failed_answer_facets_route_to_exact_official_pages():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    assert retriever._explicit_required_page_markers(
+        "Who is the upcoming MBZUAI Nexus Speaker Series talk by Xiang Meng hosted by?"
+    ) == ["https://ai-nexus.mbzuai.ac.ae"]
+    assert retriever._explicit_required_page_markers(
+        "Which MBZUAI careers page section lists vacancies for the Computing and Mathematical Sciences Division?"
+    ) == ["https://careers.mbzuai.ac.ae"]
+    assert retriever._explicit_required_page_markers(
+        "What is the main objective of the weather-informed malaria prediction and planning project?"
+    ) == ["https://research.mbzuai.ac.ae/research-projects"]
+    assert retriever._explicit_required_page_markers(
+        "What academic history example is shown in the form, and what does it say about the GPA fields?"
+    ) == [
+        "https://staticcdn.mbzuai.ac.ae/mbzuaiwpprd01/2023/11/"
+        "MBZUAI-Application-Instructions_UGRIP.pdf"
+    ]
+
+
+def test_policy_page_and_this_page_guidelines_use_media_evidence():
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+    from pipeline.retrieval.evidence_packer import _is_explicit_media_query
+
+    policy_query = (
+        "According to the policy page, what are the main guidelines and timing rules "
+        "for promotion from Associate to Full Professor?"
+    )
+    shown_query = (
+        "What do the guidelines shown on this page say about the number and types "
+        "of recommendation letters needed for promotion?"
+    )
+    assert _is_media_query(policy_query) is True
+    assert _is_explicit_media_query(policy_query) is True
+    assert _is_media_query(shown_query) is True
+    assert _is_explicit_media_query(shown_query) is True
+
+
+def test_arabic_research_board_query_gets_cross_lingual_nanda_aliases():
+    from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
+
+    aliases = _semantic_query_alias_tokens(
+        "أي نموذج مذكور في لوحة مشاريع البحث بوصفه نموذجاً هندياً للغات الكبيرة؟"
+    )
+    assert aliases[:6] == ["NANDA", "Hindi", "LLM", "knowledge", "reasoning", "performance"]
+
+
 def test_deictic_context_page_must_exist_in_frozen_corpus():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

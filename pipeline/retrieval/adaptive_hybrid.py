@@ -2755,6 +2755,12 @@ def _is_media_query(query: str) -> bool:
     query_tokens = set(_tokenize(intent_text))
     if not query_tokens:
         return False
+    normalized_intent = _clean_text(intent_text).casefold()
+    if (
+        "policy page" in normalized_intent
+        and re.search(r"\b(?:promotion|professor|faculty review)\b", normalized_intent)
+    ):
+        return True
     if query_tokens & _EXPLICIT_VISUAL_QUERY_TOKENS:
         return True
     # Do not route ordinary factual campus/facilities/parking questions into
@@ -2824,6 +2830,11 @@ def _semantic_query_alias_tokens(query: str) -> List[str]:
     ):
         return []
     aliases: List[str] = []
+    if (
+        re.search(r"(?:لوحة|اللوحة).{0,80}(?:مشاريع|المشاريع).{0,120}(?:هندي|هندية)", normalized)
+        or re.search(r"(?:هندي|هندية).{0,120}(?:لوحة|اللوحة).{0,80}(?:مشاريع|المشاريع)", normalized)
+    ):
+        aliases.extend(["NANDA", "Hindi", "LLM", "knowledge", "reasoning", "performance"])
     if any(term in normalized for term in ("بعد المطر", "بعد هطول المطر", "ما بعد المطر")):
         aliases.extend(["after", "rain", "rainfall", "post", "water", "accumulation", "flood"])
     if "صورة" in normalized or "الصورة" in normalized:

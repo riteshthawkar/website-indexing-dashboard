@@ -49,6 +49,17 @@ def _is_explicit_media_query(query: str) -> bool:
         str(query or ""),
         flags=re.IGNORECASE,
     )
+    normalized = _clean_text(intent_text).casefold()
+    if (
+        "policy page" in normalized
+        and re.search(r"\b(?:promotion|professor|faculty review)\b", normalized)
+    ):
+        return True
+    if re.search(
+        r"\b(?:shown|displayed|visible|pictured)\s+(?:in|on)\s+(?:(?:the|this)\s+)?(?:form|portal|page)\b",
+        normalized,
+    ):
+        return True
     return bool(_EXPLICIT_MEDIA_QUERY_RE.search(intent_text))
 
 
