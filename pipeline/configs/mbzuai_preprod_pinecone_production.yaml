@@ -1,0 +1,62 @@
+# Interim production profile for deploying the redesigned MBZUAI corpus through
+# the existing Pinecone-backed retrieval infrastructure. The evaluated c650 /
+# Gemini-1536 / dense-graph representation and all preproduction artifact pins
+# remain inherited unchanged; only the vector-store transport changes.
+_inherit: mbzuai_preprod_production.yaml
+
+vector_store:
+  provider: "pinecone"
+  dimensions: 1536
+
+embedder:
+  pinecone_index: "mbzuai-gemini-retrieval-v3"
+  pinecone_sparse_index: ""
+  enable_sparse: false
+  enable_sparse_evidence_spans: false
+  use_sparse_embeddings: false
+  create_index_if_missing: true
+  verify_index_after_upload: true
+  verify_index_min_count_only: false
+
+# Lists replace their inherited value during config resolution. Keep this
+# sequence identical to mbzuai_production except for the final store adapter.
+stages:
+  - id: verify_selected_profile
+    type: formatter
+    plugin: selected_profile_guard
+  - id: assemble_selected_release
+    type: formatter
+    plugin: selected_release_assembly
+  - id: format_assertion_slices
+    type: formatter
+    plugin: extraction_slices
+  - id: extract_assertions_openai
+    type: formatter
+    plugin: openai_assertion_extract
+  - id: validate_assertions_openai
+    type: formatter
+    plugin: openai_assertion_validate
+  - id: canonicalize_assertions
+    type: formatter
+    plugin: assertion_canonicalize
+  - id: promote_assertions
+    type: formatter
+    plugin: assertion_promote
+  - id: format_retrieval
+    type: formatter
+    plugin: retrieval_bundle_v2
+  - id: format_graph
+    type: formatter
+    plugin: knowledge_graph
+  - id: promote_graph
+    type: formatter
+    plugin: semantic_graph_promote
+  - id: community_graph
+    type: formatter
+    plugin: semantic_graph_community
+  - id: summarize_community_graph
+    type: formatter
+    plugin: semantic_graph_summarize
+  - id: upload_retrieval
+    type: embedder
+    plugin: gemini_pinecone

@@ -6,6 +6,8 @@ RELEASE_PROJECT_NAME="${RELEASE_PROJECT_NAME:-mbzuai_main}"
 PIPELINE_WORK_DIR="${PIPELINE_WORK_DIR:-/data/releases/runs}"
 RUN_ID="${RUN_ID:-mbzuai-production-$(date -u +%Y%m%dT%H%M%SZ)}"
 PYTHON_BIN="${PYTHON:-python}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RELEASE_STORAGE_MARKER_FILE="${RELEASE_STORAGE_MARKER_FILE:-/data/releases/.mbzuai-release-storage}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python3 >/dev/null 2>&1; then
@@ -24,9 +26,21 @@ if [[ ! -f "$RELEASE_STORAGE_MARKER_FILE" ]]; then
   echo "Release storage marker is missing: $RELEASE_STORAGE_MARKER_FILE" >&2
   exit 1
 fi
-if [[ "$PIPELINE_CONFIG" != "mbzuai_production" && "${ALLOW_NON_PRODUCTION_INDEXING:-false}" != "true" ]]; then
-  echo "Deployment indexing requires PIPELINE_CONFIG=mbzuai_production." >&2
-  exit 1
+if [[ "${ALLOW_NON_PRODUCTION_INDEXING:-false}" != "true" ]]; then
+  if ! "$PYTHON_BIN" - "$PROJECT_ROOT" "$PIPELINE_CONFIG" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from pipeline.core.config import load_config
+
+config = load_config(sys.argv[2])
+if not bool((config.get("pipeline") or {}).get("production_profile", False)):
+    raise SystemExit(1)
+PY
+  then
+    echo "Deployment indexing requires a config with pipeline.production_profile=true." >&2
+    exit 1
+  fi
 fi
 if [[ "${PIPELINE_PREFLIGHT:-true}" != "true" ]]; then
   echo "PIPELINE_PREFLIGHT must be true for deployment indexing." >&2

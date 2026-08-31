@@ -58,8 +58,18 @@ if [[ "$ANSWER_EVAL_MODE" == "disabled" ]]; then
   echo "ANSWER_EVAL_MODE=disabled is forbidden for production promotion." >&2
   exit 1
 fi
-if [[ "$PIPELINE_CONFIG" != "mbzuai_production" ]]; then
-  echo "Production promotion requires PIPELINE_CONFIG=mbzuai_production." >&2
+if ! "$PYTHON_BIN" - "$PROJECT_ROOT" "$PIPELINE_CONFIG" <<'PY'
+import sys
+
+sys.path.insert(0, sys.argv[1])
+from pipeline.core.config import load_config
+
+config = load_config(sys.argv[2])
+if not bool((config.get("pipeline") or {}).get("production_profile", False)):
+    raise SystemExit(1)
+PY
+then
+  echo "Production promotion requires a config with pipeline.production_profile=true." >&2
   exit 1
 fi
 if [[ "$ANSWER_EVAL_MODE" != "websocket" ]]; then
@@ -216,7 +226,8 @@ attest_candidate() {
     "$CANDIDATE_RETRIEVER_ATTESTATION_URL" \
     "$CANDIDATE_BACKEND_COMMIT_SHA" \
     "$evidence_output" \
-    "$release_manifest_file" <<'PY'
+    "$release_manifest_file" \
+    "$PIPELINE_CONFIG" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -232,6 +243,7 @@ retriever_url = urlparse(sys.argv[7])
 expected_backend_commit = sys.argv[8]
 evidence_output = sys.argv[9]
 release_manifest_file = sys.argv[10]
+expected_config_name = sys.argv[11]
 if (
     answer_url.scheme not in {"ws", "wss"}
     or not answer_url.hostname
@@ -298,8 +310,10 @@ if expected.get("selected_release_assembly_sha256"):
             ),
         }
     )
-if retriever.get("ready") is not True or retriever.get("config_name") != "mbzuai_production":
-    raise SystemExit("retriever-candidate is not ready with mbzuai_production")
+if retriever.get("ready") is not True or retriever.get("config_name") != expected_config_name:
+    raise SystemExit(
+        f"retriever-candidate is not ready with {expected_config_name}"
+    )
 for key, value in expected_identity.items():
     if not value or retriever.get(key) != value:
         raise SystemExit(

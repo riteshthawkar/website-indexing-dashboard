@@ -67,7 +67,7 @@ def main() -> int:
         "WEB_CONCURRENCY", "RETRIEVAL_SERVICE_URL", "RETRIEVAL_SERVICE_MODE",
         "RETRIEVAL_SERVICE_REQUIRE_READY", "RETRIEVAL_SERVICE_TIMEOUT_SECONDS",
         "RETRIEVAL_SERVICE_STARTUP_TIMEOUT_SECONDS", "RETRIEVAL_SERVICE_READINESS_TIMEOUT_SECONDS",
-        "EXPECTED_RETRIEVAL_COMMIT_SHA", "EXPECTED_RETRIEVAL_RUN_ID",
+        "EXPECTED_RETRIEVAL_COMMIT_SHA", "EXPECTED_RETRIEVAL_CONFIG_NAME", "EXPECTED_RETRIEVAL_RUN_ID",
         "EXPECTED_RETRIEVAL_BUNDLE_SHA256", "EMBEDDING_PROVIDER", "EMBEDDING_MODEL_NAME",
         "EMBEDDING_OUTPUT_DIMENSIONALITY", "GENERATION_MODEL", "QUERY_REWRITE_MODEL",
         "RERANKER_MODEL", "GROUNDED_FINALIZER_MODEL", "FOLLOWUP_SUGGESTION_MODEL",
@@ -89,6 +89,7 @@ def main() -> int:
         "RETRIEVAL_SERVICE_STARTUP_TIMEOUT_SECONDS": "1500",
         "RETRIEVAL_SERVICE_READINESS_TIMEOUT_SECONDS": "5",
         "EXPECTED_RETRIEVAL_COMMIT_SHA": "${retriever.COMMIT_HASH}",
+        "EXPECTED_RETRIEVAL_CONFIG_NAME": "mbzuai_preprod_pinecone_production",
         "EMBEDDING_PROVIDER": "google",
         "EMBEDDING_MODEL_NAME": "gemini-embedding-2",
         "EMBEDDING_OUTPUT_DIMENSIONALITY": "1536",
@@ -144,7 +145,7 @@ def main() -> int:
     assert retriever.get("instance_size_slug") == "apps-d-4vcpu-16gb"
     retriever_env = _environment(retriever)
     expected_retriever_keys = {
-        "SERVICE_ENVIRONMENT", "PIPELINE_CONFIG", "GOOGLE_API_KEY", "PGVECTOR_DSN",
+        "SERVICE_ENVIRONMENT", "PIPELINE_CONFIG", "GOOGLE_API_KEY", "PINECONE_API_KEY",
         "RELEASE_COMMIT_SHA", "RELEASE_STORAGE_MODE", "RELEASE_ARCHIVE_TARGET_ROOT",
         "ACTIVE_RELEASE_FILE", "RELEASE_RUNS_ROOT", "RELEASE_STORAGE_MARKER_FILE",
         "RELEASE_ARCHIVE_S3_URI", "RELEASE_ARCHIVE_S3_ENDPOINT_URL",
@@ -165,7 +166,7 @@ def main() -> int:
     assert set(retriever_env) == expected_retriever_keys, "unexpected retriever environment keys"
     for key in (
         "GOOGLE_API_KEY",
-        "PGVECTOR_DSN",
+        "PINECONE_API_KEY",
         "RELEASE_ARCHIVE_S3_ACCESS_KEY_ID",
         "RELEASE_ARCHIVE_S3_SECRET_ACCESS_KEY",
     ):
@@ -176,7 +177,7 @@ def main() -> int:
         )
     for key, value in {
         "SERVICE_ENVIRONMENT": "production",
-        "PIPELINE_CONFIG": "mbzuai_production",
+        "PIPELINE_CONFIG": "mbzuai_preprod_pinecone_production",
         "RELEASE_COMMIT_SHA": "${_self.COMMIT_HASH}",
         "RELEASE_STORAGE_MODE": "hydrate",
         "RELEASE_ARCHIVE_TARGET_ROOT": "/data/releases/current",

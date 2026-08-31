@@ -681,11 +681,11 @@ def _validate_upload_manifest(
         errors.append("pgvector upload manifest schema_version must be at least 5")
     if selected_profile and _positive_int(upload.get("schema_version")) < 6:
         errors.append("selected-profile vector upload manifest schema_version must be at least 6")
-    if provider == "pgvector" and not re.fullmatch(
+    if (provider == "pgvector" or selected_profile) and not re.fullmatch(
         r"[0-9a-f]{64}",
         str(upload.get("production_indexing_contract_fingerprint") or "").strip().lower(),
     ):
-        errors.append("pgvector upload manifest indexing contract fingerprint is missing or invalid")
+        errors.append("vector upload manifest indexing contract fingerprint is missing or invalid")
     if str(upload.get("model") or "").strip() != expected_model:
         errors.append(
             f"embedding model must be {expected_model!r}; got {str(upload.get('model') or '<missing>')!r}"
@@ -698,7 +698,7 @@ def _validate_upload_manifest(
     if not str(upload.get("index_name") or "").strip():
         errors.append("vector index target is missing")
     sparse_enabled = bool(str(upload.get("sparse_index_name") or "").strip())
-    if provider == "pinecone" and not sparse_enabled:
+    if provider == "pinecone" and not sparse_enabled and not selected_profile:
         errors.append("sparse Pinecone index name is missing")
     if provider == "pgvector" and sparse_enabled:
         errors.append("selected pgvector dense-graph release must not declare a sparse index")
@@ -721,6 +721,18 @@ def _validate_upload_manifest(
 
     planned = upload.get("planned") if isinstance(upload.get("planned"), dict) else {}
     uploaded = upload.get("uploaded") if isinstance(upload.get("uploaded"), dict) else {}
+    if not sparse_enabled:
+        unexpected_sparse_counts = sorted(
+            key
+            for payload in (planned, uploaded)
+            for key, value in payload.items()
+            if str(key).startswith("sparse_") and _positive_int(value) > 0
+        )
+        if unexpected_sparse_counts:
+            errors.append(
+                "dense-only vector upload declares non-zero sparse counts: "
+                f"{sorted(set(unexpected_sparse_counts))}"
+            )
     for lane in lanes:
         keys = [lane]
         if sparse_enabled:

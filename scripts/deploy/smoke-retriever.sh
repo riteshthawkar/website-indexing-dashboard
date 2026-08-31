@@ -15,6 +15,7 @@ EXPECTED_KNOWLEDGE_GRAPH_INDEX_SHA256="${EXPECTED_KNOWLEDGE_GRAPH_INDEX_SHA256:-
 EXPECTED_LEXICAL_CORPUS_SHA256="${EXPECTED_LEXICAL_CORPUS_SHA256:-}"
 EXPECTED_PROMOTED_ASSERTIONS_SHA256="${EXPECTED_PROMOTED_ASSERTIONS_SHA256:-}"
 EXPECTED_ANSWER_RUNTIME_COMMIT_SHA="${EXPECTED_ANSWER_RUNTIME_COMMIT_SHA:-}"
+EXPECTED_RETRIEVER_CONFIG_NAME="${EXPECTED_RETRIEVER_CONFIG_NAME:-${PIPELINE_CONFIG:-mbzuai_production}}"
 RETRIEVAL_SERVICE_TOKEN="${RETRIEVAL_SERVICE_TOKEN:-}"
 
 if ! command -v curl >/dev/null 2>&1; then
@@ -103,7 +104,8 @@ curl --fail --silent --show-error \
   "$EXPECTED_KNOWLEDGE_GRAPH_INDEX_SHA256" \
   "$EXPECTED_LEXICAL_CORPUS_SHA256" \
   "$EXPECTED_PROMOTED_ASSERTIONS_SHA256" \
-  "$EXPECTED_ANSWER_RUNTIME_COMMIT_SHA" <<'PY'
+  "$EXPECTED_ANSWER_RUNTIME_COMMIT_SHA" \
+  "$EXPECTED_RETRIEVER_CONFIG_NAME" <<'PY'
 import json
 import sys
 from pathlib import Path
@@ -113,9 +115,10 @@ result = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 expected_commit, expected_run, expected_bundle, expected_release = sys.argv[3:7]
 expected_graph, expected_graph_index, expected_lexical, expected_assertions = sys.argv[7:11]
 expected_answer_runtime_commit = sys.argv[11]
+expected_config_name = sys.argv[12]
 if ready.get("ready") is not True:
     raise SystemExit("retriever /attestationz did not report ready=true")
-if ready.get("config_name") != "mbzuai_production":
+if ready.get("config_name") != expected_config_name:
     raise SystemExit(f"retriever is using unexpected config: {ready.get('config_name')!r}")
 if ready.get("commit_sha") != expected_commit:
     raise SystemExit(f"retriever commit mismatch: {ready.get('commit_sha')!r} != {expected_commit!r}")

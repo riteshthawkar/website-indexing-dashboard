@@ -81,6 +81,23 @@ def test_retrieval_readiness_exposes_validated_release_identity(tmp_path, monkey
     assert "work_dir" not in payload
 
 
+def test_pinecone_production_profile_requires_no_pgvector_dsn(tmp_path, monkeypatch):
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    monkeypatch.setenv("RETRIEVAL_SERVICE_TOKEN", "Rtrv_7zQ9-aB3mN8.xK2pL6:sD4wF1cV5")
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-prod-7zQ9aB3mN8xK2pL6sD4wF1cV5")
+    monkeypatch.setenv("GOOGLE_API_KEY", "AIza-prod-7zQ9aB3mN8xK2pL6sD4wF1cV5")
+    monkeypatch.setenv("PINECONE_API_KEY", "pc-prod-7zQ9aB3mN8xK2pL6sD4wF1cV5")
+    monkeypatch.delenv("PGVECTOR_DSN", raising=False)
+
+    app = create_retrieval_service_app(
+        config_name="mbzuai_preprod_pinecone_production",
+        work_dir=tmp_path,
+    )
+
+    assert app is not None
+
+
 def test_startup_probe_checks_dense_sparse_embedding_and_full_retrieval(tmp_path):
     from pipeline.core.io import atomic_write_json
     from pipeline.service.retrieval_api import _run_startup_probe
@@ -90,6 +107,7 @@ def test_startup_probe_checks_dense_sparse_embedding_and_full_retrieval(tmp_path
     atomic_write_json(
         manifest_path,
         {
+            "sparse_index_name": "sparse-v3",
             "namespaces": {"chunks": namespace},
             "uploaded": {"chunks": 2, "sparse_chunks": 2},
         },
@@ -150,6 +168,67 @@ def test_startup_probe_checks_dense_sparse_embedding_and_full_retrieval(tmp_path
     }
 
 
+def test_startup_probe_supports_selected_dense_only_pinecone_release(tmp_path):
+    from pipeline.core.io import atomic_write_json
+    from pipeline.service.retrieval_api import _run_startup_probe
+
+    namespace = "chunks--run-42"
+    atomic_write_json(
+        tmp_path / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json",
+        {
+            "provider": "pinecone",
+            "index_name": "dense-v3",
+            "sparse_index_name": "",
+            "namespaces": {"chunks": namespace},
+            "uploaded": {"chunks": 2},
+        },
+    )
+
+    class DenseIndex:
+        def describe_index_stats(self, **_kwargs):
+            return {"namespaces": {namespace: {"vector_count": 2}}}
+
+        def query(self, **kwargs):
+            assert kwargs["namespace"] == namespace
+            return {"matches": [{"id": "chunk-1"}]}
+
+    class Vector:
+        output_dimensionality = 3
+
+        def _pinecone_index(self):
+            return DenseIndex()
+
+        def _pinecone_sparse_index(self):
+            raise AssertionError("dense-only startup must not initialize a sparse index")
+
+        def embed_query(self, _query):
+            return [0.1, 0.2, 0.3]
+
+    class Retriever:
+        vector = Vector()
+
+        def retrieve(self, _query, *, query_vector):
+            assert query_vector == [0.1, 0.2, 0.3]
+            return {
+                "query_embedding_status": "ok",
+                "abstained": False,
+                "retrieval_documents": [{"id": "chunk-1"}],
+            }
+
+    report = _run_startup_probe(
+        Retriever(),
+        work_dir=tmp_path,
+        query="Where is MBZUAI located?",
+        operation_timeout_seconds=2.0,
+    )
+
+    assert report == {
+        "dense_namespace_count": 1,
+        "sparse_namespace_count": 0,
+        "evidence_count": 1,
+    }
+
+
 def test_startup_probe_rejects_remote_namespace_count_drift(tmp_path):
     from pipeline.core.io import atomic_write_json
     from pipeline.service.retrieval_api import _run_startup_probe
@@ -158,6 +237,7 @@ def test_startup_probe_rejects_remote_namespace_count_drift(tmp_path):
     atomic_write_json(
         tmp_path / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json",
         {
+            "sparse_index_name": "sparse-v3",
             "namespaces": {"chunks": namespace},
             "uploaded": {"chunks": 2, "sparse_chunks": 2},
         },

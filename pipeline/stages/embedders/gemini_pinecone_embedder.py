@@ -862,6 +862,29 @@ def _ensure_index(pc: Any, *, index_name: str, dimension: int, cloud: str, regio
     from pinecone import ServerlessSpec
 
     if pc.has_index(index_name):
+        describe_index = getattr(pc, "describe_index", None)
+        if callable(describe_index):
+            description = describe_index(index_name)
+            actual_dimension = (
+                description.get("dimension")
+                if isinstance(description, Mapping)
+                else getattr(description, "dimension", None)
+            )
+            actual_metric = (
+                description.get("metric")
+                if isinstance(description, Mapping)
+                else getattr(description, "metric", None)
+            )
+            if actual_dimension is not None and int(actual_dimension) != int(dimension):
+                raise ValueError(
+                    f"Existing Pinecone index {index_name} has dimension "
+                    f"{actual_dimension}; expected {dimension}"
+                )
+            if actual_metric and str(actual_metric).strip().lower() != str(metric).strip().lower():
+                raise ValueError(
+                    f"Existing Pinecone index {index_name} uses metric "
+                    f"{actual_metric}; expected {metric}"
+                )
         return True
     pc.create_index(
         name=index_name,
@@ -1381,22 +1404,39 @@ def _clear_namespace(index: Any, *, namespace: str, request_timeout: float | Tup
 @register_stage
 class GeminiPineconeEmbedder(EmbedderStage):
     name = "gemini_pinecone"
-    description = "Embeds chunks, parents, and media with Gemini and uploads them to Pinecone."
+    description = (
+        "Embeds release-scoped retrieval lanes with Gemini and uploads them to Pinecone, "
+        "including selected Page Cards and actions."
+    )
 
     async def validate_config(self, config: Dict[str, Any]) -> List[str]:
         errors = []
         emb_cfg = config.get("embedder", {})
+        vector_store = config.get("vector_store", {})
         if not (os.getenv("GOOGLE_API_KEY") or os.getenv("GEMINI_API_KEY")):
             errors.append("GOOGLE_API_KEY or GEMINI_API_KEY is required for Gemini embeddings")
         if not os.getenv("PINECONE_API_KEY"):
             errors.append("PINECONE_API_KEY is required")
         if not emb_cfg.get("pinecone_index"):
             errors.append("embedder.pinecone_index is required")
+        if str(vector_store.get("provider") or "pinecone").strip().lower() != "pinecone":
+            errors.append("vector_store.provider must be pinecone")
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
         config = ctx.embedder_config
         input_paths = _resolve_indexing_input_paths(ctx)
+        selected_profile = (
+            ctx.config.get("selected_profile")
+            if isinstance(ctx.config.get("selected_profile"), Mapping)
+            else {}
+        )
+        if str(selected_profile.get("variant_id") or "").strip():
+            from pipeline.stages.embedders.selected_pinecone import (
+                execute_selected_profile_pinecone,
+            )
+
+            return execute_selected_profile_pinecone(ctx, config, input_paths)
         chunk_file = input_paths["chunks"]
         parent_file = input_paths["parents"]
         media_file = input_paths["media"]

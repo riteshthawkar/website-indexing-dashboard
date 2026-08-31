@@ -578,42 +578,47 @@ def load_effective_config(
 ) -> Dict[str, Any]:
     """Load the effective config without allowing production-profile drift.
 
-    Historical and development config names retain the legacy behavior of
-    preferring a run-local snapshot.  An explicitly requested
-    ``mbzuai_production`` profile is different: the current canonical profile
-    remains authoritative for runtime capabilities, but its immutable indexing
-    contract must match the run snapshot exactly.  A mismatch fails closed and
-    requires a new run or the explicit migration workflow.
+    Historical and development configs prefer a run-local snapshot. Any
+    explicitly requested config marked ``pipeline.production_profile=true`` is
+    authoritative for runtime capabilities, while its immutable indexing
+    contract must match the run snapshot exactly. This applies equally to the
+    canonical pgvector profile and an approved store-specific deployment
+    profile such as the interim Pinecone release.
     """
 
     snapshot_path = Path(work_dir) / "resolved_config.json" if work_dir else None
     snapshot = load_resolved_run_snapshot(work_dir) if work_dir else None
-    canonical_production_requested = Path(str(name or "")).stem == "mbzuai_production"
-    if canonical_production_requested:
-        if snapshot_path is not None and snapshot_path.exists() and snapshot is None:
-            raise ProductionConfigMismatchError(
-                f"Run resolved_config.json is unreadable or invalid: {snapshot_path}"
-            )
     snapshot_config = (
         dict(snapshot.get("config"))
         if isinstance(snapshot, dict) and isinstance(snapshot.get("config"), dict)
         else None
     )
-    if not canonical_production_requested:
+    try:
+        requested_config = load_config(name, search_dirs=search_dirs, overrides=None)
+    except FileNotFoundError:
+        if snapshot_config is None:
+            raise
         config = snapshot_config
-        if config is None:
-            config = load_config(name, search_dirs=search_dirs, overrides=None)
         if overrides:
             config = _deep_merge(config, overrides)
         return config
 
-    requested_config = load_config(name, search_dirs=search_dirs, overrides=None)
     if overrides:
         requested_config = _deep_merge(requested_config, overrides)
     pipeline_cfg = requested_config.get("pipeline")
-    if not isinstance(pipeline_cfg, dict) or not bool(pipeline_cfg.get("production_profile", False)):
+    production_requested = bool(
+        pipeline_cfg.get("production_profile", False)
+        if isinstance(pipeline_cfg, dict)
+        else False
+    )
+    if not production_requested:
+        if snapshot_config is None:
+            return requested_config
+        return _deep_merge(snapshot_config, overrides) if overrides else snapshot_config
+
+    if snapshot_path is not None and snapshot_path.exists() and snapshot is None:
         raise ProductionConfigMismatchError(
-            "The explicitly requested mbzuai_production config is not marked as a production profile"
+            f"Run resolved_config.json is unreadable or invalid: {snapshot_path}"
         )
     if snapshot_config is None:
         return requested_config
@@ -631,9 +636,10 @@ def load_effective_config(
     requested_fingerprint = production_indexing_contract_fingerprint(requested_config)
     if actual_snapshot_fingerprint != requested_fingerprint:
         raise ProductionConfigMismatchError(
-            "Run indexing config does not match the explicitly requested canonical production profile "
+            "Run indexing config does not match the explicitly requested production profile "
             f"(run={actual_snapshot_fingerprint}, requested={requested_fingerprint}). "
-            "Create a fresh mbzuai_production run or use the explicit migrate-release workflow; "
+            "Create a fresh run with the requested production profile or use the explicit "
+            "migrate-release workflow; "
             "the saved run config will not silently override production."
         )
     return requested_config

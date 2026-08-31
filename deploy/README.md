@@ -77,13 +77,13 @@ must first pass the backend and indexing pre-deploy workflows. Then build and
 promote against the exact commits, publish the immutable runtime archive, set
 its S3 URI/endpoint/region/SHA/host and the expected run/bundle identity in DigitalOcean, and
 initiate the production deployment from the protected release process. A
-mismatched old archive is rejected by the serving fingerprint. The pgvector
-Droplet setup, TLS, role separation, backup policy, and release lifecycle are
-documented in [`deploy/pgvector/README.md`](pgvector/README.md). The private
-retriever receives only its encrypted read-only `PGVECTOR_DSN`; the indexing
-worker holds the separate `PGVECTOR_INGEST_DSN`. The mandatory startup query
-must verify exact database counts and execute a live nearest-neighbor query
-before `/readyz` succeeds.
+mismatched old archive is rejected by the serving fingerprint. The interim
+redesigned-site deployment uses `mbzuai_preprod_pinecone_production`; only the
+private retriever receives `PINECONE_API_KEY`, and the startup probe verifies
+every release-scoped dense namespace plus a live nearest-neighbor query before
+`/readyz` succeeds. The longer-term pgvector Droplet setup, TLS, role
+separation, backup policy, and release lifecycle remain documented in
+[`deploy/pgvector/README.md`](pgvector/README.md).
 
 The routed retriever uses thread-local provider clients, request-local
 diagnostics, immutable local indexes, and an atomic lazy graph loader. Each

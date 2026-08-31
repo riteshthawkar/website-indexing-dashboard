@@ -19,8 +19,9 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from pipeline.core.config import load_config
+from pipeline.core.config import load_config, load_effective_config
 from pipeline.retrieval import AdaptiveHybridRetriever
+from pipeline.retrieval.adaptive_hybrid import apply_vector_upload_manifest_config
 
 
 logger = logging.getLogger(__name__)
@@ -252,20 +253,27 @@ def _run_startup_probe(
         sparse_counts: Dict[str, int] = {}
     elif provider == "pinecone":
         dense_handle = vector._pinecone_index()
-        sparse_handle = vector._pinecone_sparse_index()
+        sparse_enabled = bool(str(manifest.get("sparse_index_name") or "").strip())
+        sparse_handle = vector._pinecone_sparse_index() if sparse_enabled else None
         dense_counts = _namespace_counts(
             dense_handle.describe_index_stats(timeout=operation_timeout_seconds)
         )
-        sparse_counts = _namespace_counts(
-            sparse_handle.describe_index_stats(timeout=operation_timeout_seconds)
+        sparse_counts = (
+            _namespace_counts(
+                sparse_handle.describe_index_stats(timeout=operation_timeout_seconds)
+            )
+            if sparse_handle is not None
+            else {}
         )
         for lane, namespace_value in namespaces.items():
             namespace = str(namespace_value or "").strip()
             expected_dense = int(uploaded.get(str(lane)) or 0)
             expected_sparse = int(uploaded.get(f"sparse_{lane}") or 0)
-            if not namespace or expected_dense <= 0 or dense_counts.get(namespace) != expected_dense:
+            if not namespace or int(dense_counts.get(namespace) or 0) != expected_dense:
                 raise RuntimeError(f"startup probe dense namespace count mismatch for {lane}")
-            if expected_sparse <= 0 or sparse_counts.get(namespace) != expected_sparse:
+            if sparse_enabled and (
+                int(sparse_counts.get(namespace) or 0) != expected_sparse
+            ):
                 raise RuntimeError(f"startup probe sparse namespace count mismatch for {lane}")
 
         query_vector = list(vector.embed_query(query))
@@ -283,15 +291,16 @@ def _run_startup_probe(
         )
         if not _response_items(dense_response):
             raise RuntimeError("startup probe dense query returned no matches")
-        sparse_response = sparse_handle.search(
-            namespace=chunk_namespace,
-            top_k=1,
-            inputs={"text": query},
-            fields=[],
-            timeout=operation_timeout_seconds,
-        )
-        if not _response_items(sparse_response, nested=True):
-            raise RuntimeError("startup probe sparse query returned no hits")
+        if sparse_handle is not None:
+            sparse_response = sparse_handle.search(
+                namespace=chunk_namespace,
+                top_k=1,
+                inputs={"text": query},
+                fields=[],
+                timeout=operation_timeout_seconds,
+            )
+            if not _response_items(sparse_response, nested=True):
+                raise RuntimeError("startup probe sparse query returned no hits")
     else:
         raise RuntimeError(f"startup probe vector provider is unsupported: {provider}")
 
@@ -479,7 +488,16 @@ def create_retrieval_service_app(
     bounded_concurrency = max(1, int(max_concurrency))
     bounded_timeout = max(1.0, float(request_timeout_seconds))
     bounded_queue_timeout = max(0.05, float(queue_timeout_seconds))
-    production_config = Path(config_name).stem == "mbzuai_production"
+    try:
+        config_preview = load_config(config_name)
+    except FileNotFoundError:
+        config_preview = {}
+    preview_pipeline = (
+        config_preview.get("pipeline")
+        if isinstance(config_preview.get("pipeline"), Mapping)
+        else {}
+    )
+    production_config = bool(preview_pipeline.get("production_profile", False))
     service_token = str(os.getenv("RETRIEVAL_SERVICE_TOKEN") or "")
     token_error = _service_token_error(service_token) if service_token else "is required"
     if production_config and token_error:
@@ -487,7 +505,11 @@ def create_retrieval_service_app(
     if service_token and token_error:
         raise ValueError(f"RETRIEVAL_SERVICE_TOKEN {token_error}")
     if production_config:
-        runtime_config = load_config(config_name)
+        runtime_config = load_effective_config(config_name, work_dir=resolved_work_dir)
+        runtime_config = apply_vector_upload_manifest_config(
+            runtime_config,
+            resolved_work_dir,
+        )
         vector_store_cfg = (
             runtime_config.get("vector_store")
             if isinstance(runtime_config.get("vector_store"), Mapping)

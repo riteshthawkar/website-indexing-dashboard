@@ -77,6 +77,10 @@ services:
         value: ${retriever.COMMIT_HASH}
         scope: RUN_TIME
         type: GENERAL
+      - key: EXPECTED_RETRIEVAL_CONFIG_NAME
+        value: mbzuai_preprod_pinecone_production
+        scope: RUN_TIME
+        type: GENERAL
       - key: EXPECTED_RETRIEVAL_RUN_ID
         value: CHANGE_ME_TO_PROMOTED_RUN_ID
         scope: RUN_TIME
@@ -230,15 +234,15 @@ services:
         scope: RUN_TIME
         type: GENERAL
       - key: PIPELINE_CONFIG
-        value: mbzuai_production
+        value: mbzuai_preprod_pinecone_production
         scope: RUN_TIME
         type: GENERAL
       - key: GOOGLE_API_KEY
         value: CHANGE_ME_IN_DIGITALOCEAN
         scope: RUN_TIME
         type: SECRET
-      - key: PGVECTOR_DSN
-        value: CHANGE_ME_TO_READ_ONLY_PRIVATE_PGVECTOR_DSN_WITH_SSLMODE
+      - key: PINECONE_API_KEY
+        value: CHANGE_ME_TO_VALID_PINECONE_API_KEY
         scope: RUN_TIME
         type: SECRET
       - key: RELEASE_COMMIT_SHA

@@ -18,6 +18,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Tuple
 
 from pipeline.core.config import (
     indexing_implementation_hashes,
+    load_config,
     load_effective_config,
     production_indexing_contract_fingerprint,
     production_serving_contract_fingerprint,
@@ -61,7 +62,7 @@ DEFAULT_RELEASE_ANSWER_GATES = (
     PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.multilingual_v2_release.json"
 )
 LEGACY_ONLY_VALIDATION_PLUGINS = {"mbzuai_legacy_vectorstores", "mbzuai_legacy_pinecone"}
-RELEASE_MUTATING_VALIDATION_PLUGINS = {"gemini_pgvector"}
+RELEASE_MUTATING_VALIDATION_PLUGINS = {"gemini_pgvector", "gemini_pinecone"}
 ReleaseProgressCallback = Callable[[str, Mapping[str, Any]], None]
 PROMOTION_ATTESTATION_SCHEMA_VERSION = 1
 PROMOTION_ATTESTATION_MAX_AGE_SECONDS = 120.0
@@ -278,8 +279,13 @@ def build_promotion_attestation_evidence(
         raise ValueError("promotion release manifest has not passed its gates")
     if manifest.get("promoted") is True or manifest.get("promotion_attestation"):
         raise ValueError("promotion release manifest already contains promotion evidence")
-    if Path(str(manifest.get("config_name") or "")).stem != "mbzuai_production":
-        raise ValueError("promotion attestation evidence is only valid for mbzuai_production")
+    manifest_config_name = str(manifest.get("config_name") or "").strip()
+    try:
+        manifest_config = load_config(manifest_config_name)
+    except (FileNotFoundError, ValueError) as exc:
+        raise ValueError("promotion release manifest config is missing or invalid") from exc
+    if not bool((manifest_config.get("pipeline") or {}).get("production_profile", False)):
+        raise ValueError("promotion attestation evidence requires a production profile")
 
     retriever_commit = str(expected_retriever_commit_sha or "").strip().lower()
     backend_commit = str(expected_backend_commit_sha or "").strip().lower()
@@ -307,8 +313,10 @@ def build_promotion_attestation_evidence(
 
     if retriever_attestation.get("ready") is not True:
         raise ValueError("retriever-candidate is not ready")
-    if str(retriever_attestation.get("config_name") or "") != "mbzuai_production":
-        raise ValueError("retriever-candidate is not running mbzuai_production")
+    if str(retriever_attestation.get("config_name") or "") != manifest_config_name:
+        raise ValueError(
+            "retriever-candidate is not running the release manifest config"
+        )
     retriever_field_map = {
         "run_id": "run_id",
         "retriever_commit_sha": "commit_sha",
