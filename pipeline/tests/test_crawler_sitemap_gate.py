@@ -279,6 +279,33 @@ def test_completion_gate_rejects_pending_or_unmapped_inventory_urls():
     assert crawler.stats["seed_inventory_urls_unmapped"] == 1
 
 
+def test_completion_gate_requires_successful_priority_seeds():
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.config = {"require_complete_priority_seeds": True}
+    crawler.max_pages = 100
+    crawler.crawl_state = {"pending": []}
+    crawler.seed_inventory = {"urls": []}
+    crawler.dynamic_collection_inventory = {"urls": []}
+    crawler.priority_seed_urls = [
+        "https://preprod.mbzuai.ac.ae/captured",
+        "https://preprod.mbzuai.ac.ae/failed",
+        "https://preprod.mbzuai.ac.ae/unmapped",
+    ]
+    crawler.url_mapping = {
+        "https://preprod.mbzuai.ac.ae/captured": "/tmp/captured.html",
+        "https://preprod.mbzuai.ac.ae/failed": "SKIPPED_HTTP_500",
+    }
+    crawler.stats = {}
+
+    errors = crawler._crawl_completion_errors()
+
+    assert len(errors) == 2
+    assert "unmapped=1" in errors[0]
+    assert "failed=1" in errors[1]
+    assert crawler.stats["priority_seed_urls_unmapped"] == 1
+    assert crawler.stats["priority_seed_urls_failed"] == 1
+
+
 def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     crawler = crawler_module.Crawl4AICrawler()
     crawler.stats = {"pages_failed": 0, "skipped_urls": 0}

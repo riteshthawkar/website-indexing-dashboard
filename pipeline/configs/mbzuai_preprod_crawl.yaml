@@ -31,6 +31,7 @@ crawler:
   fail_on_empty_result: true
   fail_on_incomplete_frontier: true
   require_complete_seed_inventory: true
+  require_complete_priority_seeds: true
   require_https: true
   ignore_https_errors: false
 
@@ -202,13 +203,12 @@ crawler:
     - "https://preprod.mbzuai.ac.ae/"
     - "https://preprod.mbzuai.ac.ae/ar"
     - "https://preprod.mbzuai.ac.ae/about-us"
-    - "https://preprod.mbzuai.ac.ae/about-us/office-the-president"
+    - "https://preprod.mbzuai.ac.ae/office-the-president"
     - "https://preprod.mbzuai.ac.ae/about-us/leadership"
     - "https://preprod.mbzuai.ac.ae/about-us/contact-us"
     - "https://preprod.mbzuai.ac.ae/research"
     - "https://preprod.mbzuai.ac.ae/research/our-divisions"
     - "https://preprod.mbzuai.ac.ae/research/projects-hub"
-    - "https://preprod.mbzuai.ac.ae/study"
     - "https://preprod.mbzuai.ac.ae/study/undergraduate-program"
     - "https://preprod.mbzuai.ac.ae/study/msc-programs"
     - "https://preprod.mbzuai.ac.ae/study/phd-programs"

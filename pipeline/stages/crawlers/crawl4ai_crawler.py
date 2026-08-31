@@ -2555,6 +2555,20 @@ class Crawl4AICrawler(CrawlerStage):
             for normalized in [_normalize_http_url(value)]
             if normalized
         }
+        priority_urls = {
+            normalized
+            for value in (getattr(self, "priority_seed_urls", []) or [])
+            for normalized in [_normalize_http_url(value)]
+            if normalized
+        }
+        unmapped_priority_urls = sorted(priority_urls - mapped_urls)
+        failed_priority_urls = sorted(
+            url
+            for url in priority_urls & mapped_urls
+            if str((getattr(self, "url_mapping", {}) or {}).get(url) or "").startswith(
+                "SKIPPED"
+            )
+        )
         unmapped_inventory_urls = sorted(inventory_urls - mapped_urls)
         dynamic_inventory_urls = {
             normalized
@@ -2580,6 +2594,8 @@ class Crawl4AICrawler(CrawlerStage):
             )
         )
         self.stats["frontier_pending_remaining"] = len(pending)
+        self.stats["priority_seed_urls_unmapped"] = len(unmapped_priority_urls)
+        self.stats["priority_seed_urls_failed"] = len(failed_priority_urls)
         self.stats["seed_inventory_urls_unmapped"] = len(unmapped_inventory_urls)
         self.stats["dynamic_collection_urls_unmapped"] = len(unmapped_dynamic_urls)
         self.stats["dynamic_collection_urls_failed"] = len(failed_dynamic_urls)
@@ -2590,6 +2606,19 @@ class Crawl4AICrawler(CrawlerStage):
                 "Crawler frontier is incomplete after reaching a terminal condition: "
                 f"pending={len(pending)} max_pages={self.max_pages}"
             )
+        if bool(self.config.get("require_complete_priority_seeds", False)):
+            if unmapped_priority_urls:
+                errors.append(
+                    "Priority seed URLs have no durable crawl outcome: "
+                    f"unmapped={len(unmapped_priority_urls)} "
+                    f"sample={unmapped_priority_urls[:10]}"
+                )
+            if failed_priority_urls:
+                errors.append(
+                    "Priority seed URLs were not successfully captured: "
+                    f"failed={len(failed_priority_urls)} "
+                    f"sample={failed_priority_urls[:10]}"
+                )
         if unmapped_inventory_urls and bool(
             self.config.get("require_complete_seed_inventory", False)
         ):
