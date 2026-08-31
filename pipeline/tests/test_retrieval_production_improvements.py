@@ -3424,6 +3424,65 @@ def test_evidence_pack_scopes_single_required_page_even_for_aggregation_intent()
     assert [item["source_url"] for item in pack["items"]] == [target_url]
 
 
+@pytest.mark.parametrize(
+    ("query", "relation_text", "expected_label"),
+    [
+        (
+            'Who is the speaker for the talk titled "Applying Image Analysis & AI to Cancer & Metabolic Syndrome"?',
+            "### Applying Image Analysis & AI to Cancer & Metabolic Syndrome\n* Sir Michael Brady - Emeritus Professor",
+            "Sir Michael Brady",
+        ),
+        (
+            "Who is the upcoming MBZUAI Nexus Speaker Series talk by Xiang Meng hosted by?",
+            "Xiang Meng\nResearch Scientist\nHost:\n[Prof. Marcos Matabuena](https://mbzuai.ac.ae/study/faculty/marcos-matabuena/)",
+            "Prof. Marcos Matabuena",
+        ),
+    ],
+)
+def test_evidence_pack_reserves_contiguous_person_relation_chunk(
+    query,
+    relation_text,
+    expected_label,
+):
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    target_url = "https://ai-nexus.mbzuai.ac.ae/example-talk"
+    result = {
+        "fact_documents": [
+            {
+                "id": f"generic-fact-{index}",
+                "text": f"Generic event fact {index} about the MBZUAI Nexus Speaker Series.",
+                "source_url": target_url,
+            }
+            for index in range(5)
+        ],
+        "retrieval_documents": [
+            {
+                "id": "chunk:c650:document-revision:event:00001:relation",
+                "text": (
+                    "TITLE: Example talk\nTYPE: webpage\nSECTION: Event\n"
+                    f"SOURCE_URL: {target_url}\n\n{relation_text}"
+                ),
+                "source_url": target_url,
+            }
+        ],
+    }
+
+    pack = build_evidence_pack(
+        query=query,
+        result=result,
+        coverage_plan={"intent": "exact_fact", "required_pages": [target_url]},
+        max_items=4,
+        max_chars=3000,
+        max_per_source=2,
+    )
+
+    assert any(
+        item["kind"] == "chunk" and expected_label in item["text"]
+        for item in pack["items"]
+    )
+
+
 def test_confidence_counts_official_authority_class_for_backfilled_spans():
     from pipeline.retrieval.evidence_packer import score_retrieval_confidence
 

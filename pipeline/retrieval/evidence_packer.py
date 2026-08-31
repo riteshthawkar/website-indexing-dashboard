@@ -1210,6 +1210,11 @@ def build_evidence_pack(
     max_per_source = max(1, int(max_per_source or 2))
     explicit_media_query = _is_explicit_media_query(query)
     structured_detail_query = bool(_MULTI_DETAIL_QUERY_RE.search(str(query or "")))
+    normalized_query = str(query or "").casefold()
+    relational_person_query = bool(
+        re.search(r"\b(?:who|whom)\b", normalized_query)
+        and re.search(r"\b(?:speaker|host|hosted|hosting)\b", normalized_query)
+    )
 
     seen_keys = set()
     source_counts: Dict[str, int] = {}
@@ -1333,7 +1338,7 @@ def build_evidence_pack(
                 query=query,
                 max_chars=item_char_limit,
             )
-        elif kind == "chunk" and _MULTI_DETAIL_QUERY_RE.search(str(query or "")):
+        elif kind == "chunk" and (structured_detail_query or relational_person_query):
             # A complete structured block is safer than a short extracted span,
             # but sending a full page chunk adds latency and the answer runtime
             # may prefix-truncate it again. Preserve a bounded, query-dense
@@ -1453,6 +1458,68 @@ def build_evidence_pack(
         for _score, kind, doc in candidates:
             if kind == "assertion":
                 _append_candidate(kind, doc)
+                break
+
+    if relational_person_query and not explicit_media_query:
+        # A person/role relation is often represented most faithfully in the
+        # contiguous event card (title + Speaker/Host + linked person). Tiny
+        # extracted facts can retain only the person's bare name while higher-
+        # prior generic spans consume the per-page cap. Reserve the best leaf
+        # that carries the relation before those fragments are selected.
+        generic_relation_terms = {
+            "mbzuai",
+            "nexus",
+            "series",
+            "talk",
+            "titled",
+            "upcoming",
+            "speaker",
+            "host",
+            "hosted",
+            "hosting",
+            "who",
+            "whom",
+        }
+        specific_terms = _query_terms(query) - generic_relation_terms
+        asks_for_host = bool(re.search(r"\b(?:host|hosted|hosting)\b", normalized_query))
+        for _score, kind, doc in candidates:
+            if kind != "chunk" or not _doc_id(doc).startswith("chunk:"):
+                continue
+            if required_page_set and not _candidate_matches_any_required_page(doc):
+                continue
+            metadata = _doc_metadata(doc)
+            # Keep the original line structure while removing representation
+            # headers. ``_doc_text`` intentionally collapses whitespace, which
+            # would make a leading TITLE header consume the entire event card.
+            raw_text = str(
+                doc.get("text")
+                or doc.get("value")
+                or metadata.get("context")
+                or ""
+            )
+            body_text = "\n".join(
+                line
+                for line in raw_text.splitlines()
+                if not re.match(
+                    r"^\s*(?:TITLE|TYPE|SECTION|SOURCE_URL|PARENT_TYPE)\s*:",
+                    line,
+                    flags=re.IGNORECASE,
+                )
+            ).casefold()
+            body_terms = _query_terms(body_text)
+            relation_present = (
+                bool(re.search(r"\bhost\s*:", body_text))
+                if asks_for_host
+                else (
+                    bool(re.search(r"\bspeaker\b", body_text))
+                    or (
+                        bool(specific_terms)
+                        and len(specific_terms & body_terms)
+                        >= min(3, len(specific_terms))
+                    )
+                )
+            )
+            if relation_present and _append_candidate(kind, doc):
                 break
 
     for required_page in required_pages:
