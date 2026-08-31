@@ -31,6 +31,10 @@ _DESCRIPTIVE_APPLY_RE = re.compile(
     r"\b(?:requirements?|rules?|conditions?|policies|fees?)\s+apply\s+to\b",
     flags=re.IGNORECASE,
 )
+_TITLED_APPLY_RE = re.compile(
+    r"\b(?:titled|called|named)\s+[\"'“‘][^\"'”’]{0,180}\bapply(?:ing)?\b",
+    flags=re.IGNORECASE,
+)
 
 
 def admissions_workflow_audience(query: Any) -> str:
@@ -43,6 +47,10 @@ def admissions_workflow_audience(query: Any) -> str:
     if workflow_match.group(0).casefold() == "apply" and _DESCRIPTIVE_APPLY_RE.search(text):
         # “Requirements apply to undergraduate applicants” describes scope;
         # it is not a request to perform the application workflow.
+        return ""
+    if workflow_match.group(0).casefold() in {"apply", "applying"} and _TITLED_APPLY_RE.search(text):
+        # A work, event, or talk title such as “Applying Image Analysis …” is
+        # content identity, not an instruction to enter the admissions flow.
         return ""
     if re.search(r"\b(?:undergraduate|bachelor|bsc|b\.sc)\b|(?:البكالوريوس|الجامعية)", text):
         return "undergraduate"

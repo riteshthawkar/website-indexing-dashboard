@@ -37,13 +37,19 @@ _EXPLICIT_MEDIA_QUERY_RE = re.compile(
     r"screenshot|visual|workflow|framework|pdf)\b"
     r"|\b(?:shown|displayed|visible|pictured)\s+(?:in|on)\s+(?:the\s+)?(?:form|portal|page)\b"
     r"|(?:صورة|الصورة|صور|مخطط|المخطط|رسم|الشكل|خريطة|الخريطة|إنفوغراف|الإنفوغراف|"
-    r"جدول|الجدول|لقطة شاشة|سير العمل|إطار|الإطار)",
+    r"جدول|الجدول|لقطة شاشة|سير العمل|إطار|الإطار|لوحة|اللوحة)",
     re.IGNORECASE,
 )
 
 
 def _is_explicit_media_query(query: str) -> bool:
-    return bool(_EXPLICIT_MEDIA_QUERY_RE.search(str(query or "")))
+    intent_text = re.sub(
+        r"\b(?:titled|called|named)\s+[\"'“‘][^\"'”’]{0,240}[\"'”’]",
+        " ",
+        str(query or ""),
+        flags=re.IGNORECASE,
+    )
+    return bool(_EXPLICIT_MEDIA_QUERY_RE.search(intent_text))
 
 
 def _extract_official_source_url_from_text(*values: Any) -> str:
@@ -585,18 +591,44 @@ def _query_dense_excerpt(value: Any, query: str, limit: int) -> str:
     if not positions:
         return _truncate_text(text, limit)
 
+    query_lower = _clean_text(query).casefold()
+    facet_phrases: List[str] = []
+    if re.search(r"\b(?:experience|required experience|how much experience)\b|(?:خبرة|الخبرة|الخبرات)", query_lower):
+        facet_phrases.extend(("professional experience required", "experience required", "at least"))
+    if re.search(r"\b(?:qualification|qualifications|degree|required and preferred|preferred)\b|(?:المؤهل|المؤهلات)", query_lower):
+        facet_phrases.extend(
+            (
+                "academic qualifications required",
+                "strongly preferred",
+                "preferred but not mandatory",
+                "minimum 8+ years",
+                "certified irb professional",
+            )
+        )
+    facet_positions = [
+        position
+        for phrase in facet_phrases
+        if (position := normalized.find(phrase)) >= 0
+    ]
+    positions.extend(facet_positions)
+
     best: tuple[int, int, int, int] | None = None
     best_bounds = (0, limit)
     leading_context = min(320, max(100, limit // 4))
     for position in positions:
-        window_start = max(0, position - leading_context)
+        is_facet_anchor = position in facet_positions
+        anchor_context = min(180, leading_context) if is_facet_anchor else leading_context
+        window_start = max(0, position - anchor_context)
         window_end = min(len(text), window_start + limit)
         window_start = max(0, window_end - limit)
         window = normalized[window_start:window_end]
         matched_terms = {term for term in terms if term.casefold() in window}
         # Prefer broad concept coverage, then more specific/longer concepts.
         # Earlier positions are only a final deterministic tie-breaker.
+        matched_facets = {phrase for phrase in facet_phrases if phrase in window}
         score = (
+            len(matched_facets),
+            sum(len(phrase) for phrase in matched_facets),
             len(matched_terms),
             sum(len(term) for term in matched_terms),
             -abs(position - (window_start + leading_context)),

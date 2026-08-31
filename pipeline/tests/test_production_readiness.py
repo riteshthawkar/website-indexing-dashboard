@@ -11113,6 +11113,21 @@ class TestAdaptiveHybridRetriever:
         assert classify_query_mode("Whose name does MBZUAI carry?") == QueryMode.FACT
         assert classify_query_mode("In which city is MBZUAI based?") == QueryMode.FACT
         assert classify_query_mode(
+            "Which MBZUAI careers page section lists vacancies for the Computing and Mathematical Sciences Division?"
+        ) == QueryMode.FACT
+        assert classify_query_mode(
+            "Who is the upcoming MBZUAI Nexus Speaker Series talk by Xiang Meng hosted by?"
+        ) == QueryMode.FACT
+        assert classify_query_mode(
+            'Who is the speaker for the MBZUAI Nexus talk titled "Applying Image Analysis & AI to Cancer & Metabolic Syndrome"?'
+        ) == QueryMode.FACT
+        assert classify_query_mode("What does the Digital Twin Lab create?") == QueryMode.FACT
+        assert classify_query_mode("أين سيُعقد GITEX GLOBAL 2025 المذكور في الصفحة؟") == QueryMode.FACT
+        assert classify_query_mode(
+            "ما الفكرة الأساسية التي يشرحها ملخص فعالية «Physical AI and the Intelligence of Things»؟"
+        ) == QueryMode.FACT
+        assert classify_query_mode("أي نموذج مذكور في لوحة مشاريع البحث؟") == QueryMode.SCOPED
+        assert classify_query_mode(
             "ما عنوان البريد الإلكتروني الذي ينبغي التواصل معه بشأن متطلبات إمكانية الوصول قبل زيارة جامعة محمد بن زايد للذكاء الاصطناعي؟"
         ) == QueryMode.FACT
         assert classify_query_mode("What five core AI specializations does MBZUAI offer in its M.Sc. and Ph.D. programs?") == QueryMode.SCOPED

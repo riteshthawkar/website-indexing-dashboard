@@ -19,6 +19,9 @@ def test_non_admissions_apply_language_does_not_force_admissions_pages():
         "Who can apply for onsite access to the MBZUAI Library?"
     ) == ""
     assert canonical_admissions_marker("How do I apply for an MBZUAI job vacancy?") == ""
+    assert canonical_admissions_marker(
+        'Who speaks at the MBZUAI Nexus talk titled "Applying Image Analysis & AI to Cancer"?'
+    ) == ""
 
 
 def test_evergreen_workflow_penalizes_news_but_time_bound_question_does_not():

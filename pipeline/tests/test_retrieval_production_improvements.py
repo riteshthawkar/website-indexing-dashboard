@@ -8337,6 +8337,55 @@ def test_arabic_nonvisual_fact_query_does_not_route_to_the_media_lane():
     assert _is_media_query("ما متطلبات القبول في برنامج الماجستير؟") is False
 
 
+def test_quoted_image_analysis_talk_title_does_not_route_to_media_lane():
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+
+    assert _is_media_query(
+        'Who is the speaker for the talk titled "Applying Image Analysis & AI to Cancer"?'
+    ) is False
+
+
+def test_arabic_project_board_routes_to_media_lane():
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+
+    assert _is_media_query("أي نموذج مذكور في لوحة مشاريع البحث؟") is True
+
+
+def test_digital_twin_required_page_distinguishes_research_from_publications():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    assert retriever._explicit_required_page_markers("What does the Digital Twin Lab create?") == [
+        "/researches/digital-twin-lab"
+    ]
+    assert retriever._explicit_required_page_markers(
+        "Which publication on the Digital Twin Lab page is about optical flow?"
+    ) == ["/publications/digital-twin-lab"]
+
+
+def test_deictic_context_page_must_exist_in_frozen_corpus():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._coverage_page_records_by_url = {
+        "https://research.mbzuai.ac.ae/meet-us": {
+            "source_url": "https://research.mbzuai.ac.ae/meet-us"
+        }
+    }
+    retriever._coverage_page_records = list(retriever._coverage_page_records_by_url.values())
+
+    assert retriever._context_page_for_query(
+        "أين سيُعقد الحدث المذكور في الصفحة؟",
+        "https://research.mbzuai.ac.ae/meet-us/",
+    ) == "https://research.mbzuai.ac.ae/meet-us"
+    assert retriever._context_page_for_query(
+        "Where is MBZUAI?", "https://research.mbzuai.ac.ae/meet-us"
+    ) == ""
+    assert retriever._context_page_for_query(
+        "What is mentioned on this page?", "https://evil.example/page"
+    ) == ""
+
+
 def test_arabic_academic_qualification_query_adds_english_retrieval_aliases():
     from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
 

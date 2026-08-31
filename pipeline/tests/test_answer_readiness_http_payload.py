@@ -9,6 +9,7 @@ from pipeline.evaluation.answer_readiness import (
     _build_judge_prompt,
     _chat_prediction_row_from_payload,
     _forbidden_term_present,
+    _eval_context_referrer,
     _looks_like_no_answer,
     _post_chat_request,
     _required_term_supported,
@@ -108,6 +109,24 @@ def test_http_answer_prediction_sends_dataset_language_and_protocol(monkeypatch)
     assert captured["payload"]["language"] == "Arabic"
     assert captured["payload"]["protocol_version"] == "1.0"
     assert row["language"] == "Arabic"
+
+
+def test_answer_readiness_supplies_referrer_only_for_page_deictic_examples():
+    deictic = EvalExample(
+        id="deictic",
+        query="What is the main point on this page?",
+        query_type="fact",
+        metadata={"required_pages": ["https://metaverse.mbzuai.ac.ae/press/example"]},
+    )
+    ordinary = EvalExample(
+        id="ordinary",
+        query="What is the main point of the project?",
+        query_type="fact",
+        metadata={"required_pages": ["https://metaverse.mbzuai.ac.ae/press/example"]},
+    )
+
+    assert _eval_context_referrer(deictic) == "https://metaverse.mbzuai.ac.ae/press/example"
+    assert _eval_context_referrer(ordinary) == ""
 
 
 def test_arabic_answer_matching_normalizes_diacritics_digits_and_articles():

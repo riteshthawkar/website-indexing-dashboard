@@ -799,6 +799,8 @@ _VISUAL_INTENT_TOKENS = {
     "الإطار",
     "إطار",
     "لقطة",
+    "لوحة",
+    "اللوحة",
 }
 
 _EXPLICIT_VISUAL_QUERY_TOKENS = {
@@ -852,6 +854,8 @@ _EXPLICIT_VISUAL_QUERY_TOKENS = {
     "الإطار",
     "إطار",
     "لقطة",
+    "لوحة",
+    "اللوحة",
 }
 
 _MEDIA_PRIORITY_TOKENS = {
@@ -2739,7 +2743,16 @@ def _rrf_merge(rankings: Sequence[Sequence[str]], *, k: int = 60) -> List[Tuple[
 
 
 def _is_media_query(query: str) -> bool:
-    query_tokens = set(_tokenize(query))
+    # Do not treat a visual-domain word inside a quoted work/event title as a
+    # request to inspect an image. For example, “the talk titled \"Applying
+    # Image Analysis …\"” is an exact event lookup, not a media query.
+    intent_text = re.sub(
+        r"\b(?:titled|called|named)\s+[\"'“‘][^\"'”’]{0,240}[\"'”’]",
+        " ",
+        str(query or ""),
+        flags=re.IGNORECASE,
+    )
+    query_tokens = set(_tokenize(intent_text))
     if not query_tokens:
         return False
     if query_tokens & _EXPLICIT_VISUAL_QUERY_TOKENS:
@@ -3006,8 +3019,17 @@ def _semantic_query_alias_tokens(query: str) -> List[str]:
 
 def classify_query_mode(query: str) -> QueryMode:
     normalized = _clean_text(query).lower()
+    intent_normalized = _clean_text(
+        re.sub(
+            r"\b(?:titled|called|named)\s+[\"'“‘][^\"'”’]{0,240}[\"'”’]",
+            " ",
+            str(query or ""),
+            flags=re.IGNORECASE,
+        )
+    ).lower()
     words = normalized.split()
     query_tokens = set(_tokenize(query))
+    intent_tokens = set(_tokenize(intent_normalized))
     lookup_profile = _lookup_query_profile(query)
     broad_terms = {
         "explain",
@@ -3030,7 +3052,6 @@ def classify_query_mode(query: str) -> QueryMode:
         "process",
         "اشرح",
         "لخص",
-        "ملخص",
         "نظرة عامة",
         "نظرة شاملة",
         "قارن",
@@ -3038,6 +3059,20 @@ def classify_query_mode(query: str) -> QueryMode:
         "صف",
         "بالتفصيل",
     }
+    broad_query = any(
+        (
+            term in intent_tokens
+            if " " not in term
+            else bool(
+                re.search(
+                    rf"(?<!\w){re.escape(term)}(?!\w)",
+                    intent_normalized,
+                    flags=re.IGNORECASE,
+                )
+            )
+        )
+        for term in broad_terms
+    )
     synthesis_topic_terms = {
         "location",
         "parking",
@@ -3071,6 +3106,9 @@ def classify_query_mode(query: str) -> QueryMode:
         "what is ",
         "what are ",
         "what was ",
+        "what does ",
+        "what do ",
+        "how does ",
         "من ",
         "متى ",
         "أين ",
@@ -3080,6 +3118,8 @@ def classify_query_mode(query: str) -> QueryMode:
         "ما هي ",
         "كم ",
         "هل ",
+        "أي ",
+        "اي ",
     )
     narrow_fact_terms = {
         "address",
@@ -3118,25 +3158,24 @@ def classify_query_mode(query: str) -> QueryMode:
         return QueryMode.SCOPED
     if _requested_role_subtypes(query):
         return QueryMode.FACT
-    if lookup_profile.is_exact_lookup and len(words) <= 32 and not any(term in normalized for term in broad_terms):
+    if lookup_profile.is_exact_lookup and len(words) <= 32 and not broad_query:
         return QueryMode.FACT
-    if fact_phrase and len(words) <= 18 and not any(term in normalized for term in broad_terms):
+    if fact_phrase and len(words) <= 18 and not broad_query:
         return QueryMode.FACT
-    if len(words) <= 12 and normalized.startswith(fact_starts) and not any(term in normalized for term in broad_terms) and not scoped_anchor:
+    if len(words) <= 12 and normalized.startswith(fact_starts) and not broad_query and not scoped_anchor:
         return QueryMode.FACT
     if (
-        len(words) <= 18
+        len(words) <= 28
         and normalized.startswith(fact_starts)
-        and not any(term in normalized for term in broad_terms)
+        and not broad_query
         and not scoped_anchor
-        and bool(query_tokens & narrow_fact_terms)
     ):
         return QueryMode.FACT
     if scoped_legal_relation:
         return QueryMode.SCOPED
     if scoped_anchor and len(words) <= 22:
         return QueryMode.SCOPED
-    if len(words) >= 14 or any(term in normalized for term in broad_terms):
+    if len(words) >= 14 or broad_query:
         return QueryMode.SYNTHESIS
     return QueryMode.SCOPED
 
@@ -4564,6 +4603,18 @@ class AdaptiveHybridRetriever:
         if not query_tokens or not text:
             return 0.0
         bonus = 0.0
+        query_years = set(re.findall(r"\b20\d{2}\b", normalized_query))
+        if query_years:
+            media_years = set(re.findall(r"\b20\d{2}\b", text))
+            if query_years & media_years:
+                bonus += 3.2
+            elif media_years:
+                bonus -= 2.8
+        page_match = re.search(r"\bpage\s+(\d{1,3})\b", normalized_query)
+        if page_match:
+            page_number = page_match.group(1)
+            if re.search(rf"\b(?:page|pdf[_ ]page)\s*[:#-]?\s*{re.escape(page_number)}\b", text):
+                bonus += 2.6
         if {"which", "labelled", "labeled"} & query_tokens and {"facility", "facilities"} & query_tokens:
             comma_count = text.count(",")
             bonus += min(comma_count * 0.12, 0.84)

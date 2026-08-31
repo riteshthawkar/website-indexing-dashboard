@@ -1065,6 +1065,17 @@ class RoutedHybridRetriever:
             "coverage_status": coverage_status,
         }
 
+    def _context_page_for_query(self, query: str, context_page_url: str | None) -> str:
+        if not context_page_url or not re.search(
+            r"\b(?:this|that)\s+(?:page|article|form)\b|\bmentioned\s+(?:in|on)\s+the\s+page\b|"
+            r"(?:هذه الصفحة|الصفحة المذكورة|المذكور في الصفحة|الواردة في هذه الصفحة)",
+            str(query or ""),
+            flags=re.IGNORECASE,
+        ):
+            return ""
+        page = self._coverage_page_record_for_url(context_page_url)
+        return str((page or {}).get("source_url") or "").strip()
+
     def _evidence_budget_for_plan(self, coverage_plan: Dict[str, Any]) -> tuple[int, int, int]:
         intent = str((coverage_plan or {}).get("intent") or "")
         if intent == "multi_page_aggregation":
@@ -1598,6 +1609,10 @@ class RoutedHybridRetriever:
                 continue
             if any(token in lowered.split() for token in ("mbzuai", "phd", "msc", "master", "doctor")):
                 continue
+            if lowered.endswith((" lab", " laboratory", " center", " centre")):
+                # Capitalized research-unit names satisfy the loose person-name
+                # regex but must never create synthetic faculty-profile routes.
+                continue
             names.append(cleaned)
         return list(dict.fromkeys(names))
 
@@ -1883,7 +1898,10 @@ class RoutedHybridRetriever:
         if "meta wall" in lower and re.search(r"\b(?:gpu|uses?|metaverse center)\b", lower):
             markers.append("https://metaverse.mbzuai.ac.ae/studio")
         if "digital twin lab" in lower:
-            markers.append("/publications/digital-twin-lab")
+            if re.search(r"\b(?:publication|publications|paper|papers|article|articles)\b", lower):
+                markers.append("/publications/digital-twin-lab")
+            else:
+                markers.append("/researches/digital-twin-lab")
         if "mbzuai latest publications" in lower:
             markers.append("/mbzuai-scopus")
         if "news on ai and technology" in lower:
@@ -3166,9 +3184,14 @@ class RoutedHybridRetriever:
         skip_query_planner: bool = False,
         navigation_context: Mapping[str, Any] | None = None,
         original_query: str | None = None,
+        context_page_url: str | None = None,
     ) -> Dict[str, Any]:
         routing_started = time.perf_counter()
         coverage_query = str(original_query or "").strip() or query
+        resolved_context_page = self._context_page_for_query(
+            coverage_query,
+            context_page_url,
+        )
         mode = classify_query_mode(coverage_query)
         media_query = _is_media_query(coverage_query)
         unsupported_reason = self._unsupported_intent_reason(coverage_query)
@@ -3446,6 +3469,10 @@ class RoutedHybridRetriever:
             payload["query_embedding_error"] = payload.get("query_embedding_error") or query_embedding_error
         payload["graph_context_latency_ms"] = graph_context_latency_ms
         payload["graph_augment_latency_ms"] = graph_augment_latency_ms
+        if resolved_context_page:
+            payload["required_pages"] = [resolved_context_page]
+            payload["required_pages_source"] = "current_page_context"
+            payload["context_page_url"] = resolved_context_page
         if graph_error:
             payload["routing_graph_error"] = graph_error
         confidence, factors = score_retrieval_confidence(payload)

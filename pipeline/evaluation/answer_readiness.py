@@ -2089,6 +2089,24 @@ def _chat_prediction_row_from_payload(
     }
 
 
+def _eval_context_referrer(example: EvalExample) -> str:
+    """Simulate the widget's parent-page referrer for page-deictic cases only."""
+
+    if not re.search(
+        r"\b(?:this|that)\s+(?:page|article|form)\b|\bmentioned\s+(?:in|on)\s+the\s+page\b|"
+        r"(?:هذه الصفحة|الصفحة المذكورة|المذكور في الصفحة|الواردة في هذه الصفحة)",
+        str(example.query or ""),
+        flags=re.IGNORECASE,
+    ):
+        return ""
+    required_pages = (example.metadata or {}).get("required_pages") or []
+    for value in required_pages:
+        candidate = str(value or "").strip()
+        if candidate.startswith(("https://", "http://")):
+            return candidate
+    return ""
+
+
 def _post_chat_request(
     *,
     endpoint: str,
@@ -2109,6 +2127,9 @@ def _post_chat_request(
         "conversation_turn": 1,
         "device_type": "release-check",
     }
+    context_referrer = _eval_context_referrer(example)
+    if context_referrer:
+        payload["referrer"] = context_referrer
     resolved_widget_key = _resolve_widget_key(widget_key)
     if resolved_widget_key:
         payload["widget_key"] = resolved_widget_key
@@ -2198,6 +2219,9 @@ async def _websocket_chat_request_async(
         "conversation_turn": 1,
         "device_type": "release-check",
     }
+    context_referrer = _eval_context_referrer(example)
+    if context_referrer:
+        payload["referrer"] = context_referrer
     resolved_widget_key = _resolve_widget_key(widget_key)
     if resolved_widget_key:
         payload["widget_key"] = resolved_widget_key
