@@ -3854,6 +3854,48 @@ def test_required_page_span_backfill_clears_stale_abstention():
     assert payload["selected_evidence_span_ids"] == ["ai-reach-purpose"]
 
 
+def test_required_page_backfill_cannot_clear_premise_grounding_abstention():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    target_url = "https://mbzuai.ac.ae/campus-community/campus-facilities"
+    retriever.vector = SimpleNamespace(
+        evidence_span_map={
+            "masdar-shuttle": {
+                "id": "masdar-shuttle",
+                "text": "The Masdar City campus provides a shuttle service.",
+                "source_url": target_url,
+                "linked_chunk_ids": ["chunk-masdar-shuttle"],
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    payload = {
+        "abstained": True,
+        "premise_grounding_required": True,
+        "verification_status": "abstained",
+        "adjudication_method": "heuristic",
+        "adjudication_reason": "presupposed_entity_or_scope_not_supported",
+        "selected_evidence_span_ids": [],
+        "selected_chunk_ids": [],
+        "evidence_span_documents": [],
+        "retrieval_documents": [],
+    }
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query="What is the shuttle timetable for MBZUAI's Mars research campus?",
+        payload=payload,
+        coverage_plan={"required_pages": [target_url]},
+    )
+
+    assert changed is False
+    assert payload["abstained"] is True
+    assert payload["verification_status"] == "abstained"
+    assert payload["adjudication_reason"] == "presupposed_entity_or_scope_not_supported"
+    assert payload["selected_evidence_span_ids"] == []
+    assert payload["retrieval_documents"] == []
+
+
 def test_required_page_fact_backfill_injects_exact_faq_admissions_contact():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

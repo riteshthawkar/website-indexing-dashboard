@@ -158,19 +158,28 @@ def extract_premise_requirements(
         )
         if cleaned:
             requirements.append(cleaned)
-    for match in re.finditer(
-        r"(برنامج)\s+(.+?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
-        text,
-        flags=re.IGNORECASE,
-    ):
-        cleaned = _clean_requirement(
-            f"{match.group(2)} {match.group(1)}",
-            preserve={"برنامج"},
+    arabic_academic_program_context = bool(
+        re.search(
+            r"(?:متطلبات|شروط)\s+القبول|(?:التقديم|الالتحاق|الدراسة)\s+(?:في|بـ?)|"
+            r"(?:درجة|تخصص|أكاديمي|أكاديمية|دكتوراه|ماجستير|بكالوريوس)",
+            text,
+            flags=re.IGNORECASE,
         )
-        if cleaned and not set(_tokenize(cleaned)) <= {
-            "برنامج", "دكتوراه", "ماجستير", "الماجستير", "بكالوريوس", "البكالوريوس"
-        }:
-            requirements.append(cleaned)
+    )
+    if arabic_academic_program_context:
+        for match in re.finditer(
+            r"(برنامج)\s+(.+?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            cleaned = _clean_requirement(
+                f"{match.group(2)} {match.group(1)}",
+                preserve={"برنامج"},
+            )
+            if cleaned and not set(_tokenize(cleaned)) <= {
+                "برنامج", "دكتوراه", "ماجستير", "الماجستير", "بكالوريوس", "البكالوريوس"
+            }:
+                requirements.append(cleaned)
 
     # Location-scoped institutional units.  Require the location and unit to
     # co-occur in evidence instead of allowing a generic contact/campus result.

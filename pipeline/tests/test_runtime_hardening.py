@@ -721,6 +721,30 @@ def test_premise_grounding_fallback_rejects_generic_scoped_evidence():
     assert result["reason"] == "presupposed_entity_or_scope_not_supported"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "في الصفحة 10 من برنامج دفعة 2024 العربي، ما الهدف المذكور في النص على الصورة؟",
+        "في الصفحة 9 من برنامج حفل التخرج 2025 العربي، ماذا تُظهر صورة هوية الحدث؟",
+        "بحسب الخريطة الواردة في برنامج حفل تخريج دفعة 2024، أين تقع الجامعة؟",
+    ],
+)
+def test_arabic_document_program_references_are_not_academic_premises(query):
+    from pipeline.core.evidence_adjudicator import query_requires_premise_grounding
+
+    assert query_requires_premise_grounding(query) is False
+
+
+def test_arabic_academic_program_offering_remains_a_grounded_premise():
+    from pipeline.core.evidence_adjudicator import extract_premise_requirements
+
+    requirements = extract_premise_requirements(
+        "ما متطلبات القبول في برنامج الطب البيطري بجامعة محمد بن زايد للذكاء الاصطناعي؟"
+    )
+
+    assert requirements == ["الطب البيطري برنامج"]
+
+
 def test_premise_grounding_routes_non_fact_queries(monkeypatch):
     import pipeline.retrieval.routed_hybrid as module
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
@@ -866,6 +890,72 @@ def test_verified_media_evidence_skips_text_only_adjudication(monkeypatch):
     assert result["media_evidence_verified"] is True
     assert result["verification_status"] == "verified_media_evidence"
     assert result["adjudication_reason"] == "grounded_media_evidence"
+
+
+def test_verified_media_does_not_bypass_premise_grounding(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    calls = []
+
+    def adjudicate(**kwargs):
+        calls.append(kwargs)
+        return {
+            "used": True,
+            "method": "openai",
+            "abstain": True,
+            "selected_answer_ids": [],
+            "selected_fact_ids": [],
+            "selected_chunk_ids": [],
+            "reason": "presupposed_entity_or_scope_not_supported",
+            "confidence": 0.97,
+        }
+
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", adjudicate)
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.selective_adjudication_enabled = True
+    retriever.evidence_adjudicator_model = "gpt-5-nano"
+    retriever.evidence_adjudicator_reasoning_effort = "minimal"
+    retriever.evidence_adjudicator_min_confidence = 0.58
+    retriever.evidence_adjudicator_max_completion_tokens = 100
+    retriever.evidence_adjudicator_retries = 1
+    retriever.evidence_adjudicator_retry_delay_sec = 0.0
+    retriever.evidence_adjudicator_per_request_delay_sec = 0.0
+    retriever.evidence_adjudicator_timeout_sec = 1.0
+    retriever.evidence_adjudicator_provider_timeout_sec = 0.8
+    retriever.evidence_adjudicator_max_workers = 1
+    retriever.evidence_adjudicator_answer_limit = 2
+    retriever.evidence_adjudicator_fact_limit = 2
+    retriever.evidence_adjudicator_chunk_limit = 2
+    retriever.vector = SimpleNamespace(
+        _has_grounded_media_candidates=lambda **_kwargs: True,
+    )
+
+    try:
+        result = retriever._apply_evidence_adjudication(
+            "What is the shuttle timetable for MBZUAI's Mars research campus?",
+            {
+                "mode": "fact",
+                "abstained": False,
+                "retrieval_confidence": 0.9,
+                "selected_media_ids": ["media-mars-research"],
+                "dense_media_ids": ["media-mars-research"],
+                "media": [{"id": "media-mars-research"}],
+                "retrieval_documents": [
+                    {
+                        "id": "masdar-shuttle",
+                        "text": "The Masdar City campus provides a shuttle service.",
+                    }
+                ],
+            },
+        )
+    finally:
+        retriever.close()
+
+    assert len(calls) == 1
+    assert result["premise_grounding_required"] is True
+    assert result["abstained"] is True
+    assert result["verification_status"] == "abstained"
 
 
 def test_adaptive_retrieval_uses_request_local_timing_diagnostics():

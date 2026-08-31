@@ -728,11 +728,14 @@ class RoutedHybridRetriever:
                     media_rankings=media_rankings,
                 )
             )
-        if media_evidence_verified:
+        if media_evidence_verified and not premise_grounding_required:
             # Media records carry OCR, captions, source URLs, and independent
             # dense/sparse ranks. A text-only adjudicator cannot validate that
             # evidence and can incorrectly discard the exact visual because
-            # its surrounding prose is weak or unrelated.
+            # its surrounding prose is weak or unrelated.  A verified image
+            # match is not, however, proof that a presupposed entity or scope
+            # exists.  Premise-bearing queries must still pass the fail-closed
+            # evidence adjudicator.
             payload["media_evidence_verified"] = True
             payload.setdefault("adjudication_used", False)
             payload["verification_status"] = "verified_media_evidence"
@@ -2770,6 +2773,14 @@ class RoutedHybridRetriever:
         payload: Dict[str, Any],
         coverage_plan: Dict[str, Any],
     ) -> bool:
+        if bool(payload.get("abstained")) and bool(
+            payload.get("premise_grounding_required")
+        ):
+            # Coverage backfill may rescue an ordinary weak retrieval when a
+            # deterministic page route supplies the missing evidence.  It
+            # must never overturn a fail-closed decision that the query's
+            # presupposed entity, asset, offering, or scope is unsupported.
+            return False
         required_pages = [
             str(value)
             for value in (coverage_plan.get("required_pages") or [])
