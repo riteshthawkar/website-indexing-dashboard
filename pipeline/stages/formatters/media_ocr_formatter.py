@@ -616,7 +616,8 @@ def _load_adjudicated_batch_results(
     result_hashes = {str(value) for value in raw_results}
     missing = sorted(selected_hashes - result_hashes)
     unexpected = sorted(result_hashes - selected_hashes)
-    if missing or unexpected:
+    allow_unused_results = bool(config.get("allow_unused_batch_results", False))
+    if missing or (unexpected and not allow_unused_results):
         raise ValueError(
             "Batch OCR result coverage mismatch: "
             f"missing={len(missing)}, unexpected={len(unexpected)}"
@@ -668,6 +669,7 @@ def _load_adjudicated_batch_results(
         "batch_contract_sha256": expected_contract,
         "quality_revision": quality_revision,
         "result_count": len(results),
+        "unused_result_count": len(unexpected),
     }
     return results, evidence
 

@@ -23,6 +23,10 @@ formatter:
     batch_results:
       path: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-20260831-v2/results/adjudicated.json"
       sha256: "e6ed8c61911c8d4ec0ee1a4245f9bda4699d5d72083e959fc0959e1c8af6ffc3"
+    # A refreshed corpus may remove old visuals. Ignore adjudicated results
+    # that are no longer selected, but continue to fail if any current
+    # OCR-required content hash is missing from the pinned batch.
+    allow_unused_batch_results: true
     input_artifacts:
       page_media_file:
         path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260831-v4/stage_outputs/annotate_media/semantically_annotated_page_media.json"

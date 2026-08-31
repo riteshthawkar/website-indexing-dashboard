@@ -51,8 +51,8 @@ crawler:
     "preprod.mbzuai.ac.ae": 1
 
   # The navigation graph exposes only a subset of published content. The
-  # public search view is a bounded content inventory (156 pages / 1,506
-  # unique URLs on 2026-08-30). It is used only to seed underlying pages; the
+  # public search view is a bounded content inventory (156 pages / 1,507
+  # unique URLs on 2026-08-31). It is used only to seed underlying pages; the
   # result pages themselves are not admitted to the crawl frontier or corpus.
   seed_inventory_endpoints:
     - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/search"

@@ -1,5 +1,5 @@
-# Derived processing profile for the immutable 2026-08-30 preproduction crawl.
-# Stage zero is bootstrapped from mbzuai-preprod-crawl-20260830-v5; this run
+# Derived processing profile for the immutable 2026-08-31 preproduction crawl.
+# Stage zero is bootstrapped from mbzuai-preprod-crawl-20260831-v6; this run
 # never rewrites or re-downloads the raw crawl artifacts.
 _inherit: mbzuai_preprod_crawl.yaml
 
@@ -44,13 +44,13 @@ formatter:
     every public page and asset on the MBZUAI preproduction website regardless
     of robots.txt, robots metadata, or X-Robots-Tag directives.
 
-  # The corrected crawl exhausted a 2,036-URL page frontier. Ten document
-  # downloads are tracked separately. Its 227 hard failures are explicit and
-  # immutable: 217 live HTTP 404 outcomes and 10 live HTTP 500 outcomes. All
+  # The corrected crawl exhausted a 2,038-URL page frontier. Ten document
+  # downloads are tracked separately. Its 224 hard failures are explicit and
+  # immutable: 214 live HTTP 404 outcomes and 10 live HTTP 500 outcomes. All
   # 1,198 required SPA-discovered detail URLs were captured successfully.
-  expected_site_inventory_count: 2036
+  expected_site_inventory_count: 2038
   minimum_inventory_coverage_ratio: 0.88
-  maximum_hard_failure_count: 227
+  maximum_hard_failure_count: 224
   fail_on_critical_coverage: true
   fail_on_inventory_gap: true
   fail_on_hard_failure_gap: true
@@ -63,6 +63,7 @@ formatter:
   critical_url_max_link_word_ratio: 0.75
   critical_url_patterns:
     - "/about-us/?$"
+    - "/office-the-president/?$"
     - "/about-us/leadership/?$"
     - "/about-us/contact-us/?$"
     - "/research/?$"
@@ -118,8 +119,8 @@ formatter:
     # changed visuals remain provider work and must satisfy full completion.
     reuse_input_annotations: true
     reuse_annotation_manifest_files:
-      - path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260830-v3/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
-        sha256: "93d289327865b0ff1d9c99a907f4c2a8652ec893a95918cc5bd376e5a2da0974"
+      - path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260831-v4/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
+        sha256: "d408a28bfc6fa03d30df79fb4e9b0354749da4b79a096c02b60a5c6dbb815774"
 
 stages:
   - id: crawl_web

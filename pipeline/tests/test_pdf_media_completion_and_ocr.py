@@ -685,6 +685,35 @@ def test_batch_ocr_import_is_sha_pinned_and_coverage_complete(tmp_path: Path):
         )
     with pytest.raises(ValueError, match="coverage mismatch"):
         _load_adjudicated_batch_results(config, [{"content_hash": "c" * 64}])
+    with pytest.raises(ValueError, match="coverage mismatch"):
+        _load_adjudicated_batch_results(
+            {**config, "allow_unused_batch_results": True},
+            [{"content_hash": "c" * 64}],
+        )
+
+    unused_hash = "d" * 64
+    unused = dict(payload["results"][content_hash])
+    unused["content_hash"] = unused_hash
+    unused["ocr_input_hash"] = hashlib.sha256(
+        f"{contract_hash}:{unused_hash}:{quality_revision}".encode()
+    ).hexdigest()
+    payload["results"][unused_hash] = unused
+    atomic_write_json(result_path, payload)
+    subset_config = {
+        **config,
+        "batch_results": {
+            "path": str(result_path),
+            "sha256": hashlib.sha256(result_path.read_bytes()).hexdigest(),
+        },
+        "allow_unused_batch_results": True,
+    }
+
+    imported, evidence = _load_adjudicated_batch_results(
+        subset_config, [{"content_hash": content_hash}]
+    )
+
+    assert set(imported) == {content_hash}
+    assert evidence["unused_result_count"] == 1
 
 
 def test_standalone_ocr_inputs_are_sha_pinned(tmp_path: Path):
