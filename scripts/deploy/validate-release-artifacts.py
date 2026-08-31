@@ -369,6 +369,17 @@ def _select_runtime_graph(work_dir: Path) -> tuple[Path, Path, str]:
     # Keep this order exactly aligned with graph_artifacts.GRAPH_ARTIFACT_CANDIDATES.
     candidates = (
         (
+            work_dir
+            / "stage_outputs"
+            / "summarize_community_graph"
+            / "summarized_community_graph.json",
+            work_dir
+            / "stage_outputs"
+            / "summarize_community_graph"
+            / "summarized_community_graph_index.json",
+            "summarized_community_local_graph",
+        ),
+        (
             work_dir / "stage_outputs" / "community_graph" / "community_knowledge_graph.json",
             work_dir / "stage_outputs" / "community_graph" / "community_knowledge_graph_index.json",
             "community_local_graph",

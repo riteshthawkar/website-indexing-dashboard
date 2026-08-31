@@ -78,6 +78,37 @@ def test_selected_dense_only_pinecone_manifest_is_supported():
     assert errors == []
 
 
+def test_deployment_validator_prefers_complete_summarized_community_graph(tmp_path):
+    validator = _validator_module()
+    community_dir = tmp_path / "stage_outputs" / "community_graph"
+    community_dir.mkdir(parents=True)
+    community_graph = community_dir / "community_knowledge_graph.json"
+    community_index = community_dir / "community_knowledge_graph_index.json"
+    community_graph.write_text("{}", encoding="utf-8")
+    community_index.write_text("{}", encoding="utf-8")
+
+    summarized_dir = tmp_path / "stage_outputs" / "summarize_community_graph"
+    summarized_dir.mkdir(parents=True)
+    summarized_graph = summarized_dir / "summarized_community_graph.json"
+    summarized_index = summarized_dir / "summarized_community_graph_index.json"
+    summarized_graph.write_text("{}", encoding="utf-8")
+    summarized_index.write_text("{}", encoding="utf-8")
+
+    graph_path, index_path, graph_kind = validator._select_runtime_graph(tmp_path)
+
+    assert graph_path == summarized_graph
+    assert index_path == summarized_index
+    assert graph_kind == "summarized_community_local_graph"
+
+    summarized_index.unlink()
+    try:
+        validator._select_runtime_graph(tmp_path)
+    except validator.ValidationError as exc:
+        assert "canonical graph artifact is incomplete" in str(exc)
+    else:
+        raise AssertionError("an incomplete summarized graph must fail closed")
+
+
 def test_dense_only_pinecone_manifest_rejects_hidden_sparse_counts():
     validator = _validator_module()
     upload = _selected_upload()
