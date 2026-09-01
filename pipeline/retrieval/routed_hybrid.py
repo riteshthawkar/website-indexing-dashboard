@@ -49,7 +49,7 @@ _ADJUDICATOR_RUNTIME_INIT_LOCK = Lock()
 _AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|roles|responsibilities|features|benefits|"
     r"differences|criteria|items|articles|entries|listed|shown|displayed|sections|"
-    r"categories|divisions?|stages|process|support|services|uses|options|focus areas|"
+    r"categories|stages|process|support|services|uses|options|focus areas|"
     r"research interests|hands-on access|offerings|committees|industry engagement)\b"
     r"|(?:المتطلبات|المؤهلات|الأدوار|المسؤوليات|المزايا|الفروقات|المعايير|العناصر|"
     r"المقالات|أقسام|اقسام|فئات|مراحل|عملية|الدعم|دعم|الخدمات|خدمات|استخدامات|"
@@ -1856,32 +1856,6 @@ class RoutedHybridRetriever:
             )
         if "office of the registrar" in lower or "مكتب التسجيل" in lower:
             markers.append("/student-resources/office-of-the-registrar")
-        division_list_requested = bool(
-            re.search(
-                r"\b(?:(?:what|which|name|list)\b.{0,80}\bdivisions?|"
-                r"(?:two|three|all|current|research|academic)\s+divisions?|"
-                r"our divisions(?:\s+page)?)\b",
-                lower,
-            )
-            or re.search(
-                r"(?:ما|ماذا|أي|اي|اذكر|اعرض).{0,80}(?:الأقسام|الاقسام|اقسام|الشعب|التقسيمات)|"
-                r"(?:الأقسام|الاقسام|اقسام|الشعب|التقسيمات).{0,40}(?:البحثية|الأكاديمية|الاكاديمية|الحالية|كل|جميع)",
-                arabic_folded,
-            )
-        )
-        historical_division_scope = bool(
-            re.search(
-                r"\b(?:histor(?:y|ical)|former|previous|old|archived?|catalog(?:ue)?|"
-                r"organi[sz]ational chart|20(?:0\d|1\d|2[0-4]))\b",
-                lower,
-            )
-            or re.search(
-                r"(?:تاريخ|تاريخي|سابق|قدي(?:م|مة)|مؤرشف|كتالوج|دليل الجامعة|الهيكل التنظيمي)",
-                arabic_folded,
-            )
-        )
-        if division_list_requested and not historical_division_scope:
-            markers.append("/research/our-divisions")
         research_projects_page_requested = any(
             phrase in lower
             for phrase in (
