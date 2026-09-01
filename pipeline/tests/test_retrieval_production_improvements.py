@@ -2265,6 +2265,96 @@ def test_routed_required_page_backfill_injects_complete_parent_for_list_query():
     assert "See 15 more" in pack["items"][0]["text"]
 
 
+def test_routed_current_division_query_uses_current_page_and_complete_parent():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    page_url = "https://preprod.mbzuai.ac.ae/research/our-divisions"
+    revision_id = "document-revision:our-divisions"
+    parent_id = f"parent:c650:{revision_id}:page"
+    parent_text = (
+        "Division of Biological and Life Sciences. "
+        "Division of Computing and Mathematical Sciences. "
+        "Division of Undergraduate Studies."
+    )
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "page": {
+                "id": "page-card:our-divisions",
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "title": "Our Divisions",
+            }
+        },
+        evidence_span_map={},
+        fact_map={},
+        summary_map={},
+        chunk_map={},
+        parent_map={
+            parent_id: {
+                "id": parent_id,
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "document_title": "Our Divisions",
+                "text": parent_text,
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    retriever._coverage_page_records = retriever._build_coverage_page_records()
+    retriever._coverage_page_records_by_url = {
+        page["normalized_url"]: page
+        for page in retriever._coverage_page_records
+    }
+    retriever._coverage_record_indexes = retriever._build_coverage_record_indexes()
+    query = "What are the two divisions in MBZUAI?"
+
+    plan = retriever._infer_coverage_requirements(query, "exact_fact")
+    payload = {
+        "selected_chunk_ids": [],
+        "selected_parent_ids": [],
+        "selected_fact_ids": [],
+        "selected_evidence_span_ids": [],
+        "retrieval_documents": [],
+        "abstained": False,
+    }
+    changed = retriever._augment_payload_for_required_coverage(
+        query=query,
+        payload=payload,
+        coverage_plan=plan,
+    )
+    pack = build_evidence_pack(
+        query=query,
+        result=payload,
+        max_items=4,
+        max_chars=4000,
+        max_per_source=2,
+        coverage_plan=plan,
+    )
+
+    assert retriever._explicit_required_page_markers(query) == [
+        "/research/our-divisions"
+    ]
+    assert plan["required_pages"] == [page_url]
+    assert changed is True
+    assert payload["selected_parent_ids"][0] == parent_id
+    assert pack["items"][0]["id"] == parent_id
+    assert "Biological and Life Sciences" in pack["items"][0]["text"]
+    assert "Computing and Mathematical Sciences" in pack["items"][0]["text"]
+    assert "Undergraduate Studies" in pack["items"][0]["text"]
+
+
+def test_routed_historical_division_query_does_not_force_current_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert retriever._explicit_required_page_markers(
+        "What were MBZUAI's two divisions in the 2020 catalogue organizational chart?"
+    ) == []
+
+
 def test_evidence_pack_reserves_leaf_chunk_for_required_multi_detail_page():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 
