@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import logging
+import re
+from pathlib import Path
 from typing import Any, Dict, Mapping
 
 from pipeline.core.base import StageContext, StageResult
 from pipeline.core.config import production_indexing_contract_fingerprint
-from pipeline.core.io import atomic_write_json, load_json_safe
-from pipeline.core.release_assembly import SELECTED_DENSE_RECORD_KINDS
+from pipeline.core.io import atomic_write_json, load_json_safe, sha256_file
+from pipeline.core.release_assembly import (
+    SELECTED_DENSE_RECORD_KINDS,
+    selected_release_file_path,
+)
 from pipeline.stages.embedders.gemini_pgvector_embedder import (
     _LANE_KINDS,
     _apply_selected_media_input_contract,
@@ -37,6 +42,157 @@ from pipeline.stages.embedders.gemini_pinecone_embedder import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _vector_values(value: Any) -> list[float]:
+    raw = value.get("values") if isinstance(value, Mapping) else getattr(value, "values", None)
+    return [float(item) for item in raw] if isinstance(raw, (list, tuple)) else []
+
+
+def _fetched_vectors(response: Any) -> Mapping[str, Any]:
+    vectors = (
+        response.get("vectors")
+        if isinstance(response, Mapping)
+        else getattr(response, "vectors", None)
+    )
+    return vectors if isinstance(vectors, Mapping) else {}
+
+
+def _load_vector_reuse_source(
+    *,
+    config: Mapping[str, Any],
+    lanes: Mapping[str, list[Dict[str, Any]]],
+    index_name: str,
+    model: str,
+    dimensions: int,
+) -> Dict[str, Any] | None:
+    reuse = config.get("vector_reuse")
+    if not isinstance(reuse, Mapping) or not bool(reuse.get("enabled", False)):
+        return None
+    source_work_dir = Path(str(reuse.get("source_work_dir") or "")).expanduser()
+    if not source_work_dir.is_absolute():
+        source_work_dir = Path.cwd() / source_work_dir
+    source_work_dir = source_work_dir.resolve()
+    manifest_file = (
+        source_work_dir
+        / "stage_outputs"
+        / "upload_retrieval"
+        / "index_upload_manifest.json"
+    )
+    expected_manifest_sha = str(
+        reuse.get("source_upload_manifest_sha256") or ""
+    ).strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_manifest_sha):
+        raise ValueError(
+            "embedder.vector_reuse.source_upload_manifest_sha256 must be a SHA-256 digest"
+        )
+    if not manifest_file.is_file() or sha256_file(manifest_file) != expected_manifest_sha:
+        raise ValueError("Pinned Pinecone vector-reuse manifest is missing or drifted")
+    manifest = load_json_safe(manifest_file, None)
+    if not isinstance(manifest, Mapping):
+        raise ValueError("Pinned Pinecone vector-reuse manifest is invalid")
+    if (
+        str(manifest.get("provider") or "") != "pinecone"
+        or str(manifest.get("release_status") or "") != "ready"
+        or str(manifest.get("index_name") or "") != index_name
+        or str(manifest.get("model") or "") != model
+        or int(manifest.get("output_dimensionality") or 0) != dimensions
+    ):
+        raise ValueError("Pinned Pinecone vector-reuse release is incompatible")
+
+    assembly_file = (
+        source_work_dir
+        / "stage_outputs"
+        / "assemble_selected_release"
+        / "selected_release_assembly.json"
+    )
+    expected_assembly_sha = str(
+        manifest.get("selected_release_assembly_sha256") or ""
+    ).strip().lower()
+    if (
+        not assembly_file.is_file()
+        or not re.fullmatch(r"[0-9a-f]{64}", expected_assembly_sha)
+        or sha256_file(assembly_file) != expected_assembly_sha
+    ):
+        raise ValueError("Pinned vector-reuse selected assembly is missing or drifted")
+    assembly = load_json_safe(assembly_file, None)
+    if not isinstance(assembly, Mapping):
+        raise ValueError("Pinned vector-reuse selected assembly is invalid")
+    source_paths = {
+        "chunks": str(selected_release_file_path(assembly, assembly_file, "chunks")),
+        "parents": str(selected_release_file_path(assembly, assembly_file, "parents")),
+        "media": str(selected_release_file_path(assembly, assembly_file, "media")),
+        "page_cards": str(
+            selected_release_file_path(assembly, assembly_file, "page_cards")
+        ),
+        "actions": str(selected_release_file_path(assembly, assembly_file, "actions")),
+        "facts": "",
+        "evidence_spans": "",
+        "summaries": "",
+        "assertions": "",
+        "entities": "",
+        "communities": "",
+        "graph_bundle": "",
+    }
+    source_lanes = _load_lane_records(
+        source_paths,
+        enable_dense_facts=False,
+        enable_dense_evidence_spans=False,
+        enable_dense_assertions=False,
+        enable_dense_summaries=False,
+        enable_dense_entities=False,
+        enable_dense_communities=False,
+        selected_profile=True,
+    )
+    planned = manifest.get("planned") if isinstance(manifest.get("planned"), Mapping) else {}
+    uploaded = manifest.get("uploaded") if isinstance(manifest.get("uploaded"), Mapping) else {}
+    fingerprints = (
+        manifest.get("record_fingerprints")
+        if isinstance(manifest.get("record_fingerprints"), Mapping)
+        else {}
+    )
+    source_by_id: Dict[str, Dict[str, Dict[str, Any]]] = {}
+    reusable_counts: Dict[str, int] = {}
+    missing_counts: Dict[str, int] = {}
+    for lane, records in lanes.items():
+        old_records = source_lanes.get(lane) or []
+        if int(planned.get(lane) or 0) != len(old_records) or int(
+            uploaded.get(lane) or 0
+        ) != len(old_records):
+            raise ValueError(f"Pinned vector-reuse lane is incomplete: {lane}")
+        if str(fingerprints.get(lane) or "") != _record_text_fingerprint(old_records):
+            raise ValueError(f"Pinned vector-reuse lane fingerprint drifted: {lane}")
+        old_by_id = {str(record["id"]): record for record in old_records}
+        reusable = {
+            str(record["id"]): record
+            for record in records
+            if str(record.get("id") or "") in old_by_id
+            and _record_embedding_text(record)
+            == _record_embedding_text(old_by_id[str(record["id"])])
+        }
+        source_by_id[lane] = reusable
+        reusable_counts[lane] = len(reusable)
+        missing_counts[lane] = len(records) - len(reusable)
+    if bool(reuse.get("require_complete", False)) and any(missing_counts.values()):
+        raise ValueError(
+            "Pinned vector-reuse source does not exactly cover the selected release: "
+            f"{missing_counts}"
+        )
+    namespaces = manifest.get("namespaces")
+    if not isinstance(namespaces, Mapping):
+        raise ValueError("Pinned vector-reuse namespaces are missing")
+    return {
+        "source_work_dir": str(source_work_dir),
+        "source_upload_manifest_sha256": expected_manifest_sha,
+        "source_release_id": str(manifest.get("namespace_release_id") or ""),
+        "source_index": str(manifest.get("index_name") or ""),
+        "source_namespaces": {lane: str(namespaces.get(lane) or "") for lane in lanes},
+        "source_by_id": source_by_id,
+        "eligible": reusable_counts,
+        "missing": missing_counts,
+        "require_complete": bool(reuse.get("require_complete", False)),
+        "fetch_batch_size": max(1, min(1000, int(reuse.get("fetch_batch_size") or 500))),
+    }
 
 
 def _zero_progress(totals: Mapping[str, int]) -> Dict[str, int]:
@@ -141,6 +297,16 @@ def execute_selected_profile_pinecone(
     index_name = str(config.get("pinecone_index") or "").strip()
     if not index_name:
         return StageResult.failure("embedder.pinecone_index is required")
+    try:
+        vector_reuse = _load_vector_reuse_source(
+            config=config,
+            lanes=lanes,
+            index_name=index_name,
+            model=model,
+            dimensions=dimensions,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        return StageResult.failure(str(exc))
 
     namespaces = _resolve_upload_namespaces(config, run_id=ctx.run_id)
     totals = {lane: len(records) for lane, records in lanes.items()}
@@ -206,26 +372,104 @@ def execute_selected_profile_pinecone(
                     max_delay_sec=retry_max,
                 )
 
-        gemini = _make_gemini_client(
-            request_timeout_ms=int(config.get("gemini_request_timeout_ms") or 120000)
+        source_index = (
+            _make_index_handle(str(vector_reuse["source_index"]))
+            if vector_reuse is not None
+            else None
         )
+        gemini = None
+        reused_counts = {lane: 0 for lane in lanes}
+        embedded_counts = {lane: 0 for lane in lanes}
         for lane, records in lanes.items():
             remaining = records[uploaded[lane] :]
-            for batch in _iter_batches(remaining, text_batch_size):
+            processing_batch_size = (
+                int(vector_reuse["fetch_batch_size"])
+                if vector_reuse is not None
+                else text_batch_size
+            )
+            for batch in _iter_batches(remaining, processing_batch_size):
                 batch_records = list(batch)
-                vectors = _call_with_retry(
-                    f"embed_selected_pinecone_{lane}_batch",
-                    lambda batch_records=batch_records: _embed_text_batch(
-                        gemini,
-                        model=model,
-                        texts=[_record_embedding_text(record) for record in batch_records],
-                        task_type=task_type,
-                        output_dimensionality=dimensions,
-                    ),
-                    max_attempts=max_retries,
-                    base_delay_sec=retry_base,
-                    max_delay_sec=retry_max,
-                )
+                vectors_by_id: Dict[str, list[float]] = {}
+                if vector_reuse is not None and source_index is not None:
+                    reusable_ids = [
+                        str(record["id"])
+                        for record in batch_records
+                        if str(record["id"])
+                        in vector_reuse["source_by_id"][lane]
+                    ]
+                    if reusable_ids:
+                        source_namespace = str(
+                            vector_reuse["source_namespaces"].get(lane) or ""
+                        )
+                        if not source_namespace:
+                            raise ValueError(
+                                f"Pinned vector-reuse namespace is missing: {lane}"
+                            )
+                        response = _call_with_retry(
+                            f"fetch_reusable_selected_pinecone_{lane}_batch",
+                            lambda reusable_ids=reusable_ids, source_namespace=source_namespace: source_index.fetch(
+                                ids=reusable_ids,
+                                namespace=source_namespace,
+                            ),
+                            max_attempts=max_retries,
+                            base_delay_sec=retry_base,
+                            max_delay_sec=retry_max,
+                        )
+                        fetched = _fetched_vectors(response)
+                        for record_id in reusable_ids:
+                            values = _vector_values(fetched.get(record_id))
+                            if len(values) == dimensions:
+                                vectors_by_id[record_id] = values
+                        if bool(vector_reuse["require_complete"]) and len(
+                            vectors_by_id
+                        ) != len(reusable_ids):
+                            raise ValueError(
+                                "Pinned vector-reuse fetch was incomplete for lane "
+                                f"{lane}: expected={len(reusable_ids)}, "
+                                f"fetched={len(vectors_by_id)}"
+                            )
+
+                missing_records = [
+                    record
+                    for record in batch_records
+                    if str(record["id"]) not in vectors_by_id
+                ]
+                if missing_records and vector_reuse is not None and bool(
+                    vector_reuse["require_complete"]
+                ):
+                    raise ValueError(
+                        "Pinned vector-reuse source did not cover all records in lane "
+                        f"{lane}: missing={len(missing_records)}"
+                    )
+                for embed_batch in _iter_batches(missing_records, text_batch_size):
+                    embed_records = list(embed_batch)
+                    if gemini is None:
+                        gemini = _make_gemini_client(
+                            request_timeout_ms=int(
+                                config.get("gemini_request_timeout_ms") or 120000
+                            )
+                        )
+                    embedded = _call_with_retry(
+                        f"embed_selected_pinecone_{lane}_batch",
+                        lambda embed_records=embed_records: _embed_text_batch(
+                            gemini,
+                            model=model,
+                            texts=[
+                                _record_embedding_text(record)
+                                for record in embed_records
+                            ],
+                            task_type=task_type,
+                            output_dimensionality=dimensions,
+                        ),
+                        max_attempts=max_retries,
+                        base_delay_sec=retry_base,
+                        max_delay_sec=retry_max,
+                    )
+                    for record, vector in zip(embed_records, embedded):
+                        vectors_by_id[str(record["id"])] = vector
+                    embedded_counts[lane] += len(embed_records)
+                reused_counts[lane] += len(batch_records) - len(missing_records)
+                vectors = [vectors_by_id[str(record["id"])] for record in batch_records]
                 uploaded[lane] += _call_with_retry(
                     f"upsert_selected_pinecone_{lane}_batch",
                     lambda batch_records=batch_records, vectors=vectors, lane=lane: _upsert_namespace(
@@ -331,6 +575,25 @@ def execute_selected_profile_pinecone(
         },
         "retrieval_bundle_stats": totals,
         "media_metrics": media_metrics,
+        "vector_reuse": (
+            {
+                "enabled": True,
+                "source_work_dir": vector_reuse["source_work_dir"],
+                "source_upload_manifest_sha256": vector_reuse[
+                    "source_upload_manifest_sha256"
+                ],
+                "source_release_id": vector_reuse["source_release_id"],
+                "eligible": vector_reuse["eligible"],
+                "missing_before_fetch": vector_reuse["missing"],
+                "reused": reused_counts,
+                "embedded": embedded_counts,
+                "complete_reuse": all(
+                    reused_counts[lane] == totals[lane] for lane in totals
+                ),
+            }
+            if vector_reuse is not None
+            else {"enabled": False}
+        ),
         "sparse": {"enabled": False, "index_name": "", "model": "", "record_stats": {}},
         "verification": {
             "dense": {

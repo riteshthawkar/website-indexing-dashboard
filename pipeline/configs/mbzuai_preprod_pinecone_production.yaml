@@ -17,6 +17,12 @@ embedder:
   create_index_if_missing: true
   verify_index_after_upload: true
   verify_index_min_count_only: false
+  vector_reuse:
+    enabled: true
+    source_work_dir: "runs/mbzuai_main/mbzuai-preprod-readable-titles-pinecone-production-20260831-v3"
+    source_upload_manifest_sha256: "3292ba2d4058d01f03c3b6b40fe26e75b7ab9bf57357f4338c32c14e4b124209"
+    require_complete: true
+    fetch_batch_size: 500
 
 # Lists replace their inherited value during config resolution. Keep this
 # sequence identical to mbzuai_production except for the final store adapter.

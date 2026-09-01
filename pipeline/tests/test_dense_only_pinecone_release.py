@@ -205,6 +205,15 @@ def test_selected_pinecone_upload_includes_page_cards_and_actions(tmp_path, monk
             self.uploaded_ids.setdefault(namespace, []).extend(item["id"] for item in vectors)
             self.counts[namespace] = len(self.uploaded_ids[namespace])
 
+        def fetch(self, *, ids, namespace):
+            return {
+                "namespace": namespace,
+                "vectors": {
+                    record_id: {"id": record_id, "values": [0.3, 0.4]}
+                    for record_id in ids
+                },
+            }
+
         def describe_index_stats(self):
             return {
                 "namespaces": {
@@ -273,6 +282,58 @@ def test_selected_pinecone_upload_includes_page_cards_and_actions(tmp_path, monk
     assert manifest["uploaded"]["actions"] == 1
     assert index.uploaded_ids[manifest["namespaces"]["page_cards"]] == ["page_card-1"]
     assert index.uploaded_ids[manifest["namespaces"]["actions"]] == ["action-1"]
+
+    monkeypatch.setattr(
+        module,
+        "_load_vector_reuse_source",
+        lambda **_kwargs: {
+            "source_work_dir": "/pinned/release",
+            "source_upload_manifest_sha256": "6" * 64,
+            "source_release_id": "release-1",
+            "source_index": "test-index",
+            "source_namespaces": {
+                lane: f"source-{lane}" for lane in lanes
+            },
+            "source_by_id": {
+                lane: {str(record["id"]): record for record in records}
+                for lane, records in lanes.items()
+            },
+            "eligible": {lane: len(records) for lane, records in lanes.items()},
+            "missing": {lane: 0 for lane in lanes},
+            "require_complete": True,
+            "fetch_batch_size": 500,
+        },
+    )
+    monkeypatch.setattr(
+        module,
+        "_make_gemini_client",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("complete vector reuse must not call Gemini")
+        ),
+    )
+    reuse_ctx = StageContext(
+        run_id="release-2",
+        project_name="mbzuai_main",
+        config=config,
+        work_dir=tmp_path / "reuse-run",
+        stage_definition={"type": "embedder", "plugin": "gemini_pinecone"},
+        stage_id="upload_retrieval",
+    )
+    reuse_result = module.execute_selected_profile_pinecone(
+        reuse_ctx, config["embedder"], paths
+    )
+
+    assert reuse_result.status == StageStatus.COMPLETED
+    reuse_manifest = json.loads(
+        (reuse_ctx.stage_work_dir / "index_upload_manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert reuse_manifest["vector_reuse"]["complete_reuse"] is True
+    assert reuse_manifest["vector_reuse"]["embedded"] == {
+        lane: 0 for lane in lanes
+    }
+    assert reuse_manifest["vector_reuse"]["reused"]["page_cards"] == 1
 
 
 def test_existing_pinecone_index_must_match_embedding_contract(monkeypatch):
