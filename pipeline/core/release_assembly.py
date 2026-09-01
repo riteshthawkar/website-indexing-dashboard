@@ -11,20 +11,22 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
+import tempfile
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from pipeline.core.io import (
-    atomic_copy_file,
     atomic_write_json,
     combine_sha256_digests,
     sha256_file,
 )
 
 
-SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION = "mbzuai.selected_release_assembly.v2"
+SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION = "mbzuai.selected_release_assembly.v3"
+SELECTED_RELEASE_CONTENT_POLICY_SCHEMA_VERSION = "mbzuai.selected_release_content_policy.v1"
 SELECTED_MEDIA_INPUT_CAPTION_TEXT = "caption_text"
 SELECTED_MEDIA_INPUT_IMAGE_AND_CAPTION_TEXT = "image_and_caption_text"
 SELECTED_MEDIA_INPUT_MODES = (
@@ -70,8 +72,10 @@ SELECTED_RELEASE_SOURCE_HASH_KEYS = (
     "chunk_index_sha256",
     "page_graph_bridge_sha256",
     "navigation_catalog_sha256",
+    "content_policy_sha256",
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+_DOCUMENT_REVISION_ID_RE = re.compile(r"^document-revision:[A-Za-z0-9._-]+$")
 _CHECKPOINT_FILES = {
     "pipeline_state_sha256": "pipeline_state.json",
     "artifact_catalog_sha256": "artifact_catalog.json",
@@ -87,6 +91,46 @@ _CHECKPOINT_FILES = {
 
 class SelectedReleaseAssemblyError(ValueError):
     """Raised when immutable selected-release inputs cannot be joined safely."""
+
+
+def normalize_excluded_document_revision_ids(value: Any) -> Tuple[str, ...]:
+    """Normalize an exact, release-bound document-revision exclusion policy."""
+
+    if value in (None, (), []):
+        return ()
+    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
+        raise SelectedReleaseAssemblyError(
+            "excluded_document_revision_ids must be a sequence"
+        )
+    normalized: set[str] = set()
+    for raw in value:
+        revision_id = str(raw or "").strip()
+        if not _DOCUMENT_REVISION_ID_RE.fullmatch(revision_id):
+            raise SelectedReleaseAssemblyError(
+                "excluded_document_revision_ids contains an invalid document revision: "
+                f"{revision_id or '<empty>'}"
+            )
+        normalized.add(revision_id)
+    return tuple(sorted(normalized))
+
+
+def selected_release_content_policy_sha256(
+    excluded_document_revision_ids: Sequence[str],
+) -> str:
+    excluded = normalize_excluded_document_revision_ids(
+        excluded_document_revision_ids
+    )
+    payload = {
+        "schema_version": SELECTED_RELEASE_CONTENT_POLICY_SCHEMA_VERSION,
+        "excluded_document_revision_ids": list(excluded),
+    }
+    canonical = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(canonical).hexdigest()
 
 
 def _strict_json(path: Path, *, label: str) -> Any:
@@ -384,6 +428,224 @@ def _candidate_records(
     return records, grouped, counts
 
 
+def _curate_candidate_records(
+    *,
+    records: Sequence[Dict[str, Any]],
+    record_kinds: Sequence[str],
+    excluded_document_revision_ids: Sequence[str],
+) -> Tuple[
+    List[Dict[str, Any]],
+    Dict[str, List[Dict[str, Any]]],
+    Dict[str, int],
+    Dict[str, int],
+]:
+    excluded = set(excluded_document_revision_ids)
+    if not excluded:
+        grouped = {kind: [] for kind in record_kinds}
+        for record in records:
+            grouped[str(record["kind"])].append(record)
+        counts = {kind: len(grouped[kind]) for kind in record_kinds}
+        return list(records), grouped, counts, {kind: 0 for kind in record_kinds}
+
+    seen_excluded: set[str] = set()
+    selected: List[Dict[str, Any]] = []
+    grouped = {kind: [] for kind in record_kinds}
+    removed_counts: Counter[str] = Counter()
+    for record in records:
+        kind = str(record.get("kind") or "")
+        revision_id = str(record.get("document_revision_id") or "").strip()
+        if revision_id in excluded:
+            seen_excluded.add(revision_id)
+            removed_counts[kind] += 1
+            continue
+        selected.append(record)
+        grouped[kind].append(record)
+
+    missing = sorted(excluded - seen_excluded)
+    if missing:
+        raise SelectedReleaseAssemblyError(
+            "content policy document revisions are absent from the frozen candidate: "
+            + ", ".join(missing)
+        )
+    counts = {kind: len(grouped[kind]) for kind in record_kinds}
+    if any(count <= 0 for count in counts.values()):
+        raise SelectedReleaseAssemblyError(
+            f"content policy produced an empty selected lane: {counts}"
+        )
+    return (
+        selected,
+        grouped,
+        counts,
+        {kind: int(removed_counts[kind]) for kind in record_kinds},
+    )
+
+
+def _write_filtered_candidate_jsonl(
+    *,
+    source: Path,
+    destination: Path,
+    selected_record_ids: set[str],
+) -> int:
+    """Atomically copy retained JSONL records without changing their bytes."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(dir=str(destination.parent), suffix=".tmp")
+    written = 0
+    try:
+        with source.open("rb") as input_handle, os.fdopen(fd, "wb") as output_handle:
+            for line_number, raw_line in enumerate(input_handle, start=1):
+                stripped = raw_line.strip()
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except json.JSONDecodeError as exc:
+                    raise SelectedReleaseAssemblyError(
+                        "candidate records contain invalid JSON at line "
+                        f"{line_number}"
+                    ) from exc
+                record_id = (
+                    str(record.get("id") or "") if isinstance(record, dict) else ""
+                )
+                if record_id not in selected_record_ids:
+                    continue
+                output_handle.write(raw_line)
+                if not raw_line.endswith(b"\n"):
+                    output_handle.write(b"\n")
+                written += 1
+            output_handle.flush()
+            os.fsync(output_handle.fileno())
+        os.replace(temporary, destination)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    if written != len(selected_record_ids):
+        raise SelectedReleaseAssemblyError(
+            "filtered candidate record count differs from selected record identities: "
+            f"written={written}, selected={len(selected_record_ids)}"
+        )
+    return written
+
+
+def _curate_assembled_artifacts(
+    *,
+    chunk_index: Mapping[str, Any],
+    navigation: Mapping[str, Any],
+    grouped: Mapping[str, List[Dict[str, Any]]],
+    excluded_document_revision_ids: Sequence[str],
+) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    """Remove excluded documents and every graph/chunk reference to them."""
+
+    excluded = set(excluded_document_revision_ids)
+    selected_chunk_ids = {str(record["id"]) for record in grouped["chunk"]}
+    selected_action_ids = {str(record["id"]) for record in grouped["action"]}
+
+    curated_chunk_index = copy.deepcopy(dict(chunk_index))
+    chunks = [
+        chunk
+        for chunk in curated_chunk_index.get("chunks") or []
+        if isinstance(chunk, Mapping)
+        and str(chunk.get("chunk_id") or "") in selected_chunk_ids
+    ]
+    documents: List[Dict[str, Any]] = []
+    for raw_document in curated_chunk_index.get("documents") or []:
+        if not isinstance(raw_document, Mapping):
+            continue
+        document = dict(raw_document)
+        chunk_ids = [str(value) for value in document.get("chunk_ids") or []]
+        retained = [value for value in chunk_ids if value in selected_chunk_ids]
+        if retained and len(retained) != len(chunk_ids):
+            raise SelectedReleaseAssemblyError(
+                "document-revision policy partially removed a checkpoint document: "
+                f"{document.get('document_id') or '<missing>'}"
+            )
+        if not retained:
+            continue
+        document["chunk_ids"] = retained
+        document["chunk_count"] = len(retained)
+        documents.append(document)
+    curated_chunk_index["chunks"] = chunks
+    curated_chunk_index["documents"] = documents
+    curated_chunk_index["chunk_count"] = len(chunks)
+    curated_chunk_index["document_count"] = len(documents)
+
+    curated_navigation = copy.deepcopy(dict(navigation))
+    removed_page_card_ids = {
+        str(page.get("page_card_id") or "")
+        for page in curated_navigation.get("pages") or []
+        if isinstance(page, Mapping)
+        and str(page.get("document_revision_id") or "") in excluded
+    }
+    pages: List[Dict[str, Any]] = []
+    for raw_page in curated_navigation.get("pages") or []:
+        if not isinstance(raw_page, Mapping):
+            continue
+        if str(raw_page.get("document_revision_id") or "") in excluded:
+            continue
+        page = dict(raw_page)
+        page["chunk_ids"] = [
+            str(value)
+            for value in page.get("chunk_ids") or []
+            if str(value) in selected_chunk_ids
+        ]
+        page["action_ids"] = [
+            str(value)
+            for value in page.get("action_ids") or []
+            if str(value) in selected_action_ids
+        ]
+        page["outgoing_page_card_ids"] = [
+            str(value)
+            for value in page.get("outgoing_page_card_ids") or []
+            if str(value) not in removed_page_card_ids
+        ]
+        sections: List[Dict[str, Any]] = []
+        for raw_section in page.get("sections") or []:
+            if not isinstance(raw_section, Mapping):
+                continue
+            section = dict(raw_section)
+            section["chunk_ids"] = [
+                str(value)
+                for value in section.get("chunk_ids") or []
+                if str(value) in selected_chunk_ids
+            ]
+            sections.append(section)
+        page["sections"] = sections
+        pages.append(page)
+
+    navigation_chunks = [
+        chunk
+        for chunk in curated_navigation.get("chunks") or []
+        if isinstance(chunk, Mapping)
+        and str(chunk.get("chunk_id") or "") in selected_chunk_ids
+    ]
+    actions = [
+        action
+        for action in curated_navigation.get("actions") or []
+        if isinstance(action, Mapping)
+        and str(action.get("action_id") or "") in selected_action_ids
+        and str(action.get("page_card_id") or "") not in removed_page_card_ids
+    ]
+    action_types = Counter(
+        str(action.get("action_type") or "")
+        for action in actions
+        if str(action.get("action_type") or "")
+    )
+    curated_navigation["pages"] = pages
+    curated_navigation["chunks"] = navigation_chunks
+    curated_navigation["actions"] = actions
+    curated_navigation["stats"] = {
+        "pages": len(pages),
+        "sections": sum(len(page.get("sections") or []) for page in pages),
+        "chunks": len(navigation_chunks),
+        "actions": len(actions),
+        "action_types": dict(sorted(action_types.items())),
+    }
+    return curated_chunk_index, curated_navigation
+
+
 def _chunk_bridge(
     *,
     grouped: Mapping[str, List[Dict[str, Any]]],
@@ -554,8 +816,9 @@ def assemble_selected_release(
     candidate_records_sha256: str,
     checkpoint_run_dir: str | Path,
     checkpoint_evidence: Mapping[str, Any],
+    excluded_document_revision_ids: Sequence[str] = (),
 ) -> Dict[str, Any]:
-    """Assemble and persist the exact evaluated dense corpus plus graph bridge."""
+    """Assemble the evaluated corpus plus a deterministic revision policy."""
 
     output_dir = Path(output_dir).expanduser().resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -565,6 +828,10 @@ def assemble_selected_release(
     checkpoint_run_dir = Path(checkpoint_run_dir).expanduser().resolve()
 
     configured_kinds = tuple(str(kind) for kind in record_kinds)
+    excluded_revisions = normalize_excluded_document_revision_ids(
+        excluded_document_revision_ids
+    )
+    content_policy_sha = selected_release_content_policy_sha256(excluded_revisions)
     if configured_kinds != SELECTED_DENSE_RECORD_KINDS:
         raise SelectedReleaseAssemblyError(
             "selected release record kinds must exactly match the evaluated dense-graph contract"
@@ -605,7 +872,7 @@ def assemble_selected_release(
     if str(manifest.get("records_sha256") or "").strip().lower() != records_digest:
         raise SelectedReleaseAssemblyError("candidate manifest does not bind the records file")
 
-    records, grouped, counts = _candidate_records(
+    candidate_records, candidate_grouped, candidate_counts = _candidate_records(
         manifest=manifest,
         records_file=candidate_records_file,
         record_kinds=configured_kinds,
@@ -616,8 +883,8 @@ def assemble_selected_release(
         variant_id=variant_id,
         winner=winner,
     )
-    old_to_new, candidate_by_id = _chunk_bridge(
-        grouped=grouped,
+    old_to_new, _candidate_by_id = _chunk_bridge(
+        grouped=candidate_grouped,
         chunk_index=chunk_index,
         navigation=navigation,
     )
@@ -628,9 +895,33 @@ def assemble_selected_release(
     assembled_navigation = _remap_chunk_references(
         copy.deepcopy(dict(navigation)), old_to_new
     )
-    candidate_chunk_ids = set(candidate_by_id)
-    _validate_remapped_ids(assembled_chunk_index, candidate_chunk_ids)
-    _validate_remapped_ids(assembled_navigation, candidate_chunk_ids)
+    records, grouped, counts, removed_counts = _curate_candidate_records(
+        records=candidate_records,
+        record_kinds=configured_kinds,
+        excluded_document_revision_ids=excluded_revisions,
+    )
+    assembled_chunk_index, assembled_navigation = _curate_assembled_artifacts(
+        chunk_index=assembled_chunk_index,
+        navigation=assembled_navigation,
+        grouped=grouped,
+        excluded_document_revision_ids=excluded_revisions,
+    )
+    selected_chunk_ids = {str(record["id"]) for record in grouped["chunk"]}
+    old_to_new = {
+        old_id: new_id
+        for old_id, new_id in old_to_new.items()
+        if new_id in selected_chunk_ids
+    }
+    _validate_remapped_ids(assembled_chunk_index, selected_chunk_ids)
+    _validate_remapped_ids(assembled_navigation, selected_chunk_ids)
+
+    selected_records_copy = output_dir / "selected_dense_records.jsonl"
+    _write_filtered_candidate_jsonl(
+        source=candidate_records_file,
+        destination=selected_records_copy,
+        selected_record_ids={str(record["id"]) for record in records},
+    )
+    selected_records_digest = sha256_file(selected_records_copy)
 
     chunk_metadata = assembled_chunk_index.get("metadata")
     if not isinstance(chunk_metadata, dict):
@@ -638,17 +929,16 @@ def assemble_selected_release(
         assembled_chunk_index["metadata"] = chunk_metadata
     chunk_metadata["selected_profile_variant_id"] = variant_id
     chunk_metadata["candidate_records_sha256"] = records_digest
+    chunk_metadata["selected_records_sha256"] = selected_records_digest
+    chunk_metadata["content_policy_sha256"] = content_policy_sha
     chunk_metadata["chunk_ids_remapped_to_evaluated_candidate"] = True
     assembled_navigation["selected_profile"] = {
         "variant_id": variant_id,
         "candidate_records_sha256": records_digest,
+        "selected_records_sha256": selected_records_digest,
+        "content_policy_sha256": content_policy_sha,
         "chunk_ids_remapped_to_evaluated_candidate": True,
     }
-
-    exact_records_copy = output_dir / "selected_dense_records.jsonl"
-    atomic_copy_file(candidate_records_file, exact_records_copy)
-    if sha256_file(exact_records_copy) != records_digest:
-        raise SelectedReleaseAssemblyError("candidate records changed during atomic assembly copy")
 
     array_files = _write_record_arrays(output_dir, grouped)
     chunk_index_path = output_dir / "selected_chunk_index.json"
@@ -663,6 +953,8 @@ def assemble_selected_release(
             "variant_id": variant_id,
             "source_chunk_index_sha256": checkpoint_hashes["chunk_index_sha256"],
             "candidate_records_sha256": records_digest,
+            "selected_records_sha256": selected_records_digest,
+            "content_policy_sha256": content_policy_sha,
             "mapping_count": len(old_to_new),
             "old_to_evaluated_chunk_id": dict(sorted(old_to_new.items())),
         },
@@ -671,8 +963,8 @@ def assemble_selected_release(
 
     files = {
         "selected_dense_records": {
-            "file": exact_records_copy.name,
-            "sha256": records_digest,
+            "file": selected_records_copy.name,
+            "sha256": selected_records_digest,
             "record_count": len(records),
         },
         **array_files,
@@ -703,6 +995,7 @@ def assemble_selected_release(
         "candidate_records_sha256": records_digest,
         "checkpoint_run_dir": str(checkpoint_run_dir),
         **checkpoint_hashes,
+        "content_policy_sha256": content_policy_sha,
     }
     assembly_sha = combine_sha256_digests(
         *[str(source[key]) for key in SELECTED_RELEASE_SOURCE_HASH_KEYS],
@@ -720,6 +1013,13 @@ def assemble_selected_release(
         "embedding_spec": embedding_spec,
         "record_kinds": list(configured_kinds),
         "record_kind_counts": counts,
+        "source_record_kind_counts": candidate_counts,
+        "content_policy": {
+            "schema_version": SELECTED_RELEASE_CONTENT_POLICY_SCHEMA_VERSION,
+            "excluded_document_revision_ids": list(excluded_revisions),
+            "removed_record_kind_counts": removed_counts,
+            "removed_record_count": sum(removed_counts.values()),
+        },
         "dense_lane_counts": {
             "chunks": counts["chunk"],
             "parents": counts["parent"] + counts["parent_section"],

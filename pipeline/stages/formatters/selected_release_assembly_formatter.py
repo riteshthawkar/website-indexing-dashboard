@@ -59,6 +59,14 @@ class SelectedReleaseAssemblyFormatter(FormatterStage):
                         "formatter.selected_release_assembly.checkpoint_evidence."
                         f"{key} must be a SHA-256 digest"
                     )
+        excluded_revisions = assembly.get("excluded_document_revision_ids") or []
+        if isinstance(excluded_revisions, (str, bytes)) or not isinstance(
+            excluded_revisions, list
+        ):
+            errors.append(
+                "formatter.selected_release_assembly.excluded_document_revision_ids "
+                "must be a list"
+            )
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
@@ -77,6 +85,9 @@ class SelectedReleaseAssemblyFormatter(FormatterStage):
                 candidate_records_sha256=str(config.get("candidate_records_sha256") or ""),
                 checkpoint_run_dir=str(config.get("checkpoint_run_dir") or ""),
                 checkpoint_evidence=dict(config.get("checkpoint_evidence") or {}),
+                excluded_document_revision_ids=list(
+                    config.get("excluded_document_revision_ids") or []
+                ),
             )
             files = manifest["files"]
 
@@ -132,6 +143,12 @@ class SelectedReleaseAssemblyFormatter(FormatterStage):
                     "dense_records": sum(lane_counts.values()),
                     "evaluated_record_kinds": len(SELECTED_DENSE_RECORD_KINDS),
                     "mapped_chunks": int(manifest["coverage"]["mapped_chunk_count"]),
+                    "excluded_records": int(
+                        (manifest.get("content_policy") or {}).get(
+                            "removed_record_count"
+                        )
+                        or 0
+                    ),
                 },
                 artifacts=artifacts,
             )

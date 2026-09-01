@@ -57,7 +57,11 @@ SELECTED_RECORD_KINDS = (
     "page_card",
     "action",
 )
-SELECTED_ASSEMBLY_SCHEMA = "mbzuai.selected_release_assembly.v2"
+SELECTED_ASSEMBLY_SCHEMAS = {
+    "mbzuai.selected_release_assembly.v2",
+    "mbzuai.selected_release_assembly.v3",
+}
+SELECTED_CONTENT_POLICY_SCHEMA = "mbzuai.selected_release_content_policy.v1"
 SELECTED_EMBEDDING_SPEC_KEYS = (
     "provider",
     "model",
@@ -96,7 +100,7 @@ PRODUCTION_MIN_RETRIEVAL_QUERIES = 160
 PRODUCTION_MIN_ANSWER_QUERIES = 160
 PREPROD_EVAL_POLICY_ID = "mbzuai-preprod-current-eval-v1"
 PREPROD_RETRIEVAL_DATASET_SHA256 = (
-    "d48b847fa1a12d49d5f10009988dfc1c47f9e7fb813cde365993f6d3c4762f5c"
+    "671844a284042ca0cede5393f419bf017b471de6ecc5021c0f9f370a96d45135"
 )
 PREPROD_RETRIEVAL_GATES_SHA256 = (
     "08299b4953ac1075624ecf07cbe40c410502df0e5993f58272eae1565407b304"
@@ -105,8 +109,8 @@ PREPROD_ANSWER_DATASET_SHA256 = PREPROD_RETRIEVAL_DATASET_SHA256
 PREPROD_ANSWER_GATES_SHA256 = (
     "79dd20b2b909117dcf52736a0551747d77dd22a47bd7b6675b3b9956d497ea82"
 )
-PREPROD_MIN_RETRIEVAL_QUERIES = 94
-PREPROD_MIN_ANSWER_QUERIES = 94
+PREPROD_MIN_RETRIEVAL_QUERIES = 95
+PREPROD_MIN_ANSWER_QUERIES = 95
 PRODUCTION_ANSWER_JUDGE_PROVIDER = "gemini"
 PRODUCTION_ANSWER_JUDGE_MODEL = "gemini-2.5-flash"
 PRODUCTION_EVAL_POLICIES = {
@@ -520,7 +524,8 @@ def _validate_selected_release_assembly(
     )
     assembly = _json_object(assembly_path, "selected release assembly")
     errors: list[str] = []
-    if str(assembly.get("schema_version") or "") != SELECTED_ASSEMBLY_SCHEMA:
+    assembly_schema = str(assembly.get("schema_version") or "")
+    if assembly_schema not in SELECTED_ASSEMBLY_SCHEMAS:
         errors.append("selected release assembly schema is unsupported")
     if str(assembly.get("status") or "") != "ready_for_embedding":
         errors.append("selected release assembly is not ready for embedding")
@@ -618,9 +623,39 @@ def _validate_selected_release_assembly(
         errors.append("selected release assembly file entries must resolve uniquely")
 
     source = assembly.get("source") if isinstance(assembly.get("source"), dict) else {}
+    source_hash_keys = list(SELECTED_SOURCE_HASH_KEYS)
+    if assembly_schema == "mbzuai.selected_release_assembly.v3":
+        source_hash_keys.append("content_policy_sha256")
+        policy = (
+            assembly.get("content_policy")
+            if isinstance(assembly.get("content_policy"), dict)
+            else {}
+        )
+        excluded = policy.get("excluded_document_revision_ids")
+        if (
+            policy.get("schema_version") != SELECTED_CONTENT_POLICY_SCHEMA
+            or not isinstance(excluded, list)
+            or excluded != sorted(set(str(value) for value in excluded))
+        ):
+            errors.append("selected release content policy is invalid")
+        else:
+            policy_payload = {
+                "schema_version": SELECTED_CONTENT_POLICY_SCHEMA,
+                "excluded_document_revision_ids": excluded,
+            }
+            policy_sha = hashlib.sha256(
+                json.dumps(
+                    policy_payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            if str(source.get("content_policy_sha256") or "") != policy_sha:
+                errors.append("selected release content policy digest is invalid")
     source_hashes = [
         str(source.get(key) or "").strip().lower()
-        for key in SELECTED_SOURCE_HASH_KEYS
+        for key in source_hash_keys
     ]
     if any(not re.fullmatch(r"[0-9a-f]{64}", value) for value in source_hashes):
         errors.append("selected release assembly source hash set is incomplete")

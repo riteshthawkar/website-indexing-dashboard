@@ -21,6 +21,9 @@ from pipeline.core.release_assembly import (
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_FILE = PROJECT_ROOT / "pipeline/configs/mbzuai_selected_release_assembly.yaml"
+PREPROD_CONFIG_FILE = (
+    PROJECT_ROOT / "pipeline/configs/mbzuai_preprod_selected_release_assembly.yaml"
+)
 
 
 def _assembly_kwargs(tmp_path: Path) -> dict:
@@ -42,10 +45,38 @@ def _assembly_kwargs(tmp_path: Path) -> dict:
     }
 
 
+def _preprod_assembly_kwargs(tmp_path: Path) -> dict:
+    config = load_config(str(PREPROD_CONFIG_FILE))
+    profile = config["selected_profile"]
+    assembly = config["formatter"]["selected_release_assembly"]
+    return {
+        "output_dir": tmp_path,
+        "variant_id": profile["variant_id"],
+        "record_kinds": profile["record_kinds"],
+        "decision_file": PROJECT_ROOT / profile["decision_file"],
+        "decision_sha256": profile["decision_sha256"],
+        "candidate_manifest_file": PROJECT_ROOT / assembly["candidate_manifest_file"],
+        "candidate_manifest_sha256": assembly["candidate_manifest_sha256"],
+        "candidate_records_file": PROJECT_ROOT / assembly["candidate_records_file"],
+        "candidate_records_sha256": assembly["candidate_records_sha256"],
+        "checkpoint_run_dir": PROJECT_ROOT / assembly["checkpoint_run_dir"],
+        "checkpoint_evidence": assembly["checkpoint_evidence"],
+        "excluded_document_revision_ids": assembly[
+            "excluded_document_revision_ids"
+        ],
+    }
+
+
 @pytest.fixture(scope="module")
 def real_assembly(tmp_path_factory: pytest.TempPathFactory) -> dict:
     output_dir = tmp_path_factory.mktemp("selected-release-assembly")
     return assemble_selected_release(**_assembly_kwargs(output_dir))
+
+
+@pytest.fixture(scope="module")
+def curated_preprod_assembly(tmp_path_factory: pytest.TempPathFactory) -> dict:
+    output_dir = tmp_path_factory.mktemp("curated-preprod-selected-release")
+    return assemble_selected_release(**_preprod_assembly_kwargs(output_dir))
 
 
 def test_real_selected_release_assembly_is_exact_and_chunk_complete(real_assembly: dict) -> None:
@@ -111,6 +142,63 @@ def test_assembly_preserves_frozen_record_bytes_and_remaps_navigation(real_assem
     assert len(bridge["old_to_evaluated_chunk_id"]) == 17259
     assert {entry["chunk_id"] for entry in navigation["chunks"]} == candidate_ids
     assert all(chunk_id.startswith("chunk:c650:") for chunk_id in candidate_ids)
+
+
+def test_preprod_content_policy_removes_all_historical_catalogue_lanes(
+    curated_preprod_assembly: dict,
+) -> None:
+    excluded = {
+        "document-revision:7ddc4c25b58b1a46bcaf730d",
+        "document-revision:eb7e6316bae431c75a332663",
+        "document-revision:41ff7ff60291e89cc7ae2289",
+        "document-revision:9dcb343a8590e5cb253ff6fb",
+        "document-revision:16b53c2b81c101733fde1eea",
+    }
+    current = "document-revision:da5aa7f1e49c2f2c1ea921a4"
+    policy = curated_preprod_assembly["content_policy"]
+
+    assert set(policy["excluded_document_revision_ids"]) == excluded
+    assert policy["removed_record_kind_counts"] == {
+        "chunk": 1673,
+        "parent": 5,
+        "parent_section": 1634,
+        "media": 109,
+        "page_card": 0,
+        "action": 0,
+    }
+    assert policy["removed_record_count"] == 3421
+    assert curated_preprod_assembly["record_kind_counts"] == {
+        "chunk": 10388,
+        "parent": 1852,
+        "parent_section": 7696,
+        "media": 3009,
+        "page_card": 1879,
+        "action": 442,
+    }
+    assert curated_preprod_assembly["coverage"]["mapped_chunk_count"] == 10388
+    assert curated_preprod_assembly["coverage"]["all_candidate_chunks_mapped"] is True
+    assert curated_preprod_assembly["coverage"]["all_navigation_chunks_remapped"] is True
+
+    records_file = selected_release_file_path(
+        curated_preprod_assembly,
+        curated_preprod_assembly["manifest_file"],
+        "selected_dense_records",
+    )
+    observed_revisions = {
+        str(record.get("document_revision_id") or "")
+        for line in records_file.read_text(encoding="utf-8").splitlines()
+        if line
+        for record in (json.loads(line),)
+    }
+    assert not (observed_revisions & excluded)
+    assert current in observed_revisions
+
+
+def test_content_policy_fails_closed_when_revision_is_absent(tmp_path: Path) -> None:
+    kwargs = _assembly_kwargs(tmp_path)
+    kwargs["excluded_document_revision_ids"] = ["document-revision:not-present"]
+    with pytest.raises(SelectedReleaseAssemblyError, match="absent from the frozen candidate"):
+        assemble_selected_release(**kwargs)
 
 
 def test_assembly_rejects_source_digest_drift(tmp_path: Path) -> None:

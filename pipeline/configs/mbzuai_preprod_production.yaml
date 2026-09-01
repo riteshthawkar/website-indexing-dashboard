@@ -8,6 +8,15 @@ _inherit: mbzuai_production.yaml
 
 formatter:
   selected_release_assembly:
+    # Historical catalogues are superseded by the official 2024-2025 edition.
+    # Bind the exact document revisions into the release so all dense, lexical,
+    # graph, parent, and media lanes are curated together.
+    excluded_document_revision_ids:
+      - "document-revision:7ddc4c25b58b1a46bcaf730d"  # 2020-2021
+      - "document-revision:eb7e6316bae431c75a332663"  # 2021-2022
+      - "document-revision:41ff7ff60291e89cc7ae2289"  # 2022-2023
+      - "document-revision:9dcb343a8590e5cb253ff6fb"  # 2023-2024
+      - "document-revision:16b53c2b81c101733fde1eea"  # duplicate 2023-2024
     checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep_readable_titles/mbzuai-preprod-combined-selected-index-prep-readable-titles-20260831-v3"
     candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-readable-titles-20260831-v4/candidates/c650/manifest.json"
     candidate_manifest_sha256: "b049084bd36cd603ed13ec778cc0900c2fe8d2a5de3847e96f13d8d7f3bcee11"
