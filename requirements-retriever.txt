@@ -4,6 +4,7 @@
 # The retriever serves an already-built release and must not install Crawl4AI,
 # Playwright, Docling, Torch, Transformers, igraph, or Leiden.
 boto3==1.43.46
+beautifulsoup4==4.13.3
 fastapi==0.136.1
 google-genai==1.75.0
 openai==2.28.0
