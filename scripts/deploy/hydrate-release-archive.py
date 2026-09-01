@@ -66,8 +66,15 @@ def _set_stream_timeout(stream: Any, timeout_seconds: float) -> None:
 
     setter = getattr(stream, "set_socket_timeout", None)
     if callable(setter):
-        setter(max(0.001, timeout_seconds))
-        return
+        try:
+            setter(max(0.001, timeout_seconds))
+            return
+        except (AttributeError, OSError):
+            # Botocore's StreamingBody can detach its urllib3 socket as soon as
+            # ContentLength bytes have been consumed. Treat timeout propagation
+            # as best effort in that state; the client-level read timeout and
+            # the explicit end-to-end deadline remain enforced below.
+            pass
     fp = getattr(stream, "fp", None)
     raw = getattr(fp, "raw", None)
     candidates = (
@@ -328,9 +335,9 @@ def _download_s3(
             digest = hashlib.sha256()
             downloaded = 0
             with destination.open("wb") as output:
-                while True:
+                while downloaded < declared:
                     _set_stream_timeout(body, _remaining_seconds(deadline))
-                    block = body.read(1024 * 1024)
+                    block = body.read(min(1024 * 1024, declared - downloaded))
                     _remaining_seconds(deadline)
                     if not block:
                         break

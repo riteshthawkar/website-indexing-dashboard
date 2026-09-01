@@ -515,6 +515,73 @@ def test_authenticated_s3_hydration_streams_checksum_pinned_object(
     assert secret_key not in output.out + output.err
 
 
+def test_authenticated_s3_hydration_stops_at_declared_length_without_retouching_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _load_hydrator_module()
+    content = b"complete private release object"
+
+    class Body:
+        def __init__(self) -> None:
+            self._content = io.BytesIO(content)
+            self.timeout_calls = 0
+            self.closed = False
+
+        def set_socket_timeout(self, _timeout: float) -> None:
+            self.timeout_calls += 1
+            if self.timeout_calls > 1:
+                raise AttributeError("socket detached after ContentLength bytes")
+
+        def read(self, size: int = -1) -> bytes:
+            return self._content.read(size)
+
+        def close(self) -> None:
+            self.closed = True
+
+    body = Body()
+
+    class FakeEvents:
+        def register(self, _event: str, _handler: object) -> None:
+            return None
+
+    class FakeClient:
+        meta = types.SimpleNamespace(events=FakeEvents())
+
+        def get_object(self, **_kwargs: object) -> dict[str, object]:
+            return {"ContentLength": len(content), "Body": body}
+
+    boto3 = types.ModuleType("boto3")
+    boto3.client = lambda *_args, **_kwargs: FakeClient()  # type: ignore[attr-defined]
+    botocore = types.ModuleType("botocore")
+    botocore_config = types.ModuleType("botocore.config")
+    botocore_config.Config = lambda **kwargs: types.SimpleNamespace(**kwargs)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "boto3", boto3)
+    monkeypatch.setitem(sys.modules, "botocore", botocore)
+    monkeypatch.setitem(sys.modules, "botocore.config", botocore_config)
+
+    downloaded = module._download_s3(
+        uri="s3://mbzuai-releases/production/release-2026.tar.gz",
+        endpoint_url="https://nyc3.digitaloceanspaces.com",
+        region="nyc3",
+        destination=tmp_path / "release.tar.gz",
+        expected_sha256=hashlib.sha256(content).hexdigest(),
+        allowed_hosts={
+            "nyc3.digitaloceanspaces.com",
+            "mbzuai-releases.nyc3.digitaloceanspaces.com",
+        },
+        access_key_id="A1B2C3D4E5F6G7H8I9J0",
+        secret_access_key="correct-horse-battery-staple-archive-key-2026",
+        session_token="",
+        timeout_seconds=30,
+        max_bytes=1024,
+    )
+
+    assert downloaded == len(content)
+    assert body.timeout_calls == 1
+    assert body.closed is True
+
+
 def test_authenticated_s3_hydration_closes_oversized_response(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
