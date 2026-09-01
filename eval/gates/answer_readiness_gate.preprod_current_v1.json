@@ -1,0 +1,140 @@
+{
+  "overall": {
+    "query_count": {"min": 94},
+    "answerable_query_count": {"min": 70},
+    "no_answer_query_count": {"min": 24},
+    "pass_rate": {"min": 0.9},
+    "answerable_pass_rate": {"min": 0.9},
+    "support_present_rate": {"min": 0.92},
+    "expected_reference_url_pass_rate": {"min": 0.88},
+    "must_include_pass_rate": {"min": 0.88},
+    "must_include_coverage_mean": {"min": 0.9},
+    "must_not_include_pass_rate": {"min": 1.0},
+    "no_answer_pass_rate": {"min": 1.0},
+    "llm_judge_pass_rate": {"min": 0.9},
+    "llm_overall_mean": {"min": 0.8},
+    "llm_correctness_mean": {"min": 0.8},
+    "llm_groundedness_mean": {"min": 0.8},
+    "llm_relevance_mean": {"min": 0.82},
+    "llm_helpfulness_mean": {"min": 0.8},
+    "llm_completeness_mean": {"min": 0.8},
+    "llm_citation_quality_mean": {"min": 0.8},
+    "llm_component_quality_mean": {"min": 0.74},
+    "llm_safety_mean": {"min": 0.86},
+    "llm_judge_error_rate": {"max": 0.0},
+    "prediction_integrity_error_rate": {"max": 0.0},
+    "prediction_missing_rate": {"max": 0.0},
+    "prediction_duplicate_rate": {"max": 0.0},
+    "prediction_unknown_rate": {"max": 0.0},
+    "error_rate": {"max": 0.0},
+    "p50_first_content_latency_ms": {"max": 8000},
+    "p95_first_content_latency_ms": {"max": 15000},
+    "p99_first_content_latency_ms": {"max": 25000},
+    "p50_latency_ms": {"max": 30000},
+    "p95_latency_ms": {"max": 60000},
+    "p99_latency_ms": {"max": 90000},
+    "max_latency_ms": {"max": 120000}
+  },
+  "by_query_type": {
+    "fact": {
+      "query_count": {"min": 52},
+      "pass_rate": {"min": 0.88},
+      "llm_correctness_mean": {"min": 0.8}
+    },
+    "scoped": {
+      "query_count": {"min": 20},
+      "pass_rate": {"min": 0.75},
+      "llm_groundedness_mean": {"min": 0.8}
+    },
+    "synthesis": {
+      "query_count": {"min": 4},
+      "pass_rate": {"min": 0.88},
+      "llm_completeness_mean": {"min": 0.8},
+      "llm_helpfulness_mean": {"min": 0.8}
+    },
+    "multimodal": {
+      "query_count": {"min": 18},
+      "pass_rate": {"min": 0.8},
+      "llm_groundedness_mean": {"min": 0.8},
+      "llm_citation_quality_mean": {"min": 0.75}
+    }
+  },
+  "by_source_type": {
+    "webpage": {
+      "query_count": {"min": 52},
+      "support_present_rate": {"min": 0.9},
+      "expected_reference_url_pass_rate": {"min": 0.88}
+    },
+    "none": {
+      "query_count": {"min": 24},
+      "no_answer_pass_rate": {"min": 1.0},
+      "must_not_include_pass_rate": {"min": 1.0}
+    },
+    "image": {
+      "query_count": {"min": 6},
+      "support_present_rate": {"min": 0.8},
+      "expected_reference_url_pass_rate": {"min": 0.75}
+    },
+    "pdf": {
+      "query_count": {"min": 12},
+      "support_present_rate": {"min": 0.8},
+      "expected_reference_url_pass_rate": {"min": 0.75}
+    }
+  },
+  "by_language": {
+    "English": {
+      "query_count": {"min": 63},
+      "answerable_query_count": {"min": 51},
+      "no_answer_query_count": {"min": 12},
+      "pass_rate": {"min": 0.9},
+      "support_present_rate": {"min": 0.92},
+      "no_answer_pass_rate": {"min": 1.0},
+      "error_rate": {"max": 0.0}
+    },
+    "Arabic": {
+      "query_count": {"min": 31},
+      "answerable_query_count": {"min": 19},
+      "no_answer_query_count": {"min": 12},
+      "pass_rate": {"min": 0.8},
+      "support_present_rate": {"min": 0.83},
+      "must_include_pass_rate": {"min": 0.8},
+      "no_answer_pass_rate": {"min": 1.0},
+      "llm_groundedness_mean": {"min": 0.78},
+      "llm_safety_mean": {"min": 0.86},
+      "error_rate": {"max": 0.0}
+    }
+  },
+  "by_benchmark_tag": {
+    "mbzuai_multilingual_v2": {
+      "query_count": {"min": 94},
+      "pass_rate": {"min": 0.9},
+      "llm_judge_pass_rate": {"min": 0.9}
+    },
+    "multi_source": {
+      "query_count": {"min": 4},
+      "pass_rate": {"min": 0.86},
+      "llm_completeness_mean": {"min": 0.8},
+      "llm_groundedness_mean": {"min": 0.8}
+    },
+    "multimodal": {
+      "query_count": {"min": 18},
+      "pass_rate": {"min": 0.8},
+      "llm_citation_quality_mean": {"min": 0.75}
+    },
+    "navigation": {
+      "query_count": {"min": 8},
+      "pass_rate": {"min": 0.8},
+      "llm_component_quality_mean": {"min": 0.74}
+    },
+    "cross_lingual": {
+      "query_count": {"min": 15},
+      "pass_rate": {"min": 0.8},
+      "llm_groundedness_mean": {"min": 0.78}
+    },
+    "abstention": {
+      "query_count": {"min": 24},
+      "no_answer_pass_rate": {"min": 1.0},
+      "must_not_include_pass_rate": {"min": 1.0}
+    }
+  }
+}

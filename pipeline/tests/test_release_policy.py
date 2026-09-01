@@ -2,6 +2,13 @@ from __future__ import annotations
 
 from pipeline.core.release import _validation_config_for_release
 from pipeline.core.release_policy import (
+    PREPROD_ANSWER_DATASET,
+    PREPROD_ANSWER_GATES,
+    PREPROD_EVAL_POLICY_ID,
+    PREPROD_MIN_ANSWER_QUERIES,
+    PREPROD_MIN_RETRIEVAL_QUERIES,
+    PREPROD_RETRIEVAL_DATASET,
+    PREPROD_RETRIEVAL_GATES,
     PRODUCTION_ANSWER_DATASET,
     PRODUCTION_ANSWER_GATES,
     PRODUCTION_EVAL_POLICY_ID,
@@ -10,6 +17,7 @@ from pipeline.core.release_policy import (
     PRODUCTION_RETRIEVAL_DATASET,
     PRODUCTION_RETRIEVAL_GATES,
     production_answer_judge_manifest_metadata,
+    production_eval_policy_id_for_config,
     production_eval_manifest_metadata,
     validate_production_eval_inputs,
     validate_production_eval_manifest,
@@ -40,6 +48,40 @@ def test_committed_production_evaluation_policy_matches_pinned_hashes() -> None:
         answer_dataset=PRODUCTION_ANSWER_DATASET,
         answer_gates=PRODUCTION_ANSWER_GATES,
     ) == []
+
+
+def test_committed_preprod_evaluation_policy_matches_pinned_hashes() -> None:
+    assert (
+        production_eval_policy_id_for_config("mbzuai_preprod_pinecone_production")
+        == PREPROD_EVAL_POLICY_ID
+    )
+    assert production_eval_policy_id_for_config("mbzuai_production") == PRODUCTION_EVAL_POLICY_ID
+    assert validate_production_eval_inputs(
+        retrieval_dataset=PREPROD_RETRIEVAL_DATASET,
+        retrieval_gates=PREPROD_RETRIEVAL_GATES,
+        answer_dataset=PREPROD_ANSWER_DATASET,
+        answer_gates=PREPROD_ANSWER_GATES,
+        policy_id=PREPROD_EVAL_POLICY_ID,
+    ) == []
+
+    retrieval = {
+        **production_eval_manifest_metadata(
+            answer=False,
+            policy_id=PREPROD_EVAL_POLICY_ID,
+        ),
+        "query_count": PREPROD_MIN_RETRIEVAL_QUERIES,
+    }
+    answer = {
+        **production_eval_manifest_metadata(
+            answer=True,
+            policy_id=PREPROD_EVAL_POLICY_ID,
+        ),
+        "query_count": PREPROD_MIN_ANSWER_QUERIES,
+        "llm_judge": production_answer_judge_manifest_metadata(
+            policy_id=PREPROD_EVAL_POLICY_ID,
+        ),
+    }
+    assert validate_production_eval_manifest(retrieval, answer) == []
 
 
 def test_production_evaluation_policy_rejects_arbitrary_inputs(tmp_path) -> None:

@@ -43,6 +43,7 @@ from pipeline.core.orchestrator import PipelineOrchestrator
 from pipeline.core.preflight import assess_production_readiness
 from pipeline.core.run_audit import audit_run
 from pipeline.core.release_policy import (
+    production_eval_policy_id_for_config,
     production_eval_manifest_metadata,
     validate_production_eval_inputs,
     validate_production_eval_manifest,
@@ -1544,6 +1545,7 @@ def build_release_manifest(
     canonical_production = bool(pipeline_config.get("production_profile", False)) or Path(
         str(config_name or "")
     ).stem == "mbzuai_production"
+    production_eval_policy_id = production_eval_policy_id_for_config(config_name)
     normalized_answer_runtime_commit = str(answer_runtime_commit_sha or "").strip().lower()
     resolved_snapshot = load_json_safe(work_path / "resolved_config.json", {}) or {}
     indexing_build = (
@@ -1683,6 +1685,7 @@ def build_release_manifest(
                 retrieval_gates=resolved_gates,
                 answer_dataset=resolved_answer_dataset,
                 answer_gates=resolved_answer_gates,
+                policy_id=production_eval_policy_id,
             )
         )
     eval_output_path = work_path / "release" / "retrieval_eval_report.json"
@@ -1843,11 +1846,17 @@ def build_release_manifest(
             "Canonical production answer evaluation must identify the evaluated backend Git commit"
         )
     retrieval_eval_policy = {
-        **production_eval_manifest_metadata(answer=False),
+        **production_eval_manifest_metadata(
+            answer=False,
+            policy_id=production_eval_policy_id,
+        ),
         "query_count": _count(eval_report.get("query_count")),
     }
     answer_eval_policy = {
-        **production_eval_manifest_metadata(answer=True),
+        **production_eval_manifest_metadata(
+            answer=True,
+            policy_id=production_eval_policy_id,
+        ),
         "query_count": _count(answer_report.get("query_count")),
         "llm_judge": answer_report.get("llm_judge") or {},
     }
