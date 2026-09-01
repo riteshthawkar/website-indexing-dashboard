@@ -1951,6 +1951,8 @@ def build_release_manifest(
             "page_graph_navigation_catalog_sha256": vector_manifest.get(
                 "page_graph_navigation_catalog_sha256", ""
             ),
+            "media_input": vector_manifest.get("media_input", ""),
+            "selected_profile": vector_manifest.get("selected_profile") or {},
             "upload_input_sha256": vector_manifest.get("upload_input_sha256", ""),
             "expected_uploads": _vector_expected_counts_for_manifest(
                 vector_manifest,

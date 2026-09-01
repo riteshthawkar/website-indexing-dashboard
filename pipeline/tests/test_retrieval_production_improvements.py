@@ -6715,6 +6715,7 @@ def test_release_build_validates_raw_namespace_bases_without_double_suffix(tmp_p
     upload_manifest["namespace_strategy"] = "release"
     upload_manifest["namespace_release_id"] = work_dir.name
     upload_manifest["namespaces"] = resolved_namespaces
+    upload_manifest["media_input"] = "caption_text"
     for label in ("dense", "sparse"):
         report = upload_manifest["verification"][label]
         report["expected"] = {
@@ -6752,6 +6753,8 @@ def test_release_build_validates_raw_namespace_bases_without_double_suffix(tmp_p
 
     assert passed
     assert release_manifest["status"] == "passed"
+    assert release_manifest["vector_index"]["media_input"] == "caption_text"
+    assert release_manifest["vector_index"]["selected_profile"] == {}
     assert not any("namespace" in error.lower() for error in release_manifest["errors"])
 
 
