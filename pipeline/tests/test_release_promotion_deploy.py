@@ -208,6 +208,7 @@ def test_release_promotion_attests_candidate_backend_identity(tmp_path: Path) ->
     assert "release-check --config" in pipeline_calls
     assert "release-check --config" in pipeline_calls.split("promote-release", 1)[0]
     assert "--promote" not in pipeline_calls.split("promote-release", 1)[0]
+    assert "--resume-answer-predictions" in pipeline_calls.split("promote-release", 1)[0]
     assert "promote-release --manifest" in pipeline_calls
 
 

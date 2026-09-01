@@ -404,6 +404,7 @@ args=(
   --answer-model "$ANSWER_MODEL"
   --judge-model "$JUDGE_MODEL"
   --answer-runtime-commit-sha "$CANDIDATE_BACKEND_COMMIT_SHA"
+  --resume-answer-predictions
   --parallelism "$PARALLELISM"
 )
 
