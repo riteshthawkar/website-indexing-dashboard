@@ -220,3 +220,36 @@ def test_direct_production_release_check_promote_fails_before_evaluation(tmp_pat
     assert result.returncode == 2
     assert "Direct production release-check --promote is forbidden" in result.stderr
     assert not (tmp_path / "does-not-exist" / "release").exists()
+
+
+def test_release_check_parser_calls_builder_with_supported_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pipeline import cli
+
+    captured: dict = {}
+
+    def fake_build_release_manifest(**kwargs):
+        captured.update(kwargs)
+        return {"status": "failed", "promoted": False, "errors": []}, False
+
+    monkeypatch.setattr(cli, "build_release_manifest", fake_build_release_manifest)
+    monkeypatch.setattr(
+        cli,
+        "write_release_manifest",
+        lambda _manifest, _work_dir: tmp_path / "retrieval_release_manifest.json",
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "pipeline",
+            "release-check",
+            "--work-dir",
+            str(tmp_path),
+        ],
+    )
+
+    assert cli.main() == 1
+    assert "splits" not in captured

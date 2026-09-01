@@ -530,7 +530,6 @@ def cmd_release_check(args: argparse.Namespace) -> int:
         answer_readiness_waiver_reason=args.answer_readiness_waiver_reason,
         query_cache_path=args.query_cache,
         retrieval_cache_path=args.retrieval_cache,
-        splits=args.split,
         parallelism=args.parallelism,
         skip_stage_validation=args.skip_stage_validation,
         progress_callback=progress_callback,
