@@ -11126,6 +11126,9 @@ class TestAdaptiveHybridRetriever:
         assert classify_query_mode(
             "ما الفكرة الأساسية التي يشرحها ملخص فعالية «Physical AI and the Intelligence of Things»؟"
         ) == QueryMode.FACT
+        assert classify_query_mode(
+            "اذكر عنوان إحدى أحدث المنشورات المدرجة في صفحة «MBZUAI Latest Publications»."
+        ) == QueryMode.SYNTHESIS
         assert classify_query_mode("أي نموذج مذكور في لوحة مشاريع البحث؟") == QueryMode.SCOPED
         assert classify_query_mode(
             "ما عنوان البريد الإلكتروني الذي ينبغي التواصل معه بشأن متطلبات إمكانية الوصول قبل زيارة جامعة محمد بن زايد للذكاء الاصطناعي؟"

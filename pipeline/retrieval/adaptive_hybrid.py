@@ -3165,6 +3165,35 @@ def classify_query_mode(query: str) -> QueryMode:
     ):
         return QueryMode.SYNTHESIS
 
+    # A request for one member of a named page/list still needs list-level
+    # context. Routing it as a narrow fact can suppress the Page Card and
+    # parent lanes, leaving only an isolated item with no proof that it belongs
+    # to the list the user named.
+    list_membership_query = bool(
+        re.search(
+            r"\b(?:one|any)\s+(?:item\s+)?(?:of|from)\b.{0,120}"
+            r"\b(?:list|listed|latest|publication|publications|page)\b",
+            normalized,
+        )
+        or re.search(
+            r"(?:إحدى|احدى|أحد|احد).{0,120}"
+            r"(?:المدرجة|القائمة|المنشورات|الصفحة)",
+            normalized,
+        )
+    )
+    if list_membership_query:
+        return QueryMode.SYNTHESIS
+
+    # Questions that explicitly join several interrogative clauses require a
+    # combined evidence set even when they begin with a fact-style phrase.
+    # Detect clause starts, not incidental words inside a single question.
+    interrogative_clauses = re.findall(
+        r"(?:^|,\s*|\band\s+)(?:(?:in\s+)?which|what|where|when|who|how)\b",
+        normalized,
+    )
+    if len(interrogative_clauses) >= 2:
+        return QueryMode.SYNTHESIS
+
     if _is_media_query(query):
         return QueryMode.SCOPED
     if _requested_role_subtypes(query):

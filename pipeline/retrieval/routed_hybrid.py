@@ -647,6 +647,26 @@ class RoutedHybridRetriever:
         )
         return payload
 
+    def _enforce_grounded_evidence_pack(
+        self,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Fail closed when post-processing leaves no answerable evidence."""
+
+        if bool(payload.get("abstained")):
+            return payload
+        evidence_pack = payload.get("evidence_pack")
+        if not isinstance(evidence_pack, Mapping) or list(
+            evidence_pack.get("items") or []
+        ):
+            return payload
+        return self._abstained_payload_from_result(
+            result=payload,
+            reason="empty_grounded_evidence_pack",
+            confidence=0.0,
+            method="deterministic_evidence_pack_guard",
+        )
+
     def _reorder_documents(
         self,
         *,
@@ -3801,6 +3821,7 @@ class RoutedHybridRetriever:
         payload["missing_required_entities"] = payload["evidence_pack"].get("missing_required_entities") or []
         payload["missing_required_pages"] = payload["evidence_pack"].get("missing_required_pages") or []
         payload["missing_required_sections"] = payload["evidence_pack"].get("missing_required_sections") or []
+        payload = self._enforce_grounded_evidence_pack(payload)
         postprocess_stage_latency_ms["evidence_pack_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             3,

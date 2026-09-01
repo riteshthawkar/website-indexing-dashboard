@@ -9341,6 +9341,52 @@ def test_evidence_pack_adds_arabic_president_role_answer_aliases():
     } <= terms
 
 
+def test_routed_retriever_fails_closed_when_evidence_pack_is_empty():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    payload = retriever._enforce_grounded_evidence_pack(
+        {
+            "selected_chunk_ids": ["chunk:spurious-phone"],
+            "selected_answer_ids": ["answer:spurious-phone"],
+            "retrieval_documents": [
+                {
+                    "id": "answer:spurious-phone",
+                    "text": "An unrelated OCR phone number.",
+                }
+            ],
+            "evidence_pack": {
+                "items": [],
+                "coverage_status": "insufficient",
+            },
+            "abstained": False,
+        }
+    )
+
+    assert payload["abstained"] is True
+    assert payload["selected_chunk_ids"] == []
+    assert payload["selected_answer_ids"] == []
+    assert payload["retrieval_documents"] == []
+    assert payload["adjudication_method"] == "deterministic_evidence_pack_guard"
+    assert payload["adjudication_reason"] == "empty_grounded_evidence_pack"
+
+
+def test_routed_retriever_preserves_nonempty_grounded_evidence_pack():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    original = {
+        "selected_chunk_ids": ["chunk:grounded"],
+        "evidence_pack": {
+            "items": [{"id": "chunk:grounded", "text": "Grounded evidence."}],
+            "coverage_status": "complete",
+        },
+        "abstained": False,
+    }
+
+    assert retriever._enforce_grounded_evidence_pack(original) is original
+
+
 def test_evidence_pack_prefers_exact_arabic_president_role_chunk():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 
