@@ -555,7 +555,7 @@ def test_llm_judge_honors_bounded_parallelism_and_preserves_dataset_order(monkey
         }
 
     monkeypatch.setenv("ANSWER_READINESS_JUDGE_MAX_PARALLELISM", "2")
-    monkeypatch.setattr(answer_readiness, "_make_judge_client", object)
+    monkeypatch.setattr(answer_readiness, "_make_judge_client", lambda **_kwargs: object())
     monkeypatch.setattr(answer_readiness, "_judge_answer_row", fake_judge_answer_row)
 
     judged = answer_readiness._run_llm_judge(
@@ -578,6 +578,52 @@ def test_llm_judge_honors_bounded_parallelism_and_preserves_dataset_order(monkey
     assert sorted(payload["id"] for payload in row_events) == [example.id for example in examples]
     assert sorted(payload["completed"] for payload in row_events) == [1, 2, 3, 4]
     assert all(result["judge_provider"] == "gemini" for result in judged.values())
+
+
+def test_llm_judge_uses_transport_timeout_without_nested_worker(monkeypatch):
+    from pipeline.evaluation import answer_readiness
+
+    captured = {}
+
+    class FakeHttpOptions:
+        def __init__(self, *, timeout):
+            captured["timeout"] = timeout
+
+    class FakeTypes:
+        HttpOptions = FakeHttpOptions
+
+    class FakeModels:
+        def generate_content(self, *, model, contents):
+            captured["thread_id"] = threading.get_ident()
+            captured["model"] = model
+            captured["contents"] = contents
+            return type("Response", (), {"text": "ok"})()
+
+    class FakeGenai:
+        class Client:
+            def __init__(self, *, api_key, http_options):
+                captured["api_key"] = api_key
+                captured["http_options"] = http_options
+                self.models = FakeModels()
+
+    monkeypatch.setenv("GOOGLE_API_KEY", "judge-key")
+    monkeypatch.setattr(answer_readiness, "import_genai", lambda: FakeGenai)
+    monkeypatch.setattr(answer_readiness, "import_genai_types", lambda: FakeTypes)
+
+    caller_thread_id = threading.get_ident()
+    client = answer_readiness._make_judge_client(timeout_seconds=12.5)
+    result = answer_readiness._call_judge_model(
+        client,
+        model="gemini-test",
+        prompt="Judge this answer",
+        timeout_seconds=12.5,
+    )
+
+    assert captured["timeout"] == 12_500
+    assert captured["thread_id"] == caller_thread_id
+    assert captured["model"] == "gemini-test"
+    assert captured["contents"] == "Judge this answer"
+    assert result == "ok"
 
 
 def test_openai_judge_fallback_can_be_disabled(monkeypatch):

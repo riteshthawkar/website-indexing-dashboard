@@ -11,7 +11,7 @@ import urllib.error
 import urllib.request
 import uuid
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence
 from urllib.parse import unquote, urlparse, urlunparse
 from zoneinfo import ZoneInfo
 
-from pipeline.core.google_genai import import_genai
+from pipeline.core.google_genai import import_genai, import_genai_types
 from pipeline.core.io import atomic_write_json
 from pipeline.core.openai_client import json_completion
 from pipeline.evaluation.answer_generation import generate_answer_predictions
@@ -1173,11 +1173,15 @@ _JUDGE_SCORE_FIELDS = (
 )
 
 
-def _make_judge_client():
+def _make_judge_client(*, timeout_seconds: float = 120.0):
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required for LLM judge evaluation")
-    return import_genai().Client(api_key=api_key)
+    timeout_ms = max(1_000, int(max(1.0, float(timeout_seconds or 1.0)) * 1_000))
+    return import_genai().Client(
+        api_key=api_key,
+        http_options=import_genai_types().HttpOptions(timeout=timeout_ms),
+    )
 
 
 def _truncate_jsonable(value: Any, *, max_chars: int = 9000) -> Any:
@@ -1389,15 +1393,10 @@ def _normalize_judge_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _call_judge_model(client: Any, *, model: str, prompt: str, timeout_seconds: float) -> str:
-    executor = ThreadPoolExecutor(max_workers=1)
-    future = executor.submit(lambda: client.models.generate_content(model=model, contents=prompt))
-    try:
-        response = future.result(timeout=max(1.0, float(timeout_seconds or 1.0)))
-    except FutureTimeoutError as exc:
-        future.cancel()
-        raise TimeoutError(f"LLM judge timed out after {timeout_seconds} seconds") from exc
-    finally:
-        executor.shutdown(wait=False, cancel_futures=True)
+    # The client owns the real transport timeout. A nested executor timeout can
+    # return control while its non-daemon worker remains blocked in SSL I/O,
+    # which then hangs interpreter shutdown after an otherwise-passed release.
+    response = client.models.generate_content(model=model, contents=prompt)
     return str(getattr(response, "text", "") or "").strip()
 
 
@@ -1577,7 +1576,7 @@ def _run_llm_judge(
     fallback_model = _openai_judge_fallback_model() if allow_openai_fallback else ""
     primary_error = ""
     try:
-        client = _make_judge_client()
+        client = _make_judge_client(timeout_seconds=timeout_seconds)
     except Exception as exc:
         if not fallback_model:
             raise
