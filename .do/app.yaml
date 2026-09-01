@@ -198,19 +198,19 @@ services:
         scope: RUN_TIME
         type: GENERAL
     health_check:
-      initial_delay_seconds: 1500
-      period_seconds: 30
+      initial_delay_seconds: 30
+      period_seconds: 15
       timeout_seconds: 10
       success_threshold: 2
-      failure_threshold: 10
+      failure_threshold: 30
       http_path: /readyz
       port: 8080
     liveness_health_check:
-      initial_delay_seconds: 1500
-      period_seconds: 30
+      initial_delay_seconds: 30
+      period_seconds: 15
       timeout_seconds: 10
       success_threshold: 1
-      failure_threshold: 10
+      failure_threshold: 30
       http_path: /livez
       port: 8080
     termination:
@@ -386,19 +386,19 @@ services:
         scope: RUN_TIME
         type: GENERAL
     health_check:
-      initial_delay_seconds: 1350
-      period_seconds: 30
+      initial_delay_seconds: 30
+      period_seconds: 15
       timeout_seconds: 10
       success_threshold: 2
-      failure_threshold: 10
+      failure_threshold: 30
       http_path: /readyz
       port: 8060
     liveness_health_check:
-      initial_delay_seconds: 1350
-      period_seconds: 30
+      initial_delay_seconds: 30
+      period_seconds: 15
       timeout_seconds: 10
       success_threshold: 1
-      failure_threshold: 10
+      failure_threshold: 30
       http_path: /healthz
       port: 8060
     termination:
