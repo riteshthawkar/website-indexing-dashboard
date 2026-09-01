@@ -296,6 +296,27 @@ def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
             "page_card": 1,
             "action": 1,
         },
+        "source_record_kind_counts": {
+            "chunk": 2,
+            "parent": 1,
+            "parent_section": 1,
+            "media": 1,
+            "page_card": 1,
+            "action": 1,
+        },
+        "content_policy": {
+            "schema_version": "mbzuai.selected_release_content_policy.v1",
+            "excluded_document_revision_ids": ["document-revision:obsolete"],
+            "removed_record_kind_counts": {
+                "chunk": 1,
+                "parent": 0,
+                "parent_section": 0,
+                "media": 0,
+                "page_card": 0,
+                "action": 0,
+            },
+            "removed_record_count": 1,
+        },
         "dense_lane_counts": {
             "chunks": 1,
             "parents": 2,
@@ -305,7 +326,7 @@ def _write_selected_runtime_artifacts(work_dir: Path, config: dict) -> dict:
         },
         "source": source,
         "coverage": {
-            "checkpoint_chunk_count": 1,
+            "checkpoint_chunk_count": 2,
             "candidate_chunk_count": 1,
             "mapped_chunk_count": 1,
             "text_exact_match_count": 1,

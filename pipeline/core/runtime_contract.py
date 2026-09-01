@@ -373,6 +373,7 @@ def validate_runtime_artifact_contract(
                 SELECTED_EMBEDDING_SPEC_KEYS,
                 SELECTED_RELEASE_ASSEMBLY_SCHEMA_VERSION,
                 SELECTED_RELEASE_BINDING_ORDER,
+                SELECTED_RELEASE_CONTENT_POLICY_SCHEMA_VERSION,
                 SELECTED_RELEASE_SOURCE_HASH_KEYS,
                 SelectedReleaseAssemblyError,
                 selected_release_file_path,
@@ -594,17 +595,72 @@ def validate_runtime_artifact_contract(
                     "all_navigation_chunks_remapped"
                 ) is not True:
                     errors.append("selected release assembly chunk/navigation coverage is incomplete")
+                filtered_chunk_coverage_keys = (
+                    "candidate_chunk_count",
+                    "mapped_chunk_count",
+                    "text_exact_match_count",
+                    "navigation_chunk_count",
+                )
                 if any(
                     int(coverage.get(key) or 0) != normalized_lane_counts["chunks"]
-                    for key in (
-                        "checkpoint_chunk_count",
-                        "candidate_chunk_count",
-                        "mapped_chunk_count",
-                        "text_exact_match_count",
-                        "navigation_chunk_count",
-                    )
+                    for key in filtered_chunk_coverage_keys
                 ):
                     errors.append("selected release assembly chunk coverage counts drifted")
+
+                # A v3 content policy is applied after the frozen checkpoint is
+                # bridged to the candidate records.  The checkpoint count must
+                # therefore remain bound to the unfiltered source count, while
+                # candidate/mapped/navigation counts bind to the curated lane.
+                content_policy = (
+                    assembly_payload.get("content_policy")
+                    if isinstance(assembly_payload.get("content_policy"), Mapping)
+                    else {}
+                )
+                source_kind_counts = (
+                    assembly_payload.get("source_record_kind_counts")
+                    if isinstance(
+                        assembly_payload.get("source_record_kind_counts"), Mapping
+                    )
+                    else {}
+                )
+                checkpoint_chunk_count = int(
+                    coverage.get("checkpoint_chunk_count") or 0
+                )
+                if content_policy:
+                    if str(content_policy.get("schema_version") or "") != (
+                        SELECTED_RELEASE_CONTENT_POLICY_SCHEMA_VERSION
+                    ):
+                        errors.append("selected release content policy schema is unsupported")
+                    removed_kind_counts = (
+                        content_policy.get("removed_record_kind_counts")
+                        if isinstance(
+                            content_policy.get("removed_record_kind_counts"), Mapping
+                        )
+                        else {}
+                    )
+                    for kind in SELECTED_DENSE_RECORD_KINDS:
+                        source_count = int(source_kind_counts.get(kind) or 0)
+                        removed_count = int(removed_kind_counts.get(kind) or 0)
+                        retained_count = int(kind_counts.get(kind) or 0)
+                        if source_count - removed_count != retained_count:
+                            errors.append(
+                                f"selected release content policy count differs for {kind}"
+                            )
+                    if int(content_policy.get("removed_record_count") or 0) != sum(
+                        int(removed_kind_counts.get(kind) or 0)
+                        for kind in SELECTED_DENSE_RECORD_KINDS
+                    ):
+                        errors.append("selected release content policy removed count drifted")
+                    if checkpoint_chunk_count != int(
+                        source_kind_counts.get("chunk") or 0
+                    ):
+                        errors.append(
+                            "selected release assembly checkpoint chunk count drifted"
+                        )
+                elif checkpoint_chunk_count != normalized_lane_counts["chunks"]:
+                    errors.append(
+                        "selected release assembly checkpoint chunk count drifted"
+                    )
 
                 bundle_stats = (
                     bundle_payload.get("stats")
