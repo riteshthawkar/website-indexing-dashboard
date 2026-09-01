@@ -17,10 +17,20 @@ ANSWER_MODEL="${ANSWER_MODEL:-gemini-2.5-flash}"
 PARALLELISM="${RELEASE_CHECK_PARALLELISM:-2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-CANONICAL_RELEASE_DATASET="$PROJECT_ROOT/eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl"
-CANONICAL_RELEASE_GATES="$PROJECT_ROOT/eval/gates/retrieval_gate.multilingual_v2_release.json"
+pipeline_config_stem="$(basename "$PIPELINE_CONFIG")"
+pipeline_config_stem="${pipeline_config_stem%.yaml}"
+pipeline_config_stem="${pipeline_config_stem%.yml}"
+if [[ "$pipeline_config_stem" == "mbzuai_preprod" \
+  || "$pipeline_config_stem" == mbzuai_preprod_* ]]; then
+  CANONICAL_RELEASE_DATASET="$PROJECT_ROOT/eval/mbzuai_gold/mbzuai_preprod_multilingual_current_v1.jsonl"
+  CANONICAL_RELEASE_GATES="$PROJECT_ROOT/eval/gates/retrieval_gate.preprod_current_v1.json"
+  CANONICAL_ANSWER_GATES="$PROJECT_ROOT/eval/gates/answer_readiness_gate.preprod_current_v1.json"
+else
+  CANONICAL_RELEASE_DATASET="$PROJECT_ROOT/eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl"
+  CANONICAL_RELEASE_GATES="$PROJECT_ROOT/eval/gates/retrieval_gate.multilingual_v2_release.json"
+  CANONICAL_ANSWER_GATES="$PROJECT_ROOT/eval/gates/answer_readiness_gate.multilingual_v2_release.json"
+fi
 CANONICAL_ANSWER_DATASET="$CANONICAL_RELEASE_DATASET"
-CANONICAL_ANSWER_GATES="$PROJECT_ROOT/eval/gates/answer_readiness_gate.multilingual_v2_release.json"
 PYTHON_BIN="${PYTHON:-python}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   if command -v python3 >/dev/null 2>&1; then
