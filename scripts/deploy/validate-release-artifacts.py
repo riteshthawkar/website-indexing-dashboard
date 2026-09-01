@@ -94,8 +94,39 @@ PRODUCTION_ANSWER_GATES_SHA256 = (
 )
 PRODUCTION_MIN_RETRIEVAL_QUERIES = 160
 PRODUCTION_MIN_ANSWER_QUERIES = 160
+PREPROD_EVAL_POLICY_ID = "mbzuai-preprod-current-eval-v1"
+PREPROD_RETRIEVAL_DATASET_SHA256 = (
+    "d48b847fa1a12d49d5f10009988dfc1c47f9e7fb813cde365993f6d3c4762f5c"
+)
+PREPROD_RETRIEVAL_GATES_SHA256 = (
+    "08299b4953ac1075624ecf07cbe40c410502df0e5993f58272eae1565407b304"
+)
+PREPROD_ANSWER_DATASET_SHA256 = PREPROD_RETRIEVAL_DATASET_SHA256
+PREPROD_ANSWER_GATES_SHA256 = (
+    "79dd20b2b909117dcf52736a0551747d77dd22a47bd7b6675b3b9956d497ea82"
+)
+PREPROD_MIN_RETRIEVAL_QUERIES = 94
+PREPROD_MIN_ANSWER_QUERIES = 94
 PRODUCTION_ANSWER_JUDGE_PROVIDER = "gemini"
 PRODUCTION_ANSWER_JUDGE_MODEL = "gemini-2.5-flash"
+PRODUCTION_EVAL_POLICIES = {
+    PRODUCTION_EVAL_POLICY_ID: {
+        "retrieval_dataset_sha256": PRODUCTION_RETRIEVAL_DATASET_SHA256,
+        "retrieval_gates_sha256": PRODUCTION_RETRIEVAL_GATES_SHA256,
+        "answer_dataset_sha256": PRODUCTION_ANSWER_DATASET_SHA256,
+        "answer_gates_sha256": PRODUCTION_ANSWER_GATES_SHA256,
+        "minimum_retrieval_queries": PRODUCTION_MIN_RETRIEVAL_QUERIES,
+        "minimum_answer_queries": PRODUCTION_MIN_ANSWER_QUERIES,
+    },
+    PREPROD_EVAL_POLICY_ID: {
+        "retrieval_dataset_sha256": PREPROD_RETRIEVAL_DATASET_SHA256,
+        "retrieval_gates_sha256": PREPROD_RETRIEVAL_GATES_SHA256,
+        "answer_dataset_sha256": PREPROD_ANSWER_DATASET_SHA256,
+        "answer_gates_sha256": PREPROD_ANSWER_GATES_SHA256,
+        "minimum_retrieval_queries": PREPROD_MIN_RETRIEVAL_QUERIES,
+        "minimum_answer_queries": PREPROD_MIN_ANSWER_QUERIES,
+    },
+}
 _SECRET_CONFIG_KEYS = {
     "api_key",
     "authorization_header",
@@ -270,6 +301,21 @@ def _validate_gates(manifest: dict[str, Any], *, allow_waiver: bool) -> list[str
     preflight = manifest.get("preflight") if isinstance(manifest.get("preflight"), dict) else {}
     audit = manifest.get("audit") if isinstance(manifest.get("audit"), dict) else {}
     evaluation = manifest.get("evaluation") if isinstance(manifest.get("evaluation"), dict) else {}
+    answer = manifest.get("answer_evaluation") if isinstance(manifest.get("answer_evaluation"), dict) else {}
+    retrieval_policy_id = str(evaluation.get("policy_id") or "").strip()
+    answer_policy_id = str(answer.get("policy_id") or "").strip()
+    policy_id = retrieval_policy_id
+    if (
+        not policy_id
+        or policy_id != answer_policy_id
+        or policy_id not in PRODUCTION_EVAL_POLICIES
+    ):
+        errors.append(
+            "retrieval and answer evaluation policy_id values must match one trusted "
+            "production policy"
+        )
+        policy_id = PRODUCTION_EVAL_POLICY_ID
+    policy = PRODUCTION_EVAL_POLICIES[policy_id]
     if preflight.get("ok") is not True:
         errors.append("production preflight is not marked successful")
     if audit.get("ok") is not True:
@@ -278,35 +324,36 @@ def _validate_gates(manifest: dict[str, Any], *, allow_waiver: bool) -> list[str
     if retrieval_gates.get("passed") is not True:
         errors.append("retrieval evaluation gates are not marked passed")
     expected_retrieval_policy = {
-        "policy_id": PRODUCTION_EVAL_POLICY_ID,
-        "dataset_sha256": PRODUCTION_RETRIEVAL_DATASET_SHA256,
-        "gates_sha256": PRODUCTION_RETRIEVAL_GATES_SHA256,
-        "minimum_query_count": PRODUCTION_MIN_RETRIEVAL_QUERIES,
+        "policy_id": policy_id,
+        "dataset_sha256": policy["retrieval_dataset_sha256"],
+        "gates_sha256": policy["retrieval_gates_sha256"],
+        "minimum_query_count": policy["minimum_retrieval_queries"],
     }
     for key, expected in expected_retrieval_policy.items():
         if evaluation.get(key) != expected:
             errors.append(
-                f"retrieval evaluation {key} does not match {PRODUCTION_EVAL_POLICY_ID}"
+                f"retrieval evaluation {key} does not match {policy_id}"
             )
-    if _positive_int(evaluation.get("query_count")) < PRODUCTION_MIN_RETRIEVAL_QUERIES:
+    minimum_retrieval_queries = int(policy["minimum_retrieval_queries"])
+    minimum_answer_queries = int(policy["minimum_answer_queries"])
+    if _positive_int(evaluation.get("query_count")) < minimum_retrieval_queries:
         errors.append(
             "retrieval evaluation query_count must be at least "
-            f"{PRODUCTION_MIN_RETRIEVAL_QUERIES}"
+            f"{minimum_retrieval_queries}"
         )
 
-    answer = manifest.get("answer_evaluation") if isinstance(manifest.get("answer_evaluation"), dict) else {}
     if not answer:
         errors.append("answer evaluation is missing")
     expected_answer_policy = {
-        "policy_id": PRODUCTION_EVAL_POLICY_ID,
-        "dataset_sha256": PRODUCTION_ANSWER_DATASET_SHA256,
-        "gates_sha256": PRODUCTION_ANSWER_GATES_SHA256,
-        "minimum_query_count": PRODUCTION_MIN_ANSWER_QUERIES,
+        "policy_id": policy_id,
+        "dataset_sha256": policy["answer_dataset_sha256"],
+        "gates_sha256": policy["answer_gates_sha256"],
+        "minimum_query_count": minimum_answer_queries,
     }
     for key, expected in expected_answer_policy.items():
         if answer.get(key) != expected:
             errors.append(
-                f"answer evaluation {key} does not match {PRODUCTION_EVAL_POLICY_ID}"
+                f"answer evaluation {key} does not match {policy_id}"
             )
     if status == "passed_with_waiver":
         if not allow_waiver:
@@ -321,10 +368,10 @@ def _validate_gates(manifest: dict[str, Any], *, allow_waiver: bool) -> list[str
             errors.append("passed releases cannot skip or waive answer evaluation")
         if answer_gates.get("passed") is not True:
             errors.append("answer evaluation gates are not marked passed")
-        if _positive_int(answer.get("query_count")) < PRODUCTION_MIN_ANSWER_QUERIES:
+        if _positive_int(answer.get("query_count")) < minimum_answer_queries:
             errors.append(
                 "answer evaluation query_count must be at least "
-                f"{PRODUCTION_MIN_ANSWER_QUERIES}"
+                f"{minimum_answer_queries}"
             )
         judge = answer.get("llm_judge") if isinstance(answer.get("llm_judge"), dict) else {}
         expected_judge = {
@@ -341,12 +388,12 @@ def _validate_gates(manifest: dict[str, Any], *, allow_waiver: bool) -> list[str
             if judge.get(key) != expected:
                 errors.append(
                     f"answer evaluation llm_judge.{key} does not match "
-                    f"{PRODUCTION_EVAL_POLICY_ID}"
+                    f"{policy_id}"
                 )
-        if _positive_int(judge.get("judged_count")) < PRODUCTION_MIN_ANSWER_QUERIES:
+        if _positive_int(judge.get("judged_count")) < minimum_answer_queries:
             errors.append(
                 "answer evaluation llm_judge.judged_count must be at least "
-                f"{PRODUCTION_MIN_ANSWER_QUERIES}"
+                f"{minimum_answer_queries}"
             )
     return errors
 

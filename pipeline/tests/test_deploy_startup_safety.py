@@ -35,6 +35,11 @@ EVAL_MIN_QUERY_COUNT = 160
 RETRIEVAL_DATASET_SHA256 = "fa400a69bcb9f1a61b6cdb9c8033fed3b16426d2d58b8cec1b427fe097499ac8"
 RETRIEVAL_GATES_SHA256 = "ba221e2d2507582d1566270f5116e423fefce21639cfb23c5773819bfad91128"
 ANSWER_GATES_SHA256 = "94fd1df2f00eef43f1fa957bb82147fb08be896f1a474f91b8837b74c92913eb"
+PREPROD_EVAL_POLICY_ID = "mbzuai-preprod-current-eval-v1"
+PREPROD_EVAL_MIN_QUERY_COUNT = 94
+PREPROD_RETRIEVAL_DATASET_SHA256 = "d48b847fa1a12d49d5f10009988dfc1c47f9e7fb813cde365993f6d3c4762f5c"
+PREPROD_RETRIEVAL_GATES_SHA256 = "08299b4953ac1075624ecf07cbe40c410502df0e5993f58272eae1565407b304"
+PREPROD_ANSWER_GATES_SHA256 = "79dd20b2b909117dcf52736a0551747d77dd22a47bd7b6675b3b9956d497ea82"
 ANSWER_RUNTIME_COMMIT_SHA = "e" * 40
 INDEXING_BUILD = {
     "commit_sha": "f" * 40,
@@ -600,6 +605,60 @@ def test_active_release_requires_matching_passed_manifest(tmp_path: Path) -> Non
     )
 
     result = _resolve(pointer_path, runs_root)
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(work_dir.resolve())
+
+
+def test_active_release_accepts_trusted_preprod_evaluation_policy(tmp_path: Path) -> None:
+    runs_root = tmp_path / "runs"
+    work_dir = runs_root / "run-1"
+    manifest_path = work_dir / "release" / "retrieval_release_manifest.json"
+    pointer_path = tmp_path / "active_release.json"
+    _make_required_artifacts(work_dir)
+    manifest = _manifest_payload(status="passed", work_dir=str(work_dir))
+    manifest["config_name"] = "mbzuai_preprod_pinecone_production"
+    manifest["evaluation"].update(
+        {
+            "policy_id": PREPROD_EVAL_POLICY_ID,
+            "dataset_sha256": PREPROD_RETRIEVAL_DATASET_SHA256,
+            "gates_sha256": PREPROD_RETRIEVAL_GATES_SHA256,
+            "minimum_query_count": PREPROD_EVAL_MIN_QUERY_COUNT,
+            "query_count": PREPROD_EVAL_MIN_QUERY_COUNT,
+        }
+    )
+    manifest["answer_evaluation"].update(
+        {
+            "policy_id": PREPROD_EVAL_POLICY_ID,
+            "dataset_sha256": PREPROD_RETRIEVAL_DATASET_SHA256,
+            "gates_sha256": PREPROD_ANSWER_GATES_SHA256,
+            "minimum_query_count": PREPROD_EVAL_MIN_QUERY_COUNT,
+            "query_count": PREPROD_EVAL_MIN_QUERY_COUNT,
+        }
+    )
+    manifest["answer_evaluation"]["llm_judge"]["judged_count"] = (
+        PREPROD_EVAL_MIN_QUERY_COUNT
+    )
+    _write_json(manifest_path, manifest)
+    _write_json(
+        pointer_path,
+        {
+            "schema_version": 1,
+            "status": "passed",
+            "run_id": "run-1",
+            "release_id": "release-1",
+            "production_indexing_contract_fingerprint": CONTRACT_FINGERPRINT,
+            "production_serving_contract_fingerprint": SERVING_CONTRACT_FINGERPRINT,
+            "answer_runtime_commit_sha": ANSWER_RUNTIME_COMMIT_SHA,
+            "active_release_manifest": str(manifest_path),
+        },
+    )
+
+    result = _resolve(
+        pointer_path,
+        runs_root,
+        PIPELINE_CONFIG="mbzuai_preprod_pinecone_production",
+    )
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == str(work_dir.resolve())
