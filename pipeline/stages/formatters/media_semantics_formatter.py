@@ -586,6 +586,7 @@ def _apply_verified_annotation_seed_manifests(
     specs: Sequence[Mapping[str, Any]],
     *,
     prompt_revision: str,
+    relative_base_dirs: Sequence[Path] = (),
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     """Import completed occurrence semantics from explicitly hashed manifests."""
 
@@ -594,7 +595,16 @@ def _apply_verified_annotation_seed_manifests(
     for spec in specs:
         path = Path(str(spec.get("path") or "")).expanduser()
         if not path.is_absolute():
-            path = Path.cwd() / path
+            candidate_roots = [
+                Path(value).expanduser().resolve()
+                for value in relative_base_dirs
+            ]
+            candidate_roots.append(Path.cwd().resolve())
+            candidates = [(root / path).resolve() for root in candidate_roots]
+            path = next(
+                (candidate for candidate in candidates if candidate.is_file()),
+                candidates[0],
+            )
         path = path.resolve()
         expected_sha = str(spec.get("sha256") or "").lower()
         if not path.is_file():
@@ -1093,10 +1103,17 @@ class MediaSemanticsFormatter(FormatterStage):
             seed_specs = config.get("reuse_annotation_manifest_files") or []
             if seed_specs and not isinstance(seed_specs, list):
                 raise ValueError("reuse_annotation_manifest_files must be a list")
+            configured_work_dir = Path(
+                str(ctx.config.get("work_dir") or "./runs")
+            ).expanduser()
+            if not configured_work_dir.is_absolute():
+                configured_work_dir = Path.cwd() / configured_work_dir
+            artifact_workspace = configured_work_dir.resolve().parent
             source_items, external_seed_evidence = _apply_verified_annotation_seed_manifests(
                 source_items,
                 [value for value in seed_specs if isinstance(value, dict)],
                 prompt_revision=prompt_revision,
+                relative_base_dirs=[artifact_workspace],
             )
             markdown_mapping_path = ctx.previous_outputs.get("md_mapping_file")
             html_mapping_path = ctx.previous_outputs.get("mapping_file")

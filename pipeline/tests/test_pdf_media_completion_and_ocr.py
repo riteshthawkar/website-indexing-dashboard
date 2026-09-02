@@ -374,6 +374,51 @@ def test_external_annotation_seed_is_sha_pinned_and_path_independent(tmp_path: P
         )
 
 
+def test_external_annotation_seed_resolves_from_artifact_workspace(tmp_path: Path):
+    content_hash = "c" * 64
+    seed_item = normalize_media_item(
+        {
+            "type": "image",
+            "id": "workspace-figure",
+            "url": "file:///old/run/workspace-figure.png",
+            "local_path": "/old/run/workspace-figure.png",
+            "content_hash": content_hash,
+            "source_type": "pdf",
+            "source_url": "https://example.test/guide.pdf",
+            "document_id": "guide",
+            "page_number": 4,
+            "crop_source": "docling_layout_recovery",
+            "semantic_caption": "A source-backed campus diagram.",
+            "annotation_status": "completed",
+            "annotation_provider": "google-gemini",
+            "annotation_model": "gemini-3.5-flash-lite",
+            "annotation_prompt_revision": "mbzuai-media-semantics-v2-section-context",
+        }
+    )
+    relative_path = Path("runs") / "seed" / "manifest.json"
+    seed_path = tmp_path / relative_path
+    seed_path.parent.mkdir(parents=True)
+    atomic_write_json(seed_path, build_media_manifest([seed_item]))
+    digest = hashlib.sha256(seed_path.read_bytes()).hexdigest()
+    current = {
+        **seed_item,
+        "url": "file:///new/run/workspace-figure.png",
+        "local_path": "/new/run/workspace-figure.png",
+        "semantic_caption": "",
+        "annotation_status": "",
+    }
+
+    imported, evidence = _apply_verified_annotation_seed_manifests(
+        [current],
+        [{"path": str(relative_path), "sha256": digest}],
+        prompt_revision="mbzuai-media-semantics-v2-section-context",
+        relative_base_dirs=[tmp_path],
+    )
+
+    assert imported[0]["semantic_caption"] == "A source-backed campus diagram."
+    assert evidence[0]["path"] == str(seed_path.resolve())
+
+
 def test_page_window_pdf_media_is_recovered_with_public_url(tmp_path: Path):
     raw_run = tmp_path / "raw"
     downloads = raw_run / "downloads"
