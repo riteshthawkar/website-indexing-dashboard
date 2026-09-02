@@ -54,6 +54,12 @@ def test_short_enumerations_use_synthesis_but_exact_values_remain_facts():
         == QueryMode.SYNTHESIS
     )
     assert classify_query_mode("What is the admissions email?") == QueryMode.FACT
+    assert (
+        classify_query_mode(
+            "According to the Human Phenotype Project page, what age range is eligible to participate?"
+        )
+        == QueryMode.FACT
+    )
     assert classify_query_mode("ما البريد الإلكتروني للقبول؟") == QueryMode.FACT
     assert classify_query_mode("ما ساعات عمل الدعم؟") == QueryMode.FACT
     assert (
@@ -219,6 +225,213 @@ def test_generalized_coverage_prefers_exact_content_phrase_over_broader_top_hit(
     assert inferred["required_pages"] == [exact_url]
 
 
+def test_top_dense_consensus_beats_a_same_title_mirrored_route():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    dedicated_url = "https://study.example.edu"
+    mirror_url = "https://www.example.edu/human-phenotype-project"
+    query = (
+        "According to the Human Phenotype Project page, what age range is "
+        "eligible to participate?"
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:dedicated": {
+                "id": "card:dedicated",
+                "source_url": dedicated_url,
+            },
+            "card:filler": {
+                "id": "card:filler",
+                "source_url": "https://www.example.edu/research",
+            },
+            "card:mirror": {"id": "card:mirror", "source_url": mirror_url},
+        },
+        chunk_map={
+            "chunk:dedicated": {
+                "id": "chunk:dedicated",
+                "source_url": dedicated_url,
+            },
+            **{
+                f"chunk:filler:{index}": {
+                    "id": f"chunk:filler:{index}",
+                    "source_url": f"https://www.example.edu/filler-{index}",
+                }
+                for index in range(4)
+            },
+            "chunk:mirror": {"id": "chunk:mirror", "source_url": mirror_url},
+        },
+    )
+
+    def page(source_url, text):
+        title = "Human Phenotype Project"
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": title.casefold(),
+            "identity_tokens": set(_tokenize(title)),
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+            "document_revision_ids": set(),
+            "linked_chunk_ids": set(),
+            "explicit_alias_urls": set(),
+        }
+
+    retriever._coverage_page_records = [
+        page(
+            dedicated_url,
+            "Human Phenotype Project participants aged 18 to 70 are eligible",
+        ),
+        page(
+            mirror_url,
+            "Human Phenotype Project overview, milestones, faculty and students",
+        ),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        query,
+        "exact_fact",
+        {
+            "dense_page_card_ids": [
+                "card:dedicated",
+                "card:filler",
+                "card:mirror",
+            ],
+            "dense_chunk_ids": [
+                "chunk:dedicated",
+                "chunk:filler:0",
+                "chunk:filler:1",
+                "chunk:filler:2",
+                "chunk:filler:3",
+                "chunk:mirror",
+            ],
+        },
+    )
+
+    assert inferred["required_pages"] == [dedicated_url]
+
+
+def test_page_coverage_tokens_include_late_sections_after_phrase_window():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://long.mbzuai.ac.ae/study"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={},
+        evidence_span_map={},
+        chunk_map={
+            **{
+                f"chunk:{index}": {
+                    "id": f"chunk:{index}",
+                    "source_url": page_url,
+                    "text": (f"introductory-section-{index} " * 100),
+                }
+                for index in range(12)
+            },
+            "chunk:late": {
+                "id": "chunk:late",
+                "source_url": page_url,
+                "section_heading": "Eligibility",
+                "text": "lateeligibilitymarker participant requirements",
+            },
+        },
+        summary_map={},
+        parent_map={},
+    )
+
+    pages = retriever._build_coverage_page_records()
+
+    assert len(pages) == 1
+    assert "lateeligibilitymarker" in pages[0]["tokens"]
+    assert "lateeligibilitymarker" not in pages[0]["search_text"]
+    assert pages[0]["tail_tokens"] == {"study"}
+    assert pages[0]["host_identity_tokens"] == {"long"}
+
+
+def test_generalized_coverage_computes_query_features_once_per_variant():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    query = "Which marine robotics laboratories are listed?"
+    target_url = "https://research.example.edu/marine-robotics"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(page_card_map={}, chunk_map={})
+
+    def page(index):
+        source_url = (
+            target_url
+            if index == 0
+            else f"https://research.example.edu/topic-{index}"
+        )
+        text = (
+            "marine robotics laboratories autonomous systems"
+            if index == 0
+            else f"unrelated research topic {index}"
+        )
+        identity = "Marine Robotics" if index == 0 else f"Topic {index}"
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": text,
+            "tokens": set(_tokenize(text)),
+        }
+
+    retriever._coverage_page_records = [page(index) for index in range(80)]
+    original = retriever._generalized_page_query_features
+    feature_calls = []
+
+    def counted_features(value):
+        feature_calls.append(value)
+        return original(value)
+
+    retriever._generalized_page_query_features = counted_features
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        query,
+        "multi_page_aggregation",
+        {},
+    )
+
+    assert inferred["required_pages"] == [target_url]
+    assert feature_calls == [query]
+
+
+def test_coverage_status_refresh_preserves_scope_without_reinference():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://www.example.edu/research/groups"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._infer_coverage_requirements = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("coverage scope must not be inferred during status refresh")
+    )
+
+    refreshed = retriever._refresh_coverage_plan_status(
+        {
+            "intent": "multi_page_aggregation",
+            "required_pages": [page_url],
+            "required_pages_source": "semantic_page_evidence",
+        },
+        {
+            "selected_chunk_ids": ["chunk:groups"],
+            "retrieval_documents": [
+                {
+                    "id": "chunk:groups",
+                    "source_url": page_url,
+                    "text": "The university has two research groups.",
+                }
+            ],
+        },
+    )
+
+    assert refreshed["required_pages"] == [page_url]
+    assert refreshed["coverage_status"] == "complete"
+
+
 def test_spa_routes_do_not_become_aliases_from_a_shared_revision():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -315,7 +528,7 @@ def test_cross_lingual_page_binding_bridges_a_dense_aggregate_parent():
         item["normalized_url"]: item for item in retriever._coverage_page_records
     }
     query = (
-        "ما المعلومة الأساسية في مشروع تطوير صور رمزية ثلاثية الأبعاد "
+        "ما المعلومة الأساسية التي تعرضها صفحة مشروع تطوير صور رمزية ثلاثية الأبعاد "
         "للمعلمين والطلاب من أجل الفصول الافتراضية؟"
     )
 
@@ -443,6 +656,61 @@ def test_generalized_coverage_bridges_languages_from_dense_representation_agreem
     assert inferred["required_pages_source"] == "semantic_page_evidence"
 
 
+def test_cross_script_page_name_mismatch_does_not_veto_dense_source_consensus():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    careers_url = "https://careers.example.edu"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:careers": {
+                "id": "card:careers",
+                "source_url": careers_url,
+            }
+        },
+        chunk_map={
+            "chunk:careers": {
+                "id": "chunk:careers",
+                "source_url": careers_url,
+            }
+        },
+    )
+    identity = "Careers open positions"
+    sequence = retriever._generalized_page_token_sequence(identity)
+    retriever._coverage_page_records = [
+        {
+            "source_url": careers_url,
+            "normalized_url": careers_url,
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "identity_sequence_text": f" {' '.join(sequence)} ",
+            "search_text": "Faculty Research Engineering Vacancies global offices".casefold(),
+            "tokens": set(
+                _tokenize(
+                    "Faculty Research Engineering Vacancies global offices"
+                )
+            ),
+            "host_identity_tokens": {"careers"},
+            "tail_tokens": set(),
+            "page_is_arabic": False,
+        }
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "ما هي أقسام الوظائف المفتوحة في صفحة الوظائف، وما هي المراكز العالمية؟",
+        "multi_page_aggregation",
+        {
+            "dense_page_card_ids": ["card:careers"],
+            "dense_chunk_ids": ["chunk:careers"],
+        },
+    )
+
+    assert inferred["required_pages"] == [careers_url]
+    assert inferred["required_pages_source"] == "semantic_page_evidence"
+
+
 def test_generalized_comparison_retains_each_high_ranked_dense_page():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -541,6 +809,427 @@ def test_generalized_compound_question_retains_two_complementary_pages():
     assert set(inferred["required_pages"]) == {tuition_url, aid_url}
 
 
+def test_cross_lingual_compound_question_keeps_corroborated_sibling_page_cards():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    overview_url = "https://careers.example.edu/"
+    detail_url = "https://careers.example.edu/vacancies"
+    unrelated_url = "https://news.example.edu/archive"
+    ambiguous_url = "https://careers.example.edu/faculty"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:overview": {"id": "card:overview", "source_url": overview_url},
+            "card:detail": {"id": "card:detail", "source_url": detail_url},
+            "card:unrelated": {"id": "card:unrelated", "source_url": unrelated_url},
+            "card:ambiguous": {"id": "card:ambiguous", "source_url": ambiguous_url},
+        },
+        chunk_map={
+            "chunk:overview": {
+                "id": "chunk:overview",
+                "source_url": overview_url,
+                "text": (
+                    "Faculty opportunities across academic department "
+                    "appointments. Faculty Vacancies Research Vacancies "
+                    "Engineering Vacancies."
+                ),
+            },
+        },
+    )
+
+    def page(source_url, identity, text):
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+        }
+
+    retriever._coverage_page_records = [
+        page(
+            overview_url,
+            "Careers",
+            "Faculty Vacancies Research Vacancies Engineering Vacancies",
+        ),
+        page(
+            detail_url,
+            "All Vacancies",
+            "A global working community in Abu Dhabi Paris and Silicon Valley",
+        ),
+        page(unrelated_url, "News archive", "Institutional news"),
+        page(
+            ambiguous_url,
+            "Faculty opportunities across academic department appointments",
+            "Faculty jobs by academic department",
+        ),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "ما هي أقسام وظائف ACME، وما هي المراكز العالمية المذكورة؟",
+        "multi_page_aggregation",
+        {
+            "dense_page_card_ids": [
+                "card:overview",
+                "card:detail",
+                "card:unrelated",
+                "card:ambiguous",
+            ],
+            "dense_chunk_ids": ["chunk:overview"],
+            "planner_confidence": 0.8,
+            "query_retrieval_expansion": (
+                "ACME أقسام الوظائف jobs page sections three global centers"
+            ),
+        },
+    )
+
+    assert set(inferred["required_pages"]) == {
+        overview_url,
+        detail_url,
+    }
+
+
+def test_required_page_card_survives_long_spa_chunk_evidence():
+    page_url = "https://events.mbzuai.ac.ae/talks/physical-intelligence"
+    page_card_id = "page-card:physical-intelligence"
+    long_noise = " Unrelated event schedule and speaker biography." * 180
+    pack = build_evidence_pack(
+        query=(
+            "What features and main benefits does the Physical Intelligence "
+            "abstract describe?"
+        ),
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:physical:00001:first",
+                    "text": (
+                        "Physical intelligence uses efficient models on robots and sensors."
+                        + long_noise
+                    ),
+                    "source_url": page_url,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 0,
+                },
+                {
+                    "id": "chunk:physical:00002:second",
+                    "text": (
+                        "Physical systems need adaptive machine intelligence."
+                        + long_noise
+                    ),
+                    "source_url": page_url,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 1,
+                },
+                {
+                    "id": page_card_id,
+                    "text": (
+                        "Physical AI is compact, adaptive, and embodied, inspired "
+                        "by the dynamics of living systems."
+                    ),
+                    "source_url": page_url,
+                    "span_type": "page_card_summary",
+                    "coverage_page_card": True,
+                },
+            ]
+        },
+        max_items=8,
+        max_chars=8000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "scoped",
+            "required_pages": [page_url],
+            "query_specific_rules_enabled": False,
+            "semantic_sufficiency_enabled": True,
+        },
+    )
+
+    assert pack["items"][0]["id"] == page_card_id
+    assert pack["items"][0]["coverage_page_card"] is True
+    assert pack["coverage_status"] == "complete"
+    assert len(" ".join(item["text"] for item in pack["items"])) <= 8000
+
+
+def test_named_site_token_prefers_that_official_host_over_a_mirror():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    def page(source_url):
+        identity = "Atlas Institute collaboration"
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": "partners research labs startups".casefold(),
+            "tokens": set(_tokenize("partners research labs startups")),
+        }
+
+    named_host = page("https://atlas.example/collaborate")
+    mirrored_host = page("https://university.example/research/atlas")
+    query = "According to Atlas, which partners collaborate with the institute?"
+
+    assert retriever._generalized_page_target_score(
+        query,
+        named_host,
+    ) > retriever._generalized_page_target_score(query, mirrored_host)
+
+
+def test_explicit_page_scope_beats_content_heavy_mirror_consensus():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    careers_url = "https://careers.example.edu"
+    division_url = "https://www.example.edu/research/marine-systems"
+    query = (
+        "Which Example University careers page section lists vacancies for "
+        "the Marine Systems Division?"
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:division": {"id": "card:division", "source_url": division_url},
+        },
+        chunk_map={
+            "chunk:division": {"id": "chunk:division", "source_url": division_url},
+            "chunk:careers": {"id": "chunk:careers", "source_url": careers_url},
+        },
+    )
+
+    def page(source_url, identity, content, host_tokens):
+        identity_sequence = retriever._generalized_page_token_sequence(identity)
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "identity_sequence_text": f" {' '.join(identity_sequence)} ",
+            "search_text": content.casefold(),
+            "tokens": set(_tokenize(content)),
+            "host_identity_tokens": set(host_tokens),
+            "tail_tokens": set(),
+        }
+
+    retriever._coverage_page_records = [
+        page(
+            division_url,
+            "Marine Systems Division",
+            "The division has open faculty opportunities and research vacancies.",
+            set(),
+        ),
+        page(
+            careers_url,
+            "Careers",
+            "Faculty vacancies include the Marine Systems Division.",
+            {"career", "careers"},
+        ),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        query,
+        "exact_fact",
+        {
+            "dense_page_card_ids": ["card:division"],
+            "dense_chunk_ids": ["chunk:division", "chunk:careers"],
+        },
+    )
+
+    assert inferred["required_pages"] == [careers_url]
+
+
+def test_named_page_acronym_prefers_dedicated_host_over_top_mirror():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    dedicated_url = "https://hpp.example.edu"
+    mirror_url = "https://www.example.edu/news/human-phenotype-project"
+    query = (
+        "On the Human Phenotype Project page, what does the image show and "
+        "what does the surrounding text say?"
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:mirror": {"id": "card:mirror", "source_url": mirror_url},
+            "card:dedicated": {
+                "id": "card:dedicated",
+                "source_url": dedicated_url,
+            },
+        },
+        chunk_map={
+            "chunk:mirror": {"id": "chunk:mirror", "source_url": mirror_url},
+            "chunk:dedicated": {
+                "id": "chunk:dedicated",
+                "source_url": dedicated_url,
+            },
+        },
+    )
+
+    def page(source_url, host_tokens):
+        identity = "Human Phenotype Project"
+        identity_sequence = retriever._generalized_page_token_sequence(identity)
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "identity_sequence_text": f" {' '.join(identity_sequence)} ",
+            "search_text": (
+                "Human Phenotype Project image and surrounding participant text"
+            ).casefold(),
+            "tokens": set(
+                _tokenize(
+                    "Human Phenotype Project image and surrounding participant text"
+                )
+            ),
+            "host_identity_tokens": set(host_tokens),
+            "tail_tokens": set(),
+        }
+
+    retriever._coverage_page_records = [
+        page(mirror_url, set()),
+        page(dedicated_url, {"hpp"}),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        query,
+        "broad_synthesis",
+        {
+            "dense_page_card_ids": ["card:mirror", "card:dedicated"],
+            "dense_chunk_ids": ["chunk:mirror", "chunk:dedicated"],
+        },
+    )
+
+    assert inferred["required_pages"][0] == dedicated_url
+
+
+def test_verified_media_infers_generic_named_page_but_not_numbered_pdf_page():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://atlas.example.edu/diagnostics"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._coverage_intent = lambda _query, _mode: "scoped"
+    retriever._explicit_required_page_markers = lambda _query: []
+    calls = []
+
+    def infer(query, _intent, _payload=None):
+        calls.append(query)
+        return {
+            "required_entities": [],
+            "required_pages": [page_url],
+            "required_sections": [],
+            "required_pages_source": "semantic_page_evidence",
+        }
+
+    retriever._infer_coverage_requirements = infer
+    retriever._selected_source_urls = lambda _payload: {
+        retriever._normalize_source_url(page_url)
+    }
+
+    named_plan = retriever._coverage_plan_for_result(
+        query="On the Atlas Diagnostics page, what does the image show?",
+        payload={
+            "media_evidence_verified": True,
+            "selected_media_ids": ["media:atlas"],
+            "selected_chunk_ids": ["chunk:atlas"],
+        },
+        mode=QueryMode.SCOPED,
+    )
+    numbered_plan = retriever._coverage_plan_for_result(
+        query="What does the image on page 9 show?",
+        payload={
+            "media_evidence_verified": True,
+            "selected_media_ids": ["media:page-9"],
+            "selected_chunk_ids": ["chunk:page-9"],
+        },
+        mode=QueryMode.SCOPED,
+    )
+
+    assert named_plan["required_pages"] == [page_url]
+    assert calls == ["On the Atlas Diagnostics page, what does the image show?"]
+    assert numbered_plan["required_pages"] == []
+    assert numbered_plan["required_pages_source"] == "verified_media_evidence"
+
+
+def test_required_page_scope_prioritizes_media_from_that_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://atlas.example.edu/diagnostics"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    payload = {
+        "media": [
+            {
+                "id": "media:broad",
+                "source_url": "https://www.example.edu/research-projects",
+            },
+            {"id": "media:target", "source_url": page_url},
+        ],
+        "selected_media_ids": ["media:broad", "media:target"],
+    }
+
+    retriever._prioritize_required_page_evidence(
+        query="On the Atlas Diagnostics page, what does the image show?",
+        payload=payload,
+        coverage_plan={"required_pages": [page_url]},
+    )
+
+    assert [media["id"] for media in payload["media"]] == [
+        "media:target",
+        "media:broad",
+    ]
+    assert payload["selected_media_ids"][:2] == [
+        "media:target",
+        "media:broad",
+    ]
+
+
+def test_explicit_source_language_variant_promotes_second_dense_media_hit():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_media_results = 1
+    retriever.chunk_map = {}
+    retriever.parent_map = {}
+    retriever.parent_ids_by_chunk = {}
+    retriever.section_parent_ids_by_chunk = {}
+    retriever.page_parent_ids_by_chunk = {}
+    retriever.media_map = {
+        "english": {
+            "id": "english",
+            "media_type": "image",
+            "source_url": "https://cdn.mbzuai.ac.ae/event-program.pdf",
+            "linked_chunk_ids": [],
+        },
+        "arabic": {
+            "id": "arabic",
+            "media_type": "image",
+            "source_url": "https://cdn.mbzuai.ac.ae/event-program-AR.pdf",
+            "linked_chunk_ids": [],
+        },
+    }
+    retriever.media_texts_by_id = {
+        "english": "Event identity image page 9 حفل التخرج 2025",
+        "arabic": "هوية الحدث في الصفحة 9 حفل التخرج 2025",
+    }
+    retriever._is_low_signal_media = lambda _media: False
+    retriever._score_media_relevance = lambda _query, _media: 1.0
+
+    selected = retriever._attach_media(
+        [],
+        ["english", "arabic"],
+        "في الصفحة 9 من البرنامج العربي، ماذا تُظهر صورة هوية الحدث؟",
+        dense_media_hits=["english", "arabic"],
+    )
+
+    assert [item["id"] for item in selected] == ["arabic"]
+
+
 def test_generalized_compound_question_keeps_top_dense_partial_identity_page():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -626,6 +1315,7 @@ def test_financial_detail_pack_reserves_complete_leaf_and_drops_fragment_facts()
             "fact_documents": [
                 {"id": "fact:marker", "text": "###", "source_url": program_url},
                 {"id": "fact:fragment", "text": "Th", "source_url": program_url},
+                {"id": "fact:stopword-fragment", "text": "From our", "source_url": program_url},
             ],
             "retrieval_documents": [
                 {
@@ -666,6 +1356,9 @@ def test_financial_detail_pack_reserves_complete_leaf_and_drops_fragment_facts()
     assert "AED 170,000" in packed_text
     assert "###" not in packed_text
     assert not any(item["id"] == "fact:fragment" for item in pack["items"])
+    assert not any(
+        item["id"] == "fact:stopword-fragment" for item in pack["items"]
+    )
 
 
 def test_generalized_coverage_does_not_bind_unrelated_dense_page_without_identity():

@@ -1094,6 +1094,62 @@ class RoutedHybridRetriever:
             return "faculty_program_detail"
         return "exact_fact" if mode == QueryMode.FACT else mode.value
 
+    def _refresh_coverage_plan_status(
+        self,
+        coverage_plan: Mapping[str, Any],
+        payload: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """Refresh evidence-dependent status without inferring page scope again.
+
+        Required-page backfill mutates only the selected evidence. Re-running
+        semantic page inference after injecting that evidence is redundant and
+        can create a self-reinforcing page signal. Keep the inferred scope
+        stable and update only the fields that genuinely changed.
+        """
+
+        plan = dict(coverage_plan or {})
+        required_pages = [
+            str(value)
+            for value in (plan.get("required_pages") or [])
+            if str(value).strip()
+        ]
+        required_entities = [
+            str(value)
+            for value in (plan.get("required_entities") or [])
+            if str(value).strip()
+        ]
+        required_sections = [
+            str(value)
+            for value in (plan.get("required_sections") or [])
+            if str(value).strip()
+        ]
+        selected_span_ids = [
+            str(value)
+            for value in (payload.get("selected_evidence_span_ids") or [])
+            if str(value).strip()
+        ]
+        has_evidence = bool(
+            selected_span_ids
+            or payload.get("selected_chunk_ids")
+            or payload.get("answer_documents")
+            or payload.get("fact_documents")
+        )
+        coverage_status = "complete" if has_evidence else "insufficient"
+        if required_pages:
+            selected_sources = self._selected_source_urls(dict(payload))
+            missing_pages = [
+                page
+                for page in required_pages
+                if self._normalize_source_url(page) not in selected_sources
+            ]
+            if missing_pages:
+                coverage_status = "partial" if has_evidence else "insufficient"
+        elif (required_entities or required_sections) and not selected_span_ids:
+            coverage_status = "partial" if has_evidence else "insufficient"
+        plan["selected_span_ids"] = selected_span_ids
+        plan["coverage_status"] = coverage_status
+        return plan
+
     def _coverage_plan_for_result(
         self,
         *,
@@ -1103,12 +1159,19 @@ class RoutedHybridRetriever:
     ) -> Dict[str, Any]:
         intent = self._coverage_intent(query, mode)
         explicit_page_markers = self._explicit_required_page_markers(query)
-        if payload.get("media_evidence_verified") and not explicit_page_markers:
+        explicit_named_page_scope = self._query_has_explicit_named_page_scope(query)
+        if (
+            payload.get("media_evidence_verified")
+            and not explicit_page_markers
+            and not explicit_named_page_scope
+        ):
             # The media verifier already established a source-backed visual
             # match (OCR/caption plus dense or sparse evidence). Heuristic page
             # inference would dilute the media pack and trigger unnecessary
-            # corpus scans. Explicit named-page requirements remain binding:
-            # a coincidental image result must not erase the user's scope.
+            # corpus scans. Explicit named-page requirements remain binding,
+            # whether they came from a legacy route marker or from the generic
+            # ``<name> page`` grammar: a coincidental image result must not
+            # erase the user's scope.
             inferred = {
                 "required_entities": [],
                 "required_pages": [],
@@ -1153,44 +1216,19 @@ class RoutedHybridRetriever:
             for value in (payload.get("required_sections") or inferred.get("required_sections") or [])
             if str(value).strip()
         ]
-        selected_span_ids = [
-            str(value)
-            for value in (payload.get("selected_evidence_span_ids") or [])
-            if str(value).strip()
-        ]
-        has_evidence = bool(
-            selected_span_ids
-            or payload.get("selected_chunk_ids")
-            or payload.get("answer_documents")
-            or payload.get("fact_documents")
-        )
-        coverage_status = "complete" if has_evidence else "insufficient"
-        if required_pages:
-            selected_sources = self._selected_source_urls(payload)
-            missing_pages = [
-                page
-                for page in required_pages
-                if self._normalize_source_url(page) not in selected_sources
-            ]
-            if missing_pages:
-                coverage_status = "partial" if has_evidence else "insufficient"
-        elif (required_entities or required_sections) and not selected_span_ids:
-            coverage_status = "partial" if has_evidence else "insufficient"
-        return {
+        return self._refresh_coverage_plan_status({
             "intent": intent,
             "required_entities": required_entities,
             "required_pages": required_pages,
             "required_pages_source": required_pages_source,
             "required_sections": required_sections,
-            "selected_span_ids": selected_span_ids,
-            "coverage_status": coverage_status,
             "query_specific_rules_enabled": bool(
                 getattr(self, "query_specific_retrieval_rules_enabled", True)
             ),
             "semantic_sufficiency_enabled": bool(
                 getattr(self, "semantic_evidence_sufficiency_enabled", False)
             ),
-        }
+        }, payload)
 
     def _context_page_for_query(self, query: str, context_page_url: str | None) -> str:
         if not context_page_url or not re.search(
@@ -1452,7 +1490,49 @@ class RoutedHybridRetriever:
         for page in by_url.values():
             parsed = urlparse(page["source_url"])
             slug_text = " ".join(part.replace("-", " ") for part in unquote(parsed.path or "").split("/") if part)
+            tail_text = ""
+            path_segments = [
+                part
+                for part in unquote(parsed.path or "").split("/")
+                if part
+            ]
+            if path_segments:
+                tail_text = re.sub(r"[-_.]+", " ", path_segments[-1])
+            tail_tokens = {
+                token
+                for token in _tokenize(tail_text)
+                if len(token) > 1
+                and token not in _GENERALIZED_PAGE_STOPWORDS
+                and not token.isdigit()
+            }
+            host_identity_tokens = {
+                token
+                for label in (parsed.hostname or "").casefold().split(".")
+                for token in _tokenize(label)
+                if len(token) > 2
+                and token
+                not in {
+                    "www",
+                    "com",
+                    "org",
+                    "net",
+                    "edu",
+                    "ac",
+                    "preprod",
+                    "staging",
+                    "mbzuai",
+                }
+            }
             search_text = " ".join([slug_text, *page["parts"]])[:12000].casefold()
+            # Phrase matching stays bounded, but page-level term coverage must
+            # include late sections. Otherwise a long page silently loses the
+            # exact facet that distinguishes it from a same-title mirror once
+            # the first 12k characters are consumed by introductions or SPA
+            # navigation. Store only unique normalized tokens, keeping memory
+            # bounded by vocabulary size rather than source length.
+            content_tokens = set(_tokenize(slug_text))
+            for part in page["parts"]:
+                content_tokens.update(_tokenize(part))
             identity_text = " ".join(
                 [parsed.hostname or "", slug_text, *page["identity_parts"]]
             )[:2400].casefold()
@@ -1463,9 +1543,15 @@ class RoutedHybridRetriever:
                     "source_url": page["source_url"],
                     "normalized_url": page["normalized_url"],
                     "search_text": search_text,
-                    "tokens": set(_tokenize(search_text)),
+                    "tokens": content_tokens,
                     "identity_text": identity_text,
                     "identity_tokens": set(_tokenize(identity_text)),
+                    "tail_tokens": tail_tokens,
+                    "host_identity_tokens": host_identity_tokens,
+                    "page_is_arabic": bool(
+                        "/ar/" in page["normalized_url"]
+                        or page["normalized_url"].endswith("/ar")
+                    ),
                     "search_sequence_text": f" {' '.join(search_sequence)} ",
                     "identity_sequence_text": f" {' '.join(identity_sequence)} ",
                     "document_revision_ids": set(page["document_revision_ids"]),
@@ -2085,14 +2171,167 @@ class RoutedHybridRetriever:
                 sequence.append(token)
         return tuple(sequence)
 
+    def _explicit_page_target_sequences(self, query: str) -> tuple[tuple[str, ...], ...]:
+        """Extract the named scope attached to a generic page/site surface.
+
+        A question such as ``Which Atlas careers page section ...?`` contains
+        two different concepts: ``Atlas careers`` identifies the source page,
+        while the rest identifies the fact to read from that page.  Treating
+        every token as an equal page-identity signal lets a content-heavy
+        mirror beat the page the user explicitly named.  This extractor uses
+        only grammar around generic web-surface words; it contains no known
+        host, route, entity, or answer values.
+        """
+
+        value = str(query or "")
+        targets: List[tuple[str, ...]] = []
+        generic_target_tokens = {
+            "article",
+            "document",
+            "figure",
+            "image",
+            "pdf",
+            "section",
+            "visual",
+            "web",
+        }
+        english_surface_re = re.compile(
+            r"\b(?:home\s*page|homepage|web\s*page|webpage|website|site|portal|profile|page)\b",
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+        for match in english_surface_re.finditer(value):
+            prefix_window = value[max(0, match.start() - 180) : match.start()]
+            raw_prefix_tokens = re.findall(
+                r"[^\W_]+(?:['’][^\W_]+)?",
+                prefix_window,
+                flags=re.UNICODE,
+            )[-10:]
+            sequence = [
+                token
+                for token in self._generalized_page_token_sequence(
+                    " ".join(raw_prefix_tokens)
+                )[-6:]
+                if token not in generic_target_tokens
+            ]
+            if sequence:
+                targets.append(tuple(sequence))
+
+        # Arabic normally places the surface noun before the page name.  A
+        # numbered PDF reference (for example "page 9") is intentionally not
+        # a named-page scope and therefore keeps the fast verified-media path.
+        arabic_surface_re = re.compile(
+            r"(?:صفحة|موقع|بوابة)\s+(?P<target>[^؟?،,.;:]{1,120})",
+            flags=re.IGNORECASE | re.UNICODE,
+        )
+        for match in arabic_surface_re.finditer(value):
+            raw_target = str(match.group("target") or "").strip()
+            if not raw_target or raw_target[0].isdigit():
+                continue
+            raw_target = re.split(
+                r"\b(?:ما|ماذا|كيف|أين|اين|لماذا|متى|هل)\b",
+                raw_target,
+                maxsplit=1,
+            )[0]
+            sequence = [
+                token
+                for token in self._generalized_page_token_sequence(raw_target)[:7]
+                if token not in generic_target_tokens
+            ]
+            if sequence:
+                targets.append(tuple(sequence))
+
+        return tuple(dict.fromkeys(targets))
+
+    def _query_has_explicit_named_page_scope(self, query: str) -> bool:
+        return bool(self._explicit_page_target_sequences(query))
+
+    def _generalized_page_query_features(self, query: str) -> Dict[str, Any]:
+        """Precompute immutable query features shared by every candidate page.
+
+        Page coverage can score thousands of pages. Query tokenization and the
+        ordered phrase windows are independent of the candidate, so rebuilding
+        them inside each page score is pure request-time CPU overhead.
+        """
+
+        tokens = self._generalized_page_query_tokens(query)
+        sequence = self._generalized_page_token_sequence(query)
+        explicit_page_targets = self._explicit_page_target_sequences(query)
+        target_acronyms = {
+            "".join(token[0] for token in target)
+            for target in explicit_page_targets
+            if 2 <= len(target) <= 7
+            and all(re.fullmatch(r"[a-z][a-z0-9-]*", token) for token in target)
+        }
+        target_acronyms.discard("")
+        query_acronym_expansions: Dict[str, tuple[str, ...]] = {}
+        for width in range(2, min(5, len(sequence)) + 1):
+            for offset in range(0, len(sequence) - width + 1):
+                expansion = tuple(sequence[offset : offset + width])
+                if not all(
+                    re.fullmatch(r"[a-z][a-z0-9-]*", token)
+                    for token in expansion
+                ):
+                    continue
+                acronym = "".join(token[0] for token in expansion)
+                if len(acronym) >= 2:
+                    query_acronym_expansions.setdefault(acronym, expansion)
+        phrase_candidates: List[tuple[int, str]] = []
+        maximum = min(10, len(sequence))
+        for width in range(maximum, 1, -1):
+            for offset in range(0, len(sequence) - width + 1):
+                phrase_candidates.append(
+                    (width, f" {' '.join(sequence[offset : offset + width])} ")
+                )
+        return {
+            "tokens": tokens,
+            "sequence": sequence,
+            "phrase_candidates": tuple(phrase_candidates),
+            "normalized_query": " ".join(
+                token for token in _tokenize(query) if token in tokens
+            ),
+            "is_arabic": bool(re.search(r"[\u0600-\u06ff]", query)),
+            "latin_tokens": set(
+                re.findall(r"[a-z][a-z0-9_-]{1,}", query.casefold())
+            ),
+            "explicit_page_targets": explicit_page_targets,
+            "target_acronyms": target_acronyms,
+            "query_acronym_expansions": query_acronym_expansions,
+            "emphasized_host_tokens": {
+                token.casefold()
+                for token in re.findall(r"\b[A-Z][A-Z0-9]{1,9}\b", query)
+            },
+            "root_page_requested": bool(
+                re.search(
+                    r"\b(?:home\s*page|homepage|front\s+page|landing\s+page|root\s+page)\b|"
+                    r"(?:الصفحة\s+الرئيسية|الواجهة\s+الرئيسية)",
+                    query,
+                    flags=re.IGNORECASE,
+                )
+            ),
+            "definition_page_requested": bool(
+                re.search(
+                    r"\b(?:what|who)\s+(?:is|are)\b|\b(?:describe|overview of|tell me about)\b|"
+                    r"(?:ما\s+(?:هو|هي)|من\s+(?:هو|هي)|نبذة\s+عن|عرّف)",
+                    query,
+                    flags=re.IGNORECASE,
+                )
+            ),
+        }
+
     def _longest_generalized_page_phrase_match(
         self,
         query: str,
         page: Mapping[str, Any],
         *,
         identity: bool,
+        query_features: Mapping[str, Any] | None = None,
     ) -> int:
-        query_sequence = self._generalized_page_token_sequence(query)
+        features = (
+            query_features
+            if isinstance(query_features, Mapping)
+            else self._generalized_page_query_features(query)
+        )
+        query_sequence = tuple(features.get("sequence") or ())
         if len(query_sequence) < 2:
             return 0
         field = "identity_sequence_text" if identity else "search_sequence_text"
@@ -2103,24 +2342,80 @@ class RoutedHybridRetriever:
                 page.get(fallback_field) or ""
             )
             haystack = f" {' '.join(page_sequence)} "
-        maximum = min(10, len(query_sequence))
-        for width in range(maximum, 1, -1):
-            for offset in range(0, len(query_sequence) - width + 1):
-                phrase = " ".join(query_sequence[offset : offset + width])
-                if f" {phrase} " in haystack:
-                    return width
+        phrase_candidates = features.get("phrase_candidates") or ()
+        for width, phrase in phrase_candidates:
+            if phrase in haystack:
+                return int(width)
         return 0
 
     def _generalized_page_target_score(
         self,
         query: str,
         page: Dict[str, Any],
+        *,
+        query_features: Mapping[str, Any] | None = None,
     ) -> float:
         """Score page identity and content without domain/fact-specific rules."""
 
-        query_tokens = self._generalized_page_query_tokens(query)
+        features = (
+            query_features
+            if isinstance(query_features, Mapping)
+            else self._generalized_page_query_features(query)
+        )
+        query_tokens = set(features.get("tokens") or set())
         if not query_tokens:
             return 0.0
+        host_identity_tokens = set(page.get("host_identity_tokens") or set())
+        if not host_identity_tokens:
+            try:
+                source_host = (
+                    urlparse(str(page.get("source_url") or "")).hostname or ""
+                ).casefold()
+            except Exception:
+                source_host = ""
+            host_identity_tokens = {
+                token
+                for label in source_host.split(".")
+                for token in _tokenize(label)
+                if len(token) > 2
+                and token
+                not in {
+                    "www",
+                    "com",
+                    "org",
+                    "net",
+                    "edu",
+                    "ac",
+                    "preprod",
+                    "staging",
+                    "mbzuai",
+                }
+            }
+        tail_tokens = set(page.get("tail_tokens") or set())
+        if not tail_tokens:
+            try:
+                path_segments = [
+                    segment
+                    for segment in unquote(
+                        urlparse(str(page.get("source_url") or "")).path or ""
+                    ).split("/")
+                    if segment
+                ]
+            except Exception:
+                path_segments = []
+            tail_tokens = {
+                token
+                for token in _tokenize(
+                    re.sub(
+                        r"[-_.]+",
+                        " ",
+                        path_segments[-1] if path_segments else "",
+                    )
+                )
+                if len(token) > 1
+                and token not in _GENERALIZED_PAGE_STOPWORDS
+                and not token.isdigit()
+            }
         identity_tokens = set(page.get("identity_tokens") or set())
         content_tokens = set(page.get("tokens") or set())
         identity_overlap = query_tokens & identity_tokens
@@ -2129,20 +2424,128 @@ class RoutedHybridRetriever:
         content_ratio = len(content_overlap) / float(len(query_tokens))
         score = (1.15 * identity_ratio) + (0.42 * content_ratio)
         score += min(0.24, 0.08 * len(identity_overlap))
+        if query_tokens & host_identity_tokens:
+            # A user who explicitly names a site/institute token should prefer
+            # that official host over a mirrored institutional summary.  This
+            # is a generic hostname/entity signal, not a known-site routing
+            # rule, and still requires ordinary semantic retrieval evidence.
+            score += 0.44
+            if (
+                query_tokens
+                & host_identity_tokens
+                & set(features.get("emphasized_host_tokens") or set())
+            ):
+                # An acronym or other deliberately capitalized host identity
+                # is a stronger scope signal than an incidental generic word.
+                score += 1.15
+
+        query_acronym_expansions = dict(
+            features.get("query_acronym_expansions") or {}
+        )
+        for host_token in host_identity_tokens:
+            expansion = tuple(query_acronym_expansions.get(host_token) or ())
+            if (
+                len(host_token) < 3
+                or not expansion
+                or len(set(expansion) & identity_tokens) / float(len(expansion)) < 0.75
+            ):
+                continue
+            # Dedicated sites frequently use an acronym as the host while the
+            # question spells out the entity. Bind the two only when the page
+            # identity independently contains the expansion.
+            score += 1.15
+            break
+
+        explicit_page_targets = tuple(
+            tuple(target)
+            for target in (features.get("explicit_page_targets") or ())
+            if target
+        )
+        target_acronyms = set(features.get("target_acronyms") or set())
+        if explicit_page_targets:
+            page_identity_tokens = identity_tokens | tail_tokens | host_identity_tokens
+            target_binding_scores: List[float] = []
+            for target in explicit_page_targets:
+                target_tokens = set(target)
+                if not target_tokens:
+                    continue
+                # Tokens nearest the surface word carry more scope weight:
+                # in "Example University careers page", ``careers`` names
+                # the page kind while the organization words are context.
+                target_weights = {
+                    token: float(index + 1)
+                    for index, token in enumerate(target)
+                }
+                total_target_weight = sum(target_weights.values()) or 1.0
+                overlap_ratio = sum(
+                    weight
+                    for token, weight in target_weights.items()
+                    if token in page_identity_tokens
+                ) / total_target_weight
+                binding_score = 1.75 * overlap_ratio
+                target_phrase = f" {' '.join(target)} "
+                if target_phrase in str(page.get("identity_sequence_text") or ""):
+                    binding_score += 0.50
+                target_acronym = (
+                    "".join(token[0] for token in target)
+                    if 2 <= len(target) <= 7
+                    and all(re.fullmatch(r"[a-z][a-z0-9-]*", token) for token in target)
+                    else ""
+                )
+                explicit_host_match = bool(
+                    (
+                        {target[-1]}
+                        | ({target_acronym} if target_acronym else set())
+                    )
+                    & host_identity_tokens
+                )
+                if explicit_host_match:
+                    binding_score += 1.20
+                    try:
+                        explicit_host_path = (
+                            urlparse(str(page.get("source_url") or "")).path or "/"
+                        )
+                    except Exception:
+                        explicit_host_path = "/invalid"
+                    if explicit_host_path.rstrip("/") == "":
+                        # If the name immediately before "page" identifies the
+                        # host itself, its root is the natural site-level page;
+                        # deeper routes remain preferable when the target also
+                        # names their path identity.
+                        binding_score += 1.80
+                if bool(features.get("root_page_requested")):
+                    try:
+                        path = urlparse(str(page.get("source_url") or "")).path or "/"
+                    except Exception:
+                        path = "/invalid"
+                    binding_score += 1.00 if path.rstrip("/") == "" else -0.30
+                target_binding_scores.append(binding_score)
+
+            if target_binding_scores:
+                best_target_binding = max(target_binding_scores)
+                score += best_target_binding
+                if best_target_binding <= 0.05 and not (
+                    target_acronyms & host_identity_tokens
+                ):
+                    # The candidate may discuss the requested fact, but its
+                    # identity does not match the explicitly named page.
+                    score -= 0.70
 
         query_sequence_length = max(
             1,
-            len(self._generalized_page_token_sequence(query)),
+            len(features.get("sequence") or ()),
         )
         identity_phrase_length = self._longest_generalized_page_phrase_match(
             query,
             page,
             identity=True,
+            query_features=features,
         )
         content_phrase_length = self._longest_generalized_page_phrase_match(
             query,
             page,
             identity=False,
+            query_features=features,
         )
         if identity_phrase_length >= 3:
             score += min(
@@ -2157,29 +2560,6 @@ class RoutedHybridRetriever:
                 + (0.35 * content_phrase_length / query_sequence_length),
             )
 
-        try:
-            path_segments = [
-                segment
-                for segment in unquote(
-                    urlparse(str(page.get("source_url") or "")).path or ""
-                ).split("/")
-                if segment
-            ]
-        except Exception:
-            path_segments = []
-        tail_tokens = {
-            token
-            for token in _tokenize(
-                re.sub(
-                    r"[-_.]+",
-                    " ",
-                    path_segments[-1] if path_segments else "",
-                )
-            )
-            if len(token) > 1
-            and token not in _GENERALIZED_PAGE_STOPWORDS
-            and not token.isdigit()
-        }
         tail_overlap = query_tokens & tail_tokens
         if tail_overlap:
             score += 0.72 * (
@@ -2191,16 +2571,32 @@ class RoutedHybridRetriever:
             if _is_enumeration_query(query) and tail_tokens <= query_tokens:
                 score += 0.22
 
-        normalized_query = " ".join(
-            token for token in _tokenize(query) if token in query_tokens
-        )
+        if bool(features.get("definition_page_requested")) and not bool(
+            features.get("root_page_requested")
+        ):
+            definition_identity_tokens = {
+                "about",
+                "overview",
+                "profile",
+            }
+            if definition_identity_tokens & (identity_tokens | tail_tokens):
+                # About/overview pages are a generic source-role match for a
+                # definitional question. The ordinary dense/content lanes must
+                # still establish the entity itself.
+                score += 0.90
+
+        normalized_query = str(features.get("normalized_query") or "")
         identity_text = str(page.get("identity_text") or "")
         if normalized_query and normalized_query in identity_text:
             score += 0.28
 
-        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
+        query_is_arabic = bool(features.get("is_arabic"))
         normalized_url = str(page.get("normalized_url") or "")
-        page_is_arabic = "/ar/" in normalized_url or normalized_url.endswith("/ar")
+        page_is_arabic = bool(
+            page.get("page_is_arabic")
+            if "page_is_arabic" in page
+            else "/ar/" in normalized_url or normalized_url.endswith("/ar")
+        )
         if query_is_arabic == page_is_arabic:
             score += 0.08
         elif not query_is_arabic and page_is_arabic:
@@ -2244,6 +2640,31 @@ class RoutedHybridRetriever:
                 semantic_query_variants.append(
                     ("planner_expansion", retrieval_expansion, expansion_tokens)
                 )
+        semantic_query_features = {
+            label: self._generalized_page_query_features(semantic_query)
+            for label, semantic_query, _tokens in semantic_query_variants
+        }
+        original_query_features = semantic_query_features["original"]
+        query_is_arabic_script = bool(original_query_features.get("is_arabic"))
+        query_latin_tokens = set(
+            original_query_features.get("latin_tokens") or set()
+        )
+        preferred_host_tokens = set(
+            original_query_features.get("emphasized_host_tokens") or set()
+        ) | set(original_query_features.get("target_acronyms") or set()) | set(
+            (original_query_features.get("query_acronym_expansions") or {}).keys()
+        )
+        for target in original_query_features.get("explicit_page_targets") or ():
+            if target:
+                preferred_host_tokens.add(target[-1])
+        preferred_host_candidate_exists = bool(
+            preferred_host_tokens
+            and any(
+                preferred_host_tokens
+                & set(page.get("host_identity_tokens") or set())
+                for page in self._coverage_page_records
+            )
+        )
         page_card_rank: Dict[str, int] = {}
         page_card_map = getattr(self.vector, "page_card_map", {})
         for rank, card_id in enumerate(payload.get("dense_page_card_ids") or []):
@@ -2289,27 +2710,57 @@ class RoutedHybridRetriever:
             if normalized:
                 evidence_source_rank.setdefault(normalized, rank)
 
-        scored: List[tuple[float, float, Dict[str, Any]]] = []
-        for page in self._coverage_page_records:
-            normalized = str(page.get("normalized_url") or "")
-            page_is_arabic = "/ar/" in normalized or normalized.endswith("/ar")
-            query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
-            if not query_is_arabic and page_is_arabic:
+        compound_facet_request = _is_compound_facet_query(query)
+
+        # For a cross-lingual compound question, the dense Page Card lane can
+        # correctly identify two complementary sibling pages even when only
+        # one of them has an exact-source dense chunk.  Require an independently
+        # corroborated page on the same official host before trusting such a
+        # sibling.  This keeps the bridge corpus-agnostic while avoiding a hard
+        # dependency on a stochastic translation from the query planner.
+        directly_corroborated_page_hosts: set[str] = set()
+        for normalized, card_rank in page_card_rank.items():
+            if card_rank > 5 or dense_source_rank.get(normalized, 999) > 5:
                 continue
             try:
-                tail = unquote(
-                    urlparse(str(page.get("source_url") or "")).path or ""
-                ).rstrip("/").rsplit("/", 1)[-1]
+                host = (urlparse(normalized).hostname or "").casefold()
             except Exception:
-                tail = ""
-            tail_tokens = {
-                token
-                for token in _tokenize(re.sub(r"[-_.]+", " ", tail))
-                if len(token) > 1
-                and token not in _GENERALIZED_PAGE_STOPWORDS
-                and not token.isdigit()
-            }
+                host = ""
+            if host:
+                directly_corroborated_page_hosts.add(host)
+
+        scored: List[tuple[float, float, bool, Dict[str, Any]]] = []
+        for page in self._coverage_page_records:
+            normalized = str(page.get("normalized_url") or "")
+            page_is_arabic = bool(
+                page.get("page_is_arabic")
+                if "page_is_arabic" in page
+                else "/ar/" in normalized or normalized.endswith("/ar")
+            )
+            if not query_is_arabic_script and page_is_arabic:
+                continue
+            tail_tokens = set(page.get("tail_tokens") or set())
+            if not tail_tokens:
+                try:
+                    tail = unquote(
+                        urlparse(str(page.get("source_url") or "")).path or ""
+                    ).rstrip("/").rsplit("/", 1)[-1]
+                except Exception:
+                    tail = ""
+                tail_tokens = {
+                    token
+                    for token in _tokenize(re.sub(r"[-_.]+", " ", tail))
+                    if len(token) > 1
+                    and token not in _GENERALIZED_PAGE_STOPWORDS
+                    and not token.isdigit()
+                }
             identity_tokens = set(page.get("identity_tokens") or set())
+            content_tokens = set(page.get("tokens") or set())
+            original_query_tokens = semantic_query_variants[0][2]
+            discriminating_content_overlap = bool(
+                (original_query_tokens - identity_tokens - tail_tokens)
+                & content_tokens
+            )
             aggregate_identity_rank: int | None = None
             aggregate_identity_length = 0
             if normalized in page_card_rank:
@@ -2365,19 +2816,44 @@ class RoutedHybridRetriever:
                 key=lambda value: value[0],
                 default=(0.0, "original", query),
             )
+            direct_page_card_dense_agreement = bool(
+                normalized in page_card_rank
+                and page_card_rank[normalized] <= 5
+                and normalized in dense_source_rank
+                and dense_source_rank[normalized] <= 5
+            )
+            top_direct_dense_consensus = bool(
+                normalized in page_card_rank
+                and page_card_rank[normalized] == 0
+                and normalized in dense_source_rank
+                and dense_source_rank[normalized] == 0
+                and discriminating_content_overlap
+            )
             page_card_dense_agreement = bool(
                 normalized in page_card_rank
                 and page_card_rank[normalized] <= 5
                 and (
-                    (
-                        normalized in dense_source_rank
-                        and dense_source_rank[normalized] <= 5
-                    )
+                    direct_page_card_dense_agreement
                     or (
                         aggregate_identity_rank is not None
                         and aggregate_identity_rank <= 5
                     )
                 )
+            )
+            try:
+                page_host = (urlparse(normalized).hostname or "").casefold()
+            except Exception:
+                page_host = ""
+            preferred_host_match = bool(
+                preferred_host_tokens
+                & set(page.get("host_identity_tokens") or set())
+            )
+            corroborated_sibling_page_card = bool(
+                compound_facet_request
+                and page_host
+                and page_host in directly_corroborated_page_hosts
+                and normalized in page_card_rank
+                and page_card_rank[normalized] <= 3
             )
             dense_identity_agreement = bool(
                 normalized in dense_source_rank
@@ -2394,21 +2870,58 @@ class RoutedHybridRetriever:
             # expansion replace the original page score when it genuinely
             # bridges scripts/languages or the original has almost no lexical
             # signal at all; dense retrieval still corroborates the page.
-            semantic_score = self._generalized_page_target_score(query, page)
-            query_is_arabic_script = bool(re.search(r"[\u0600-\u06ff]", query))
+            semantic_score = self._generalized_page_target_score(
+                query,
+                page,
+                query_features=original_query_features,
+            )
             for label, semantic_query, _query_tokens in semantic_query_variants:
                 if label == "original":
                     continue
+                expansion_features = semantic_query_features[label]
                 expansion_is_arabic_script = bool(
-                    re.search(r"[\u0600-\u06ff]", semantic_query)
+                    expansion_features.get("is_arabic")
                 )
+                expansion_latin_tokens = set(
+                    expansion_features.get("latin_tokens") or set()
+                )
+                cross_script_semantic_bridge = bool(
+                    query_is_arabic_script
+                    and (expansion_latin_tokens - query_latin_tokens)
+                ) or (query_is_arabic_script != expansion_is_arabic_script)
                 if (
-                    query_is_arabic_script != expansion_is_arabic_script
+                    cross_script_semantic_bridge
                     or semantic_score < 0.30
                 ):
+                    expansion_score = self._generalized_page_target_score(
+                        semantic_query,
+                        page,
+                        query_features=expansion_features,
+                    )
+                    if (
+                        cross_script_semantic_bridge
+                        and expansion_score < 0.50
+                    ):
+                        # A weak cross-script rewrite is useful for recall, but
+                        # not discriminating enough to reorder independently
+                        # ranked dense Page Cards. Planner synonyms can be
+                        # ambiguous (for example, "sections" vs "departments").
+                        # Strong phrase/identity matches remain fully effective.
+                        # A page-name token in the user's script cannot
+                        # lexically match an otherwise correct page identity
+                        # in another script.  Do not let that expected
+                        # mismatch become a negative veto after the dense
+                        # Page Card and dense chunk lanes independently agree
+                        # on the same source.  The expansion remains only a
+                        # small recall signal; cross-lane agreement below is
+                        # still required before the page becomes mandatory.
+                        expansion_score = max(
+                            0.0,
+                            min(expansion_score, 0.12),
+                        )
                     semantic_score = max(
                         semantic_score,
-                        self._generalized_page_target_score(semantic_query, page),
+                        expansion_score,
                     )
             # A required page is a hard evidence constraint. Bind only when its
             # identity covers most requested concepts, or when independent
@@ -2420,6 +2933,7 @@ class RoutedHybridRetriever:
             if not (
                 binding_coverage >= 0.50
                 or page_card_dense_agreement
+                or corroborated_sibling_page_card
                 or dense_identity_agreement
                 or top_dense_partial_identity
                 or semantic_score >= 0.75
@@ -2445,7 +2959,31 @@ class RoutedHybridRetriever:
                     0.06,
                     0.30 - (0.035 * dense_source_rank[normalized]),
                 )
-            elif aggregate_identity_rank is not None:
+            weak_compound_aggregate = bool(
+                compound_facet_request
+                and semantic_score < 0.50
+                and corroborated_sibling_page_card
+            )
+            if direct_page_card_dense_agreement:
+                # Exact-source agreement is stronger than a child title found
+                # inside an SPA/landing-page aggregate.
+                agreement_score += 0.14
+                if top_direct_dense_consensus:
+                    # When both independently embedded representations rank
+                    # the exact same source first, that consensus
+                    # must outweigh a mirrored/similarly named route receiving
+                    # a lexical boost from its URL slug. This disambiguates
+                    # duplicate page titles without a host- or fact-specific
+                    # rule and still requires ordinary semantic retrieval.
+                    if not (
+                        preferred_host_candidate_exists
+                        and not preferred_host_match
+                    ):
+                        agreement_score += 0.90
+            elif (
+                aggregate_identity_rank is not None
+                and not weak_compound_aggregate
+            ):
                 agreement_score += max(
                     0.06,
                     0.30 - (0.035 * aggregate_identity_rank),
@@ -2454,10 +2992,35 @@ class RoutedHybridRetriever:
                     0.40,
                     0.05 * aggregate_identity_length,
                 )
+            if (
+                corroborated_sibling_page_card
+                and not direct_page_card_dense_agreement
+                and (
+                    aggregate_identity_rank is None
+                    or weak_compound_aggregate
+                )
+            ):
+                agreement_score += 0.38
+            if (
+                query_is_arabic_script != page_is_arabic
+                and (
+                    page_card_dense_agreement
+                    or corroborated_sibling_page_card
+                )
+            ):
+                # In a cross-script request, a literal explicit-page token
+                # cannot match the candidate's identity text and therefore
+                # contributes the expected mismatch penalty.  Independent
+                # Page Card/chunk consensus (or a tightly ranked sibling on
+                # that already-corroborated host) is stronger evidence than
+                # this absence of lexical overlap.  Neutralize only the
+                # negative score; positive semantic evidence is untouched.
+                semantic_score = max(0.0, semantic_score)
             total_score = semantic_score + agreement_score
             identity_binding = semantic_score >= 0.42 and total_score >= 0.66
             cross_lane_binding = (
-                page_card_dense_agreement and total_score >= 0.58
+                (page_card_dense_agreement or corroborated_sibling_page_card)
+                and total_score >= 0.58
             )
             dense_partial_binding = (
                 (dense_identity_agreement or top_dense_partial_identity)
@@ -2465,13 +3028,23 @@ class RoutedHybridRetriever:
                 and total_score >= 0.54
             )
             if identity_binding or cross_lane_binding or dense_partial_binding:
-                scored.append((total_score, semantic_score, page))
+                scored.append(
+                    (
+                        total_score,
+                        semantic_score,
+                        bool(
+                            page_card_dense_agreement
+                            or corroborated_sibling_page_card
+                        ),
+                        page,
+                    )
+                )
 
         scored.sort(
             key=lambda item: (
                 -item[0],
                 -item[1],
-                item[2].get("normalized_url") or "",
+                item[3].get("normalized_url") or "",
             )
         )
         if not scored:
@@ -2490,12 +3063,11 @@ class RoutedHybridRetriever:
                 flags=re.IGNORECASE,
             )
         )
-        compound_facet_request = _is_compound_facet_query(query)
         max_pages = 4 if comparison_request else 2 if compound_facet_request else 1
         multi_page_request = comparison_request or compound_facet_request
         pages = [
             str(page.get("source_url") or "")
-            for score, _semantic_score, page in scored
+            for score, _semantic_score, _corroborated_binding, page in scored
             if score
             >= (
                 0.66
@@ -2505,6 +3077,7 @@ class RoutedHybridRetriever:
             and (
                 not multi_page_request
                 or _semantic_score >= 0.50
+                or _corroborated_binding
             )
         ][:max_pages]
         pages = self._dedupe_explicit_pages_by_family(pages, query=query)
@@ -3773,6 +4346,50 @@ class RoutedHybridRetriever:
                 ]
                 payload["retrieval_documents"] = [*ordered_required, *other_docs]
 
+        # Media is an independently retrieved representation and is packed
+        # before ordinary text for visual questions.  Once a page has been
+        # semantically bound, apply that same scope to media ordering; merely
+        # sorting text evidence cannot prevent a broadly similar image from a
+        # different page becoming citation [1].
+        media_docs = [
+            media
+            for media in (payload.get("media") or [])
+            if isinstance(media, dict)
+        ]
+        if media_docs:
+            def media_sort_key(index_media: tuple[int, Dict[str, Any]]) -> tuple[int, int, int, int]:
+                index, media = index_media
+                match = self._required_page_match_rank(
+                    self._source_url_from_record(media),
+                    required_pages,
+                )
+                if match is None:
+                    return (1, 999, 1, index)
+                rank, exact = match
+                return (0, rank, 0 if exact else 1, index)
+
+            ordered_media = [
+                media
+                for _index, media in sorted(
+                    enumerate(media_docs),
+                    key=media_sort_key,
+                )
+            ]
+            payload["media"] = ordered_media
+            ordered_media_ids = [
+                str(media.get("id") or "")
+                for media in ordered_media
+                if str(media.get("id") or "")
+            ]
+            original_media_ids = [
+                str(value)
+                for value in (payload.get("selected_media_ids") or [])
+                if str(value)
+            ]
+            payload["selected_media_ids"] = list(
+                dict.fromkeys([*ordered_media_ids, *original_media_ids])
+            )
+
     def _augment_payload_for_required_coverage(
         self,
         *,
@@ -4597,10 +5214,9 @@ class RoutedHybridRetriever:
             confidence, factors = score_retrieval_confidence(payload)
             payload["retrieval_confidence"] = confidence
             payload["confidence_factors"] = factors
-            coverage_plan = self._coverage_plan_for_result(
-                query=coverage_query,
-                payload=payload,
-                mode=mode,
+            coverage_plan = self._refresh_coverage_plan_status(
+                coverage_plan,
+                payload,
             )
         postprocess_stage_latency_ms["coverage_planning_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,

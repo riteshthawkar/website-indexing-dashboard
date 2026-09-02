@@ -1108,6 +1108,9 @@ def _prediction_row_is_complete(row: Mapping[str, Any]) -> bool:
     finish_reason = _text(row.get("finish_reason") or metadata.get("finish_reason")).casefold()
     if finish_reason in {"error", "stream_error", "timeout", "cancelled", "canceled"}:
         return False
+    terminal_event = _text(metadata.get("terminal_event")).casefold()
+    if terminal_event in {"error", "timeout", "failed", "failure"}:
+        return False
     return bool(_text(row.get("response")))
 
 
@@ -2023,10 +2026,12 @@ def _chat_prediction_row_from_payload(
         else {}
     )
     payload_status = str(payload.get("status") or "").strip().lower()
+    terminal_status = str(terminal_event or "").strip().lower()
     preserve_error = bool(error) and (
         status_code >= 400
         or bool(transport_error)
         or payload_status in {"error", "failed", "failure", "not_found"}
+        or terminal_status in {"error", "timeout", "failed", "failure"}
         or not response_text.strip()
     )
     metadata = {

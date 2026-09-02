@@ -614,6 +614,7 @@ def _evidence_sufficiency(
     structured_items = 0
     aggregate_items = 0
     trusted_aggregate_items = 0
+    trusted_page_card_sources: set[str] = set()
     required_page_set = {
         normalized
         for value in required_pages
@@ -650,6 +651,21 @@ def _evidence_sufficiency(
                 and _normalize_url_for_match(source_url) in required_page_set
             ):
                 trusted_aggregate_items += 1
+        if bool(item.get("coverage_page_card")) and (
+            not required_page_set
+            or _normalize_url_for_match(source_url) in required_page_set
+        ):
+            trusted_page_card_sources.add(
+                _normalize_url_for_match(source_url)
+            )
+
+    all_required_pages_have_page_cards = bool(
+        required_page_set
+        and required_page_set <= trusted_page_card_sources
+    )
+    trusted_bound_representation = bool(
+        trusted_aggregate_items or all_required_pages_have_page_cards
+    )
 
     alignment_variants = [
         {
@@ -687,18 +703,18 @@ def _evidence_sufficiency(
         query_term_count
         and overlap < minimum_alignment
         and retrieval_confidence < 0.65
-        and not trusted_aggregate_items
+        and not trusted_bound_representation
     ):
         reasons.append("weak_query_evidence_alignment")
     if (
         broad_intent
-        and not trusted_aggregate_items
+        and not trusted_bound_representation
         and retrieval_confidence < 0.65
     ):
         reasons.append("low_confidence_broad_evidence_without_bound_page")
     if (
         broad_intent
-        and not trusted_aggregate_items
+        and not trusted_bound_representation
         and (len(content_keys) < 2 or len(official_sources) < 2)
     ):
         reasons.append("insufficient_distinct_evidence_for_broad_request")
@@ -721,6 +737,8 @@ def _evidence_sufficiency(
         "structured_item_count": structured_items,
         "aggregate_item_count": aggregate_items,
         "trusted_aggregate_item_count": trusted_aggregate_items,
+        "trusted_page_card_source_count": len(trusted_page_card_sources),
+        "all_required_pages_have_page_cards": all_required_pages_have_page_cards,
         "retrieval_confidence": round(retrieval_confidence, 4),
         "reasons": reasons,
     }
@@ -1098,6 +1116,45 @@ _KIND_BASE_SCORE = {
     "media": 0.0,
 }
 
+_FACT_FRAGMENT_ONLY_TOKENS = {
+    "a",
+    "an",
+    "and",
+    "at",
+    "by",
+    "for",
+    "from",
+    "in",
+    "of",
+    "on",
+    "or",
+    "our",
+    "the",
+    "their",
+    "to",
+    "with",
+    "من",
+    "في",
+    "على",
+    "عن",
+    "إلى",
+    "الى",
+}
+
+
+def _usable_fact_or_assertion_text(value: Any) -> bool:
+    text = _clean_text(value)
+    tokens = [
+        token.casefold()
+        for token in re.findall(r"[^\W_]+", text, flags=re.UNICODE)
+    ]
+    if len(text) < 6 or len(tokens) < 2:
+        return False
+    return not (
+        len(text) < 24
+        and all(token in _FACT_FRAGMENT_ONLY_TOKENS for token in tokens)
+    )
+
 
 _MULTI_DETAIL_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|qualification|academic qualification|roles|positions|responsibilities|steps|"
@@ -1427,6 +1484,11 @@ def _candidate_score(
         # has been semantically bound. This is especially important when the
         # query and source use different languages.
         score += max(8.0, 34.0 - (3.0 * dense_semantic_rank))
+    if bool(doc.get("coverage_page_card")):
+        # Page Cards are concise, release-bound summaries of a semantically
+        # resolved page. Keep one ahead of noisy SPA aggregate chunks so the
+        # generator sees the page's purpose and topic structure.
+        score += 44.0
     if _is_official_mbzuai_url(source):
         score += 18.0
     elif not source:
@@ -1585,9 +1647,8 @@ def build_evidence_pack(
             len(text) < 20 or len(re.findall(r"\w+", text, re.UNICODE)) < 3
         ):
             continue
-        if kind in {"fact", "assertion"} and (
-            len(text) < 6
-            or len(re.findall(r"[^\W_]+", text, re.UNICODE)) < 2
+        if kind in {"fact", "assertion"} and not _usable_fact_or_assertion_text(
+            text
         ):
             # Extraction artifacts such as markdown markers or severed word
             # prefixes are not independently usable factual evidence. Small
@@ -1702,6 +1763,18 @@ def build_evidence_pack(
                 item_char_limit,
                 include_legacy_aliases=query_specific_rules_enabled,
             )
+        elif kind == "chunk" and len(item_text) > 3200:
+            # Long SPA aggregate chunks frequently continue into unrelated
+            # cards or events. Keep a query-dense window for ordinary factual
+            # and scoped requests as well, leaving room for the complementary
+            # Page Card representation in the same evidence budget.
+            item_char_limit = min(item_char_limit, 3200)
+            item_text = _query_dense_excerpt(
+                item_text,
+                evidence_matching_query,
+                item_char_limit,
+                include_legacy_aliases=query_specific_rules_enabled,
+            )
         if len(item_text) > item_char_limit:
             item_text = item_text[: max(0, item_char_limit)].rsplit(" ", 1)[0].strip() or item_text[:item_char_limit].strip()
             truncated = True
@@ -1710,6 +1783,11 @@ def build_evidence_pack(
         if kind in {"chunk", "evidence_span", "media", "summary"} and (
             len(item_text) < 20
             or len(re.findall(r"\w+", item_text, re.UNICODE)) < 3
+        ):
+            truncated = True
+            return False
+        if kind in {"fact", "assertion"} and not _usable_fact_or_assertion_text(
+            item_text
         ):
             truncated = True
             return False
@@ -1731,6 +1809,7 @@ def build_evidence_pack(
                 "confidence": _confidence(doc),
                 "authority_score": _authority_score(doc),
                 "coverage_aggregate": bool(doc.get("coverage_aggregate")),
+                "coverage_page_card": bool(doc.get("coverage_page_card")),
                 "coverage_dense_evidence": bool(
                     doc.get("coverage_dense_evidence")
                 ),
@@ -2045,6 +2124,9 @@ def build_evidence_pack(
                 return index
         return 999
 
+    def _coverage_page_card_sort_rank(item: Dict[str, Any]) -> int:
+        return 0 if bool(item.get("coverage_page_card")) else 1
+
     coverage_first_intent = intent in {"broad_synthesis", "multi_page_aggregation", "large_page"} or len(required_pages) > 1
     if coverage_first_intent:
         if explicit_media_query:
@@ -2061,6 +2143,7 @@ def build_evidence_pack(
                 key=lambda item: (
                     _required_page_sort_rank(item),
                     _required_entity_sort_rank(item),
+                    _coverage_page_card_sort_rank(item),
                     evidence_order.get(str(item.get("kind") or ""), 99),
                     int(item.get("rank") or 0),
                 )
@@ -2079,6 +2162,7 @@ def build_evidence_pack(
             items.sort(
                 key=lambda item: (
                     _required_page_sort_rank(item),
+                    _coverage_page_card_sort_rank(item),
                     evidence_order.get(str(item.get("kind") or ""), 99),
                     _required_entity_sort_rank(item),
                     int(item.get("rank") or 0),

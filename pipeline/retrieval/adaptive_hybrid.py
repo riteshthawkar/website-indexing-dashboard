@@ -3249,6 +3249,26 @@ def classify_query_mode(query: str) -> QueryMode:
         "أي ",
         "اي ",
     )
+    # Source-attribution prefixes (for example, "According to the X page,")
+    # should not turn a short factual request into synthesis solely because
+    # the full sentence crosses the word-count threshold. Classify the single
+    # interrogative clause after an English or Arabic comma, while retaining
+    # the complete query for retrieval and all broad/list intent checks.
+    factual_intent = normalized
+    source_attribution_tail = False
+    for separator in (",", "،"):
+        if separator not in factual_intent:
+            continue
+        tail = factual_intent.rsplit(separator, 1)[-1].strip()
+        if tail.startswith((*fact_starts, "what ")):
+            factual_intent = tail
+            source_attribution_tail = True
+            break
+    factual_words = factual_intent.split()
+    factual_intent_starts_question = bool(
+        factual_intent.startswith(fact_starts)
+        or (source_attribution_tail and factual_intent.startswith("what "))
+    )
     narrow_fact_terms = {
         "address",
         "bus",
@@ -3325,13 +3345,13 @@ def classify_query_mode(query: str) -> QueryMode:
     # This is a general retrieval decision, not a fact-specific answer shortcut.
     if _is_enumeration_query(query):
         return QueryMode.SYNTHESIS
-    if fact_phrase and len(words) <= 18 and not broad_query:
+    if fact_phrase and len(factual_words) <= 18 and not broad_query:
         return QueryMode.FACT
-    if len(words) <= 12 and normalized.startswith(fact_starts) and not broad_query and not scoped_anchor:
+    if len(factual_words) <= 12 and factual_intent_starts_question and not broad_query and not scoped_anchor:
         return QueryMode.FACT
     if (
-        len(words) <= 28
-        and normalized.startswith(fact_starts)
+        len(factual_words) <= 28
+        and factual_intent_starts_question
         and not broad_query
         and not scoped_anchor
     ):
@@ -4731,6 +4751,62 @@ class AdaptiveHybridRetriever:
             if token in _MEDIA_PRIORITY_TOKENS or token in _VISUAL_INTENT_TOKENS
         ]
 
+    def _requested_media_language(self, query: str) -> str:
+        """Return an explicitly requested source-language variant, if any."""
+
+        normalized = _clean_text(query).casefold()
+        if re.search(
+            r"\b(?:arabic|arabic-language)\b|"
+            r"(?:النسخة\s+العربية|البرنامج\s+العربي|باللغة\s+العربية|العربي|العربية)",
+            normalized,
+        ):
+            return "ar"
+        if re.search(
+            r"\b(?:english|english-language)\b|"
+            r"(?:النسخة\s+الإنجليزية|النسخة\s+الانجليزية|باللغة\s+الإنجليزية|"
+            r"باللغة\s+الانجليزية|الإنجليزي|الانجليزي|الإنجليزية|الانجليزية)",
+            normalized,
+        ):
+            return "en"
+        return ""
+
+    def _media_source_language(self, media: Dict[str, Any]) -> str:
+        declared = str(
+            media.get("language")
+            or media.get("source_language")
+            or ""
+        ).strip().casefold()
+        if declared.startswith("ar"):
+            return "ar"
+        if declared.startswith("en"):
+            return "en"
+
+        source_material = unquote(
+            " ".join(
+                str(media.get(key) or "")
+                for key in ("source_url", "title", "document_title", "source_path")
+            )
+        ).casefold()
+        source_tokens = {
+            token
+            for token in re.split(r"[^a-z0-9\u0600-\u06ff]+", source_material)
+            if token
+        }
+        if source_tokens & {"ar", "arabic", "عربي", "العربي", "العربية"}:
+            return "ar"
+        if source_tokens & {"en", "eng", "english", "إنجليزي", "انجليزي", "الإنجليزية", "الانجليزية"}:
+            return "en"
+        return ""
+
+    def _media_language_variant_score(self, query: str, media: Dict[str, Any]) -> float:
+        requested = self._requested_media_language(query)
+        if not requested:
+            return 0.0
+        actual = self._media_source_language(media)
+        if not actual:
+            return 0.0
+        return 1.0 if actual == requested else -1.0
+
     def _specific_visual_tokens(self, query: str) -> List[str]:
         specific = {"map", "layout", "building", "buildings", "labeled", "labelled", "parking"}
         return [token for token in self._media_keywords(query) if token in specific]
@@ -4782,8 +4858,20 @@ class AdaptiveHybridRetriever:
         media_has_arabic = bool(re.search(r"[\u0600-\u06ff]", media_text))
         if query_has_arabic:
             score += 0.55 if media_has_arabic else -0.35
+            arabic_letters = len(re.findall(r"[\u0600-\u06ff]", media_text))
+            latin_letters = len(re.findall(r"[a-z]", media_text, flags=re.IGNORECASE))
+            if arabic_letters:
+                script_ratio = arabic_letters / float(
+                    max(1, arabic_letters + latin_letters)
+                )
+                score += min(0.85, 1.70 * script_ratio)
         elif media_has_arabic and "/ar/" in str(media.get("source_url") or "").casefold():
             score -= 0.45
+        language_variant_score = self._media_language_variant_score(query, media)
+        if language_variant_score > 0:
+            score += 1.10
+        elif language_variant_score < 0:
+            score -= 0.55
         score += self._media_specificity_bonus(query, media_text)
         return score
 
@@ -7958,13 +8046,22 @@ class AdaptiveHybridRetriever:
                 dense_floor_id, _dense_floor_media = eligible_dense[0]
                 phrase_ranked = sorted(
                     (
-                        (_longest_phrase(media), -rank, media_id)
+                        (
+                            self._media_language_variant_score(query, media),
+                            _longest_phrase(media),
+                            self._score_media_relevance(query, media),
+                            -rank,
+                            media_id,
+                        )
                         for rank, (media_id, media) in enumerate(eligible_dense)
                     ),
                     reverse=True,
                 )
-                if phrase_ranked and phrase_ranked[0][0] >= 3:
-                    dense_floor_id = phrase_ranked[0][2]
+                if phrase_ranked and (
+                    phrase_ranked[0][0] > 0
+                    or phrase_ranked[0][1] >= 3
+                ):
+                    dense_floor_id = phrase_ranked[0][4]
                 dense_floor_ids.append(dense_floor_id)
         chunk_rank = {chunk_id: idx for idx, chunk_id in enumerate(chunk_ids)}
         for chunk_id in chunk_ids:

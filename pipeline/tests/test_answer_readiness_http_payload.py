@@ -12,6 +12,7 @@ from pipeline.evaluation.answer_readiness import (
     _eval_context_referrer,
     _looks_like_no_answer,
     _post_chat_request,
+    _prediction_row_is_complete,
     _required_term_supported,
     _normalize_url_for_match,
     _run_websocket_answer_predictions,
@@ -273,6 +274,30 @@ def test_answer_prediction_preserves_websocket_timeout_error_without_http_status
     assert row["error"] == "websocket_answer_readiness_timeout"
     assert row["metadata"]["error"] == "websocket_answer_readiness_timeout"
     assert row["metadata"]["terminal_event"] == "timeout"
+
+
+def test_answer_prediction_preserves_terminal_error_even_with_response_text():
+    row = _chat_prediction_row_from_payload(
+        payload={
+            "response": "Too Many Requests. Please slow down.",
+            "sources": [],
+            "error": "rate_limit_exceeded",
+        },
+        example=EvalExample(
+            id="rate-limited-row",
+            query="What services are available?",
+            query_type="scoped",
+        ),
+        backend="production_chat_websocket",
+        endpoint="ws://127.0.0.1:8000/chat",
+        latency_ms=5.0,
+        eval_request_mode=True,
+        terminal_event="error",
+    )
+
+    assert row["error"] == "rate_limit_exceeded"
+    assert row["metadata"]["terminal_event"] == "error"
+    assert _prediction_row_is_complete(row) is False
 
 
 def test_answer_prediction_preserves_structured_navigation_plan():
