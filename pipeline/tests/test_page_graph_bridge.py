@@ -477,6 +477,12 @@ def test_navigation_intent_is_explicit_and_multilingual():
     assert infer_navigation_context("What does the IFM website say about its research centers?")["intent"] == "none"
     assert infer_navigation_context("Open the official IFM page")["intent"] == "open_page"
     assert infer_navigation_context("Please download the campus map PDF")["intent"] == "download"
+    assert infer_navigation_context(
+        "According to the Executive Prospectus PDF, what percentages are shown?"
+    )["intent"] == "none"
+    assert infer_navigation_context(
+        "بحسب الإنفوغراف في الكتيب التنفيذي، ما نسبة الذكور؟"
+    )["intent"] == "none"
     assert infer_navigation_context("كيف أتواصل مع الجامعة؟")["intent"] == "contact"
     assert infer_navigation_context("What does the Search action take me to?")["intent"] == "search"
     assert infer_navigation_context("ما الذي يحمّل هذا الزر؟")["intent"] == "download"
