@@ -44,6 +44,42 @@ from pipeline.stages.embedders.gemini_pinecone_embedder import (
 logger = logging.getLogger(__name__)
 
 
+def _validate_vector_reuse_identity(
+    manifest: Mapping[str, Any],
+    *,
+    target_index_name: str,
+    model: str,
+    dimensions: int,
+    allow_cross_index: bool,
+) -> str:
+    """Validate that a ready source release contains compatible vectors.
+
+    Pinecone vectors can be copied between indexes when their embedding model
+    and dimensionality are identical. Requiring the source and destination
+    index names to match accidentally prevented the intended blue/green
+    release flow, so cross-index reuse is allowed only through an explicit
+    configuration opt-in.
+    """
+
+    source_index_name = str(manifest.get("index_name") or "").strip()
+    compatible = bool(
+        str(manifest.get("provider") or "") == "pinecone"
+        and str(manifest.get("release_status") or "") == "ready"
+        and source_index_name
+        and str(manifest.get("model") or "") == model
+        and int(manifest.get("output_dimensionality") or 0) == dimensions
+    )
+    if not compatible:
+        raise ValueError("Pinned Pinecone vector-reuse release is incompatible")
+    if source_index_name != target_index_name and not allow_cross_index:
+        raise ValueError(
+            "Pinned Pinecone vector-reuse source uses a different index; "
+            "set embedder.vector_reuse.allow_cross_index=true for an explicit "
+            "blue/green copy"
+        )
+    return source_index_name
+
+
 def _vector_values(value: Any) -> list[float]:
     raw = value.get("values") if isinstance(value, Mapping) else getattr(value, "values", None)
     return [float(item) for item in raw] if isinstance(raw, (list, tuple)) else []
@@ -91,14 +127,13 @@ def _load_vector_reuse_source(
     manifest = load_json_safe(manifest_file, None)
     if not isinstance(manifest, Mapping):
         raise ValueError("Pinned Pinecone vector-reuse manifest is invalid")
-    if (
-        str(manifest.get("provider") or "") != "pinecone"
-        or str(manifest.get("release_status") or "") != "ready"
-        or str(manifest.get("index_name") or "") != index_name
-        or str(manifest.get("model") or "") != model
-        or int(manifest.get("output_dimensionality") or 0) != dimensions
-    ):
-        raise ValueError("Pinned Pinecone vector-reuse release is incompatible")
+    source_index_name = _validate_vector_reuse_identity(
+        manifest,
+        target_index_name=index_name,
+        model=model,
+        dimensions=dimensions,
+        allow_cross_index=bool(reuse.get("allow_cross_index", False)),
+    )
 
     assembly_file = (
         source_work_dir
@@ -185,7 +220,7 @@ def _load_vector_reuse_source(
         "source_work_dir": str(source_work_dir),
         "source_upload_manifest_sha256": expected_manifest_sha,
         "source_release_id": str(manifest.get("namespace_release_id") or ""),
-        "source_index": str(manifest.get("index_name") or ""),
+        "source_index": source_index_name,
         "source_namespaces": {lane: str(namespaces.get(lane) or "") for lane in lanes},
         "source_by_id": source_by_id,
         "eligible": reusable_counts,

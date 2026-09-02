@@ -21,6 +21,10 @@ embedder:
     enabled: true
     source_work_dir: "runs/mbzuai_main/mbzuai-preprod-readable-titles-pinecone-production-20260831-v3"
     source_upload_manifest_sha256: "3292ba2d4058d01f03c3b6b40fe26e75b7ab9bf57357f4338c32c14e4b124209"
+    # Blue/green releases write to a new index, then promote only after exact
+    # count and quality gates pass. The source manifest still pins the model,
+    # dimensionality, namespaces, lane counts, and record fingerprints.
+    allow_cross_index: true
     # Reuse byte-identical vectors from v3, while embedding the corrected or
     # newly generated records that cannot exist in the previous release.
     require_complete: false

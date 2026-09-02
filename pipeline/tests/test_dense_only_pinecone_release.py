@@ -126,6 +126,64 @@ def test_dense_only_pinecone_manifest_rejects_hidden_sparse_counts():
     assert any("non-zero sparse counts" in error for error in errors)
 
 
+def test_vector_reuse_cross_index_requires_explicit_opt_in():
+    from pipeline.stages.embedders import selected_pinecone as module
+
+    manifest = {
+        "provider": "pinecone",
+        "release_status": "ready",
+        "index_name": "mbzuai-gemini-retrieval-v3",
+        "model": "gemini-embedding-2",
+        "output_dimensionality": 1536,
+    }
+
+    try:
+        module._validate_vector_reuse_identity(
+            manifest,
+            target_index_name="mbzuai-gemini-retrieval-v4",
+            model="gemini-embedding-2",
+            dimensions=1536,
+            allow_cross_index=False,
+        )
+    except ValueError as exc:
+        assert "allow_cross_index=true" in str(exc)
+    else:
+        raise AssertionError("cross-index reuse must require an explicit opt-in")
+
+    assert module._validate_vector_reuse_identity(
+        manifest,
+        target_index_name="mbzuai-gemini-retrieval-v4",
+        model="gemini-embedding-2",
+        dimensions=1536,
+        allow_cross_index=True,
+    ) == "mbzuai-gemini-retrieval-v3"
+
+
+def test_vector_reuse_cross_index_still_rejects_embedding_drift():
+    from pipeline.stages.embedders import selected_pinecone as module
+
+    manifest = {
+        "provider": "pinecone",
+        "release_status": "ready",
+        "index_name": "mbzuai-gemini-retrieval-v3",
+        "model": "gemini-embedding-2",
+        "output_dimensionality": 768,
+    }
+
+    try:
+        module._validate_vector_reuse_identity(
+            manifest,
+            target_index_name="mbzuai-gemini-retrieval-v4",
+            model="gemini-embedding-2",
+            dimensions=1536,
+            allow_cross_index=True,
+        )
+    except ValueError as exc:
+        assert "incompatible" in str(exc)
+    else:
+        raise AssertionError("cross-index reuse must reject dimensionality drift")
+
+
 def test_selected_pinecone_upload_includes_page_cards_and_actions(tmp_path, monkeypatch):
     from pipeline.stages.embedders import selected_pinecone as module
 
