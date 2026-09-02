@@ -1595,6 +1595,10 @@ def build_evidence_pack(
         re.search(r"\b(?:who|whom)\b", normalized_query)
         and re.search(r"\b(?:speaker|host|hosted|hosting)\b", normalized_query)
     )
+    person_identity_query = bool(
+        re.search(r"\b(?:who|whom)\b", normalized_query)
+        or re.search(r"(?:من|مَن)\s+(?:هو|هي)\b", str(query or ""))
+    )
     retrieval_expansion = _trusted_retrieval_expansion(result)
     evidence_matching_query = (
         f"{query}\n{retrieval_expansion}"
@@ -1921,6 +1925,27 @@ def build_evidence_pack(
         for _score, kind, doc in candidates:
             if kind == "assertion":
                 _append_candidate(kind, doc)
+                break
+
+    if person_identity_query and not explicit_media_query:
+        # Exact structured answers often carry a person's complete name,
+        # while an authoritative Page Card may refer to that person only by
+        # surname (for example, "Professor Xing").  A single-page coverage
+        # plan must not discard the selected identity answer before answer
+        # generation.  Reserve the best query-ranked answer generically;
+        # the required official page is still added below for provenance.
+        identity_answers = [
+            doc
+            for doc in _coerce_docs(result.get("answer_documents") or [])
+            if str(doc.get("record_type") or "") != "navigation_action"
+        ]
+        for doc in identity_answers:
+            kind = (
+                "assertion"
+                if doc.get("source_span_ids") or doc.get("linked_span_ids")
+                else "answer"
+            )
+            if _append_candidate(kind, doc):
                 break
 
     if relational_person_query and not explicit_media_query:

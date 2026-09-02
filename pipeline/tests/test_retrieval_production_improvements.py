@@ -699,6 +699,52 @@ def test_evidence_pack_preserves_fused_promoted_assertion_for_exact_role_fact():
     assert all(item["id"] != "chunk:c650:document-revision:other:00000:other-role" for item in pack["items"])
 
 
+def test_evidence_pack_preserves_full_identity_assertion_with_required_page():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    official_page = "https://www.example.edu/about/office-of-the-president"
+    pack = build_evidence_pack(
+        query="Who is the president of Example University?",
+        result={
+            "answer_documents": [
+                {
+                    "id": "assertion:current-president",
+                    "text": "Professor Ada Lovelace is the president of Example University.",
+                    "source_url": "https://www.example.edu/about/leadership-brochure.pdf",
+                    "document_title": "Leadership brochure",
+                    "confidence": 0.98,
+                }
+            ],
+            "evidence_span_documents": [
+                {
+                    "id": "page-card:office-of-the-president",
+                    "text": "Office of the President. As founding president, Professor Lovelace leads the university.",
+                    "source_url": official_page,
+                    "document_title": "Office of the President",
+                    "coverage_page_card": True,
+                }
+            ],
+        },
+        coverage_plan={
+            "intent": "single_page",
+            "required_pages": [official_page],
+        },
+        max_items=3,
+        max_chars=3000,
+        max_per_source=2,
+    )
+
+    packed_ids = [item["id"] for item in pack["items"]]
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "assertion:current-president" in packed_ids
+    assert "page-card:office-of-the-president" in packed_ids
+    assert "Professor Ada Lovelace" in packed_text
+    assert any(
+        item["id"] == "assertion:current-president" and item["kind"] == "answer"
+        for item in pack["items"]
+    )
+
+
 def test_evidence_pack_keeps_all_same_page_process_stages_for_detail_query():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 
