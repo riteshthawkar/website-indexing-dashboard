@@ -4787,6 +4787,161 @@ def test_temporal_guard_abstains_when_requested_admission_cycle_is_missing():
     assert should_abstain is True
 
 
+def test_fact_abstention_accepts_corroborated_named_source_inside_top_window():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
+
+    retriever = object.__new__(AdaptiveHybridRetriever)
+    retriever.temporal_exact_year_guard_enabled = False
+    retriever.temporal_guard_top_k = 3
+    retriever.abstain_min_token_overlap = 0.12
+    retriever.abstain_min_support_score = 0.05
+    retriever.fact_abstain_min_token_overlap = 0.20
+    retriever.fact_require_fact_support_overlap = 0.35
+    retriever.legacy_vectorstore_contract = ""
+    retriever.query_specific_retrieval_rules_enabled = False
+    retriever.chunk_map = {
+        "broad": {
+            "id": "broad",
+            "text": "The university maintains a broad publications archive.",
+            "source_url": "https://example.edu/publications",
+            "document_title": "Publications",
+        },
+        "direct": {
+            "id": "direct",
+            "text": (
+                "Digital Twin Lab publications. 2024: InvFlow: Involution and "
+                "multi-scale interaction for unsupervised learning of optical flow."
+            ),
+            "source_url": "https://example.edu/publications/digital-twin-lab",
+            "document_title": "Digital Twin Lab",
+        },
+    }
+    retriever.answer_texts_by_chunk = {}
+    retriever.fact_texts_by_chunk = {}
+
+    should_abstain = retriever._should_abstain(
+        query=(
+            "Which publication on the Digital Twin Lab page is listed as a "
+            "2024 paper about optical flow?\n"
+            "Retrieval expansion: Digital Twin Lab page 2024 paper optical flow"
+        ),
+        mode=QueryMode.FACT,
+        ranked_chunks=[("broad", 2.0), ("direct", 1.0)],
+        support={
+            "broad": {"score": 0.01, "sources": {"dense_chunks"}},
+            "direct": {
+                "score": 0.04,
+                "sources": {"dense_chunks", "sparse_chunks", "local_chunks"},
+            },
+        },
+    )
+
+    assert should_abstain is False
+
+
+def test_internal_retrieval_expansion_label_is_not_a_named_entity():
+    from pipeline.retrieval.adaptive_hybrid import _named_query_tokens
+
+    internal_rewrite = _named_query_tokens(
+        "ما المؤهل المطلوب لوظيفة Research Engineer؟\n"
+        "Retrieval expansion: Research Engineer required academic qualification"
+    )
+    user_query = _named_query_tokens("Explain the Retrieval Expansion Platform")
+
+    assert "retrieval" not in internal_rewrite
+    assert {"research", "engineer"}.issubset(set(internal_rewrite))
+    assert "retrieval" in user_query
+
+
+def test_fact_candidate_pool_reserves_primary_chunk_consensus_before_auxiliary_fanout():
+    from pipeline.retrieval.adaptive_hybrid import _balanced_fact_candidate_ids
+
+    auxiliary_ids = [f"aux-{index}" for index in range(60)]
+    valid_ids = {
+        "structured-1",
+        "structured-2",
+        "direct-source",
+        "dense-only",
+        "sparse-only",
+        "local-only",
+        "span-1",
+        "existing-1",
+        *auxiliary_ids,
+    }
+
+    candidates = _balanced_fact_candidate_ids(
+        structured_anchor_ids=["structured-1", "structured-2"],
+        primary_chunk_rankings=[
+            ["direct-source", "dense-only"],
+            ["sparse-only", "direct-source"],
+            ["direct-source", "local-only"],
+        ],
+        evidence_span_anchor_ids=["span-1"],
+        auxiliary_fact_seed_ids=auxiliary_ids,
+        existing_candidate_ids=["existing-1"],
+        valid_chunk_ids=valid_ids,
+        structured_anchor_limit=4,
+        primary_chunk_limit=6,
+        rrf_k=60,
+    )
+
+    assert candidates[:3] == [
+        "structured-1",
+        "structured-2",
+        "direct-source",
+    ]
+    assert candidates.index("direct-source") < 32
+    assert candidates.index("span-1") < candidates.index("aux-0")
+
+
+def test_fact_abstention_does_not_accept_named_source_with_missing_scope():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
+
+    retriever = object.__new__(AdaptiveHybridRetriever)
+    retriever.temporal_exact_year_guard_enabled = False
+    retriever.temporal_guard_top_k = 3
+    retriever.abstain_min_token_overlap = 0.12
+    retriever.abstain_min_support_score = 0.05
+    retriever.fact_abstain_min_token_overlap = 0.20
+    retriever.fact_require_fact_support_overlap = 0.35
+    retriever.legacy_vectorstore_contract = ""
+    retriever.query_specific_retrieval_rules_enabled = False
+    retriever.chunk_map = {
+        "library": {
+            "id": "library",
+            "text": "MBZUAI library opening hours are 9:00 am to 5:00 pm.",
+            "source_url": "https://example.edu/library/opening-hours",
+            "document_title": "Library opening hours",
+        },
+    }
+    retriever.answer_texts_by_chunk = {}
+    retriever.fact_texts_by_chunk = {}
+
+    should_abstain = retriever._should_abstain(
+        query="What are the opening hours of MBZUAI's Antarctica research center?",
+        mode=QueryMode.FACT,
+        ranked_chunks=[("library", 1.0)],
+        support={
+            "library": {
+                "score": 0.06,
+                "sources": {"dense_chunks", "sparse_chunks"},
+            }
+        },
+    )
+
+    assert should_abstain is True
+
+
+def test_opening_statement_is_not_classified_as_opening_hours():
+    from pipeline.retrieval.adaptive_hybrid import _lookup_query_profile
+
+    profile = _lookup_query_profile(
+        "In the IFM homepage's opening statement, how are its models described?"
+    )
+
+    assert "hours" not in profile.answer_types
+
+
 def test_answer_readiness_uses_llm_judge_for_full_response_contract(tmp_path, monkeypatch):
     from pipeline.evaluation import answer_readiness
 

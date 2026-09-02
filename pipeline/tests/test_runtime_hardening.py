@@ -721,6 +721,29 @@ def test_premise_grounding_fallback_rejects_generic_scoped_evidence():
     assert result["reason"] == "presupposed_entity_or_scope_not_supported"
 
 
+def test_existing_abstention_keeps_premise_grounding_guard_for_later_backfill():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever._intent_summary = lambda _query: {
+        "answer_types": ["hours"],
+        "requested_roles": [],
+        "subject_tokens": [],
+        "subject_phrases": [],
+        "strict_answer_required": True,
+    }
+
+    result = retriever._apply_evidence_adjudication(
+        "What are the opening hours of MBZUAI's Antarctica research center?",
+        {"abstained": True},
+    )
+
+    assert result["abstained"] is True
+    assert result["premise_grounding_required"] is True
+    assert result["verification_status"] == "not_required_abstained"
+
+
 @pytest.mark.parametrize(
     "query",
     [

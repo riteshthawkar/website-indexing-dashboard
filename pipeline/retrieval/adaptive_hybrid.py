@@ -1391,6 +1391,15 @@ def _lookup_query_profile(query: str) -> LookupQueryProfile:
         if answer_type == "website":
             phrase_hit = _website_lookup_requested(normalized, query_tokens)
             token_hit = False
+        elif answer_type == "hours":
+            phrase_hit = any(phrase in normalized for phrase in rule["phrases"])
+            # "Opening" is frequently a discourse modifier (opening
+            # statement, remarks, paragraph, section) rather than a request
+            # for business hours. Require an explicit hours phrase or another
+            # time attribute instead of classifying the bare word as hours.
+            token_hit = bool(
+                query_tokens & (set(rule["tokens"]) - {"opening"})
+            )
         else:
             phrase_hit = any(phrase in normalized for phrase in rule["phrases"])
             token_hit = bool(query_tokens & set(rule["tokens"]))
@@ -1994,6 +2003,20 @@ def _query_starts_with(query: str, prefixes: Sequence[str]) -> bool:
     return any(normalized.startswith(prefix) for prefix in prefixes)
 
 
+def _query_without_internal_rewrite_labels(query: str) -> str:
+    """Remove appended planner labels without discarding planner semantics."""
+
+    # Routed retrieval appends these labels on a new line.  They are transport
+    # metadata, not entities the evidence must mention.  Keep the generated
+    # expansion itself so cross-lingual entity and source matching still gains
+    # its English semantic bridge.
+    return re.sub(
+        r"(?im)(?<=\n)\s*(?:graph\s+)?retrieval\s+expansion\s*:\s*",
+        "\n",
+        str(query or ""),
+    )
+
+
 def _is_generic_figure_label(text: str) -> bool:
     normalized = _clean_text(text).lower()
     if not normalized.startswith("figure"):
@@ -2004,7 +2027,8 @@ def _is_generic_figure_label(text: str) -> bool:
 
 def _named_query_tokens(query: str) -> List[str]:
     tokens: List[str] = []
-    for index, raw_token in enumerate(str(query or "").split()):
+    semantic_query = _query_without_internal_rewrite_labels(query)
+    for index, raw_token in enumerate(semantic_query.split()):
         token = "".join(ch for ch in raw_token if ch.isalnum() or ch in {"-", "_", "'"}).strip()
         if not token:
             continue
@@ -2022,7 +2046,8 @@ def _named_query_tokens(query: str) -> List[str]:
 def _named_query_phrases(query: str) -> List[str]:
     phrases: List[str] = []
     current: List[str] = []
-    for index, raw_token in enumerate(str(query or "").split()):
+    semantic_query = _query_without_internal_rewrite_labels(query)
+    for index, raw_token in enumerate(semantic_query.split()):
         token = "".join(ch for ch in raw_token if ch.isalnum() or ch in {"-", "_", "'"}).strip()
         if not token:
             if len(current) >= 2:
@@ -2776,6 +2801,52 @@ def _rrf_merge(rankings: Sequence[Sequence[str]], *, k: int = 60) -> List[Tuple[
                 continue
             scores[record_id] = scores.get(record_id, 0.0) + (1.0 / (k + rank))
     return sorted(scores.items(), key=lambda item: item[1], reverse=True)
+
+
+def _balanced_fact_candidate_ids(
+    *,
+    structured_anchor_ids: Sequence[str],
+    primary_chunk_rankings: Sequence[Sequence[str]],
+    evidence_span_anchor_ids: Sequence[str],
+    auxiliary_fact_seed_ids: Sequence[str],
+    existing_candidate_ids: Sequence[str],
+    valid_chunk_ids: Iterable[str],
+    structured_anchor_limit: int,
+    primary_chunk_limit: int,
+    rrf_k: int,
+) -> List[str]:
+    """Keep primary chunk consensus inside a bounded fact reranker pool."""
+
+    valid_ids = set(str(value) for value in valid_chunk_ids if str(value))
+    structured = list(
+        dict.fromkeys(
+            str(value)
+            for value in structured_anchor_ids
+            if str(value) in valid_ids
+        )
+    )[: max(0, int(structured_anchor_limit))]
+    primary = [
+        chunk_id
+        for chunk_id, _score in _rrf_merge(
+            [ranking for ranking in primary_chunk_rankings if ranking],
+            k=rrf_k,
+        )
+        if chunk_id in valid_ids
+    ][: max(0, int(primary_chunk_limit))]
+    ordered = [
+        *structured,
+        *primary,
+        *list(evidence_span_anchor_ids)[:4],
+        *auxiliary_fact_seed_ids,
+        *existing_candidate_ids,
+    ]
+    return list(
+        dict.fromkeys(
+            str(value)
+            for value in ordered
+            if str(value) in valid_ids
+        )
+    )
 
 
 def _is_media_query(query: str) -> bool:
@@ -8041,6 +8112,83 @@ class AdaptiveHybridRetriever:
             if not _text_has_requested_temporal_anchor(query, " ".join(temporal_fragments)):
                 return True
         if mode == QueryMode.FACT:
+            # A cross-encoder can occasionally place a broadly related item
+            # just ahead of a direct match from the page or entity explicitly
+            # named by the user. Do not make the fail-closed decision from the
+            # first item alone when a small top window contains a direct,
+            # multi-lane-corroborated source match. This remains conservative:
+            # every named token/phrase must be present and the candidate must
+            # independently clear both source-identity and text-overlap gates.
+            # Inspect the full bounded fact-retrieval window. Cross-lingual
+            # reranking can place the strongest raw dense/sparse/local match
+            # immediately after the provider's returned top-k candidates.
+            for candidate_chunk_id, _candidate_score in ranked_chunks[:12]:
+                candidate = self.chunk_map.get(str(candidate_chunk_id))
+                if not candidate:
+                    continue
+                candidate_text = " ".join(
+                    [
+                        str(
+                            candidate.get("dense_text")
+                            or candidate.get("text")
+                            or ""
+                        ),
+                        *list(
+                            self.answer_texts_by_chunk.get(
+                                str(candidate_chunk_id)
+                            )
+                            or []
+                        )[:2],
+                        *list(
+                            self.fact_texts_by_chunk.get(
+                                str(candidate_chunk_id)
+                            )
+                            or []
+                        )[:2],
+                    ]
+                ).lower()
+                candidate_named_tokens = _effective_named_tokens_for_abstention(
+                    query, candidate_text
+                )
+                candidate_named_phrases = _named_query_phrases(query)
+                if not candidate_named_tokens and not candidate_named_phrases:
+                    continue
+                if _missing_token_ratio(candidate_named_tokens, candidate_text) > 0.0:
+                    continue
+                if any(
+                    phrase not in candidate_text
+                    and not all(
+                        token in candidate_text for token in _tokenize(phrase)
+                    )
+                    for phrase in candidate_named_phrases
+                ):
+                    continue
+                candidate_overlap = self._score_text_match(
+                    query,
+                    candidate.get("dense_text") or candidate.get("text") or "",
+                )
+                candidate_source_match = self._source_query_bonus(
+                    query,
+                    source_url=str(candidate.get("source_url") or ""),
+                    document_title=str(candidate.get("document_title") or ""),
+                    heading=str(candidate.get("heading") or ""),
+                    text=candidate_text,
+                    mode=mode,
+                )
+                candidate_support_sources = set(
+                    (support.get(str(candidate_chunk_id)) or {}).get("sources")
+                    or set()
+                )
+                if (
+                    candidate_overlap >= self.fact_require_fact_support_overlap
+                    and candidate_source_match >= 1.0
+                    and (
+                        len(candidate_support_sources) >= 2
+                        or candidate_source_match >= 2.0
+                    )
+                ):
+                    return False
+
             has_fact_support = bool(
                 {"dense_facts", "sparse_facts", "dense_assertions", "sparse_assertions", "local_facts", "local_answers"}
                 & set(support_sources)
@@ -8434,7 +8582,41 @@ class AdaptiveHybridRetriever:
                     ]
                 )
             )
-            candidate_chunk_ids = list(dict.fromkeys([*fact_seed_chunk_ids, *candidate_chunk_ids]))
+            # Structured facts, assertions, and spans can fan out to many
+            # chunks.  Prepending that entire fan-out used to consume the
+            # bounded reranker pool and crowd out a page chunk independently
+            # ranked at the top of the dense, sparse, and local chunk lanes.
+            # Reserve a balanced prefix for the strongest structured anchors
+            # and the primary chunk consensus before adding the auxiliary
+            # fan-out.  This keeps direct source evidence available to the
+            # reranker without weakening fact-first retrieval.
+            structured_anchor_limit = max(
+                4,
+                min(8, max(self.rerank_top_n, self.max_context_chunks) // 4),
+            )
+            primary_chunk_limit = max(
+                6,
+                min(12, max(self.rerank_top_n, self.max_context_chunks) // 3),
+            )
+            candidate_chunk_ids = _balanced_fact_candidate_ids(
+                structured_anchor_ids=[
+                    *graph_seed_chunk_ids,
+                    *answer_anchor_chunk_ids,
+                    *fact_anchor_chunk_ids,
+                ],
+                primary_chunk_rankings=[
+                    chunk_dense_ids,
+                    sparse_chunk_ids,
+                    local_chunk_ids,
+                ],
+                evidence_span_anchor_ids=evidence_span_anchor_chunk_ids,
+                auxiliary_fact_seed_ids=fact_seed_chunk_ids,
+                existing_candidate_ids=candidate_chunk_ids,
+                valid_chunk_ids=self.chunk_map,
+                structured_anchor_limit=structured_anchor_limit,
+                primary_chunk_limit=primary_chunk_limit,
+                rrf_k=self.rrf_k,
+            )
         elif fact_selection_query and fact_anchor_chunk_ids:
             candidate_chunk_ids = list(dict.fromkeys([*fact_anchor_chunk_ids, *candidate_chunk_ids]))
         elif structured_answer_query and answer_anchor_chunk_ids:
@@ -8457,7 +8639,6 @@ class AdaptiveHybridRetriever:
             force_fallback=disable_external_lanes_after_embedding_failure,
             diagnostics=request_diagnostics,
         )
-        ranked_chunks = self._promote_source_matched_chunks(query, ranked_chunks, support)
         if mode == QueryMode.FACT:
             ranked_chunks = self._promote_fact_supported_chunks(
                 query,
@@ -8465,6 +8646,15 @@ class AdaptiveHybridRetriever:
                 support,
                 anchored_chunk_ids=[*answer_anchor_chunk_ids, *fact_anchor_chunk_ids],
             )
+        # Source identity is the final textual ordering signal. Applying it
+        # after fact-support promotion prevents incidental extracted facts
+        # from burying a chunk from the page, role, lab, or entity explicitly
+        # named by the user—especially in cross-lingual queries.
+        ranked_chunks = self._promote_source_matched_chunks(
+            query,
+            ranked_chunks,
+            support,
+        )
         if media_query:
             ranked_chunks = self._promote_media_supported_chunks(
                 query,

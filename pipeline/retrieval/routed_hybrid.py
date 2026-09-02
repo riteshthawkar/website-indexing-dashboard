@@ -771,14 +771,14 @@ class RoutedHybridRetriever:
             result.setdefault("verification_status", "not_requested")
             return result
         payload = dict(result or {})
-        if payload.get("abstained"):
-            payload.setdefault("verification_status", "not_required_abstained")
-            return payload
         intent_summary = self._intent_summary(query)
         premise_grounding_required = query_requires_premise_grounding(
             query, intent_summary
         )
         payload["premise_grounding_required"] = premise_grounding_required
+        if payload.get("abstained"):
+            payload.setdefault("verification_status", "not_required_abstained")
+            return payload
         if (
             bool(payload.get("navigation_evidence_rescued"))
             and not premise_grounding_required
