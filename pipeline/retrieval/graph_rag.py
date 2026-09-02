@@ -210,6 +210,9 @@ class GraphRAGRetriever:
         self.output_dimensionality = self.base.output_dimensionality
 
         retrieval_cfg = dict(config.get("retrieval") or {})
+        self.query_specific_retrieval_rules_enabled = bool(
+            retrieval_cfg.get("query_specific_retrieval_rules_enabled", True)
+        )
         self.graph_max_fact_results = int(retrieval_cfg.get("graph_max_fact_results") or 4)
         self.graph_max_additional_media_results = int(retrieval_cfg.get("graph_max_additional_media_results") or 2)
         self.graph_max_context_documents = int(retrieval_cfg.get("graph_max_context_documents") or 4)
@@ -499,7 +502,11 @@ class GraphRAGRetriever:
 
         rewritten_query = query
         rewrite_labels: List[str] = []
-        semantic_aliases = _semantic_query_alias_tokens(query)
+        semantic_aliases = (
+            _semantic_query_alias_tokens(query)
+            if self.query_specific_retrieval_rules_enabled
+            else []
+        )
         if semantic_aliases:
             candidate, added = self._append_query_aliases(rewritten_query, semantic_aliases, max_new_tokens=6)
             if candidate != rewritten_query and added:

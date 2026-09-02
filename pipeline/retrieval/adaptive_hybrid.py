@@ -2859,6 +2859,16 @@ def _is_media_query(query: str) -> bool:
         str(query or ""),
         flags=re.IGNORECASE,
     )
+    # ``صور رمزية`` means avatars in Arabic. Treating its plural ``صور``
+    # token as an image request routes ordinary questions *about* avatars into
+    # the media lane and can displace the page text the user actually asked
+    # about. Remove only this compound concept; direct image references remain.
+    intent_text = re.sub(
+        r"(?:صور|الصور)\s+رمزية(?:\s+ثلاثية\s+الأبعاد)?",
+        " avatars ",
+        intent_text,
+        flags=re.IGNORECASE,
+    )
     query_tokens = set(_tokenize(intent_text))
     if not query_tokens:
         return False
@@ -7885,10 +7895,77 @@ class AdaptiveHybridRetriever:
             )
         return list(dict.fromkeys(parent_ids))
 
-    def _attach_media(self, chunk_ids: List[str], media_hits: List[str], query: str) -> List[Dict[str, Any]]:
+    def _attach_media(
+        self,
+        chunk_ids: List[str],
+        media_hits: List[str],
+        query: str,
+        *,
+        dense_media_hits: Sequence[str] | None = None,
+    ) -> List[Dict[str, Any]]:
         wanted_chunk_ids = set(chunk_ids)
         wanted_parent_ids = set()
         media_query = _is_media_query(query)
+        dense_floor_ids: List[str] = []
+        if media_query:
+            eligible_dense: List[Tuple[str, Dict[str, Any]]] = []
+            for media_id in dense_media_hits or []:
+                media = self.media_map.get(str(media_id))
+                if not media or self._is_low_signal_media(media):
+                    continue
+                try:
+                    host = (
+                        urlparse(str(media.get("source_url") or "")).hostname
+                        or ""
+                    ).casefold()
+                except Exception:
+                    host = ""
+                if not (
+                    host == "mbzuai.ac.ae"
+                    or host.endswith(".mbzuai.ac.ae")
+                    or host == "ifm.ai"
+                    or host.endswith(".ifm.ai")
+                ):
+                    continue
+                eligible_dense.append((str(media_id), media))
+                if len(eligible_dense) >= 4:
+                    break
+            if eligible_dense:
+                # Keep an independent semantic hit, but do not blindly freeze
+                # dense rank zero. Dense retrieval can favor a broadly similar
+                # visual while rank one contains the exact named work. A long
+                # contiguous phrase is strong, representation-agnostic identity
+                # evidence. Without one (the common cross-lingual case), retain
+                # dense rank zero.
+                query_terms = [
+                    token
+                    for token in self._informative_query_tokens(query)
+                    if token not in _VISUAL_INTENT_TOKENS and len(token) >= 3
+                ]
+
+                def _longest_phrase(media: Dict[str, Any]) -> int:
+                    media_id = str(media.get("id") or "")
+                    media_text = (
+                        getattr(self, "media_texts_by_id", {}).get(media_id)
+                        or _clean_text(media.get("text") or "")
+                    ).casefold()
+                    for size in range(min(10, len(query_terms)), 2, -1):
+                        for start in range(0, len(query_terms) - size + 1):
+                            if " ".join(query_terms[start : start + size]) in media_text:
+                                return size
+                    return 0
+
+                dense_floor_id, _dense_floor_media = eligible_dense[0]
+                phrase_ranked = sorted(
+                    (
+                        (_longest_phrase(media), -rank, media_id)
+                        for rank, (media_id, media) in enumerate(eligible_dense)
+                    ),
+                    reverse=True,
+                )
+                if phrase_ranked and phrase_ranked[0][0] >= 3:
+                    dense_floor_id = phrase_ranked[0][2]
+                dense_floor_ids.append(dense_floor_id)
         chunk_rank = {chunk_id: idx for idx, chunk_id in enumerate(chunk_ids)}
         for chunk_id in chunk_ids:
             chunk = self.chunk_map.get(chunk_id)
@@ -7907,7 +7984,7 @@ class AdaptiveHybridRetriever:
             media_rank_hint.setdefault(media_id, explicit_rank)
             if media_query:
                 relevance = self._score_media_relevance(query, media)
-                if relevance > 0.0:
+                if relevance > 0.0 or media_id in dense_floor_ids:
                     # Dense media retrieval embeds grounded caption/OCR/context
                     # directly. Preserve that independent signal even when
                     # chunk expansion has selected another page first.
@@ -7960,7 +8037,7 @@ class AdaptiveHybridRetriever:
             if not media:
                 continue
             relevance = self._score_media_relevance(query, media)
-            if relevance <= 0.0:
+            if relevance <= 0.0 and media_id not in dense_floor_ids:
                 continue
             media_type = str(media.get("media_type") or "")
             relevance_weight = 1.0
@@ -7978,9 +8055,13 @@ class AdaptiveHybridRetriever:
                 )
             )
         ranked_media.sort(key=lambda item: (-item[1], item[2], item[0]))
+        ranked_ids = [media_id for media_id, _score, _rank_hint in ranked_media]
+        selected_ids = list(dict.fromkeys([*dense_floor_ids, *ranked_ids]))[
+            : self.max_media_results
+        ]
         return [
             self.media_map[media_id]
-            for media_id, _score, _rank_hint in ranked_media[: self.max_media_results]
+            for media_id in selected_ids
             if media_id in self.media_map
         ]
 
@@ -8877,7 +8958,12 @@ class AdaptiveHybridRetriever:
         _mark_stage("selection_expansion_ms")
 
         explicit_media_hits = list(dict.fromkeys([*media_dense_ids, *sparse_media_ids, *local_media_ids]))
-        selected_media = self._attach_media(selected_chunk_ids, explicit_media_hits, query)
+        selected_media = self._attach_media(
+            selected_chunk_ids,
+            explicit_media_hits,
+            query,
+            dense_media_hits=media_dense_ids,
+        )
         selected_media_ids = [str(media.get("id") or "") for media in selected_media if str(media.get("id") or "")]
         selected_docs = []
         for chunk_id in selected_chunk_ids:

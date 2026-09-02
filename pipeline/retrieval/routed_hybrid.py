@@ -1388,9 +1388,28 @@ class RoutedHybridRetriever:
                         "identity_parts": [],
                         "document_revision_ids": set(),
                         "linked_chunk_ids": set(),
+                        "explicit_alias_urls": set(),
                     },
                 )
                 metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                for alias_key in ("canonical_url", "language_normalized_url"):
+                    alias_url = self._normalize_source_url(
+                        record.get(alias_key) or metadata.get(alias_key)
+                    )
+                    if alias_url and alias_url != key:
+                        page["explicit_alias_urls"].add(alias_url)
+                for alias_key in (
+                    "source_aliases",
+                    "alternate_urls",
+                    "language_alternate_urls",
+                ):
+                    alias_values = record.get(alias_key) or metadata.get(alias_key) or []
+                    if isinstance(alias_values, str):
+                        alias_values = [alias_values]
+                    for alias_value in alias_values:
+                        alias_url = self._normalize_source_url(alias_value)
+                        if alias_url and alias_url != key:
+                            page["explicit_alias_urls"].add(alias_url)
                 document_revision_id = str(
                     record.get("document_revision_id")
                     or metadata.get("document_revision_id")
@@ -1437,6 +1456,8 @@ class RoutedHybridRetriever:
             identity_text = " ".join(
                 [parsed.hostname or "", slug_text, *page["identity_parts"]]
             )[:2400].casefold()
+            search_sequence = self._generalized_page_token_sequence(search_text)
+            identity_sequence = self._generalized_page_token_sequence(identity_text)
             records.append(
                 {
                     "source_url": page["source_url"],
@@ -1445,8 +1466,11 @@ class RoutedHybridRetriever:
                     "tokens": set(_tokenize(search_text)),
                     "identity_text": identity_text,
                     "identity_tokens": set(_tokenize(identity_text)),
+                    "search_sequence_text": f" {' '.join(search_sequence)} ",
+                    "identity_sequence_text": f" {' '.join(identity_sequence)} ",
                     "document_revision_ids": set(page["document_revision_ids"]),
                     "linked_chunk_ids": set(page["linked_chunk_ids"]),
+                    "explicit_alias_urls": set(page["explicit_alias_urls"]),
                 }
             )
         return records
@@ -1578,13 +1602,105 @@ class RoutedHybridRetriever:
         right_page = self._coverage_page_record_for_url(right)
         if not left_page or not right_page:
             return False
+        left_url = self._normalize_source_url(left)
+        right_url = self._normalize_source_url(right)
+        if left_url == right_url:
+            return True
         left_revisions = set(left_page.get("document_revision_ids") or set())
         right_revisions = set(right_page.get("document_revision_ids") or set())
-        if left_revisions and right_revisions and left_revisions & right_revisions:
-            return True
         left_chunks = set(left_page.get("linked_chunk_ids") or set())
         right_chunks = set(right_page.get("linked_chunk_ids") or set())
-        return bool(left_chunks and right_chunks and left_chunks & right_chunks)
+        shared_representation = bool(
+            (left_revisions and right_revisions and left_revisions & right_revisions)
+            or (left_chunks and right_chunks and left_chunks & right_chunks)
+        )
+        if not shared_representation:
+            return False
+
+        # Client-rendered route snapshots can be reused by distinct SPA pages.
+        # A shared revision/chunk is not proof that two explicit URLs are aliases.
+        # Accept only an explicit canonical alias or a language-equivalent family.
+        left_aliases = set(left_page.get("explicit_alias_urls") or set())
+        right_aliases = set(right_page.get("explicit_alias_urls") or set())
+        return bool(
+            right_url in left_aliases
+            or left_url in right_aliases
+            or self._coverage_page_family_key(left_url)
+            == self._coverage_page_family_key(right_url)
+        )
+
+    def _record_explicit_alias_urls(self, record: Mapping[str, Any]) -> set[str]:
+        metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
+        aliases: set[str] = set()
+        for key in ("canonical_url", "language_normalized_url"):
+            normalized = self._normalize_source_url(
+                record.get(key) or metadata.get(key)
+            )
+            if normalized:
+                aliases.add(normalized)
+        for key in ("source_aliases", "alternate_urls", "language_alternate_urls"):
+            values = record.get(key) or metadata.get(key) or []
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                normalized = self._normalize_source_url(value)
+                if normalized:
+                    aliases.add(normalized)
+        return aliases
+
+    def _coverage_url_is_aggregate_parent(
+        self,
+        aggregate_url: Any,
+        required_page: Any,
+    ) -> bool:
+        aggregate = self._normalize_source_url(aggregate_url)
+        required = self._normalize_source_url(required_page)
+        try:
+            aggregate_parts = urlparse(aggregate)
+            required_parts = urlparse(required)
+        except Exception:
+            return False
+        aggregate_path = (aggregate_parts.path or "/").rstrip("/")
+        required_path = (required_parts.path or "/").rstrip("/")
+        return bool(
+            aggregate_parts.netloc == required_parts.netloc
+            and aggregate_path != required_path
+            and required_path.startswith(f"{aggregate_path}/")
+        )
+
+    def _record_is_aggregate_parent_evidence(
+        self,
+        record: Mapping[str, Any],
+        required_page: str,
+        required_record: Mapping[str, Any],
+    ) -> bool:
+        source_url = self._source_url_from_record(dict(record))
+        if not self._coverage_url_is_aggregate_parent(source_url, required_page):
+            return False
+        record_text = " ".join(
+            str(record.get(key) or "")
+            for key in (
+                "document_title",
+                "title",
+                "section_heading",
+                "heading",
+                "breadcrumb",
+                "text",
+                "dense_text",
+                "sparse_text",
+            )
+        )
+        if not record_text.strip():
+            return False
+        identity_text = str(required_record.get("identity_text") or "")
+        return (
+            self._longest_generalized_page_phrase_match(
+                identity_text,
+                {"search_text": record_text},
+                identity=False,
+            )
+            >= 5
+        )
 
     def _record_matches_required_page(
         self,
@@ -1592,9 +1708,26 @@ class RoutedHybridRetriever:
         required_page: str,
     ) -> bool:
         source_url = self._source_url_from_record(dict(record))
-        if self._normalize_source_url(source_url) == self._normalize_source_url(required_page):
+        normalized_source = self._normalize_source_url(source_url)
+        normalized_required = self._normalize_source_url(required_page)
+        if normalized_source == normalized_required:
             return True
         required_record = self._coverage_page_record_for_url(required_page)
+        if normalized_source:
+            explicit_aliases = self._record_explicit_alias_urls(record)
+            if normalized_required not in explicit_aliases and (
+                self._coverage_page_family_key(normalized_source)
+                != self._coverage_page_family_key(normalized_required)
+            ):
+                if required_record and self._record_is_aggregate_parent_evidence(
+                    record,
+                    required_page,
+                    required_record,
+                ):
+                    return True
+                # Do not let an unrelated SPA route inherit a required page just
+                # because the crawler captured both from one hydrated revision.
+                return False
         if not required_record:
             return False
         metadata = record.get("metadata") if isinstance(record.get("metadata"), Mapping) else {}
@@ -1937,6 +2070,47 @@ class RoutedHybridRetriever:
             and not token.isdigit()
         }
 
+    def _generalized_page_token_sequence(self, value: Any) -> tuple[str, ...]:
+        """Return ordered informative tokens for corpus-agnostic phrase binding."""
+
+        sequence: List[str] = []
+        for raw_token in re.findall(r"[^\W_]+", str(value or "").casefold(), re.UNICODE):
+            variants = _tokenize(raw_token)
+            token = variants[-1] if variants else ""
+            if (
+                len(token) > 1
+                and token not in _GENERALIZED_PAGE_STOPWORDS
+                and not token.isdigit()
+            ):
+                sequence.append(token)
+        return tuple(sequence)
+
+    def _longest_generalized_page_phrase_match(
+        self,
+        query: str,
+        page: Mapping[str, Any],
+        *,
+        identity: bool,
+    ) -> int:
+        query_sequence = self._generalized_page_token_sequence(query)
+        if len(query_sequence) < 2:
+            return 0
+        field = "identity_sequence_text" if identity else "search_sequence_text"
+        haystack = str(page.get(field) or "")
+        if not haystack.strip():
+            fallback_field = "identity_text" if identity else "search_text"
+            page_sequence = self._generalized_page_token_sequence(
+                page.get(fallback_field) or ""
+            )
+            haystack = f" {' '.join(page_sequence)} "
+        maximum = min(10, len(query_sequence))
+        for width in range(maximum, 1, -1):
+            for offset in range(0, len(query_sequence) - width + 1):
+                phrase = " ".join(query_sequence[offset : offset + width])
+                if f" {phrase} " in haystack:
+                    return width
+        return 0
+
     def _generalized_page_target_score(
         self,
         query: str,
@@ -1955,6 +2129,33 @@ class RoutedHybridRetriever:
         content_ratio = len(content_overlap) / float(len(query_tokens))
         score = (1.15 * identity_ratio) + (0.42 * content_ratio)
         score += min(0.24, 0.08 * len(identity_overlap))
+
+        query_sequence_length = max(
+            1,
+            len(self._generalized_page_token_sequence(query)),
+        )
+        identity_phrase_length = self._longest_generalized_page_phrase_match(
+            query,
+            page,
+            identity=True,
+        )
+        content_phrase_length = self._longest_generalized_page_phrase_match(
+            query,
+            page,
+            identity=False,
+        )
+        if identity_phrase_length >= 3:
+            score += min(
+                1.45,
+                (0.18 * identity_phrase_length)
+                + (0.35 * identity_phrase_length / query_sequence_length),
+            )
+        if content_phrase_length >= 3:
+            score += min(
+                1.35,
+                (0.13 * content_phrase_length)
+                + (0.35 * content_phrase_length / query_sequence_length),
+            )
 
         try:
             path_segments = [
@@ -2061,6 +2262,7 @@ class RoutedHybridRetriever:
         # Preserve source rank before reranking so a later lexical/model stage
         # cannot erase that corroboration.
         dense_source_rank: Dict[str, int] = {}
+        dense_chunk_records: List[tuple[int, Mapping[str, Any]]] = []
         chunk_map = getattr(self.vector, "chunk_map", {})
         for rank, chunk_id in enumerate(payload.get("dense_chunk_ids") or []):
             chunk = (
@@ -2070,6 +2272,7 @@ class RoutedHybridRetriever:
             )
             if not isinstance(chunk, Mapping):
                 continue
+            dense_chunk_records.append((rank, chunk))
             normalized = self._normalize_source_url(
                 self._source_url_from_record(dict(chunk))
             )
@@ -2107,6 +2310,45 @@ class RoutedHybridRetriever:
                 and not token.isdigit()
             }
             identity_tokens = set(page.get("identity_tokens") or set())
+            aggregate_identity_rank: int | None = None
+            aggregate_identity_length = 0
+            if normalized in page_card_rank:
+                for dense_rank, dense_chunk in dense_chunk_records[:6]:
+                    dense_source_url = self._source_url_from_record(dict(dense_chunk))
+                    if not self._coverage_url_is_aggregate_parent(
+                        dense_source_url,
+                        page.get("source_url"),
+                    ):
+                        continue
+                    dense_text = " ".join(
+                        str(dense_chunk.get(key) or "")
+                        for key in (
+                            "document_title",
+                            "section_heading",
+                            "heading",
+                            "breadcrumb",
+                            "text",
+                            "dense_text",
+                            "sparse_text",
+                        )
+                    )
+                    phrase_length = self._longest_generalized_page_phrase_match(
+                        str(page.get("identity_text") or ""),
+                        {"search_text": dense_text},
+                        identity=False,
+                    )
+                    if phrase_length < 5:
+                        continue
+                    if (
+                        aggregate_identity_rank is None
+                        or dense_rank < aggregate_identity_rank
+                        or (
+                            dense_rank == aggregate_identity_rank
+                            and phrase_length > aggregate_identity_length
+                        )
+                    ):
+                        aggregate_identity_rank = dense_rank
+                        aggregate_identity_length = phrase_length
             binding_candidates: List[tuple[float, str, str]] = []
             for label, semantic_query, query_tokens in semantic_query_variants:
                 binding_coverage = (
@@ -2125,9 +2367,17 @@ class RoutedHybridRetriever:
             )
             page_card_dense_agreement = bool(
                 normalized in page_card_rank
-                and normalized in dense_source_rank
                 and page_card_rank[normalized] <= 5
-                and dense_source_rank[normalized] <= 5
+                and (
+                    (
+                        normalized in dense_source_rank
+                        and dense_source_rank[normalized] <= 5
+                    )
+                    or (
+                        aggregate_identity_rank is not None
+                        and aggregate_identity_rank <= 5
+                    )
+                )
             )
             dense_identity_agreement = bool(
                 normalized in dense_source_rank
@@ -2139,6 +2389,27 @@ class RoutedHybridRetriever:
                 and dense_source_rank[normalized] <= 1
                 and binding_coverage >= 0.12
             )
+            # A same-language planner expansion must not erase a more
+            # discriminating phrase in the user's original query. Only let an
+            # expansion replace the original page score when it genuinely
+            # bridges scripts/languages or the original has almost no lexical
+            # signal at all; dense retrieval still corroborates the page.
+            semantic_score = self._generalized_page_target_score(query, page)
+            query_is_arabic_script = bool(re.search(r"[\u0600-\u06ff]", query))
+            for label, semantic_query, _query_tokens in semantic_query_variants:
+                if label == "original":
+                    continue
+                expansion_is_arabic_script = bool(
+                    re.search(r"[\u0600-\u06ff]", semantic_query)
+                )
+                if (
+                    query_is_arabic_script != expansion_is_arabic_script
+                    or semantic_score < 0.30
+                ):
+                    semantic_score = max(
+                        semantic_score,
+                        self._generalized_page_target_score(semantic_query, page),
+                    )
             # A required page is a hard evidence constraint. Bind only when its
             # identity covers most requested concepts, or when independent
             # dense Page Card/chunk representations agree. The latter is the
@@ -2151,6 +2422,7 @@ class RoutedHybridRetriever:
                 or page_card_dense_agreement
                 or dense_identity_agreement
                 or top_dense_partial_identity
+                or semantic_score >= 0.75
             ):
                 continue
             # A planner-provided translation/expansion can bridge languages, but
@@ -2163,10 +2435,6 @@ class RoutedHybridRetriever:
                 and normalized not in evidence_source_rank
             ):
                 continue
-            semantic_score = self._generalized_page_target_score(
-                binding_query,
-                page,
-            )
             agreement_score = 0.0
             if normalized in page_card_rank:
                 agreement_score += max(0.10, 0.48 - (0.055 * page_card_rank[normalized]))
@@ -2176,6 +2444,15 @@ class RoutedHybridRetriever:
                 agreement_score += max(
                     0.06,
                     0.30 - (0.035 * dense_source_rank[normalized]),
+                )
+            elif aggregate_identity_rank is not None:
+                agreement_score += max(
+                    0.06,
+                    0.30 - (0.035 * aggregate_identity_rank),
+                )
+                agreement_score += min(
+                    0.40,
+                    0.05 * aggregate_identity_length,
                 )
             total_score = semantic_score + agreement_score
             identity_binding = semantic_score >= 0.42 and total_score >= 0.66
@@ -3272,6 +3549,27 @@ class RoutedHybridRetriever:
             required_page=required_page,
             source_map=chunk_map,
         )
+        candidate_ids = {
+            str(chunk.get("id") or "")
+            for chunk in candidate_chunks
+            if isinstance(chunk, Mapping)
+        }
+        # Some detail URLs are represented inside a dense chunk from their
+        # aggregate parent page (for example, a press index card). Include only
+        # already-retrieved dense chunks whose long page identity occurs in that
+        # parent record; arbitrary sibling SPA routes remain excluded.
+        for preferred_chunk_id in preferred_rank:
+            preferred_chunk = chunk_map.get(preferred_chunk_id)
+            if (
+                preferred_chunk_id not in candidate_ids
+                and isinstance(preferred_chunk, dict)
+                and self._record_matches_required_page(
+                    preferred_chunk,
+                    required_page,
+                )
+            ):
+                candidate_chunks.append(preferred_chunk)
+                candidate_ids.add(preferred_chunk_id)
         for chunk in candidate_chunks:
             if not isinstance(chunk, dict) or not self._record_matches_required_page(
                 chunk,
@@ -4049,20 +4347,17 @@ class RoutedHybridRetriever:
         )
         query_embedding_status = "ok"
         query_embedding_error = ""
-        rewrite_requires_fresh_embedding = bool(
-            {"openai_vector_plan", "hyde_expansion"} & set(rewrites.labels)
-        )
-        if query_vector is not None and not rewrite_requires_fresh_embedding:
+        if query_vector is not None:
             query_vector = list(query_vector)
             if not query_vector:
                 query_embedding_status = "skipped_dense_no_query_vector"
         else:
             try:
-                query_vector = self.vector.embed_query(
-                    rewrites.vector_query
-                    if rewrite_requires_fresh_embedding
-                    else query
-                )
+                # Dense similarity stays anchored to the original user meaning.
+                # Planner/HyDE expansions still enrich lexical and graph lanes,
+                # but must not replace the primary semantic vector or make an
+                # identical user query retrieve a different page on each plan.
+                query_vector = self.vector.embed_query(query)
             except Exception as exc:
                 query_vector = []
                 query_embedding_status = "failed_sparse_local_fallback"

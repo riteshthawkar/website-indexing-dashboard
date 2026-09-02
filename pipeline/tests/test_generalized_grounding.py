@@ -156,6 +156,193 @@ def test_generalized_coverage_uses_semantic_page_card_not_known_url_rules():
     assert inferred["required_pages_source"] == "semantic_page_evidence"
 
 
+def test_generalized_coverage_prefers_exact_content_phrase_over_broader_top_hit():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    broad_url = "https://www.example.edu/research/foundation-models"
+    exact_url = "https://institute.example.edu/collaborate"
+    query = (
+        "What kinds of organizations does the institute partner with to co-create "
+        "foundation models and explore new frontiers in AI?"
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:broad": {"id": "card:broad", "source_url": broad_url},
+            "card:exact": {"id": "card:exact", "source_url": exact_url},
+        },
+        chunk_map={
+            "chunk:broad": {"id": "chunk:broad", "source_url": broad_url},
+            "chunk:exact": {"id": "chunk:exact", "source_url": exact_url},
+        },
+    )
+    broad_text = (
+        "The Institute of Foundation Models is a center for model science, "
+        "scale, and social value."
+    )
+    exact_text = (
+        "The institute partners with academic institutions, research labs, "
+        "startups, and enterprise leaders to co-create foundation models and "
+        "explore new frontiers in AI."
+    )
+
+    def page(source_url, identity, text):
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+        }
+
+    retriever._coverage_page_records = [
+        page(broad_url, "Institute of Foundation Models", broad_text),
+        page(exact_url, "Collaborate with the Institute", exact_text),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        query,
+        "exact_fact",
+        {
+            "dense_page_card_ids": ["card:broad", "card:exact"],
+            "dense_chunk_ids": ["chunk:broad", "chunk:exact"],
+            "planner_confidence": 0.82,
+            "query_retrieval_expansion": (
+                "institute foundation models partner organizations collaboration"
+            ),
+        },
+    )
+
+    assert inferred["required_pages"] == [exact_url]
+
+
+def test_spa_routes_do_not_become_aliases_from_a_shared_revision():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    requested_url = "https://events.example.edu/talks/target-talk"
+    unrelated_url = "https://events.example.edu/talks/another-talk"
+    revision_id = "document-revision:hydrated-spa-snapshot"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever._coverage_page_records = [
+        {
+            "source_url": requested_url,
+            "normalized_url": retriever._normalize_source_url(requested_url),
+            "document_revision_ids": {revision_id},
+            "linked_chunk_ids": {"chunk:shared"},
+            "explicit_alias_urls": set(),
+        },
+        {
+            "source_url": unrelated_url,
+            "normalized_url": retriever._normalize_source_url(unrelated_url),
+            "document_revision_ids": {revision_id},
+            "linked_chunk_ids": {"chunk:shared"},
+            "explicit_alias_urls": set(),
+        },
+    ]
+    retriever._coverage_page_records_by_url = {
+        page["normalized_url"]: page for page in retriever._coverage_page_records
+    }
+    unrelated_record = {
+        "id": "chunk:shared",
+        "source_url": unrelated_url,
+        "document_revision_id": revision_id,
+    }
+
+    assert not retriever._coverage_pages_share_representation(
+        requested_url,
+        unrelated_url,
+    )
+    assert not retriever._record_matches_required_page(
+        unrelated_record,
+        requested_url,
+    )
+    assert retriever._record_matches_required_page(
+        {**unrelated_record, "canonical_url": requested_url},
+        requested_url,
+    )
+
+
+def test_cross_lingual_page_binding_bridges_a_dense_aggregate_parent():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    target_url = "https://events.example.edu/press/teacher-avatar-project"
+    aggregate_url = "https://events.example.edu/press"
+    broader_url = "https://events.example.edu/articles/realistic-avatars"
+    target_title = "Project to develop 3D avatars of teachers and students for virtual classes"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:broader": {"id": "card:broader", "source_url": broader_url},
+            "card:target": {"id": "card:target", "source_url": target_url},
+        },
+        chunk_map={
+            "chunk:aggregate": {
+                "id": "chunk:aggregate",
+                "source_url": aggregate_url,
+                "text": f"SECTION: {target_title}. The project enhances virtual classrooms.",
+            },
+            "chunk:broader": {
+                "id": "chunk:broader",
+                "source_url": broader_url,
+                "text": "Research on generating realistic avatars in virtual worlds.",
+            },
+        },
+    )
+
+    def page(source_url, identity, text):
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+            "document_revision_ids": set(),
+            "linked_chunk_ids": set(),
+            "explicit_alias_urls": set(),
+        }
+
+    retriever._coverage_page_records = [
+        page(broader_url, "Generating realistic avatars", "Avatar research"),
+        page(target_url, target_title, target_title),
+    ]
+    retriever._coverage_page_records_by_url = {
+        item["normalized_url"]: item for item in retriever._coverage_page_records
+    }
+    query = (
+        "ما المعلومة الأساسية في مشروع تطوير صور رمزية ثلاثية الأبعاد "
+        "للمعلمين والطلاب من أجل الفصول الافتراضية؟"
+    )
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        query,
+        "exact_fact",
+        {
+            "dense_page_card_ids": ["card:broader", "card:target"],
+            "dense_chunk_ids": ["chunk:aggregate", "chunk:broader"],
+        },
+    )
+
+    assert inferred["required_pages"] == [target_url]
+    assert retriever._record_matches_required_page(
+        retriever.vector.chunk_map["chunk:aggregate"],
+        target_url,
+    )
+    assert not retriever._record_matches_required_page(
+        {
+            "id": "chunk:sibling",
+            "source_url": "https://events.example.edu/press/another-project",
+            "text": target_title,
+        },
+        target_url,
+    )
+
+
 def test_generalized_coverage_can_bridge_languages_only_with_independent_evidence():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -657,6 +844,27 @@ def test_production_mode_does_not_inject_prompt_specific_lexical_aliases():
 
     assert "autonomy" not in tokens
     assert "intelligence" not in tokens
+
+
+def test_production_graph_context_does_not_inject_query_specific_aliases(monkeypatch):
+    import pipeline.retrieval.graph_rag as graph_module
+    from pipeline.retrieval.graph_rag import GraphRAGRetriever
+
+    retriever = GraphRAGRetriever.__new__(GraphRAGRetriever)
+    retriever.query_specific_retrieval_rules_enabled = False
+    retriever._build_relation_query_plan = lambda query, mode, media_query: None
+    monkeypatch.setattr(
+        graph_module,
+        "_semantic_query_alias_tokens",
+        lambda _query: (_ for _ in ()).throw(
+            AssertionError("query-specific aliases must remain disabled")
+        ),
+    )
+
+    context = retriever.prepare_query_context("ماذا تعرض لوحة مشاريع الأبحاث؟")
+
+    assert context.rewritten_query == "ماذا تعرض لوحة مشاريع الأبحاث؟"
+    assert "semantic_alias_expansion" not in context.rewrite_labels
 
 
 def test_semantic_sufficiency_rejects_one_tangential_item_for_broad_request():

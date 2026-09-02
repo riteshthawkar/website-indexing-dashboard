@@ -622,6 +622,37 @@ def test_evidence_pack_does_not_leave_qualification_value_at_window_edge():
     assert "equivalent industry experience" in packed_text
 
 
+def test_evidence_pack_centers_qualification_without_a_section_heading():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.example.edu/jobs/policy-development-specialist"
+    pack = build_evidence_pack(
+        query="ما المؤهل الأكاديمي المطلوب لوظيفة Policy Development Specialist؟",
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:policy-development-specialist",
+                    "text": (
+                        "Policy Development Specialist. "
+                        + ("Develop and review institutional policies and guidelines. " * 70)
+                        + "Master’s degree in public policy/guidelines, higher education "
+                        "administration, law, or a related field."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Policy Development Specialist",
+                }
+            ]
+        },
+        max_items=2,
+        max_chars=1200,
+        max_per_source=2,
+    )
+
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "Master’s degree in public policy/guidelines" in packed_text
+    assert "law, or a related field" in packed_text
+
+
 def test_evidence_pack_preserves_fused_promoted_assertion_for_exact_role_fact():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 
@@ -2236,6 +2267,7 @@ def test_routed_required_page_backfill_bridges_page_alias_to_shared_chunks():
             chunk_id: {
                 "id": chunk_id,
                 "source_url": canonical_url,
+                "canonical_url": requested_url,
                 "document_revision_id": revision_id,
                 "document_title": "المشاريع",
                 "text": "تشمل الموضوعات البحثية التزييف العميق وتحليل الصور الطبية.",
@@ -8668,6 +8700,94 @@ def test_explicit_dense_media_hit_is_not_discarded_by_chunk_attachment():
     assert [item["id"] for item in selected][:2] == ["dense-gold", "linked"]
 
 
+def test_cross_lingual_dense_media_floor_survives_zero_lexical_overlap():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_media_results = 1
+    retriever.chunk_map = {
+        "selected": {"id": "selected", "media_ids": ["linked"]}
+    }
+    retriever.parent_map = {}
+    retriever.parent_ids_by_chunk = {"selected": []}
+    retriever.section_parent_ids_by_chunk = {"selected": []}
+    retriever.page_parent_ids_by_chunk = {"selected": []}
+    retriever.media_map = {
+        "dense-gold": {
+            "id": "dense-gold",
+            "media_type": "image",
+            "source_url": "https://research.mbzuai.ac.ae/projects",
+            "linked_chunk_ids": ["other"],
+        },
+        "linked": {
+            "id": "linked",
+            "media_type": "image",
+            "source_url": "https://research.mbzuai.ac.ae/other",
+            "linked_chunk_ids": ["selected"],
+        },
+    }
+    retriever._is_low_signal_media = lambda media: False
+    retriever._score_media_relevance = lambda query, media: (
+        0.0 if media["id"] == "dense-gold" else 1.0
+    )
+
+    selected = retriever._attach_media(
+        ["selected"],
+        ["dense-gold", "linked"],
+        "ماذا تعرض الصورة في لوحة مشاريع الأبحاث؟",
+        dense_media_hits=["dense-gold"],
+    )
+
+    assert [item["id"] for item in selected] == ["dense-gold"]
+
+
+def test_exact_named_media_phrase_can_promote_second_dense_hit():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_media_results = 1
+    retriever.chunk_map = {}
+    retriever.parent_map = {}
+    retriever.parent_ids_by_chunk = {}
+    retriever.section_parent_ids_by_chunk = {}
+    retriever.page_parent_ids_by_chunk = {}
+    retriever.media_map = {
+        "broad": {
+            "id": "broad",
+            "media_type": "image",
+            "source_url": "https://www.mbzuai.ac.ae/research/sustainability",
+            "linked_chunk_ids": [],
+        },
+        "exact": {
+            "id": "exact",
+            "media_type": "image",
+            "source_url": "https://metaverse.mbzuai.ac.ae/studio/gpu-cluster",
+            "linked_chunk_ids": [],
+        },
+    }
+    retriever.media_texts_by_id = {
+        "broad": "A sustainability illustration about reducing carbon-intensive travel.",
+        "exact": (
+            "Harnessing Web3 on Carbon Offset Market for Sustainability. "
+            "A two-part chart and keyword network graph."
+        ),
+    }
+    retriever._is_low_signal_media = lambda _media: False
+    retriever._score_media_relevance = lambda _query, _media: 1.0
+
+    selected = retriever._attach_media(
+        [],
+        ["broad", "exact"],
+        (
+            "What does the image under Harnessing Web3 on Carbon Offset "
+            "Market for Sustainability show?"
+        ),
+        dense_media_hits=["broad", "exact"],
+    )
+
+    assert [item["id"] for item in selected] == ["exact"]
+
+
 def test_strong_official_media_can_rescue_weak_surrounding_text():
     from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
 
@@ -8749,6 +8869,19 @@ def test_arabic_nonvisual_fact_query_does_not_route_to_the_media_lane():
     from pipeline.retrieval.adaptive_hybrid import _is_media_query
 
     assert _is_media_query("ما متطلبات القبول في برنامج الماجستير؟") is False
+
+
+def test_arabic_avatar_project_query_does_not_route_to_media_lane():
+    from pipeline.retrieval.adaptive_hybrid import _is_media_query
+    from pipeline.retrieval.evidence_packer import _is_explicit_media_query
+
+    query = (
+        "ما المعلومة الأساسية التي تعرضها صفحة مشروع تطوير صور رمزية "
+        "ثلاثية الأبعاد للمعلمين والطلاب من أجل الفصول الافتراضية؟"
+    )
+
+    assert _is_media_query(query) is False
+    assert _is_explicit_media_query(query) is False
 
 
 def test_quoted_image_analysis_talk_title_does_not_route_to_media_lane():

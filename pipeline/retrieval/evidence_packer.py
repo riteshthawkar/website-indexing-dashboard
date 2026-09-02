@@ -49,6 +49,14 @@ def _is_explicit_media_query(query: str) -> bool:
         str(query or ""),
         flags=re.IGNORECASE,
     )
+    # In Arabic, ``صور رمزية`` is the compound noun "avatars", not an
+    # instruction to inspect an image. Keep actual image references intact.
+    intent_text = re.sub(
+        r"(?:صور|الصور)\s+رمزية(?:\s+ثلاثية\s+الأبعاد)?",
+        " avatars ",
+        intent_text,
+        flags=re.IGNORECASE,
+    )
     normalized = _clean_text(intent_text).casefold()
     if (
         "policy page" in normalized
@@ -826,6 +834,14 @@ def _query_dense_excerpt(
                 "academic qualifications",
                 "academic qualification",
                 "academic qualifications required",
+                "master's degree",
+                "master’s degree",
+                "bachelor's degree",
+                "bachelor’s degree",
+                "doctoral degree",
+                "doctorate degree",
+                "phd",
+                "degree in",
                 "strongly preferred",
                 "preferred but not mandatory",
                 "minimum 8+ years",
