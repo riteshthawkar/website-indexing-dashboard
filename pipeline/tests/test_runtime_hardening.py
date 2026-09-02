@@ -768,6 +768,83 @@ def test_arabic_academic_program_offering_remains_a_grounded_premise():
     assert requirements == ["الطب البيطري برنامج"]
 
 
+def test_arabic_program_premise_excludes_requested_delivery_attributes():
+    from pipeline.core.evidence_adjudicator import extract_premise_requirements
+
+    requirements = extract_premise_requirements(
+        "هل برنامج الماجستير في الذكاء الاصطناعي التطبيقي في MBZUAI "
+        "بدوام كامل أم جزئي، وكيف يُقدَّم، وكم تستغرق مدة إكماله عادةً؟"
+    )
+
+    assert requirements == [
+        "الذكاء التطبيقي الماجستير",
+        "الذكاء التطبيقي برنامج",
+    ]
+    assert all("دوام" not in requirement for requirement in requirements)
+
+
+def test_premise_fallback_verifies_arabic_offering_against_english_source():
+    from pipeline.core.evidence_adjudicator import (
+        heuristic_adjudicate_factual_evidence,
+    )
+
+    result = heuristic_adjudicate_factual_evidence(
+        query=(
+            "هل برنامج الماجستير في الذكاء الاصطناعي التطبيقي في MBZUAI "
+            "بدوام كامل أم جزئي، وكيف يُقدَّم؟"
+        ),
+        intent_summary={
+            "answer_types": [],
+            "requested_roles": [],
+            "subject_tokens": [],
+            "subject_phrases": [],
+            "strict_answer_required": False,
+        },
+        answer_documents=[],
+        fact_documents=[],
+        retrieval_documents=[
+            {
+                "id": "maai-study-plan",
+                "text": (
+                    "The Master in Applied Artificial Intelligence program is "
+                    "part-time, in-person, and on campus."
+                ),
+            }
+        ],
+    )
+
+    assert result["abstain"] is False
+    assert result["selected_chunk_ids"] == ["maai-study-plan"]
+
+
+def test_premise_fallback_still_rejects_unsupported_arabic_offering():
+    from pipeline.core.evidence_adjudicator import (
+        heuristic_adjudicate_factual_evidence,
+    )
+
+    result = heuristic_adjudicate_factual_evidence(
+        query="ما متطلبات القبول في برنامج الطب البيطري في MBZUAI؟",
+        intent_summary={
+            "answer_types": [],
+            "requested_roles": [],
+            "subject_tokens": [],
+            "subject_phrases": [],
+            "strict_answer_required": False,
+        },
+        answer_documents=[],
+        fact_documents=[],
+        retrieval_documents=[
+            {
+                "id": "generic-admissions",
+                "text": "General graduate admissions requirements for AI programs.",
+            }
+        ],
+    )
+
+    assert result["abstain"] is True
+    assert result["reason"] == "presupposed_entity_or_scope_not_supported"
+
+
 def test_premise_grounding_routes_non_fact_queries(monkeypatch):
     import pipeline.retrieval.routed_hybrid as module
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever

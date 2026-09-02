@@ -2036,6 +2036,27 @@ class RoutedHybridRetriever:
             if normalized:
                 page_card_rank.setdefault(normalized, rank)
 
+        # Dense chunks and Page Cards are independently embedded
+        # representations. Agreement between them is strong evidence of page
+        # identity even when the query and page are in different languages.
+        # Preserve source rank before reranking so a later lexical/model stage
+        # cannot erase that corroboration.
+        dense_source_rank: Dict[str, int] = {}
+        chunk_map = getattr(self.vector, "chunk_map", {})
+        for rank, chunk_id in enumerate(payload.get("dense_chunk_ids") or []):
+            chunk = (
+                chunk_map.get(str(chunk_id))
+                if isinstance(chunk_map, Mapping)
+                else None
+            )
+            if not isinstance(chunk, Mapping):
+                continue
+            normalized = self._normalize_source_url(
+                self._source_url_from_record(dict(chunk))
+            )
+            if normalized:
+                dense_source_rank.setdefault(normalized, rank)
+
         evidence_source_rank: Dict[str, int] = {}
         for rank, doc in enumerate(payload.get("retrieval_documents") or []):
             if not isinstance(doc, Mapping):
@@ -2083,11 +2104,29 @@ class RoutedHybridRetriever:
                 key=lambda value: value[0],
                 default=(0.0, "original", query),
             )
+            page_card_dense_agreement = bool(
+                normalized in page_card_rank
+                and normalized in dense_source_rank
+                and page_card_rank[normalized] <= 5
+                and dense_source_rank[normalized] <= 5
+            )
+            dense_identity_agreement = bool(
+                normalized in dense_source_rank
+                and dense_source_rank[normalized] <= 5
+                and binding_coverage >= 0.20
+            )
             # A required page is a hard evidence constraint. Bind only when its
-            # identity—not merely a coincidental body word—covers most of the
-            # requested concepts. Ambiguous cases remain ordinary ranked
-            # retrieval and may be clarified by the planner/reranker.
-            if binding_coverage < 0.50:
+            # identity covers most requested concepts, or when independent
+            # dense Page Card/chunk representations agree. The latter is the
+            # language-neutral bridge for cross-lingual retrieval. A
+            # high-ranked dense chunk plus partial page identity is also enough
+            # to retain each side of a comparison; the evidence adjudicator
+            # still verifies the premise before an answer can be emitted.
+            if not (
+                binding_coverage >= 0.50
+                or page_card_dense_agreement
+                or dense_identity_agreement
+            ):
                 continue
             # A planner-provided translation/expansion can bridge languages, but
             # it must agree with an independent Page Card or evidence lane before
@@ -2108,8 +2147,22 @@ class RoutedHybridRetriever:
                 agreement_score += max(0.10, 0.48 - (0.055 * page_card_rank[normalized]))
             if normalized in evidence_source_rank:
                 agreement_score += max(0.04, 0.22 - (0.025 * evidence_source_rank[normalized]))
+            if normalized in dense_source_rank:
+                agreement_score += max(
+                    0.06,
+                    0.30 - (0.035 * dense_source_rank[normalized]),
+                )
             total_score = semantic_score + agreement_score
-            if semantic_score >= 0.42 and total_score >= 0.66:
+            identity_binding = semantic_score >= 0.42 and total_score >= 0.66
+            cross_lane_binding = (
+                page_card_dense_agreement and total_score >= 0.58
+            )
+            dense_partial_binding = (
+                dense_identity_agreement
+                and semantic_score >= 0.30
+                and total_score >= 0.54
+            )
+            if identity_binding or cross_lane_binding or dense_partial_binding:
                 scored.append((total_score, semantic_score, page))
 
         scored.sort(
@@ -3055,9 +3108,21 @@ class RoutedHybridRetriever:
         card["coverage_page_card"] = True
         return card
 
-    def _best_required_page_spans(self, query: str, required_page: str, *, limit: int = 2) -> List[Dict[str, Any]]:
+    def _best_required_page_spans(
+        self,
+        query: str,
+        required_page: str,
+        *,
+        limit: int = 2,
+        preferred_chunk_ids: Sequence[str] = (),
+    ) -> List[Dict[str, Any]]:
         scored: List[tuple[float, Dict[str, Any]]] = []
         evidence_span_map = getattr(self.vector, "evidence_span_map", {})
+        preferred_rank = {
+            str(chunk_id): rank
+            for rank, chunk_id in enumerate(preferred_chunk_ids)
+            if str(chunk_id)
+        }
         for span in self._coverage_candidates_for_required_page(
             record_type="evidence_spans",
             required_page=required_page,
@@ -3086,6 +3151,13 @@ class RoutedHybridRetriever:
             if not re.search(r"\b(date|deadline|when|application|admission|decision|close|screening)\b", query_lower):
                 if any(token in text_lower for token in ("applications close", "admission decision", "program dates", "postponed", "deadline")):
                     score -= 0.35
+            linked_dense_ranks = [
+                preferred_rank[str(chunk_id)]
+                for chunk_id in (span.get("linked_chunk_ids") or [])
+                if str(chunk_id) in preferred_rank
+            ]
+            if linked_dense_ranks:
+                score += max(0.35, 1.60 - (0.10 * min(linked_dense_ranks)))
             if score > 0.0:
                 scored.append((score, span))
         scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
@@ -3128,9 +3200,15 @@ class RoutedHybridRetriever:
         required_page: str,
         *,
         limit: int = 2,
+        preferred_chunk_ids: Sequence[str] = (),
     ) -> List[Dict[str, Any]]:
         scored: List[tuple[float, Dict[str, Any]]] = []
         chunk_map = getattr(self.vector, "chunk_map", {})
+        preferred_rank = {
+            str(chunk_id): rank
+            for rank, chunk_id in enumerate(preferred_chunk_ids)
+            if str(chunk_id)
+        }
         candidate_chunks = self._coverage_candidates_for_required_page(
             record_type="chunks",
             required_page=required_page,
@@ -3165,6 +3243,13 @@ class RoutedHybridRetriever:
                 text,
                 self._source_url_from_record(chunk),
             )
+            chunk_id = str(chunk.get("id") or "")
+            if chunk_id in preferred_rank:
+                # A required page was inferred from the dense lane itself.
+                # Reuse that semantic ordering when lexical scoring cannot
+                # compare languages or when a generic reranker discarded one
+                # side of a multi-page answer.
+                score += max(0.35, 1.60 - (0.10 * preferred_rank[chunk_id]))
             scored.append((score, chunk))
         scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
         return [
@@ -3412,6 +3497,7 @@ class RoutedHybridRetriever:
                 query,
                 required_page,
                 limit=chunk_limit,
+                preferred_chunk_ids=payload.get("dense_chunk_ids") or [],
             )
             if injected_chunks:
                 payload.setdefault("selected_chunk_ids", [])
@@ -3444,6 +3530,7 @@ class RoutedHybridRetriever:
                 query,
                 required_page,
                 limit=span_limit,
+                preferred_chunk_ids=payload.get("dense_chunk_ids") or [],
             )
             if not injected_spans:
                 continue
@@ -3991,23 +4078,71 @@ class RoutedHybridRetriever:
 
         stage_started = time.perf_counter()
         payload = dict(result or {})
+        payload["query"] = query
+        payload["original_query"] = coverage_query
+        payload["query_rewritten"] = rewrites.vector_query
+        payload["query_retrieval_expansion"] = rewrites.retrieval_expansion
+        payload["query_rewrite_labels"] = list(
+            dict.fromkeys([*rewrites.labels, *graph_context.rewrite_labels])
+        )
+        payload["planner_query_type"] = rewrites.planned_query_type
+        payload["planner_answer_types"] = list(rewrites.answer_types)
+        payload["planner_entity_hints"] = list(rewrites.entity_hints)
+        payload["planner_confidence"] = rewrites.planner_confidence
+        if resolved_context_page:
+            payload["required_pages"] = [resolved_context_page]
+            payload["required_pages_source"] = "current_page_context"
+            payload["context_page_url"] = resolved_context_page
         preliminary_confidence, preliminary_factors = score_retrieval_confidence(payload)
         payload["retrieval_confidence"] = preliminary_confidence
         payload["confidence_factors"] = preliminary_factors
+
+        # Coverage normally runs after factual adjudication, but cross-lingual
+        # and multi-page evidence can be discarded by reranking before the
+        # adjudicator sees it. When independent dense representations have
+        # already established a semantic page binding, inject that page's
+        # highest-ranked dense children first. This never bypasses premise
+        # verification: the ordinary adjudicator still runs immediately below
+        # and can fail closed for an unsupported entity or offering.
+        pre_adjudication_plan = self._coverage_plan_for_result(
+            query=coverage_query,
+            payload=payload,
+            mode=mode,
+        )
+        pre_adjudication_source = str(
+            pre_adjudication_plan.get("required_pages_source") or ""
+        )
+        pre_adjudication_backfill = False
+        if (
+            not bool(payload.get("abstained"))
+            and pre_adjudication_source
+            in {"semantic_page_evidence", "current_page_context"}
+        ):
+            pre_adjudication_backfill = self._augment_payload_for_required_coverage(
+                query=coverage_query,
+                payload=payload,
+                coverage_plan=pre_adjudication_plan,
+            )
+            if pre_adjudication_backfill:
+                preliminary_confidence, preliminary_factors = (
+                    score_retrieval_confidence(payload)
+                )
+                payload["retrieval_confidence"] = preliminary_confidence
+                payload["confidence_factors"] = preliminary_factors
+        payload["pre_adjudication_semantic_page_backfill"] = bool(
+            pre_adjudication_backfill
+        )
+        postprocess_stage_latency_ms["pre_adjudication_coverage_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+
+        stage_started = time.perf_counter()
         payload = self._apply_evidence_adjudication(coverage_query, payload)
         postprocess_stage_latency_ms["evidence_adjudication_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             3,
         )
-        payload["query"] = query
-        payload["original_query"] = coverage_query
-        payload["query_rewritten"] = rewrites.vector_query
-        payload["query_retrieval_expansion"] = rewrites.retrieval_expansion
-        payload["query_rewrite_labels"] = list(dict.fromkeys([*rewrites.labels, *graph_context.rewrite_labels]))
-        payload["planner_query_type"] = rewrites.planned_query_type
-        payload["planner_answer_types"] = list(rewrites.answer_types)
-        payload["planner_entity_hints"] = list(rewrites.entity_hints)
-        payload["planner_confidence"] = rewrites.planner_confidence
         payload["graph_query_rewritten"] = graph_context.rewritten_query if decision.graph_available else query
         payload["retriever_backend"] = decision.backend
         payload["routing_backend"] = decision.backend

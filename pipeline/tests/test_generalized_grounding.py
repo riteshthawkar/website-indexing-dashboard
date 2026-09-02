@@ -201,6 +201,219 @@ def test_generalized_coverage_can_bridge_languages_only_with_independent_evidenc
     assert uncorroborated["required_pages"] == []
 
 
+def test_generalized_coverage_bridges_languages_from_dense_representation_agreement():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    program_url = "https://www.example.edu/study/applied-artificial-intelligence"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:program": {
+                "id": "card:program",
+                "source_url": program_url,
+            }
+        },
+        chunk_map={
+            "chunk:program": {
+                "id": "chunk:program",
+                "source_url": program_url,
+            }
+        },
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": program_url,
+            "normalized_url": program_url,
+            "identity_text": "master in applied artificial intelligence",
+            "identity_tokens": {
+                "master",
+                "applied",
+                "artificial",
+                "intelligence",
+            },
+            "tokens": {
+                "master",
+                "applied",
+                "artificial",
+                "intelligence",
+                "part-time",
+                "campus",
+            },
+        }
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "هل البرنامج بدوام جزئي وكم تستغرق مدة إكماله؟",
+        "broad_synthesis",
+        {
+            "dense_page_card_ids": ["card:program"],
+            "dense_chunk_ids": ["chunk:program"],
+        },
+    )
+
+    assert inferred["required_pages"] == [program_url]
+    assert inferred["required_pages_source"] == "semantic_page_evidence"
+
+
+def test_generalized_comparison_retains_each_high_ranked_dense_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    masters_url = "https://www.example.edu/study/msc-programs"
+    doctoral_url = "https://www.example.edu/study/phd-programs"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={},
+        chunk_map={
+            "chunk:masters": {
+                "id": "chunk:masters",
+                "source_url": masters_url,
+            },
+            "chunk:doctoral": {
+                "id": "chunk:doctoral",
+                "source_url": doctoral_url,
+            },
+        },
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": masters_url,
+            "normalized_url": masters_url,
+            "identity_text": "msc programs master's programs",
+            "identity_tokens": {"msc", "master", "program"},
+            "tokens": {"msc", "master", "program", "scholarship", "coverage"},
+        },
+        {
+            "source_url": doctoral_url,
+            "normalized_url": doctoral_url,
+            "identity_text": "phd programs doctoral programs",
+            "identity_tokens": {"phd", "doctoral", "program"},
+            "tokens": {"phd", "doctoral", "program", "scholarship", "coverage"},
+        },
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "Compare scholarship coverage across M.Sc. and Ph.D. programs.",
+        "multi_page_aggregation",
+        {"dense_chunk_ids": ["chunk:masters", "chunk:doctoral"]},
+    )
+
+    assert set(inferred["required_pages"]) == {masters_url, doctoral_url}
+
+
+def test_generalized_coverage_does_not_bind_unrelated_dense_page_without_identity():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    unrelated_url = "https://www.example.edu/campus/parking"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={},
+        chunk_map={
+            "chunk:parking": {
+                "id": "chunk:parking",
+                "source_url": unrelated_url,
+            }
+        },
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": unrelated_url,
+            "normalized_url": unrelated_url,
+            "identity_text": "campus parking",
+            "identity_tokens": {"campus", "parking"},
+            "tokens": {"campus", "parking", "vehicle"},
+        }
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "Compare graduate scholarship programs.",
+        "multi_page_aggregation",
+        {"dense_chunk_ids": ["chunk:parking"]},
+    )
+
+    assert inferred["required_pages"] == []
+
+
+def test_required_page_chunk_backfill_preserves_dense_semantic_order():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    program_url = "https://www.example.edu/study/program"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        chunk_map={
+            "chunk:a": {
+                "id": "chunk:a",
+                "source_url": program_url,
+                "text": "Generic program introduction.",
+            },
+            "chunk:z": {
+                "id": "chunk:z",
+                "source_url": program_url,
+                "text": "Part-time and completed in two years.",
+            },
+        },
+        _score_text_match=lambda _query, _text: 0.0,
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": program_url,
+            "normalized_url": program_url,
+            "document_revision_ids": set(),
+            "linked_chunk_ids": {"chunk:a", "chunk:z"},
+        }
+    ]
+
+    chunks = retriever._best_required_page_chunks(
+        "كم تستغرق مدة البرنامج؟",
+        program_url,
+        limit=1,
+        preferred_chunk_ids=["chunk:z", "chunk:a"],
+    )
+
+    assert [chunk["id"] for chunk in chunks] == ["chunk:z"]
+
+
+def test_required_page_span_backfill_follows_linked_dense_chunk_order():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    program_url = "https://www.example.edu/study/program"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        evidence_span_map={
+            "span:unrelated": {
+                "id": "span:unrelated",
+                "source_url": program_url,
+                "text": "Generic introduction.",
+                "linked_chunk_ids": ["chunk:other"],
+            },
+            "span:duration": {
+                "id": "span:duration",
+                "source_url": program_url,
+                "text": "Part-time and completed in two years.",
+                "linked_chunk_ids": ["chunk:duration"],
+            },
+        },
+        _score_text_match=lambda _query, _text: 0.0,
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": program_url,
+            "normalized_url": program_url,
+            "document_revision_ids": set(),
+            "linked_chunk_ids": {"chunk:other", "chunk:duration"},
+        }
+    ]
+
+    spans = retriever._best_required_page_spans(
+        "كم تستغرق مدة البرنامج؟",
+        program_url,
+        limit=1,
+        preferred_chunk_ids=["chunk:duration", "chunk:other"],
+    )
+
+    assert [span["id"] for span in spans] == ["span:duration"]
+
+
 def test_production_mode_does_not_inject_prompt_specific_lexical_aliases():
     from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
 

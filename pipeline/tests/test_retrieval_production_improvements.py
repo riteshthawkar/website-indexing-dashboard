@@ -542,6 +542,41 @@ def test_evidence_pack_treats_experience_lookup_as_contiguous_detail_query():
     assert "At least 5 years" in " ".join(item["text"] for item in pack["items"])
 
 
+def test_evidence_pack_centers_cross_lingual_qualification_chunk_on_answer_block():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/research-engineer-world-modelling"
+    pack = build_evidence_pack(
+        query=(
+            "ما المؤهل الأكاديمي المطلوب للتقديم على وظيفة "
+            "Research Engineer – World Modelling؟"
+        ),
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:research-engineer-world-modelling",
+                    "text": (
+                        "Research Engineer – World Modelling. Job Purpose: "
+                        + ("Design and maintain scalable video data pipelines. " * 70)
+                        + "Academic Qualifications: MSc or PhD in Machine Learning "
+                        "or Computer Science, or equivalent industry experience. "
+                        "Professional Experience: practical experience with model training."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Research Engineer – World Modelling",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=800,
+        max_per_source=2,
+    )
+
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "MSc or PhD in Machine Learning or Computer Science" in packed_text
+    assert "equivalent industry experience" in packed_text
+
+
 def test_evidence_pack_preserves_fused_promoted_assertion_for_exact_role_fact():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 

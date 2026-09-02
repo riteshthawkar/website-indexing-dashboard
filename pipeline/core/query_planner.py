@@ -61,6 +61,15 @@ _ANSWER_TYPES = {
     "role_holder",
     "service_availability",
 }
+
+_SPECULATIVE_REWRITE_RE = re.compile(
+    r"(?:\.{3,}|…)|"
+    r"\b(?:tbd|unknown|unclear|unsure|maybe|perhaps|possibly|presumably)\b|"
+    r"\b(?:need|needs|requiring)\s+(?:current|up[- ]to[- ]date|verification|"
+    r"verify|confirmation)\b|"
+    r"\b(?:to\s+be\s+confirmed|not\s+sure)\b",
+    flags=re.IGNORECASE,
+)
 _QUERY_PLANNER_JSON_SCHEMA: Dict[str, Any] = {
     "name": "retrieval_query_plan",
     "strict": True,
@@ -124,9 +133,26 @@ def _bounded_confidence(value: Any) -> float:
 def _rewrite_preserves_query_constraints(query: str, rewrite: str) -> bool:
     """Check that a model rewrite remains anchored to the user's request."""
 
-    query_tokens = re.findall(r"[^\W_]+", str(query or "").casefold(), flags=re.UNICODE)
+    query_text = str(query or "")
+    rewrite_text = str(rewrite or "")
+    # Retrieval rewrites are search expressions, not draft answers. Reject
+    # model uncertainty, placeholders, and newly introduced questions because
+    # they can smuggle guessed entities into otherwise well-anchored rewrites.
+    query_speculation = {
+        match.group(0).casefold()
+        for match in _SPECULATIVE_REWRITE_RE.finditer(query_text)
+    }
+    if any(
+        match.group(0).casefold() not in query_speculation
+        for match in _SPECULATIVE_REWRITE_RE.finditer(rewrite_text)
+    ):
+        return False
+    if rewrite_text.count("?") > query_text.count("?"):
+        return False
+
+    query_tokens = re.findall(r"[^\W_]+", query_text.casefold(), flags=re.UNICODE)
     rewrite_tokens = set(
-        re.findall(r"[^\W_]+", str(rewrite or "").casefold(), flags=re.UNICODE)
+        re.findall(r"[^\W_]+", rewrite_text.casefold(), flags=re.UNICODE)
     )
     if not query_tokens or not rewrite_tokens:
         return False

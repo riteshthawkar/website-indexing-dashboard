@@ -822,6 +822,8 @@ def _query_dense_excerpt(
     if re.search(r"\b(?:qualification|qualifications|degree|required and preferred|preferred)\b|(?:المؤهل|المؤهلات)", query_lower):
         facet_phrases.extend(
             (
+                "academic qualifications",
+                "academic qualification",
                 "academic qualifications required",
                 "strongly preferred",
                 "preferred but not mandatory",

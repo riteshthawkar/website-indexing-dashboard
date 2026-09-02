@@ -30,6 +30,26 @@ _PREMISE_STOPWORDS = {
     "رسوم", "الرسوم", "الدراسية", "العام", "الأكاديمي", "الاكاديمي",
 }
 
+# Small, domain-neutral academic equivalence groups used only by the
+# fail-closed heuristic when provider adjudication is unavailable. They let an
+# Arabic query verify an English source (and vice versa) without weakening the
+# requirement that every meaningful offering token co-occur in one candidate.
+_PREMISE_TOKEN_EQUIVALENCE_GROUPS = (
+    {"ai", "intelligence", "الذكاء"},
+    {"artificial", "الاصطناعي"},
+    {"applied", "التطبيقي", "تطبيقي"},
+    {"master", "masters", "msc", "ماجستير", "الماجستير"},
+    {"phd", "doctoral", "doctorate", "دكتوراه", "الدكتوراه"},
+    {"bachelor", "bachelors", "بكالوريوس", "البكالوريوس"},
+    {"program", "programs", "programme", "programmes", "برنامج", "برامج"},
+    {"medicine", "medical", "الطب", "طب"},
+    {"veterinary", "البيطري", "بيطري"},
+    {"science", "sciences", "العلوم", "علوم"},
+    {"computer", "computing", "الحاسوب", "حاسوب", "الحوسبة"},
+    {"engineering", "الهندسة", "هندسة"},
+    {"robotics", "الروبوتات", "روبوتات"},
+)
+
 _EVIDENCE_ADJUDICATION_JSON_SCHEMA = {
     "name": "evidence_adjudication",
     "strict": True,
@@ -148,7 +168,10 @@ def extract_premise_requirements(
         if cleaned:
             requirements.append(cleaned)
     for match in re.finditer(
-        r"(?:^|\s)ل?(دكتوراه|ال?ماجستير|ال?بكالوريوس)\s+(?!في\s+جامعة|بجامعة|بالجامعة)(.+?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
+        r"(?:^|\s)ل?(دكتوراه|ال?ماجستير|ال?بكالوريوس)\s+"
+        r"(?!في\s+(?:جامعة|mbzuai)|بجامعة|بالجامعة)(.+?)"
+        r"(?=\s+(?:في\s+(?:جامعة|mbzuai)|بجامعة|بالجامعة|بدوام|دوام|"
+        r"وكيف|كيف|وكم|كم|ومدة|مدة)|[؟?،,]|$)",
         text,
         flags=re.IGNORECASE,
     ):
@@ -168,7 +191,8 @@ def extract_premise_requirements(
     )
     if arabic_academic_program_context:
         for match in re.finditer(
-            r"(برنامج)\s+(.+?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
+            r"(برنامج)\s+(.+?)(?=\s+(?:في\s+(?:جامعة|mbzuai)|بجامعة|"
+            r"بالجامعة|بدوام|دوام|وكيف|كيف|وكم|كم|ومدة|مدة)|[؟?،,]|$)",
             text,
             flags=re.IGNORECASE,
         ):
@@ -356,6 +380,12 @@ def _subject_supported(intent_summary: Mapping[str, Any], texts: Sequence[str]) 
 
 def _token_supported(token: str, candidate_tokens: set[str]) -> bool:
     if token in candidate_tokens:
+        return True
+    equivalent_tokens = {token}
+    for group in _PREMISE_TOKEN_EQUIVALENCE_GROUPS:
+        if token in group:
+            equivalent_tokens.update(group)
+    if equivalent_tokens & candidate_tokens:
         return True
     if not token.isascii() or len(token) < 5:
         return False

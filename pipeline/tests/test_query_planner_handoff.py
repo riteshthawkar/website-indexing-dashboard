@@ -177,3 +177,40 @@ def test_query_planner_rejects_rewrite_that_drops_user_constraints(monkeypatch):
     assert result["vector_query"] == query
     assert result["graph_query"] == query
     assert result["confidence"] == 0.0
+
+
+def test_query_planner_rejects_speculative_facts_in_anchored_rewrite(monkeypatch):
+    import pipeline.core.query_planner as module
+
+    monkeypatch.setattr(module, "make_openai_client", lambda: object())
+    monkeypatch.setattr(
+        module,
+        "json_completion",
+        lambda **_kwargs: {
+            "query_type": "synthesis",
+            "vector_query": (
+                "MBZUAI current deans three divisions: Computer Science, "
+                "Robotics, Science? (Need up-to-date deans from the leadership page.)"
+            ),
+            "graph_query": (
+                "MBZUAI divisions and their current deans, perhaps Computer "
+                "Science and Robotics"
+            ),
+            "answer_types": ["role_holder"],
+            "entity_hints": ["MBZUAI"],
+            "navigation_intent": "none",
+            "navigation_goal": "",
+            "navigation_confidence": 0.0,
+            "confidence": 0.94,
+        },
+    )
+    query = (
+        "Who are the current deans of MBZUAI's three divisions, and which "
+        "division does each lead?"
+    )
+
+    result = module.plan_query(query=query, model="gpt-test")
+
+    assert result["vector_query"] == query
+    assert result["graph_query"] == query
+    assert result["confidence"] == 0.0
