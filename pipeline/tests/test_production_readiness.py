@@ -3438,7 +3438,14 @@ except ImportError:
 
 class TestDedupFilter:
     @staticmethod
-    def _run_catalog_case(tmp_dir, specs, *, identity_records=None, force_lsh_collision=False):
+    def _run_catalog_case(
+        tmp_dir,
+        specs,
+        *,
+        identity_records=None,
+        force_lsh_collision=False,
+        quality_config=None,
+    ):
         from datasketch import MinHashLSH
         from pipeline.core.artifacts import ArtifactCatalog, build_artifact_record
         from pipeline.core.base import StageContext
@@ -3509,7 +3516,14 @@ class TestDedupFilter:
         ctx = StageContext(
             run_id="test",
             project_name="test",
-            config={"quality": {"dedup_threshold": 0.85, "dedup_num_perm": 128, "dedup_ngram_size": 5}},
+            config={
+                "quality": {
+                    "dedup_threshold": 0.85,
+                    "dedup_num_perm": 128,
+                    "dedup_ngram_size": 5,
+                    **dict(quality_config or {}),
+                }
+            },
             work_dir=tmp_dir,
             previous_outputs=previous_outputs,
             stage_definition={"type": "quality_gate", "plugin": "dedup_filter"},
@@ -3619,6 +3633,99 @@ class TestDedupFilter:
         assert not paths["stale.md"].exists()
         assert manifest["decisions"][0]["winner_source_url"] == current
         assert manifest["decisions"][0]["reason"] == "exact_markdown_bytes"
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_substantive_exact_cross_route_web_duplicates_are_collapsed(self, tmp_dir):
+        content = (
+            "MBZUAI admissions applicants submit transcripts, statements, and "
+            "recommendations through the official application portal. " * 8
+        )
+        route = "https://preprod.mbzuai.ac.ae/faq/how-do-i-apply"
+        node_alias = "https://preprod.mbzuai.ac.ae/node/405"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {
+                    "name": "node.md",
+                    "content": content,
+                    "metadata": {"source_url": node_alias, "source_type": "webpage"},
+                },
+                {
+                    "name": "route.md",
+                    "content": content,
+                    "metadata": {
+                        "source_url": route,
+                        "source_type": "webpage",
+                        "route_scope_method": "faq_active_panel",
+                    },
+                },
+            ],
+            identity_records=[
+                {
+                    "source_url": node_alias,
+                    "canonical_url": node_alias,
+                    "canonical_family_url": node_alias,
+                    "language": "en",
+                },
+                {
+                    "source_url": route,
+                    "canonical_url": route,
+                    "canonical_family_url": route,
+                    "language": "en",
+                },
+            ],
+            quality_config={"collapse_exact_cross_route_web_duplicates": True},
+        )
+        assert result.outputs["filtered_count"] == 1
+        assert paths["route.md"].exists()
+        assert not paths["node.md"].exists()
+        assert manifest["decisions"][0]["winner_source_url"] == route
+        assert (
+            manifest["decisions"][0]["reason"]
+            == "exact_cross_route_web_markdown_bytes"
+        )
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_cross_route_policy_preserves_short_shared_web_boilerplate(self, tmp_dir):
+        content = "Still have questions? Contact us."
+        first = "https://preprod.mbzuai.ac.ae/study/program-a"
+        second = "https://preprod.mbzuai.ac.ae/study/program-b"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "a.md", "content": content, "metadata": {"source_url": first, "source_type": "webpage"}},
+                {"name": "b.md", "content": content, "metadata": {"source_url": second, "source_type": "webpage"}},
+            ],
+            identity_records=[
+                {"source_url": first, "canonical_url": first, "canonical_family_url": first, "language": "en"},
+                {"source_url": second, "canonical_url": second, "canonical_family_url": second, "language": "en"},
+            ],
+            quality_config={"collapse_exact_cross_route_web_duplicates": True},
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
+
+    @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
+    def test_cross_route_policy_preserves_explicit_locale_variants(self, tmp_dir):
+        content = "MBZUAI programme requirements and application guidance. " * 20
+        english = "https://preprod.mbzuai.ac.ae/study/program"
+        arabic = "https://preprod.mbzuai.ac.ae/ar/study/program"
+        result, manifest, paths = self._run_catalog_case(
+            tmp_dir,
+            [
+                {"name": "en.md", "content": content, "metadata": {"source_url": english, "source_type": "webpage"}},
+                {"name": "ar.md", "content": content, "metadata": {"source_url": arabic, "source_type": "webpage"}},
+            ],
+            identity_records=[
+                {"source_url": english, "canonical_url": english, "canonical_family_url": english, "language": "en"},
+                {"source_url": arabic, "canonical_url": arabic, "canonical_family_url": arabic, "language": "ar"},
+            ],
+            quality_config={"collapse_exact_cross_route_web_duplicates": True},
+        )
+        assert result.outputs["filtered_count"] == 0
+        assert manifest["decisions"] == []
+        assert all(path.exists() for path in paths.values())
 
     @pytest.mark.skipif(not HAS_DATASKETCH, reason="datasketch not installed")
     def test_arabic_url_locale_overrides_incorrect_english_identity(self, tmp_dir):
@@ -9737,7 +9844,10 @@ class TestAdaptiveHybridRetriever:
         )
         monkeypatch.setattr(retriever, "_sparse_query_ids", lambda **kwargs: [])
 
-        result = retriever.retrieve("What are the admissions requirements?")
+        result = retriever.retrieve(
+            "What are the admissions requirements?",
+            mode_override="fact",
+        )
         assert result["selected_chunk_ids"][0] == "chunk1"
 
     def test_fact_mode_uses_local_fact_candidates_when_remote_fact_lanes_are_empty(self, tmp_dir, monkeypatch):
@@ -9762,7 +9872,10 @@ class TestAdaptiveHybridRetriever:
         )
         monkeypatch.setattr(retriever, "_sparse_query_ids", lambda **kwargs: [])
 
-        result = retriever.retrieve("What are the admissions requirements?")
+        result = retriever.retrieve(
+            "What are the admissions requirements?",
+            mode_override="fact",
+        )
         assert result["selected_chunk_ids"][0] == "chunk1"
         assert "fact1" in result["local_fact_ids"]
 
@@ -11133,8 +11246,8 @@ class TestAdaptiveHybridRetriever:
         assert classify_query_mode(
             "ما عنوان البريد الإلكتروني الذي ينبغي التواصل معه بشأن متطلبات إمكانية الوصول قبل زيارة جامعة محمد بن زايد للذكاء الاصطناعي؟"
         ) == QueryMode.FACT
-        assert classify_query_mode("What five core AI specializations does MBZUAI offer in its M.Sc. and Ph.D. programs?") == QueryMode.SCOPED
-        assert classify_query_mode("What everyday campus amenities can MBZUAI students use on site?") == QueryMode.SCOPED
+        assert classify_query_mode("What five core AI specializations does MBZUAI offer in its M.Sc. and Ph.D. programs?") == QueryMode.SYNTHESIS
+        assert classify_query_mode("What everyday campus amenities can MBZUAI students use on site?") == QueryMode.SYNTHESIS
         assert classify_query_mode("Explain MBZUAI's legal basis and institutional affiliation.") == QueryMode.SCOPED
         assert classify_query_mode("Summarize the law that created MBZUAI and the authority it is affiliated with.") == QueryMode.SCOPED
         assert classify_query_mode("Prepare a visitor briefing covering location, parking, transport, facilities, and working hours.") == QueryMode.SYNTHESIS
@@ -11414,7 +11527,10 @@ class TestAdaptiveHybridRetriever:
         monkeypatch.setattr(retriever, "_sparse_query_ids", lambda **kwargs: [])
         monkeypatch.setattr(retriever, "_rerank_chunk_candidates", lambda *args, **kwargs: [("chunk3", 5.0), ("chunk1", 1.0)])
 
-        result = retriever.retrieve("What are the admissions requirements?")
+        result = retriever.retrieve(
+            "What are the admissions requirements?",
+            mode_override="fact",
+        )
         assert result["selected_chunk_ids"][0] == "chunk1"
 
     def test_media_specificity_bonus_prefers_enumerated_facilities_media(self, tmp_dir, monkeypatch):
@@ -11799,7 +11915,10 @@ class TestAdaptiveHybridRetriever:
         )
         monkeypatch.setattr(retriever, "_sparse_query_ids", lambda **kwargs: [])
 
-        result = retriever.retrieve("What are the admissions requirements?")
+        result = retriever.retrieve(
+            "What are the admissions requirements?",
+            mode_override="fact",
+        )
         assert result["selected_chunk_ids"][0] == "chunk1"
 
     def test_fact_rerank_uses_smaller_fact_top_n(self, tmp_dir, monkeypatch):
@@ -18188,8 +18307,10 @@ class TestOpenAIAssertionPipeline:
         finally:
             mod.plan_query = original_planner
 
-        assert bundle.vector_query == "MBZUAI president"
-        assert bundle.graph_query == "MBZUAI role_holder president"
+        assert bundle.vector_query.startswith("Who is the president of MBZUAI?")
+        assert bundle.vector_query.endswith("MBZUAI president")
+        assert bundle.graph_query.startswith("Who is the president of MBZUAI?")
+        assert bundle.graph_query.endswith("MBZUAI role_holder president")
         assert "openai_vector_plan" in bundle.labels
 
     def test_evidence_adjudicator_heuristic_prefers_support_hours(self, monkeypatch):

@@ -24,6 +24,16 @@ embedder:
     require_complete: true
     fetch_batch_size: 500
 
+retrieval:
+  # Production retrieval must generalize to unseen questions. These settings
+  # disable the legacy evaluation-prompt-to-page rules and instead use Page
+  # Cards, parent expansion, semantic sufficiency, and a cross-encoder reranker.
+  query_specific_retrieval_rules_enabled: false
+  semantic_evidence_sufficiency_enabled: true
+  enable_rerank: true
+  rerank_model: "pinecone-rerank-v0"
+  rerank_skip_high_confidence_fact: true
+
 # Lists replace their inherited value during config resolution. Keep this
 # sequence identical to mbzuai_production except for the final store adapter.
 stages:

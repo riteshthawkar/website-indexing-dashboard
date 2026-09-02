@@ -30,6 +30,7 @@ from pipeline.stages.cleaners.common import (
     validate_cleaner_policy_config,
     visible_content_metrics,
 )
+from pipeline.stages.cleaners.route_scoping import scope_route_specific_html
 
 logger = logging.getLogger(__name__)
 
@@ -343,6 +344,7 @@ class BS4Cleaner(CleanerStage):
             if record.local_path
         }
         dispositions: List[Dict[str, Any]] = []
+        route_scoped = 0
 
         for i, fp in enumerate(files, 1):
             resolved_source = str(fp.resolve())
@@ -383,8 +385,16 @@ class BS4Cleaner(CleanerStage):
                 dispositions.append(disposition)
                 continue
 
+            scope_result = scope_route_specific_html(raw, sorted(source_urls))
+            if scope_result.applied:
+                route_scoped += 1
+                disposition["route_scope_method"] = scope_result.method
+
             try:
-                status, cleaned_html = clean_html_content(raw, preserve_media=preserve_media)
+                status, cleaned_html = clean_html_content(
+                    scope_result.html,
+                    preserve_media=preserve_media,
+                )
             except Exception as exc:
                 logger.error("Cleaning error %s: %s", fp, exc)
                 disposition.update(
@@ -454,6 +464,8 @@ class BS4Cleaner(CleanerStage):
                         "source_url": source_url,
                         "source_urls": sorted(source_urls),
                         "relative_path": relative.as_posix(),
+                        "document_title": scope_result.document_title,
+                        "route_scope_method": scope_result.method,
                         "content_metrics": metrics.to_dict(),
                     },
                     source_artifact_ids=(
@@ -513,6 +525,7 @@ class BS4Cleaner(CleanerStage):
             "cleaned": gate["accepted_count"],
             "removed": gate["filtered_count"],
             "errors": gate["failed_count"],
+            "route_scoped": route_scoped,
             "retention_ratio": gate["retention_ratio"],
         }
         if not gate["ok"]:

@@ -13,6 +13,7 @@ from threading import Lock
 from typing import Any, Dict, List, Optional
 
 from pipeline.core.base import ConverterStage, StageContext, StageResult
+from pipeline.core.document_titles import resolve_document_title
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe
 from pipeline.core.media import build_media_markdown, dedupe_media_items
 from pipeline.core.registry import register_stage
@@ -142,6 +143,8 @@ class MarkItDownConverter(ConverterStage):
         html_to_media: Dict[str, List[Dict[str, Any]]] = {}
         html_to_url: Dict[str, str] = {}
         html_to_artifact_ids: Dict[str, List[str]] = {}
+        html_to_document_title: Dict[str, str] = {}
+        html_to_route_scope_method: Dict[str, str] = {}
         html_relative_paths: Dict[str, Path] = {}
         for record in html_artifacts:
             if not record.local_path:
@@ -149,6 +152,14 @@ class MarkItDownConverter(ConverterStage):
             html_key = str(Path(record.local_path).resolve())
             html_to_artifact_ids[html_key] = [record.artifact_id]
             source_url = str(record.metadata.get("source_url") or "")
+            html_to_document_title[html_key] = resolve_document_title(
+                record.metadata.get("document_title"),
+                source_url=source_url,
+                source_file=record.metadata.get("source_path"),
+            )
+            html_to_route_scope_method[html_key] = str(
+                record.metadata.get("route_scope_method") or ""
+            )
             if source_url:
                 html_to_url[html_key] = source_url
                 if source_url in all_page_media:
@@ -163,6 +174,10 @@ class MarkItDownConverter(ConverterStage):
                 html_key = str(Path(html_path_str).resolve())
                 html_to_media[html_key] = media_items
                 html_to_url[html_key] = page_url
+                html_to_document_title.setdefault(
+                    html_key,
+                    resolve_document_title(source_url=page_url, source_file=html_key),
+                )
 
         md_mapping: Dict[str, str] = {}
         lock = Lock()
@@ -223,6 +238,14 @@ class MarkItDownConverter(ConverterStage):
                         "source_html_path": html_key,
                         "source_type": "webpage",
                         "backend": "markitdown",
+                        "document_title": html_to_document_title.get(html_key)
+                        or resolve_document_title(
+                            source_url=source_url,
+                            source_file=html_key,
+                        ),
+                        "route_scope_method": html_to_route_scope_method.get(
+                            html_key, ""
+                        ),
                     },
                     source_artifact_ids=html_to_artifact_ids.get(html_key),
                 )

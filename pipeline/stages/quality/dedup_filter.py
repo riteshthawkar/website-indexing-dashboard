@@ -61,6 +61,8 @@ class _DedupEntry:
     metadata: Dict[str, Any]
     raw_content_hash: str
     normalized_content_hash: str
+    normalized_character_count: int
+    word_count: int
     shingles: FrozenSet[int]
     minhash: Any
     identity: Dict[str, Any]
@@ -419,6 +421,15 @@ def _rank_entry(path: Path, metadata: Dict[str, Any], identity: Dict[str, Any], 
     source_url = str(identity.get("source_url") or "")
     canonical_url = str(identity.get("canonical_url") or "")
     canonical = bool(source_url and canonical_url and source_url == canonical_url)
+    route_scoped = bool(str(metadata.get("route_scope_method") or "").strip())
+    try:
+        source_path = urlsplit(source_url).path.casefold()
+    except ValueError:
+        source_path = ""
+    opaque_route = bool(
+        re.search(r"/(?:node|content|page)/\d+/?$", source_path)
+        or re.search(r"/\d+/?$", source_path)
+    )
     stale = _is_stale(metadata, identity)
     freshness = _freshness_value(metadata)
     try:
@@ -428,6 +439,8 @@ def _rank_entry(path: Path, metadata: Dict[str, Any], identity: Dict[str, Any], 
     lexical = source_url or str(metadata.get("source_file") or "") or str(path.resolve())
     rank = {
         "canonical": canonical,
+        "route_scoped": route_scoped,
+        "opaque_route": opaque_route,
         "stale": stale,
         "freshness": freshness,
         "quality_score": quality_score,
@@ -435,6 +448,8 @@ def _rank_entry(path: Path, metadata: Dict[str, Any], identity: Dict[str, Any], 
         "lexical": lexical,
     }
     return rank, (
+        0 if route_scoped else 1,
+        1 if opaque_route else 0,
         0 if canonical else 1,
         1 if stale else 0,
         -freshness,
@@ -445,17 +460,80 @@ def _rank_entry(path: Path, metadata: Dict[str, Any], identity: Dict[str, Any], 
     )
 
 
-def _identity_allows_web_duplicate(left: _DedupEntry, right: _DedupEntry) -> bool:
+def _same_language_for_cross_route_duplicate(
+    left: _DedupEntry, right: _DedupEntry
+) -> bool:
+    """Prevent exact text from merging known locale variants.
+
+    Missing language metadata is tolerated only when neither URL declares an
+    Arabic route. This keeps legacy English crawl artifacts deduplicable while
+    failing closed for explicit multilingual pages.
+    """
+
+    left_language = str(left.identity.get("language") or "").split("-", 1)[0]
+    right_language = str(right.identity.get("language") or "").split("-", 1)[0]
+    if left_language and right_language:
+        return left_language == right_language
+
+    def url_declares_arabic(entry: _DedupEntry) -> bool:
+        try:
+            parts = {
+                part.casefold()
+                for part in urlsplit(str(entry.identity.get("source_url") or "")).path.split("/")
+                if part
+            }
+        except ValueError:
+            return False
+        return "ar" in parts
+
+    return url_declares_arabic(left) == url_declares_arabic(right)
+
+
+def _is_substantive_cross_route_duplicate(
+    left: _DedupEntry,
+    right: _DedupEntry,
+    *,
+    minimum_characters: int,
+    minimum_words: int,
+) -> bool:
+    return (
+        min(left.normalized_character_count, right.normalized_character_count)
+        >= minimum_characters
+        and min(left.word_count, right.word_count) >= minimum_words
+        and _same_language_for_cross_route_duplicate(left, right)
+    )
+
+
+def _identity_allows_web_duplicate(
+    left: _DedupEntry,
+    right: _DedupEntry,
+    *,
+    collapse_exact_cross_route: bool = False,
+    minimum_characters: int = 160,
+    minimum_words: int = 20,
+) -> bool:
     left_kind = left.identity["kind"]
     right_kind = right.identity["kind"]
     if "document" in {left_kind, right_kind}:
         return False
     if left_kind == right_kind == "web":
-        if not (left.identity["canonical_identity_available"] and right.identity["canonical_identity_available"]):
-            return False
-        return (
-            left.identity["canonical_family_url"] == right.identity["canonical_family_url"]
+        same_canonical_identity = bool(
+            left.identity["canonical_identity_available"]
+            and right.identity["canonical_identity_available"]
+            and left.identity["canonical_family_url"]
+            == right.identity["canonical_family_url"]
             and left.identity["language"] == right.identity["language"]
+        )
+        if same_canonical_identity:
+            return True
+        return bool(
+            collapse_exact_cross_route
+            and _is_substantive_cross_route_duplicate(
+                left,
+                right,
+                minimum_characters=minimum_characters,
+                minimum_words=minimum_words,
+            )
         )
     return False
 
@@ -561,6 +639,15 @@ class DedupFilter(QualityGate):
         preserve_duplicate_source_media = bool(
             config.get("preserve_duplicate_source_media", False)
         )
+        collapse_exact_cross_route = bool(
+            config.get("collapse_exact_cross_route_web_duplicates", False)
+        )
+        cross_route_minimum_characters = int(
+            config.get("cross_route_exact_duplicate_minimum_characters", 160)
+        )
+        cross_route_minimum_words = int(
+            config.get("cross_route_exact_duplicate_minimum_words", 20)
+        )
 
         threshold = float(threshold)
         num_perm = int(num_perm)
@@ -645,6 +732,8 @@ class DedupFilter(QualityGate):
                     metadata=metadata,
                     raw_content_hash=hashlib.sha256(raw_content).hexdigest(),
                     normalized_content_hash=hashlib.sha256(normalized.encode("utf-8")).hexdigest(),
+                    normalized_character_count=len(normalized),
+                    word_count=len(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE)),
                     shingles=frozenset(_shingle_fingerprint(ng) for ng in ngrams),
                     minhash=m,
                     identity=identity,
@@ -707,17 +796,33 @@ class DedupFilter(QualityGate):
                     allowed = exact_content
                 else:
                     # Similarity only identifies candidates. Web deletion
-                    # additionally requires byte-identical Markdown
-                    # and matching canonical family/language identity.
-                    allowed = exact_content and _identity_allows_web_duplicate(entry, candidate)
+                    # additionally requires byte-identical Markdown. The
+                    # production cross-route policy only collapses substantive,
+                    # locale-compatible pages and records every removed URL as
+                    # a source alias for downstream Page Card linkage.
+                    allowed = exact_content and _identity_allows_web_duplicate(
+                        entry,
+                        candidate,
+                        collapse_exact_cross_route=collapse_exact_cross_route,
+                        minimum_characters=cross_route_minimum_characters,
+                        minimum_words=cross_route_minimum_words,
+                    )
                 if not allowed:
                     continue
 
                 winner = candidate
                 winner_similarity = similarity
+                cross_route_web_duplicate = bool(
+                    exact_content
+                    and kinds == {"web"}
+                    and entry.identity.get("canonical_family_url")
+                    != candidate.identity.get("canonical_family_url")
+                )
                 winner_reason = (
                     "exact_source_document_bytes"
                     if exact_source_document
+                    else "exact_cross_route_web_markdown_bytes"
+                    if cross_route_web_duplicate
                     else "exact_markdown_bytes"
                     if exact_content
                     else "near_duplicate_same_canonical_family_language"
@@ -863,6 +968,9 @@ class DedupFilter(QualityGate):
             "planned_removed_markdown_paths": duplicates,
             "planned_dependent_artifacts": dependent_plan,
             "preserve_duplicate_source_media": preserve_duplicate_source_media,
+            "collapse_exact_cross_route_web_duplicates": collapse_exact_cross_route,
+            "cross_route_exact_duplicate_minimum_characters": cross_route_minimum_characters,
+            "cross_route_exact_duplicate_minimum_words": cross_route_minimum_words,
             "planned_rebound_media_artifacts": dependent_rebind_plan,
             "duplicate_source_aliases_file": str(alias_path),
             "removed_artifact_ids": [],

@@ -18,6 +18,12 @@ quality:
   dedup_num_perm: 128
   dedup_ngram_size: 5
   preserve_duplicate_source_media: true
+  # Rendered SPA snapshots can expose the same substantive page under several
+  # route aliases. Collapse byte-identical copies while retaining every URL as
+  # Page Card/source lineage; short shared labels and boilerplate stay intact.
+  collapse_exact_cross_route_web_duplicates: true
+  cross_route_exact_duplicate_minimum_characters: 160
+  cross_route_exact_duplicate_minimum_words: 20
 
 formatter:
   corpus_merge:

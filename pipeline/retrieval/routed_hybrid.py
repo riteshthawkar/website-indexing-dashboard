@@ -39,6 +39,7 @@ from .adaptive_hybrid import (
     _query_intent,
     _semantic_query_alias_tokens,
     _tokenize,
+    _is_enumeration_query,
     classify_query_mode,
 )
 from .graph_rag import GraphQueryContext, GraphRAGRetriever, RelationCandidateSet, RelationQueryPlan
@@ -58,6 +59,15 @@ _AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
     re.IGNORECASE,
 )
+_GENERALIZED_PAGE_STOPWORDS = {
+    "a", "about", "all", "an", "and", "are", "at", "be", "does", "do",
+    "every", "for", "from", "have", "how", "in", "include", "is", "it",
+    "many", "mbzuai", "of", "on", "page", "please", "say", "show", "site",
+    "tell", "the", "there", "to", "two", "what", "which", "who", "with",
+    "our", "their", "its", "needed", "need", "جامعة", "الجامعة", "جميع",
+    "كل", "كم", "ما", "ماذا", "كيف", "في", "من", "على", "عن", "هي",
+    "هما", "اذكر",
+}
 
 
 def _with_retriever_backend(config: Dict[str, Any], backend: str) -> Dict[str, Any]:
@@ -121,6 +131,11 @@ class QueryRewriteBundle:
     navigation_goal: str = ""
     navigation_confidence: float = 0.0
     navigation_source: str = "deterministic_query_intent"
+    planned_query_type: str = ""
+    answer_types: tuple[str, ...] = ()
+    entity_hints: tuple[str, ...] = ()
+    planner_confidence: float = 0.0
+    retrieval_expansion: str = ""
 
 
 class RoutedHybridRetriever:
@@ -167,6 +182,16 @@ class RoutedHybridRetriever:
             retrieval_cfg.get("query_planner_reasoning_effort") or "minimal"
         )
         self.query_planner_min_confidence = float(retrieval_cfg.get("query_planner_min_confidence") or 0.55)
+        # Legacy releases contain query-to-page and query-to-fact rules added
+        # for individual evaluation prompts. Keep the code as an emergency
+        # rollback path, but production can run entirely on semantic retrieval,
+        # page representations, cross-encoder reranking, and evidence coverage.
+        self.query_specific_retrieval_rules_enabled = bool(
+            retrieval_cfg.get("query_specific_retrieval_rules_enabled", True)
+        )
+        self.semantic_evidence_sufficiency_enabled = bool(
+            retrieval_cfg.get("semantic_evidence_sufficiency_enabled", False)
+        )
         self.navigation_plan_enabled = bool(
             retrieval_cfg.get("navigation_plan_enabled", True)
         )
@@ -401,6 +426,8 @@ class RoutedHybridRetriever:
     ) -> QueryRewriteBundle:
         """Carry deterministic user-language aliases through an upstream rewrite."""
 
+        if not getattr(self, "query_specific_retrieval_rules_enabled", True):
+            return rewrites
         if not original_query.strip() or original_query.strip() == query.strip():
             return rewrites
         aliases = _semantic_query_alias_tokens(original_query)
@@ -428,6 +455,11 @@ class RoutedHybridRetriever:
             navigation_goal=rewrites.navigation_goal,
             navigation_confidence=rewrites.navigation_confidence,
             navigation_source=rewrites.navigation_source,
+            planned_query_type=rewrites.planned_query_type,
+            answer_types=rewrites.answer_types,
+            entity_hints=rewrites.entity_hints,
+            planner_confidence=rewrites.planner_confidence,
+            retrieval_expansion=rewrites.retrieval_expansion,
         )
 
     def _build_query_rewrite_bundle(
@@ -443,6 +475,11 @@ class RoutedHybridRetriever:
         graph_query = query
         navigation = normalize_navigation_context(query)
         generic_contact_query = _is_generic_contact_query(query)
+        planned_query_type = query_mode
+        planned_answer_types: tuple[str, ...] = ()
+        planned_entity_hints: tuple[str, ...] = ()
+        planner_confidence = 0.0
+        retrieval_expansion = ""
         if self.query_planner_enabled and use_query_planner:
             plan = plan_query(
                 query=query,
@@ -460,15 +497,49 @@ class RoutedHybridRetriever:
                 },
             )
             if planner_confidence >= self.query_planner_min_confidence:
+                candidate_query_type = str(plan.get("query_type") or "").strip().lower()
+                if candidate_query_type in {
+                    QueryMode.FACT.value,
+                    QueryMode.SCOPED.value,
+                    QueryMode.SYNTHESIS.value,
+                }:
+                    planned_query_type = candidate_query_type
+                planned_answer_types = tuple(
+                    dict.fromkeys(
+                        str(value).strip().lower()
+                        for value in (plan.get("answer_types") or [])
+                        if str(value).strip()
+                    )
+                )
+                planned_entity_hints = tuple(
+                    dict.fromkeys(
+                        str(value).strip()
+                        for value in (plan.get("entity_hints") or [])
+                        if str(value).strip()
+                    )
+                )
                 planned_vector = str(plan.get("vector_query") or "").strip()
                 planned_graph = str(plan.get("graph_query") or "").strip()
                 if planned_vector and planned_vector != vector_query:
-                    vector_query = planned_vector
+                    # The model plan is an expansion, never a replacement. This
+                    # preserves every user term even if the planner introduces
+                    # a typo or omits a nuance while still adding useful search
+                    # vocabulary for dense and lexical retrieval.
+                    retrieval_expansion = planned_vector
+                    vector_query = (
+                        f"{query}\nRetrieval expansion: {planned_vector}"
+                    )
                     labels.append("openai_vector_plan")
                 if planned_graph and planned_graph != graph_query:
-                    graph_query = planned_graph
+                    graph_query = (
+                        f"{query}\nGraph retrieval expansion: {planned_graph}"
+                    )
                     labels.append("openai_graph_plan")
-        if self.parallel_query_rewriting_enabled and not generic_contact_query:
+        if (
+            self.parallel_query_rewriting_enabled
+            and not generic_contact_query
+            and getattr(self, "query_specific_retrieval_rules_enabled", True)
+        ):
             semantic_aliases = _semantic_query_alias_tokens(query)
             if semantic_aliases:
                 candidate = self._append_alias_tokens(vector_query, semantic_aliases, max_new_tokens=6)
@@ -507,6 +578,11 @@ class RoutedHybridRetriever:
             navigation_source=str(
                 navigation.get("source") or "deterministic_query_intent"
             ),
+            planned_query_type=planned_query_type,
+            answer_types=planned_answer_types,
+            entity_hints=planned_entity_hints,
+            planner_confidence=planner_confidence,
+            retrieval_expansion=retrieval_expansion,
         )
 
     def _empty_graph_context(self, query: str) -> GraphQueryContext:
@@ -987,6 +1063,8 @@ class RoutedHybridRetriever:
         query_lower = query.lower()
         if self._unsupported_intent_reason(query):
             return "unsupported"
+        if _is_enumeration_query(query):
+            return "multi_page_aggregation"
         if re.search(r"\b(compare|all|list|across|multiple|programs|departments|schools|faculty members|aggregate)\b", query_lower):
             return "multi_page_aggregation"
         if re.search(r"\b(overview|summary|summarize|complete page|whole page|full page|entire page|large page)\b", query_lower):
@@ -1019,7 +1097,11 @@ class RoutedHybridRetriever:
                 "required_pages_source": "verified_media_evidence",
             }
         else:
-            inferred = self._infer_coverage_requirements(query, intent)
+            inferred = self._infer_coverage_requirements(
+                query,
+                intent,
+                payload,
+            )
         required_entities = [
             str(value)
             for value in (payload.get("required_entities") or inferred.get("required_entities") or [])
@@ -1083,6 +1165,12 @@ class RoutedHybridRetriever:
             "required_sections": required_sections,
             "selected_span_ids": selected_span_ids,
             "coverage_status": coverage_status,
+            "query_specific_rules_enabled": bool(
+                getattr(self, "query_specific_retrieval_rules_enabled", True)
+            ),
+            "semantic_sufficiency_enabled": bool(
+                getattr(self, "semantic_evidence_sufficiency_enabled", False)
+            ),
         }
 
     def _context_page_for_query(self, query: str, context_page_url: str | None) -> str:
@@ -1664,6 +1752,8 @@ class RoutedHybridRetriever:
         return cleaned
 
     def _facet_required_entities(self, query: str) -> List[str]:
+        if not getattr(self, "query_specific_retrieval_rules_enabled", True):
+            return []
         lower = query.casefold()
         entities: List[str] = []
         practical_campus_query = bool(
@@ -1819,7 +1909,249 @@ class RoutedHybridRetriever:
         )
         return score
 
+    def _generalized_page_query_tokens(self, query: str) -> set[str]:
+        return {
+            token
+            for token in _tokenize(query)
+            if len(token) > 1
+            and token not in _GENERALIZED_PAGE_STOPWORDS
+            and not token.isdigit()
+        }
+
+    def _generalized_page_target_score(
+        self,
+        query: str,
+        page: Dict[str, Any],
+    ) -> float:
+        """Score page identity and content without domain/fact-specific rules."""
+
+        query_tokens = self._generalized_page_query_tokens(query)
+        if not query_tokens:
+            return 0.0
+        identity_tokens = set(page.get("identity_tokens") or set())
+        content_tokens = set(page.get("tokens") or set())
+        identity_overlap = query_tokens & identity_tokens
+        content_overlap = query_tokens & content_tokens
+        identity_ratio = len(identity_overlap) / float(len(query_tokens))
+        content_ratio = len(content_overlap) / float(len(query_tokens))
+        score = (1.15 * identity_ratio) + (0.42 * content_ratio)
+        score += min(0.24, 0.08 * len(identity_overlap))
+
+        try:
+            path_segments = [
+                segment
+                for segment in unquote(
+                    urlparse(str(page.get("source_url") or "")).path or ""
+                ).split("/")
+                if segment
+            ]
+        except Exception:
+            path_segments = []
+        tail_tokens = {
+            token
+            for token in _tokenize(
+                re.sub(
+                    r"[-_.]+",
+                    " ",
+                    path_segments[-1] if path_segments else "",
+                )
+            )
+            if len(token) > 1
+            and token not in _GENERALIZED_PAGE_STOPWORDS
+            and not token.isdigit()
+        }
+        tail_overlap = query_tokens & tail_tokens
+        if tail_overlap:
+            score += 0.72 * (
+                len(tail_overlap) / float(len(query_tokens))
+            )
+            score += 0.56 * (
+                len(tail_overlap) / float(len(tail_tokens))
+            )
+            if _is_enumeration_query(query) and tail_tokens <= query_tokens:
+                score += 0.22
+
+        normalized_query = " ".join(
+            token for token in _tokenize(query) if token in query_tokens
+        )
+        identity_text = str(page.get("identity_text") or "")
+        if normalized_query and normalized_query in identity_text:
+            score += 0.28
+
+        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
+        normalized_url = str(page.get("normalized_url") or "")
+        page_is_arabic = "/ar/" in normalized_url or normalized_url.endswith("/ar")
+        if query_is_arabic == page_is_arabic:
+            score += 0.08
+        elif not query_is_arabic and page_is_arabic:
+            score -= 0.22
+        return score
+
+    def _infer_generalized_coverage_requirements(
+        self,
+        query: str,
+        intent: str,
+        payload: Mapping[str, Any] | None,
+    ) -> Dict[str, Any]:
+        """Infer evidence scope from retrieved page cards and page semantics.
+
+        The old path mapped known query phrases directly to known URLs. This
+        path instead asks whether independent retrieval lanes agree on a page
+        whose identity/content matches the query. It therefore applies to new
+        pages and previously unseen questions without encoding their answers.
+        """
+
+        payload = payload if isinstance(payload, Mapping) else {}
+        semantic_query_variants: List[tuple[str, str, set[str]]] = [
+            ("original", query, self._generalized_page_query_tokens(query))
+        ]
+        try:
+            planner_confidence = float(payload.get("planner_confidence") or 0.0)
+        except (TypeError, ValueError):
+            planner_confidence = 0.0
+        retrieval_expansion = str(
+            payload.get("query_retrieval_expansion") or ""
+        ).strip()
+        if (
+            retrieval_expansion
+            and planner_confidence
+            >= float(getattr(self, "query_planner_min_confidence", 0.55))
+        ):
+            expansion_tokens = self._generalized_page_query_tokens(
+                retrieval_expansion
+            )
+            if expansion_tokens:
+                semantic_query_variants.append(
+                    ("planner_expansion", retrieval_expansion, expansion_tokens)
+                )
+        page_card_rank: Dict[str, int] = {}
+        page_card_map = getattr(self.vector, "page_card_map", {})
+        for rank, card_id in enumerate(payload.get("dense_page_card_ids") or []):
+            card = page_card_map.get(str(card_id)) if isinstance(page_card_map, Mapping) else None
+            if not isinstance(card, Mapping):
+                continue
+            normalized = self._normalize_source_url(
+                self._source_url_from_record(dict(card))
+            )
+            if normalized:
+                page_card_rank.setdefault(normalized, rank)
+
+        evidence_source_rank: Dict[str, int] = {}
+        for rank, doc in enumerate(payload.get("retrieval_documents") or []):
+            if not isinstance(doc, Mapping):
+                continue
+            normalized = self._normalize_source_url(
+                self._source_url_from_record(dict(doc))
+            )
+            if normalized:
+                evidence_source_rank.setdefault(normalized, rank)
+
+        scored: List[tuple[float, float, Dict[str, Any]]] = []
+        for page in self._coverage_page_records:
+            normalized = str(page.get("normalized_url") or "")
+            page_is_arabic = "/ar/" in normalized or normalized.endswith("/ar")
+            query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
+            if not query_is_arabic and page_is_arabic:
+                continue
+            try:
+                tail = unquote(
+                    urlparse(str(page.get("source_url") or "")).path or ""
+                ).rstrip("/").rsplit("/", 1)[-1]
+            except Exception:
+                tail = ""
+            tail_tokens = {
+                token
+                for token in _tokenize(re.sub(r"[-_.]+", " ", tail))
+                if len(token) > 1
+                and token not in _GENERALIZED_PAGE_STOPWORDS
+                and not token.isdigit()
+            }
+            identity_tokens = set(page.get("identity_tokens") or set())
+            binding_candidates: List[tuple[float, str, str]] = []
+            for label, semantic_query, query_tokens in semantic_query_variants:
+                binding_coverage = (
+                    len(query_tokens & (identity_tokens | tail_tokens))
+                    / float(len(query_tokens))
+                    if query_tokens
+                    else 0.0
+                )
+                binding_candidates.append(
+                    (binding_coverage, label, semantic_query)
+                )
+            binding_coverage, binding_source, binding_query = max(
+                binding_candidates,
+                key=lambda value: value[0],
+                default=(0.0, "original", query),
+            )
+            # A required page is a hard evidence constraint. Bind only when its
+            # identity—not merely a coincidental body word—covers most of the
+            # requested concepts. Ambiguous cases remain ordinary ranked
+            # retrieval and may be clarified by the planner/reranker.
+            if binding_coverage < 0.50:
+                continue
+            # A planner-provided translation/expansion can bridge languages, but
+            # it must agree with an independent Page Card or evidence lane before
+            # it becomes a hard page constraint. This prevents an LLM rewrite
+            # from binding retrieval to a hallucinated page by itself.
+            if (
+                binding_source != "original"
+                and normalized not in page_card_rank
+                and normalized not in evidence_source_rank
+            ):
+                continue
+            semantic_score = self._generalized_page_target_score(
+                binding_query,
+                page,
+            )
+            agreement_score = 0.0
+            if normalized in page_card_rank:
+                agreement_score += max(0.10, 0.48 - (0.055 * page_card_rank[normalized]))
+            if normalized in evidence_source_rank:
+                agreement_score += max(0.04, 0.22 - (0.025 * evidence_source_rank[normalized]))
+            total_score = semantic_score + agreement_score
+            if semantic_score >= 0.42 and total_score >= 0.66:
+                scored.append((total_score, semantic_score, page))
+
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                -item[1],
+                item[2].get("normalized_url") or "",
+            )
+        )
+        if not scored:
+            return {
+                "required_pages": [],
+                "required_entities": [],
+                "required_sections": [],
+                "required_pages_source": "none",
+            }
+
+        top_score = scored[0][0]
+        comparison_request = bool(
+            re.search(
+                r"\b(?:compare|versus|vs\.?|across|between|multiple)\b|(?:قارن|مقارنة|بين)",
+                query,
+                flags=re.IGNORECASE,
+            )
+        )
+        max_pages = 4 if comparison_request else 1
+        pages = [
+            str(page.get("source_url") or "")
+            for score, _semantic_score, page in scored
+            if score >= max(0.66, top_score - (0.20 if comparison_request else 0.0))
+        ][:max_pages]
+        pages = self._dedupe_explicit_pages_by_family(pages, query=query)
+        return {
+            "required_pages": pages,
+            "required_entities": [],
+            "required_sections": [],
+            "required_pages_source": "semantic_page_evidence" if pages else "none",
+        }
+
     def _explicit_required_page_markers(self, query: str) -> List[str]:
+        if not getattr(self, "query_specific_retrieval_rules_enabled", True):
+            return []
         lower = query.casefold()
         arabic_folded = re.sub(r"[\u064b-\u065f\u0670\u06d6-\u06ed]", "", lower)
         query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
@@ -2287,7 +2619,18 @@ class RoutedHybridRetriever:
             markers.append("/study/master-in-applied-ai")
         return list(dict.fromkeys(markers))
 
-    def _infer_coverage_requirements(self, query: str, intent: str) -> Dict[str, Any]:
+    def _infer_coverage_requirements(
+        self,
+        query: str,
+        intent: str,
+        payload: Mapping[str, Any] | None = None,
+    ) -> Dict[str, Any]:
+        if not getattr(self, "query_specific_retrieval_rules_enabled", True):
+            return self._infer_generalized_coverage_requirements(
+                query,
+                intent,
+                payload,
+            )
         explicit_markers = self._explicit_required_page_markers(query)
         if not explicit_markers and not self._query_has_specific_target(query):
             return {
@@ -2492,6 +2835,8 @@ class RoutedHybridRetriever:
         return family_match
 
     def _facet_relevance_bonus(self, query: str, text: str, source_url: str = "") -> float:
+        if not getattr(self, "query_specific_retrieval_rules_enabled", True):
+            return 0.0
         query_lower = query.casefold()
         text_lower = text.casefold()
         source_lower = self._normalize_source_url(source_url)
@@ -2834,7 +3179,10 @@ class RoutedHybridRetriever:
     ) -> Dict[str, Any] | None:
         """Return one complete-page parent for explicit list/detail queries."""
 
-        if not _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or "")):
+        if not (
+            _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
+            or _is_enumeration_query(query)
+        ):
             return None
         scored: List[tuple[float, Dict[str, Any]]] = []
         parent_map = getattr(self.vector, "parent_map", {})
@@ -2990,6 +3338,7 @@ class RoutedHybridRetriever:
         changed = False
         aggregate_page_query = bool(
             _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
+            or _is_enumeration_query(query)
         )
         fact_limit = 4 if aggregate_page_query else 1
         chunk_limit = 3 if aggregate_page_query else 2
@@ -3500,12 +3849,27 @@ class RoutedHybridRetriever:
                 navigation_goal=rewrites.navigation_goal,
                 navigation_confidence=rewrites.navigation_confidence,
                 navigation_source=rewrites.navigation_source,
+                planned_query_type=rewrites.planned_query_type,
+                answer_types=rewrites.answer_types,
+                entity_hints=rewrites.entity_hints,
+                planner_confidence=rewrites.planner_confidence,
+                retrieval_expansion=rewrites.retrieval_expansion,
             )
         rewrites = self._preserve_original_query_aliases(
             rewrites,
             query=query,
             original_query=coverage_query,
         )
+        if (
+            rewrites.planner_confidence >= self.query_planner_min_confidence
+            and rewrites.planned_query_type == QueryMode.SYNTHESIS.value
+            and mode != QueryMode.SYNTHESIS
+        ):
+            # A high-confidence planner may identify a compound/list request
+            # that surface heuristics treated as a single fact. Upgrading keeps
+            # parent, Page Card, and summary lanes active; never downgrade a
+            # synthesis query into a narrower mode.
+            mode = QueryMode.SYNTHESIS
         planned_navigation_context = normalize_navigation_context(
             coverage_query,
             navigation_context
@@ -3518,13 +3882,20 @@ class RoutedHybridRetriever:
         )
         query_embedding_status = "ok"
         query_embedding_error = ""
-        if query_vector is not None and "hyde_expansion" not in rewrites.labels:
+        rewrite_requires_fresh_embedding = bool(
+            {"openai_vector_plan", "hyde_expansion"} & set(rewrites.labels)
+        )
+        if query_vector is not None and not rewrite_requires_fresh_embedding:
             query_vector = list(query_vector)
             if not query_vector:
                 query_embedding_status = "skipped_dense_no_query_vector"
         else:
             try:
-                query_vector = self.vector.embed_query(rewrites.vector_query if "hyde_expansion" in rewrites.labels else query)
+                query_vector = self.vector.embed_query(
+                    rewrites.vector_query
+                    if rewrite_requires_fresh_embedding
+                    else query
+                )
             except Exception as exc:
                 query_vector = []
                 query_embedding_status = "failed_sparse_local_fallback"
@@ -3631,12 +4002,17 @@ class RoutedHybridRetriever:
         payload["query"] = query
         payload["original_query"] = coverage_query
         payload["query_rewritten"] = rewrites.vector_query
+        payload["query_retrieval_expansion"] = rewrites.retrieval_expansion
         payload["query_rewrite_labels"] = list(dict.fromkeys([*rewrites.labels, *graph_context.rewrite_labels]))
+        payload["planner_query_type"] = rewrites.planned_query_type
+        payload["planner_answer_types"] = list(rewrites.answer_types)
+        payload["planner_entity_hints"] = list(rewrites.entity_hints)
+        payload["planner_confidence"] = rewrites.planner_confidence
         payload["graph_query_rewritten"] = graph_context.rewritten_query if decision.graph_available else query
         payload["retriever_backend"] = decision.backend
         payload["routing_backend"] = decision.backend
         payload["routing_reason"] = decision.reason
-        payload["routing_query_mode"] = decision.query_mode
+        payload["routing_query_mode"] = mode.value
         payload["routing_relation_family"] = (
             graph_context.relation_plan.family
             if graph_context.relation_plan is not None
@@ -3673,6 +4049,31 @@ class RoutedHybridRetriever:
         payload["retrieval_confidence"] = confidence
         payload["confidence_factors"] = factors
         stage_started = time.perf_counter()
+        dense_page_card_ids_before_fusion = [
+            str(value)
+            for value in payload.get("dense_page_card_ids") or []
+            if str(value)
+        ]
+        if self.page_card_evidence_fusion_enabled:
+            payload["dense_page_card_ids"] = (
+                self.navigation_planner.fuse_page_card_ranking(
+                    payload,
+                    evidence_weight=self.page_card_evidence_fusion_weight,
+                    rrf_k=self.page_card_evidence_fusion_rrf_k,
+                )
+            )
+        payload["dense_page_card_ids_pre_fusion"] = (
+            dense_page_card_ids_before_fusion
+        )
+        payload["page_card_fusion_applied"] = bool(
+            payload.get("dense_page_card_ids")
+            != dense_page_card_ids_before_fusion
+        )
+        postprocess_stage_latency_ms["page_card_fusion_ms"] = round(
+            (time.perf_counter() - stage_started) * 1000.0,
+            3,
+        )
+        stage_started = time.perf_counter()
         coverage_plan = self._coverage_plan_for_result(
             query=coverage_query,
             payload=payload,
@@ -3702,31 +4103,6 @@ class RoutedHybridRetriever:
             coverage_plan=coverage_plan,
         )
         postprocess_stage_latency_ms["required_page_prioritization_ms"] = round(
-            (time.perf_counter() - stage_started) * 1000.0,
-            3,
-        )
-        stage_started = time.perf_counter()
-        dense_page_card_ids_before_fusion = [
-            str(value)
-            for value in payload.get("dense_page_card_ids") or []
-            if str(value)
-        ]
-        if self.page_card_evidence_fusion_enabled:
-            payload["dense_page_card_ids"] = (
-                self.navigation_planner.fuse_page_card_ranking(
-                    payload,
-                    evidence_weight=self.page_card_evidence_fusion_weight,
-                    rrf_k=self.page_card_evidence_fusion_rrf_k,
-                )
-            )
-        payload["dense_page_card_ids_pre_fusion"] = (
-            dense_page_card_ids_before_fusion
-        )
-        payload["page_card_fusion_applied"] = bool(
-            payload.get("dense_page_card_ids")
-            != dense_page_card_ids_before_fusion
-        )
-        postprocess_stage_latency_ms["page_card_fusion_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             3,
         )

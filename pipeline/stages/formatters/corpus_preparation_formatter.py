@@ -367,7 +367,12 @@ class CorpusPreparationFormatter(FormatterStage):
                     "markdown_sha256": markdown_sha256,
                     "source_type": str(metadata.get("source_type") or ""),
                     "language": str(metadata.get("language") or ""),
-                    "title": str(metadata.get("title") or metadata.get("page_title") or ""),
+                    "title": str(
+                        metadata.get("document_title")
+                        or metadata.get("title")
+                        or metadata.get("page_title")
+                        or ""
+                    ),
                     "canonical_url": str(metadata.get("canonical_url") or ""),
                     "canonical_family_url": str(
                         metadata.get("canonical_family_url") or ""

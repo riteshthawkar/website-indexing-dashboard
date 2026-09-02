@@ -207,6 +207,26 @@ def _dedupe_key(doc: Dict[str, Any], kind: str) -> str:
     return f"text:{_source_url(doc)}:{digest}"
 
 
+def _content_dedupe_key(doc: Dict[str, Any]) -> str:
+    """Identify exact evidence repeated under different route/source IDs."""
+
+    text = _doc_text(doc)
+    if not text:
+        return ""
+    normalized = re.sub(
+        r"[^\w]+",
+        " ",
+        text.casefold(),
+        flags=re.UNICODE,
+    )
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if len(normalized.split()) < 8:
+        return ""
+    return hashlib.sha1(
+        normalized.encode("utf-8", errors="ignore")
+    ).hexdigest()
+
+
 def _coerce_docs(values: Iterable[Any]) -> List[Dict[str, Any]]:
     return [dict(value) for value in values or [] if isinstance(value, dict)]
 
@@ -347,7 +367,152 @@ def _normalize_match_token(value: Any) -> str:
     return token
 
 
-def _query_terms(query: str) -> set[str]:
+def _legacy_query_alias_terms(query: str) -> set[str]:
+    """Return prompt-specific aliases retained only for rollback profiles."""
+
+    normalized_query = _clean_text(query).casefold()
+    terms: set[str] = set()
+    if any(
+        marker in normalized_query
+        for marker in (
+            "المؤهل الأكاديمي",
+            "المؤهلات الأكاديمية",
+            "المؤهلات",
+        )
+    ):
+        terms.update(
+            {
+                "academic",
+                "qualification",
+                "qualifications",
+                "degree",
+                "bachelor",
+                "master",
+                "required",
+                "preferred",
+                "mandatory",
+            }
+        )
+    if any(
+        marker in normalized_query
+        for marker in ("أقسام الوظائف", "الوظائف المفتوحة")
+    ):
+        terms.update(
+            {"faculty", "research", "engineering", "professional", "vacancies"}
+        )
+    if "ifm" in normalized_query and any(
+        marker in normalized_query
+        for marker in ("شركاء", "الشركاء", "partners", "collaborat")
+    ):
+        terms.update(
+            {
+                "science",
+                "scale",
+                "social value",
+                "academic institutions",
+                "research labs",
+                "startups",
+                "enterprise leaders",
+            }
+        )
+    if any(marker in normalized_query for marker in ("دانييلا روس", "daniela rus")):
+        terms.update({"الاستقلالية", "الذكاء", "autonomy", "intelligence"})
+    if any(
+        marker in normalized_query
+        for marker in ("دور الرئيس", "مهام الرئيس", "صلاحيات الرئيس")
+    ):
+        terms.update(
+            {
+                "الرئيس التنفيذي",
+                "التنفيذي",
+                "مهام",
+                "الصلاحيات",
+                "إدارة الجامعة",
+                "إدارة",
+                "chief executive",
+            }
+        )
+    if (
+        any(
+            marker in normalized_query
+            for marker in ("معرض التدريب المهني", "career fair")
+        )
+        and any(
+            marker in normalized_query
+            for marker in ("الدعم", "دعم", "support")
+        )
+    ):
+        terms.update(
+            {
+                "جلسات تدريب مهني فردية",
+                "وكالات التوظيف",
+                "صور احترافية",
+                "career coaching",
+                "recruitment agencies",
+            }
+        )
+    if (
+        any(
+            marker in normalized_query
+            for marker in ("الدكتوراه", "doctorate", "doctoral", "phd")
+        )
+        and any(
+            marker in normalized_query
+            for marker in ("التوجه المهني", "career orientation", "career path")
+        )
+    ):
+        terms.update(
+            {
+                "contribute to science and humanity",
+                "experienced researchers",
+                "academia",
+                "research institute",
+                "industry",
+                "startup",
+            }
+        )
+    if (
+        any(
+            marker in normalized_query
+            for marker in ("visitor program", "برنامج الزوار")
+        )
+        and any(
+            marker in normalized_query
+            for marker in ("hands-on", "عملي", "تجربة")
+        )
+    ):
+        terms.update(
+            {
+                "research experience program",
+                "hands-on ai research experiences",
+                "personalized demos",
+                "talks",
+            }
+        )
+    if (
+        (
+            "engage" in normalized_query
+            and "capture" in normalized_query
+            and "value" in normalized_query
+        )
+        or ("يتفاعل" in normalized_query and "القيمة" in normalized_query)
+    ):
+        terms.update(
+            {
+                "exploration",
+                "refinement",
+                "high level proposal",
+                "engagement agreement sign-off",
+            }
+        )
+    return terms
+
+
+def _query_terms(
+    query: str,
+    *,
+    include_legacy_aliases: bool = False,
+) -> set[str]:
     excluded = {
         "the",
         "and",
@@ -384,6 +549,9 @@ def _query_terms(query: str) -> set[str]:
         "الى",
         "على",
         "عن",
+        "retrieval",
+        "expansion",
+        "graph",
     }
     terms = {
         normalized
@@ -392,128 +560,161 @@ def _query_terms(query: str) -> set[str]:
         and len(normalized) > 2
         and normalized not in excluded
     }
-    normalized_query = _clean_text(query).casefold()
-    if any(
-        marker in normalized_query
-        for marker in (
-            "المؤهل الأكاديمي",
-            "المؤهلات الأكاديمية",
-            "المؤهلات",
-        )
-    ):
-        # The careers corpus is commonly English while users ask about degree
-        # requirements in Arabic. These aliases let the answer-bearing
-        # qualifications span outrank generic role-summary facts.
-        terms.update(
-            {
-                "academic",
-                "qualification",
-                "qualifications",
-                "degree",
-                "bachelor",
-                "master",
-                "required",
-                "preferred",
-                "mandatory",
-            }
-        )
-    if any(
-        marker in normalized_query
-        for marker in ("أقسام الوظائف", "الوظائف المفتوحة")
-    ):
-        terms.update(
-            {
-                "faculty",
-                "research",
-                "engineering",
-                "professional",
-                "vacancies",
-            }
-        )
-    if "ifm" in normalized_query and any(
-        marker in normalized_query
-        for marker in ("شركاء", "الشركاء", "partners", "collaborat")
-    ):
-        terms.update(
-            {
-                "science",
-                "scale",
-                "social value",
-                "academic institutions",
-                "research labs",
-                "startups",
-                "enterprise leaders",
-            }
-        )
-    if any(marker in normalized_query for marker in ("دانييلا روس", "daniela rus")):
-        terms.update({"الاستقلالية", "الذكاء", "autonomy", "intelligence"})
-    if any(
-        marker in normalized_query
-        for marker in ("دور الرئيس", "مهام الرئيس", "صلاحيات الرئيس")
-    ):
-        terms.update(
-            {
-                "الرئيس التنفيذي",
-                "التنفيذي",
-                "مهام",
-                "الصلاحيات",
-                "إدارة الجامعة",
-                "إدارة",
-                "chief executive",
-            }
-        )
-    if (
-        any(marker in normalized_query for marker in ("معرض التدريب المهني", "career fair"))
-        and any(marker in normalized_query for marker in ("الدعم", "دعم", "support"))
-    ):
-        terms.update(
-            {
-                "جلسات تدريب مهني فردية",
-                "وكالات التوظيف",
-                "صور احترافية",
-                "career coaching",
-                "recruitment agencies",
-            }
-        )
-    if (
-        any(marker in normalized_query for marker in ("الدكتوراه", "doctorate", "doctoral", "phd"))
-        and any(marker in normalized_query for marker in ("التوجه المهني", "career orientation", "career path"))
-    ):
-        terms.update(
-            {
-                "contribute to science and humanity",
-                "experienced researchers",
-                "academia",
-                "research institute",
-                "industry",
-                "startup",
-            }
-        )
-    if (
-        any(marker in normalized_query for marker in ("visitor program", "برنامج الزوار"))
-        and any(marker in normalized_query for marker in ("hands-on", "عملي", "تجربة"))
-    ):
-        terms.update(
-            {
-                "research experience program",
-                "hands-on ai research experiences",
-                "personalized demos",
-                "talks",
-            }
-        )
-    if (
-        ("engage" in normalized_query and "capture" in normalized_query and "value" in normalized_query)
-        or ("يتفاعل" in normalized_query and "القيمة" in normalized_query)
-    ):
-        terms.update(
-            {
-                "exploration",
-                "refinement",
-                "high level proposal",
-                "engagement agreement sign-off",
-            }
-        )
+    if include_legacy_aliases:
+        terms.update(_legacy_query_alias_terms(query))
     return terms
+
+
+def _trusted_retrieval_expansion(result: Dict[str, Any]) -> str:
+    try:
+        planner_confidence = float(result.get("planner_confidence") or 0.0)
+    except (TypeError, ValueError):
+        planner_confidence = 0.0
+    expansion = _clean_text(result.get("query_retrieval_expansion"))
+    return expansion if expansion and planner_confidence >= 0.55 else ""
+
+
+def _evidence_sufficiency(
+    *,
+    query: str,
+    items: Sequence[Dict[str, Any]],
+    intent: str,
+    result: Dict[str, Any],
+    required_pages: Sequence[str] = (),
+) -> Tuple[bool, Dict[str, Any]]:
+    """Assess whether selected evidence is substantively related and complete.
+
+    Coverage used to become ``complete`` whenever one item existed. That lets a
+    duplicated or tangential result reach generation with no proof it addresses
+    the question. This check is domain-neutral: it uses query/evidence concept
+    overlap, evidence diversity, authority, retrieval confidence, and whether a
+    complete page aggregate was selected.
+    """
+
+    query_variants = [("original", query)]
+    retrieval_expansion = _trusted_retrieval_expansion(result)
+    if retrieval_expansion:
+        query_variants.append(("planner_expansion", retrieval_expansion))
+    query_term_variants = [
+        (label, terms)
+        for label, value in query_variants
+        if (terms := _query_terms(value))
+    ]
+    evidence_terms: set[str] = set()
+    content_keys: set[str] = set()
+    official_sources: set[str] = set()
+    structured_items = 0
+    aggregate_items = 0
+    trusted_aggregate_items = 0
+    required_page_set = {
+        normalized
+        for value in required_pages
+        if (normalized := _normalize_url_for_match(value))
+    }
+    for item in items:
+        text = _item_search_text(item)
+        evidence_terms.update(
+            normalized
+            for raw_token in re.findall(
+                r"[^\W_]+",
+                text,
+                flags=re.UNICODE,
+            )
+            if (normalized := _normalize_match_token(raw_token))
+        )
+        content_key = _content_dedupe_key(item) or _doc_id(item)
+        if content_key:
+            content_keys.add(content_key)
+        source_url = _source_url(item)
+        if source_url and _is_official_mbzuai_url(source_url):
+            official_sources.add(_normalize_url_for_match(source_url))
+        if str(item.get("kind") or "") in {
+            "action",
+            "assertion",
+            "fact",
+            "evidence_span",
+        }:
+            structured_items += 1
+        if bool(item.get("coverage_aggregate")):
+            aggregate_items += 1
+            if (
+                required_page_set
+                and _normalize_url_for_match(source_url) in required_page_set
+            ):
+                trusted_aggregate_items += 1
+
+    alignment_variants = [
+        {
+            "label": label,
+            "term_count": len(terms),
+            "overlap": len(terms & evidence_terms) / float(len(terms)),
+        }
+        for label, terms in query_term_variants
+    ]
+    best_alignment = max(
+        alignment_variants,
+        key=lambda value: float(value["overlap"]),
+        default={"label": "none", "term_count": 0, "overlap": 0.0},
+    )
+    overlap = float(best_alignment["overlap"])
+    query_term_count = int(best_alignment["term_count"])
+    try:
+        retrieval_confidence = float(result.get("retrieval_confidence") or 0.0)
+    except (TypeError, ValueError):
+        retrieval_confidence = 0.0
+    broad_intent = intent in {
+        "multi_page_aggregation",
+        "large_page",
+        "broad_synthesis",
+        "synthesis",
+    }
+
+    reasons: List[str] = []
+    if not items:
+        reasons.append("no_evidence_items")
+    if not official_sources:
+        reasons.append("no_official_source")
+    minimum_alignment = 0.32 if broad_intent else 0.24
+    if (
+        query_term_count
+        and overlap < minimum_alignment
+        and retrieval_confidence < 0.65
+    ):
+        reasons.append("weak_query_evidence_alignment")
+    if (
+        broad_intent
+        and not trusted_aggregate_items
+        and retrieval_confidence < 0.65
+    ):
+        reasons.append("low_confidence_broad_evidence_without_bound_page")
+    if (
+        broad_intent
+        and not trusted_aggregate_items
+        and (len(content_keys) < 2 or len(official_sources) < 2)
+    ):
+        reasons.append("insufficient_distinct_evidence_for_broad_request")
+
+    sufficient = not reasons
+    return sufficient, {
+        "query_term_count": query_term_count,
+        "query_term_overlap": round(overlap, 4),
+        "query_alignment_source": str(best_alignment["label"]),
+        "query_alignment_variants": [
+            {
+                **value,
+                "overlap": round(float(value["overlap"]), 4),
+            }
+            for value in alignment_variants
+        ],
+        "minimum_query_term_overlap": minimum_alignment,
+        "distinct_content_items": len(content_keys),
+        "official_source_count": len(official_sources),
+        "structured_item_count": structured_items,
+        "aggregate_item_count": aggregate_items,
+        "trusted_aggregate_item_count": trusted_aggregate_items,
+        "retrieval_confidence": round(retrieval_confidence, 4),
+        "reasons": reasons,
+    }
 
 
 _MEDIA_FIELD_RE = re.compile(r"^([A-Z][A-Z0-9_ ]{1,48}):\s*(.*)$")
@@ -568,15 +769,20 @@ def _query_relevant_excerpt(value: Any, query: str, limit: int) -> str:
     return excerpt.strip()
 
 
-def _query_dense_excerpt(value: Any, query: str, limit: int) -> str:
+def _query_dense_excerpt(
+    value: Any,
+    query: str,
+    limit: int,
+    *,
+    include_legacy_aliases: bool = False,
+) -> str:
     """Keep the window that covers the most query concepts.
 
     Long page chunks often start with role or page background and place the
     requested structured block near the end. Prefix truncation therefore drops
     exactly the qualifiers that distinguish, for example, a required degree
-    from a preferred one. Cross-lingual aliases supplied by ``_query_terms``
-    make the same selection work when an Arabic query targets English source
-    text.
+    from a preferred one. A trusted planner expansion can be included by the
+    caller when a multilingual query targets source text in another language.
     """
 
     text = _clean_text(value)
@@ -585,7 +791,14 @@ def _query_dense_excerpt(value: Any, query: str, limit: int) -> str:
     if len(text) <= limit:
         return text
 
-    terms = sorted(_query_terms(query), key=len, reverse=True)
+    terms = sorted(
+        _query_terms(
+            query,
+            include_legacy_aliases=include_legacy_aliases,
+        ),
+        key=len,
+        reverse=True,
+    )
     normalized = text.casefold()
     positions: List[int] = []
     for term in terms:
@@ -882,7 +1095,13 @@ _STAGED_PROCESS_QUERY_RE = re.compile(
 )
 
 
-def _multi_detail_chunk_coverage_bonus(query: str, item_blob: str, kind: str) -> float:
+def _multi_detail_chunk_coverage_bonus(
+    query: str,
+    item_blob: str,
+    kind: str,
+    *,
+    include_legacy_aliases: bool = False,
+) -> float:
     """Reward a complete context window when an answer spans several details.
 
     Evidence spans normally deserve a precision prior, but a span extractor can
@@ -896,7 +1115,10 @@ def _multi_detail_chunk_coverage_bonus(query: str, item_blob: str, kind: str) ->
 
     if kind != "chunk" or not _MULTI_DETAIL_QUERY_RE.search(str(query or "")):
         return 0.0
-    terms = _query_terms(query)
+    terms = _query_terms(
+        query,
+        include_legacy_aliases=include_legacy_aliases,
+    )
     if len(terms) < 3:
         return 0.0
     item_terms = {
@@ -1099,6 +1321,7 @@ def _candidate_score(
     doc: Dict[str, Any],
     required_pages: Sequence[str],
     required_entities: Sequence[str],
+    query_specific_rules_enabled: bool = True,
 ) -> float:
     raw_text = str(doc.get("text") or doc.get("value") or _doc_metadata(doc).get("context") or "")
     text = _clean_text(raw_text)
@@ -1136,7 +1359,10 @@ def _candidate_score(
     if _is_arabic_source_url(source) and not _ARABIC_TEXT_RE.search(str(query or "")):
         score -= 32.0
 
-    terms = _query_terms(query)
+    terms = _query_terms(
+        query,
+        include_legacy_aliases=query_specific_rules_enabled,
+    )
     if terms:
         text_terms = {
             normalized
@@ -1180,9 +1406,15 @@ def _candidate_score(
         document_title=_document_title(doc),
         heading=_clean_text(doc.get("section_heading") or doc.get("heading")),
     )
-    score += _multi_detail_chunk_coverage_bonus(query, item_blob, kind)
-    score += _structured_facet_coverage_bonus(query, raw_text)
-    score += _query_specific_bonus(query, item_blob, normalized_source)
+    score += _multi_detail_chunk_coverage_bonus(
+        query,
+        item_blob,
+        kind,
+        include_legacy_aliases=query_specific_rules_enabled,
+    )
+    if query_specific_rules_enabled:
+        score += _structured_facet_coverage_bonus(query, raw_text)
+        score += _query_specific_bonus(query, item_blob, normalized_source)
     if bool(doc.get("coverage_aggregate")):
         # A bounded complete-page parent is deliberately injected for a
         # multi-detail/list question. Keep it ahead of isolated snippets so
@@ -1221,6 +1453,12 @@ def build_evidence_pack(
         re.search(r"\b(?:who|whom)\b", normalized_query)
         and re.search(r"\b(?:speaker|host|hosted|hosting)\b", normalized_query)
     )
+    retrieval_expansion = _trusted_retrieval_expansion(result)
+    evidence_matching_query = (
+        f"{query}\n{retrieval_expansion}"
+        if retrieval_expansion
+        else query
+    )
 
     seen_keys = set()
     source_counts: Dict[str, int] = {}
@@ -1229,6 +1467,9 @@ def build_evidence_pack(
     truncated = False
 
     coverage_plan = coverage_plan if isinstance(coverage_plan, dict) else {}
+    query_specific_rules_enabled = bool(
+        coverage_plan.get("query_specific_rules_enabled", True)
+    )
     required_entities = _coverage_values(coverage_plan, "required_entities")
     required_pages = [
         value
@@ -1273,7 +1514,7 @@ def build_evidence_pack(
                 "breadcrumb": doc.get("breadcrumb"),
             }
         )
-        if _should_exclude_context_item(query, item_blob):
+        if query_specific_rules_enabled and _should_exclude_context_item(query, item_blob):
             continue
         key = _dedupe_key(doc, kind)
         if key in seen_keys:
@@ -1284,11 +1525,12 @@ def build_evidence_pack(
         candidates.append(
             (
                 _candidate_score(
-                    query=query,
+                    query=evidence_matching_query,
                     kind=kind,
                     doc=doc,
                     required_pages=required_pages,
                     required_entities=required_entities,
+                    query_specific_rules_enabled=query_specific_rules_enabled,
                 ),
                 kind,
                 doc,
@@ -1297,6 +1539,7 @@ def build_evidence_pack(
     candidates.sort(key=lambda item: (-item[0], _doc_id(item[2])))
 
     selected_candidate_keys: set[str] = set()
+    selected_content_keys: set[str] = set()
     media_reserve = 3 if max_items >= 6 else 2 if max_items >= 4 else 1
 
     def _candidate_matches_requirement(doc: Dict[str, Any], requirement: str, *, page: bool) -> bool:
@@ -1320,6 +1563,21 @@ def build_evidence_pack(
             return False
         source = _source_url(doc) or "local"
         normalized_source = _normalize_url_for_match(source)
+        content_key = _content_dedupe_key(doc)
+        if content_key and content_key in selected_content_keys:
+            # Keep an explicitly required page even when another URL exposes
+            # the same text; otherwise one source is enough and duplicate SPA
+            # routes must not consume the evidence budget.
+            required_source_missing = bool(
+                normalized_source in required_page_set
+                and not any(
+                    _normalize_url_for_match(item.get("source_url"))
+                    == normalized_source
+                    for item in items
+                )
+            )
+            if not required_source_missing:
+                return False
         source_cap = max_per_source
         if structured_detail_query and kind != "media":
             # Multi-aspect answers commonly span adjacent sections on one
@@ -1350,7 +1608,12 @@ def build_evidence_pack(
             # may prefix-truncate it again. Preserve a bounded, query-dense
             # window containing the whole answer-bearing block instead.
             item_char_limit = min(item_char_limit, 2400)
-            item_text = _query_dense_excerpt(item_text, query, item_char_limit)
+            item_text = _query_dense_excerpt(
+                item_text,
+                evidence_matching_query,
+                item_char_limit,
+                include_legacy_aliases=query_specific_rules_enabled,
+            )
         if len(item_text) > item_char_limit:
             item_text = item_text[: max(0, item_char_limit)].rsplit(" ", 1)[0].strip() or item_text[:item_char_limit].strip()
             truncated = True
@@ -1363,6 +1626,8 @@ def build_evidence_pack(
             truncated = True
             return False
         selected_candidate_keys.add(key)
+        if content_key:
+            selected_content_keys.add(content_key)
         source_counts[source] = source_counts.get(source, 0) + 1
         used_chars += len(item_text)
         items.append(
@@ -1377,6 +1642,7 @@ def build_evidence_pack(
                 "breadcrumb": _clean_text(doc.get("breadcrumb")),
                 "confidence": _confidence(doc),
                 "authority_score": _authority_score(doc),
+                "coverage_aggregate": bool(doc.get("coverage_aggregate")),
             }
         )
         return True
@@ -1754,9 +2020,28 @@ def build_evidence_pack(
     missing_required_sections = [
         value for value in required_sections if value and value not in item_text
     ]
+    semantic_sufficiency_enabled = bool(
+        coverage_plan.get("semantic_sufficiency_enabled", False)
+    )
+    if semantic_sufficiency_enabled:
+        evidence_sufficient, sufficiency = _evidence_sufficiency(
+            query=query,
+            items=items,
+            intent=intent,
+            result=result,
+            required_pages=required_pages,
+        )
+    else:
+        evidence_sufficient = bool(items)
+        sufficiency = {
+            "enabled": False,
+            "reasons": [],
+        }
     if bool(result.get("abstained")) or not items:
         coverage_status = "insufficient"
     elif missing_required_entities or missing_required_pages or missing_required_sections:
+        coverage_status = "partial"
+    elif not evidence_sufficient:
         coverage_status = "partial"
     else:
         coverage_status = "complete"
@@ -1779,6 +2064,7 @@ def build_evidence_pack(
         "missing_required_entities": missing_required_entities,
         "missing_required_pages": missing_required_pages,
         "missing_required_sections": missing_required_sections,
+        "sufficiency": sufficiency,
         "citation_candidates": citation_candidates,
         "budget": {
             "max_items": max_items,

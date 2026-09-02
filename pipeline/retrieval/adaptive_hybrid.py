@@ -988,6 +988,42 @@ class QueryMode(str, Enum):
     SYNTHESIS = "synthesis"
 
 
+_ENUMERATION_QUERY_RE = re.compile(
+    r"^(?:please\s+)?(?:list|name|enumerate|identify)\b"
+    r"|\b(?:list|listing)\s+(?:all|every|the|of)\b"
+    r"|\bhow\s+many\b"
+    r"|\b(?:all|every|each|both)\b"
+    r"|\bwhat\s+are\b"
+    r"|\bwhich\s+(?:are|were)\b"
+    r"|\b(?:what|which)\b.{0,100}\b(?:are\s+there|does\b.{0,40}\bhave|do\b.{0,40}\bhave)\b"
+    # Auxiliary-led plural objects: "What documents must applicants
+    # submit?", "Which programs can students choose?". Exact typed lookups
+    # (hours, email, date, phone) are classified before this check.
+    r"|\b(?:what|which)\s+(?:[\w'-]+\s+){0,3}[\w'-]+s\s+"
+    r"(?:do|does|did|are|were|can|could|should|must|will|would|have|has)\b"
+    r"|(?:اذكر|عدّد|عدد|جميع|كل|كافة|كم|ما\s+هي|ما\s+هما|أي\s+من)"
+    # Arabic often omits the copula: "ما الوحدات ... الرئيسية؟". Detect
+    # plural morphology or a plural-list adjective without encoding any
+    # domain noun or expected answer.
+    r"|^(?:ما|ماذا|أي|اي)\s+(?:هي\s+)?(?:ال)?[\u0600-\u06ff]+(?:ات|ون|ين)\b"
+    r"|^(?:ما|ماذا|أي|اي)\s+.{1,100}\b(?:الرئيسية|المتاحة|الموجودة|المقدمة|المتوفرة|المعروضة)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_enumeration_query(query: str) -> bool:
+    """Return whether answering requires a set rather than one isolated fact.
+
+    This is deliberately domain-neutral. It recognizes linguistic request shape
+    only; it never maps a question to a known answer, page, or MBZUAI fact.
+    """
+
+    normalized = _clean_text(query)
+    if not normalized:
+        return False
+    return bool(_ENUMERATION_QUERY_RE.search(normalized))
+
+
 def _clean_text(value: Any) -> str:
     return " ".join(str(value or "").split()).strip()
 
@@ -3200,6 +3236,14 @@ def classify_query_mode(query: str) -> QueryMode:
         return QueryMode.FACT
     if lookup_profile.is_exact_lookup and len(words) <= 32 and not broad_query:
         return QueryMode.FACT
+    # Short questions such as "Which divisions are there?" look like narrow
+    # facts syntactically, but a correct answer requires collecting sibling
+    # sections from a page or several documents. Treat the request shape as
+    # synthesis so page-card and parent lanes stay active. Exact typed lookups
+    # (one email, date, phone number, or office-hours value) remain facts above.
+    # This is a general retrieval decision, not a fact-specific answer shortcut.
+    if _is_enumeration_query(query):
+        return QueryMode.SYNTHESIS
     if fact_phrase and len(words) <= 18 and not broad_query:
         return QueryMode.FACT
     if len(words) <= 12 and normalized.startswith(fact_starts) and not broad_query and not scoped_anchor:
@@ -3512,6 +3556,14 @@ class AdaptiveHybridRetriever:
         retrieval_cfg = self.config.get("retrieval", {}) or {}
         embed_cfg = self.config.get("embedder", {}) or {}
         vector_store_cfg = self.config.get("vector_store", {}) or {}
+
+        # Historical profiles used prompt-specific semantic aliases to rescue
+        # individual evaluation cases. Production V2 relies on the query
+        # planner, multilingual embeddings, hybrid recall, and reranking. Keep
+        # the aliases only as an explicit rollback compatibility path.
+        self.query_specific_retrieval_rules_enabled = bool(
+            retrieval_cfg.get("query_specific_retrieval_rules_enabled", True)
+        )
 
         self.vector_store_provider = str(
             vector_store_cfg.get("provider") or "pinecone"
@@ -4364,13 +4416,31 @@ class AdaptiveHybridRetriever:
                     if token not in _LOOKUP_ENTITY_ROLE_TOKENS
                 ]
             base_tokens = [*focus_tokens, *attribute_tokens, *raw_tokens]
-            return list(dict.fromkeys([*base_tokens, *_semantic_query_alias_tokens(query)]))
+            alias_tokens = (
+                _semantic_query_alias_tokens(query)
+                if getattr(
+                    self,
+                    "query_specific_retrieval_rules_enabled",
+                    True,
+                )
+                else []
+            )
+            return list(dict.fromkeys([*base_tokens, *alias_tokens]))
         base_tokens = [
             token
             for token in _tokenize(query)
             if token not in _QUERY_STOPWORDS and len(token) >= 3
         ]
-        return list(dict.fromkeys([*base_tokens, *_semantic_query_alias_tokens(query)]))
+        alias_tokens = (
+            _semantic_query_alias_tokens(query)
+            if getattr(
+                self,
+                "query_specific_retrieval_rules_enabled",
+                True,
+            )
+            else []
+        )
+        return list(dict.fromkeys([*base_tokens, *alias_tokens]))
 
     def _lexical_query_ids(self, query: str, top_k: int, *, namespace: str) -> List[str]:
         if top_k <= 0:
@@ -7236,6 +7306,58 @@ class AdaptiveHybridRetriever:
         scored.sort(key=lambda item: (-item[1], item[2], item[0]))
         return [chunk_id for chunk_id, _score, _index in scored[: max(1, int(top_k or 1))]]
 
+    def _rank_page_child_chunk_ids_with_section_diversity(
+        self,
+        query: str,
+        parent_id: str,
+        *,
+        top_k: int,
+    ) -> List[str]:
+        """Rank a page's children while covering distinct sibling sections.
+
+        List and comparison answers commonly live in separate H2/H3 sections.
+        Ordinary relevance ranking can spend the context window on several
+        chunks from one long section and omit equally important siblings. The
+        first pass keeps the best chunk from each section; remaining slots use
+        the normal relevance order.
+        """
+
+        parent = self.parent_map.get(str(parent_id)) or {}
+        child_ids = [
+            str(value)
+            for value in (parent.get("child_chunk_ids") or [])
+            if str(value) in self.chunk_map
+        ]
+        if not child_ids:
+            return []
+        ranked = self._rank_parent_child_chunk_ids(
+            query,
+            parent_id,
+            top_k=len(child_ids),
+        )
+        first_by_section: List[str] = []
+        remainder: List[str] = []
+        seen_sections: set[str] = set()
+        for chunk_id in ranked:
+            chunk = self.chunk_map.get(chunk_id) or {}
+            section_ids = self._parent_ids_for_chunk(
+                chunk_id,
+                parent_type="section",
+            )
+            section_key = str(section_ids[0]) if section_ids else _clean_text(
+                chunk.get("heading")
+                or " > ".join(chunk.get("section_path") or [])
+                or chunk_id
+            ).casefold()
+            if section_key and section_key not in seen_sections:
+                seen_sections.add(section_key)
+                first_by_section.append(chunk_id)
+            else:
+                remainder.append(chunk_id)
+        return list(dict.fromkeys([*first_by_section, *remainder]))[
+            : max(1, int(top_k or 1))
+        ]
+
     def _expand_scoped_or_synthesis(
         self,
         seed_chunk_ids: List[str],
@@ -7342,10 +7464,17 @@ class AdaptiveHybridRetriever:
             if len(dict.fromkeys(selected)) >= self.max_context_chunks:
                 return list(dict.fromkeys(selected))[: self.max_context_chunks]
 
+        aggregate_page_query = bool(
+            mode == QueryMode.SYNTHESIS and _is_enumeration_query(query)
+        )
+
         # Seeds are copied into ``selected`` before expansion, so checking
         # ``not selected`` made page fallback unreachable for any real query.
-        # Fall back to page parents only when no section actually expanded.
-        if not expanded_section:
+        # For ordinary scoped queries, fall back to page parents only when no
+        # section expanded. Enumeration queries are different: their evidence
+        # often lives in sibling sections, so a successful single-section
+        # expansion must not prevent page-level assembly.
+        if not expanded_section or aggregate_page_query:
             page_candidates = set(page_id for page_id in by_page if page_id)
             page_candidates.update(
                 parent_id
@@ -7373,14 +7502,45 @@ class AdaptiveHybridRetriever:
                     item,
                 ),
             )
+            aggregate_page_chunks: List[str] = []
             for page_id in page_ids:
                 hit_count = len(by_page.get(page_id, []))
                 explicit_hit = page_id in explicit_parent_rank
                 if hit_count < self.same_parent_expand_threshold and mode != QueryMode.SYNTHESIS and not explicit_hit:
                     continue
-                selected.extend(self._rank_parent_child_chunk_ids(query, page_id, top_k=self.max_parent_chunks))
+                if aggregate_page_query:
+                    ranked_page_chunks = self._rank_page_child_chunk_ids_with_section_diversity(
+                        query,
+                        page_id,
+                        top_k=self.max_parent_chunks,
+                    )
+                    aggregate_page_chunks.extend(ranked_page_chunks)
+                else:
+                    selected.extend(
+                        self._rank_parent_child_chunk_ids(
+                            query,
+                            page_id,
+                            top_k=self.max_parent_chunks,
+                        )
+                    )
                 if len(dict.fromkeys(selected)) >= self.max_context_chunks:
                     return list(dict.fromkeys(selected))[: self.max_context_chunks]
+                if aggregate_page_query and aggregate_page_chunks:
+                    # One strongly ranked page normally owns the complete set.
+                    # Keep a small number of top seeds as independent recall
+                    # anchors, then reserve the context window for its sibling
+                    # sections before unrelated lower-ranked seeds.
+                    selected = list(
+                        dict.fromkeys(
+                            [
+                                *preserved_seed_ids[:2],
+                                *aggregate_page_chunks,
+                                *preserved_seed_ids[2:],
+                                *selected,
+                            ]
+                        )
+                    )
+                    return selected[: self.max_context_chunks]
 
         if not selected:
             return self._expand_fact(seed_chunk_ids)

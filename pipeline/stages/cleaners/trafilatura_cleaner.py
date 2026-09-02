@@ -28,6 +28,7 @@ from pipeline.stages.cleaners.common import (
     validate_cleaner_policy_config,
     visible_content_metrics,
 )
+from pipeline.stages.cleaners.route_scoping import scope_route_specific_html
 
 logger = logging.getLogger(__name__)
 
@@ -125,6 +126,7 @@ class TrafilaturaCleaner(CleanerStage):
         logger.info("Trafilatura cleaner found %d HTML files", len(files))
 
         fallback_cleaned = 0
+        route_scoped = 0
         content_artifacts = []
         dispositions: List[Dict[str, Any]] = []
 
@@ -178,10 +180,16 @@ class TrafilaturaCleaner(CleanerStage):
                 dispositions.append(disposition)
                 continue
 
+            scope_result = scope_route_specific_html(raw, sorted(source_urls))
+            extraction_input = scope_result.html
+            if scope_result.applied:
+                route_scoped += 1
+                disposition["route_scope_method"] = scope_result.method
+
             extraction_error = None
             try:
                 text = trafilatura.extract(
-                    raw,
+                    extraction_input,
                     include_tables=include_tables,
                     include_images=include_images,
                     include_links=include_links,
@@ -202,7 +210,7 @@ class TrafilaturaCleaner(CleanerStage):
             if not text or not content_meets_policy(selected_metrics, policy):
                 try:
                     fallback_status, fallback_html = clean_html_content(
-                        raw,
+                        extraction_input,
                         preserve_media=config.get(
                             "preserve_embedded_media",
                             ctx.crawler_config.get("extract_images", True)
@@ -304,6 +312,8 @@ class TrafilaturaCleaner(CleanerStage):
                         "source_urls": sorted(source_urls),
                         "relative_path": relative.as_posix(),
                         "selected_backend": selected_backend,
+                        "document_title": scope_result.document_title,
+                        "route_scope_method": scope_result.method,
                         "content_metrics": selected_metrics.to_dict(),
                     },
                     source_artifact_ids=(
@@ -365,6 +375,7 @@ class TrafilaturaCleaner(CleanerStage):
             "removed": gate["filtered_count"],
             "errors": gate["failed_count"],
             "fallback_cleaned": fallback_cleaned,
+            "route_scoped": route_scoped,
             "retention_ratio": gate["retention_ratio"],
         }
         if not gate["ok"]:

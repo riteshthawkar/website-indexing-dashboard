@@ -8010,7 +8010,7 @@ def test_verified_media_evidence_preserves_explicit_named_page_requirements():
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
     retriever._coverage_intent = lambda _query, _mode: "scoped"
     retriever._explicit_required_page_markers = lambda _query: ["/newest-technology"]
-    retriever._infer_coverage_requirements = lambda _query, _intent: {
+    retriever._infer_coverage_requirements = lambda _query, _intent, _payload=None: {
         "required_entities": [],
         "required_pages": [page_url],
         "required_sections": [],
@@ -9328,12 +9328,15 @@ def test_evidence_pack_recognizes_example_shown_in_form_as_media_query():
     assert "Carnegie Mellon University" in pack["items"][0]["text"]
 
 
-def test_evidence_pack_adds_arabic_president_role_answer_aliases():
-    from pipeline.retrieval.evidence_packer import _query_terms
-
-    terms = _query_terms(
-        "ما الذي تقوله صفحة القيادة والحوكمة عن دور الرئيس؟"
+def test_evidence_pack_keeps_prompt_specific_aliases_out_of_generalized_terms():
+    from pipeline.retrieval.evidence_packer import (
+        _legacy_query_alias_terms,
+        _query_terms,
     )
+
+    query = "ما الذي تقوله صفحة القيادة والحوكمة عن دور الرئيس؟"
+    terms = _query_terms(query)
+    legacy_terms = _legacy_query_alias_terms(query)
 
     assert {
         "الرئيس التنفيذي",
@@ -9341,7 +9344,8 @@ def test_evidence_pack_adds_arabic_president_role_answer_aliases():
         "الصلاحيات",
         "إدارة الجامعة",
         "إدارة",
-    } <= terms
+    } <= legacy_terms
+    assert "الرئيس التنفيذي" not in terms
 
 
 def test_routed_retriever_fails_closed_when_evidence_pack_is_empty():
