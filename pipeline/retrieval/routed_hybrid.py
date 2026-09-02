@@ -2215,19 +2215,18 @@ class RoutedHybridRetriever:
         )
         compound_facet_request = _is_compound_facet_query(query)
         max_pages = 4 if comparison_request else 2 if compound_facet_request else 1
-        score_margin = 0.20 if comparison_request else 0.0
+        multi_page_request = comparison_request or compound_facet_request
         pages = [
             str(page.get("source_url") or "")
             for score, _semantic_score, page in scored
             if score
             >= (
                 0.66
-                if compound_facet_request and not comparison_request
-                else max(0.66, top_score - score_margin)
+                if multi_page_request
+                else max(0.66, top_score)
             )
             and (
-                not compound_facet_request
-                or comparison_request
+                not multi_page_request
                 or _semantic_score >= 0.50
             )
         ][:max_pages]

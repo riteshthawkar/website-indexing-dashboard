@@ -263,7 +263,12 @@ def test_generalized_comparison_retains_each_high_ranked_dense_page():
     doctoral_url = "https://www.example.edu/study/phd-programs"
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
     retriever.vector = SimpleNamespace(
-        page_card_map={},
+        page_card_map={
+            "card:masters": {
+                "id": "card:masters",
+                "source_url": masters_url,
+            }
+        },
         chunk_map={
             "chunk:masters": {
                 "id": "chunk:masters",
@@ -295,7 +300,10 @@ def test_generalized_comparison_retains_each_high_ranked_dense_page():
     inferred = retriever._infer_generalized_coverage_requirements(
         "Compare scholarship coverage across M.Sc. and Ph.D. programs.",
         "multi_page_aggregation",
-        {"dense_chunk_ids": ["chunk:masters", "chunk:doctoral"]},
+        {
+            "dense_page_card_ids": ["card:masters"],
+            "dense_chunk_ids": ["chunk:masters", "chunk:doctoral"],
+        },
     )
 
     assert set(inferred["required_pages"]) == {masters_url, doctoral_url}
