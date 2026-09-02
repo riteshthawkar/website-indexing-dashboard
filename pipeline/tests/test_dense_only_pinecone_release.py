@@ -184,6 +184,14 @@ def test_vector_reuse_cross_index_still_rejects_embedding_drift():
         raise AssertionError("cross-index reuse must reject dimensionality drift")
 
 
+def test_vector_reuse_fetch_batches_are_bounded_for_uri_transport():
+    from pipeline.stages.embedders import selected_pinecone as module
+
+    assert module._bounded_vector_fetch_batch_size(500) == 64
+    assert module._bounded_vector_fetch_batch_size(32) == 32
+    assert module._bounded_vector_fetch_batch_size("invalid") == 64
+
+
 def test_selected_pinecone_upload_includes_page_cards_and_actions(tmp_path, monkeypatch):
     from pipeline.stages.embedders import selected_pinecone as module
 

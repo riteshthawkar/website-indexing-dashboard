@@ -27,7 +27,9 @@ embedder:
     # Reuse byte-identical vectors from v3, while embedding the corrected or
     # newly generated records that cannot exist in the previous release.
     require_complete: false
-    fetch_batch_size: 500
+    # The current Pinecone client transports fetch IDs in the request URI.
+    # Keep batches below common proxy URI limits even for long record IDs.
+    fetch_batch_size: 64
 
 retrieval:
   # Production retrieval must generalize to unseen questions. These settings

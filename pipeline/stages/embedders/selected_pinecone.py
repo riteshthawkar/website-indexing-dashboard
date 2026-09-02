@@ -42,6 +42,17 @@ from pipeline.stages.embedders.gemini_pinecone_embedder import (
 
 
 logger = logging.getLogger(__name__)
+_MAX_PINECONE_FETCH_IDS = 64
+
+
+def _bounded_vector_fetch_batch_size(value: Any) -> int:
+    """Bound Pinecone fetches for clients that encode IDs in the request URI."""
+
+    try:
+        configured = int(value or _MAX_PINECONE_FETCH_IDS)
+    except (TypeError, ValueError):
+        configured = _MAX_PINECONE_FETCH_IDS
+    return max(1, min(_MAX_PINECONE_FETCH_IDS, configured))
 
 
 def _validate_vector_reuse_identity(
@@ -226,7 +237,9 @@ def _load_vector_reuse_source(
         "eligible": reusable_counts,
         "missing": missing_counts,
         "require_complete": bool(reuse.get("require_complete", False)),
-        "fetch_batch_size": max(1, min(1000, int(reuse.get("fetch_batch_size") or 500))),
+        "fetch_batch_size": _bounded_vector_fetch_batch_size(
+            reuse.get("fetch_batch_size")
+        ),
     }
 
 
