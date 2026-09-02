@@ -301,6 +301,105 @@ def test_generalized_comparison_retains_each_high_ranked_dense_page():
     assert set(inferred["required_pages"]) == {masters_url, doctoral_url}
 
 
+def test_generalized_compound_question_retains_two_complementary_pages():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    tuition_url = "https://www.example.edu/admissions/tuition"
+    aid_url = "https://www.example.edu/admissions/scholarships"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:tuition": {"id": "card:tuition", "source_url": tuition_url},
+            "card:aid": {"id": "card:aid", "source_url": aid_url},
+        },
+        chunk_map={
+            "chunk:tuition": {"id": "chunk:tuition", "source_url": tuition_url},
+            "chunk:aid": {"id": "chunk:aid", "source_url": aid_url},
+        },
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": tuition_url,
+            "normalized_url": tuition_url,
+            "identity_text": "undergraduate tuition",
+            "identity_tokens": {"undergraduate", "tuition"},
+            "tokens": {"undergraduate", "tuition", "annual", "cost"},
+        },
+        {
+            "source_url": aid_url,
+            "normalized_url": aid_url,
+            "identity_text": "undergraduate scholarships",
+            "identity_tokens": {"undergraduate", "scholarships"},
+            "tokens": {"undergraduate", "scholarships", "merit", "need"},
+        },
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "How much is undergraduate tuition, and what scholarships are available?",
+        "multi_page_aggregation",
+        {
+            "dense_page_card_ids": ["card:tuition", "card:aid"],
+            "dense_chunk_ids": ["chunk:tuition", "chunk:aid"],
+        },
+    )
+
+    assert set(inferred["required_pages"]) == {tuition_url, aid_url}
+
+
+def test_financial_detail_pack_reserves_complete_leaf_and_drops_fragment_facts():
+    program_url = "https://www.example.edu/study/applied-ai"
+    exact_chunk_id = "chunk:c650:document-revision:program:00014:fees"
+    pack = build_evidence_pack(
+        query=(
+            "What are the application fee, fee-waiver conditions, seat-holding "
+            "fee, per-credit tuition, and total tuition?"
+        ),
+        result={
+            "fact_documents": [
+                {"id": "fact:marker", "text": "###", "source_url": program_url},
+                {"id": "fact:fragment", "text": "Th", "source_url": program_url},
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "parent:c650:document-revision:program:page",
+                    "text": "General program introduction. " * 300,
+                    "source_url": program_url,
+                    "coverage_aggregate": True,
+                },
+                {
+                    "id": exact_chunk_id,
+                    "text": (
+                        "Application fee: AED 200 after screening; waived for a "
+                        "screening score of 75% or higher, or reimbursed after "
+                        "enrollment. Seat-holding fee: AED 5,000, credited toward "
+                        "tuition. Program fee: AED 5,000 per credit. Total: AED 170,000."
+                    ),
+                    "source_url": program_url,
+                    "retrieval_rank": 1,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 0,
+                },
+            ],
+        },
+        max_items=4,
+        max_chars=3000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "scoped",
+            "required_pages": [program_url],
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    assert exact_chunk_id in [item["id"] for item in pack["items"]]
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "AED 200" in packed_text
+    assert "75%" in packed_text
+    assert "AED 170,000" in packed_text
+    assert "###" not in packed_text
+    assert not any(item["id"] == "fact:fragment" for item in pack["items"])
+
+
 def test_generalized_coverage_does_not_bind_unrelated_dense_page_without_identity():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

@@ -1086,11 +1086,12 @@ _KIND_BASE_SCORE = {
 _MULTI_DETAIL_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|qualification|academic qualification|roles|positions|responsibilities|steps|"
     r"features|benefits|differences|criteria|items|articles|entries|sections|categories|stages|process|programs?|"
-    r"experience|professional experience|"
+    r"experience|professional experience|fees?|tuition|costs?|charges?|prices?|amounts?|waivers?|conditions|"
+    r"scholarships?|financial aid|funding|coverage|per[- ]credit|seat[- ]holding|"
     r"support|services|use|uses|using|options|focus areas|research interests|hands-on access|offerings|committees|industry engagement)\b"
     r"|(?:المتطلبات|المؤهلات|المؤهل الأكاديمي|المؤهل|المناصب|الأدوار|المسؤوليات|الخطوات|المزايا|الفروقات|"
     r"المعايير|العناصر|المقالات|أقسام|اقسام|فئات|مراحل|عملية|البرنامج|برنامج|البرامج|برامج|المدة|مدة|"
-    r"المنح|منح|الشروط|شروط|الخبرة|خبرة|الخبرات|الدعم|دعم|الخدمات|خدمات|استخدامات|خيارات|"
+    r"المنح|منح|الشروط|شروط|الرسوم|رسوم|تكلفة|تكاليف|إعفاء|اعفاء|تغطية|تمويل|الخبرة|خبرة|الخبرات|الدعم|دعم|الخدمات|خدمات|استخدامات|خيارات|"
     r"المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
     r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
@@ -1172,6 +1173,38 @@ def _structured_facet_coverage_bonus(query: str, text: str) -> float:
             r"\b(?:scholarship|scholarships|financial aid|tuition support)\b|(?:منحة|منح|المنح)",
         ),
         (
+            r"\b(?:fees?|tuition|costs?|charges?|prices?|amounts?)\b|(?:الرسوم|رسوم|تكلفة|تكاليف)",
+            r"\b(?:fees?|tuition|costs?|charges?|per credit|per annum|total|aed|usd)\b|[$€£]|(?:الرسوم|رسوم|تكلفة|تكاليف|درهم|دولار)",
+        ),
+        (
+            r"(?=.*\b(?:scholarships?|financial aid)\b)(?=.*\b(?:types?|kinds?|available)\b)|(?=.*(?:منح|المنح))(?=.*(?:أنواع|انواع|المتاحة))",
+            r"\b(?:merit[- ]based|need(?:s)?[- ]based|merit scholarship|need scholarship)\b|(?:الجدارة|الحاجة|قائمة على الجدارة|قائمة على الحاجة)",
+        ),
+        (
+            r"\b(?:maximum|max(?:imum)? coverage|up to)\b|(?:الحد الأقصى|الحد الاقصى|حتى|تغطيتها)",
+            r"\b(?:up to\s*\d{1,3}%?|maximum|cover(?:s|ed|age)?)\b|\b100%\b|(?:حتى\s*\d{1,3}%?|الحد الأقصى|تغطية)",
+        ),
+        (
+            r"\bapplication fee\b|(?:رسوم التقديم|رسم التقديم|رسوم الطلب)",
+            r"\bapplication fee\b|(?:رسوم التقديم|رسم التقديم|رسوم الطلب)",
+        ),
+        (
+            r"\b(?:fee[- ]waiver|waiver conditions?|waivers?)\b|(?:إعفاء من الرسوم|اعفاء من الرسوم|شروط الإعفاء|شروط الاعفاء)",
+            r"\b(?:waiv(?:e|ed|er)|reimburs(?:e|ed|ement)|screening score|eligibility)\b|\b\d{1,3}%\b|(?:إعفاء|اعفاء|استرداد|درجة الاختبار|الأهلية)",
+        ),
+        (
+            r"\bseat[- ]holding fee\b|(?:رسوم حجز المقعد|رسم حجز المقعد)",
+            r"\bseat[- ]holding fee\b|(?:رسوم حجز المقعد|رسم حجز المقعد)",
+        ),
+        (
+            r"\bper[- ]credit(?: tuition| fee)?\b|(?:لكل ساعة معتمدة|للساعة المعتمدة)",
+            r"\bper\s+credit\b|(?:لكل ساعة معتمدة|للساعة المعتمدة)",
+        ),
+        (
+            r"\btotal tuition\b|(?:إجمالي الرسوم|اجمالي الرسوم)",
+            r"\btotal\b.{0,32}\b(?:aed|usd|tuition|fees?)\b|\b(?:aed|usd)\b.{0,32}\btotal\b|(?:إجمالي|اجمالي)",
+        ),
+        (
             r"\b(?:requirements|eligibility|admission conditions)\b|(?:شروط|الشروط|متطلبات|المتطلبات)",
             r"\b(?:requirements|eligibility|secondary school|gpa)\b|(?:شروط|الشروط|متطلبات|المتطلبات|الثانوية|90%)",
         ),
@@ -1202,7 +1235,14 @@ def _structured_facet_coverage_bonus(query: str, text: str) -> float:
             matched += 1
     if not requested:
         return 0.0
-    bonus = -12.0 if not matched else min(72.0, 26.0 * matched)
+    # Complete multi-field records should outrank a generic item that happens
+    # to mention only one broad term. Penalize missing requested facets while
+    # keeping the signal bounded so upstream fused retrieval still matters.
+    bonus = (
+        -12.0
+        if not matched
+        else min(96.0, 24.0 * matched) - min(36.0, 8.0 * (requested - matched))
+    )
     scoped_subject_contracts = (
         (
             r"\b(?:undergraduate|bachelor|bsc)\b|(?:بكالوريوس|البكالوريوس)",
@@ -1433,8 +1473,11 @@ def _candidate_score(
         kind,
         include_legacy_aliases=query_specific_rules_enabled,
     )
+    # Facet completeness is representation-agnostic and safe in the
+    # generalized production profile. Only legacy URL/fact shortcuts remain
+    # behind the query-specific-rules switch.
+    score += _structured_facet_coverage_bonus(query, raw_text)
     if query_specific_rules_enabled:
-        score += _structured_facet_coverage_bonus(query, raw_text)
         score += _query_specific_bonus(query, item_blob, normalized_source)
     if bool(doc.get("coverage_aggregate")):
         # A bounded complete-page parent is deliberately injected for a
@@ -1525,6 +1568,14 @@ def build_evidence_pack(
         if kind in {"chunk", "evidence_span", "media", "summary"} and (
             len(text) < 20 or len(re.findall(r"\w+", text, re.UNICODE)) < 3
         ):
+            continue
+        if kind in {"fact", "assertion"} and (
+            len(text) < 6
+            or len(re.findall(r"[^\W_]+", text, re.UNICODE)) < 2
+        ):
+            # Extraction artifacts such as markdown markers or severed word
+            # prefixes are not independently usable factual evidence. Small
+            # but meaningful values (for example "AED 200") still survive.
             continue
         item_blob = _item_search_text(
             {

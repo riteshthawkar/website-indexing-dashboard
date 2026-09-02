@@ -50,15 +50,34 @@ _ADJUDICATOR_RUNTIME_INIT_LOCK = Lock()
 _AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|roles|responsibilities|features|benefits|"
     r"differences|criteria|items|articles|entries|listed|shown|displayed|sections|"
-    r"categories|stages|process|support|services|uses|options|focus areas|"
+    r"categories|stages|process|fees?|tuition|costs?|waivers?|conditions|scholarships?|"
+    r"financial aid|funding|coverage|per[- ]credit|seat[- ]holding|support|services|uses|options|focus areas|"
     r"research interests|hands-on access|offerings|committees|industry engagement)\b"
     r"|(?:المتطلبات|المؤهلات|الأدوار|المسؤوليات|المزايا|الفروقات|المعايير|العناصر|"
-    r"المقالات|أقسام|اقسام|فئات|مراحل|عملية|الدعم|دعم|الخدمات|خدمات|استخدامات|"
+    r"المقالات|أقسام|اقسام|فئات|مراحل|عملية|الرسوم|رسوم|تكلفة|تكاليف|إعفاء|اعفاء|المنح|منح|تغطية|تمويل|الشروط|شروط|الدعم|دعم|الخدمات|خدمات|استخدامات|"
     r"خيارات|المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
     r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
     re.IGNORECASE,
 )
+
+
+_INTERROGATIVE_CLAUSE_RE = re.compile(
+    r"\b(?:what|which|how|where|when|who)\b"
+    r"|(?:^|[\s،,؛])و?(?:ما|ماذا|كم|كيف|أين|اين|متى|أي|اي)(?=\s)",
+    re.IGNORECASE,
+)
+
+
+def _is_compound_facet_query(query: str) -> bool:
+    """Return whether a question explicitly asks for multiple answer facets.
+
+    This is deliberately about question structure rather than known pages or
+    expected answers. It lets semantic retrieval retain a second independently
+    corroborated official page when one page covers only part of the request.
+    """
+
+    return len(_INTERROGATIVE_CLAUSE_RE.findall(str(query or ""))) >= 2
 _GENERALIZED_PAGE_STOPWORDS = {
     "a", "about", "all", "an", "and", "are", "at", "be", "does", "do",
     "every", "for", "from", "have", "how", "in", "include", "is", "it",
@@ -2188,11 +2207,13 @@ class RoutedHybridRetriever:
                 flags=re.IGNORECASE,
             )
         )
-        max_pages = 4 if comparison_request else 1
+        compound_facet_request = _is_compound_facet_query(query)
+        max_pages = 4 if comparison_request else 2 if compound_facet_request else 1
+        score_margin = 0.20 if comparison_request else 0.16 if compound_facet_request else 0.0
         pages = [
             str(page.get("source_url") or "")
             for score, _semantic_score, page in scored
-            if score >= max(0.66, top_score - (0.20 if comparison_request else 0.0))
+            if score >= max(0.66, top_score - score_margin)
         ][:max_pages]
         pages = self._dedupe_explicit_pages_by_family(pages, query=query)
         return {
