@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pipeline.core.release import _validation_config_for_release
 from pipeline.core.release_policy import (
+    LEGACY_PREPROD_EVAL_POLICY_ID,
+    LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256,
     PREPROD_ANSWER_DATASET,
     PREPROD_ANSWER_GATES,
     PREPROD_EVAL_POLICY_ID,
@@ -81,6 +83,30 @@ def test_committed_preprod_evaluation_policy_matches_pinned_hashes() -> None:
             policy_id=PREPROD_EVAL_POLICY_ID,
         ),
     }
+    assert validate_production_eval_manifest(retrieval, answer) == []
+
+
+def test_previous_preprod_policy_remains_a_valid_rollback_contract() -> None:
+    retrieval = {
+        **production_eval_manifest_metadata(
+            answer=False,
+            policy_id=LEGACY_PREPROD_EVAL_POLICY_ID,
+        ),
+        "query_count": PREPROD_MIN_RETRIEVAL_QUERIES,
+    }
+    answer = {
+        **production_eval_manifest_metadata(
+            answer=True,
+            policy_id=LEGACY_PREPROD_EVAL_POLICY_ID,
+        ),
+        "query_count": PREPROD_MIN_ANSWER_QUERIES,
+        "llm_judge": production_answer_judge_manifest_metadata(
+            policy_id=LEGACY_PREPROD_EVAL_POLICY_ID,
+        ),
+    }
+
+    assert retrieval["dataset_sha256"] == LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256
+    assert answer["dataset_sha256"] == LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256
     assert validate_production_eval_manifest(retrieval, answer) == []
 
 
