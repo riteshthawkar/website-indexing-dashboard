@@ -6,6 +6,7 @@ extraction. Falls back to BS4 cleaning when Trafilatura produces no output.
 """
 
 import logging
+import re
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -31,6 +32,83 @@ from pipeline.stages.cleaners.common import (
 from pipeline.stages.cleaners.route_scoping import scope_route_specific_html
 
 logger = logging.getLogger(__name__)
+
+
+def _heading_signatures(html: str) -> set[str]:
+    """Return normalized, substantive heading labels from an HTML candidate."""
+
+    if not html:
+        return set()
+    soup = BeautifulSoup(html, "html.parser")
+    signatures: set[str] = set()
+    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+        value = re.sub(r"\s+", " ", heading.get_text(" ", strip=True)).strip().casefold()
+        # Tiny glyph-like labels and very long accidental wrappers are not useful
+        # structural evidence.
+        if 2 <= len(value) <= 200:
+            signatures.add(value)
+    return signatures
+
+
+def _structured_fallback_comparison(
+    primary_html: str,
+    fallback_html: str,
+    *,
+    max_primary_words: int = 2000,
+    min_word_gain: int = 80,
+    min_word_ratio: float = 1.35,
+    min_missing_headings: int = 3,
+) -> Dict[str, Any]:
+    """Assess whether BS4 recovered material structure omitted by Trafilatura.
+
+    Word gain alone is deliberately insufficient: the fallback must also recover
+    multiple headings absent from the primary candidate. This prevents ordinary
+    boilerplate growth from displacing a good article extraction.
+    """
+
+    primary_metrics = visible_content_metrics(primary_html)
+    fallback_metrics = visible_content_metrics(fallback_html)
+    primary_headings = _heading_signatures(primary_html)
+    fallback_headings = _heading_signatures(fallback_html)
+    missing_headings = sorted(fallback_headings - primary_headings)
+    word_gain = fallback_metrics.visible_words - primary_metrics.visible_words
+    word_ratio = fallback_metrics.visible_words / max(primary_metrics.visible_words, 1)
+    prefer_fallback = (
+        primary_metrics.visible_words <= max_primary_words
+        and word_gain >= min_word_gain
+        and word_ratio >= min_word_ratio
+        and len(missing_headings) >= min_missing_headings
+    )
+    return {
+        "prefer_fallback": prefer_fallback,
+        "primary_words": primary_metrics.visible_words,
+        "fallback_words": fallback_metrics.visible_words,
+        "word_gain": word_gain,
+        "word_ratio": round(word_ratio, 6),
+        "primary_heading_count": len(primary_headings),
+        "fallback_heading_count": len(fallback_headings),
+        "missing_heading_count": len(missing_headings),
+        "missing_headings": missing_headings[:25],
+    }
+
+
+def _validate_structured_fallback_config(config: Dict[str, Any]) -> List[str]:
+    errors: List[str] = []
+    bool_value = config.get("compare_bs4_when_structurally_richer", True)
+    if not isinstance(bool_value, bool):
+        errors.append("cleaner.compare_bs4_when_structurally_richer must be a boolean")
+    for key, default in (
+        ("structured_fallback_max_primary_words", 2000),
+        ("structured_fallback_min_word_gain", 80),
+        ("structured_fallback_min_missing_headings", 3),
+    ):
+        value = config.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            errors.append(f"cleaner.{key} must be a non-negative integer")
+    ratio = config.get("structured_fallback_min_word_ratio", 1.35)
+    if isinstance(ratio, bool) or not isinstance(ratio, (int, float)) or float(ratio) < 1.0:
+        errors.append("cleaner.structured_fallback_min_word_ratio must be a number >= 1")
+    return errors
 
 
 def _looks_navigation_heavy(cleaned_html: str) -> bool:
@@ -79,6 +157,7 @@ class TrafilaturaCleaner(CleanerStage):
         if not isinstance(cleaner_config, dict):
             return ["cleaner must be a mapping"]
         errors = validate_cleaner_policy_config(cleaner_config)
+        errors.extend(_validate_structured_fallback_config(cleaner_config))
         try:
             import trafilatura  # noqa: F401
         except ImportError:
@@ -114,6 +193,23 @@ class TrafilaturaCleaner(CleanerStage):
             ctx.crawler_config.get("extract_images", True),
         )
         recursive = config.get("recursive", True)
+        compare_structured_fallback = config.get(
+            "compare_bs4_when_structurally_richer", True
+        )
+        structured_fallback_options = {
+            "max_primary_words": int(
+                config.get("structured_fallback_max_primary_words", 2000)
+            ),
+            "min_word_gain": int(
+                config.get("structured_fallback_min_word_gain", 80)
+            ),
+            "min_word_ratio": float(
+                config.get("structured_fallback_min_word_ratio", 1.35)
+            ),
+            "min_missing_headings": int(
+                config.get("structured_fallback_min_missing_headings", 3)
+            ),
+        }
 
         accepted_html_artifacts = ctx.find_artifacts(artifact_type="quality_accepted_html")
         pattern = "**/*.html" if recursive else "*.html"
@@ -126,6 +222,8 @@ class TrafilaturaCleaner(CleanerStage):
         logger.info("Trafilatura cleaner found %d HTML files", len(files))
 
         fallback_cleaned = 0
+        fallback_compared = 0
+        structurally_richer_fallbacks = 0
         route_scoped = 0
         content_artifacts = []
         dispositions: List[Dict[str, Any]] = []
@@ -207,7 +305,17 @@ class TrafilaturaCleaner(CleanerStage):
 
             selected_backend = "trafilatura"
             selected_metrics = visible_content_metrics(text or "")
-            if not text or not content_meets_policy(selected_metrics, policy):
+            primary_usable = bool(text) and content_meets_policy(selected_metrics, policy)
+            needs_fallback = not primary_usable
+            compare_fallback = bool(compare_structured_fallback and primary_usable)
+            fallback_status = None
+            fallback_html = None
+            fallback_metrics = None
+            cleaner_warnings: List[str] = []
+
+            if needs_fallback or compare_fallback:
+                if compare_fallback:
+                    fallback_compared += 1
                 try:
                     fallback_status, fallback_html = clean_html_content(
                         extraction_input,
@@ -219,23 +327,31 @@ class TrafilaturaCleaner(CleanerStage):
                     )
                 except Exception as exc:
                     logger.warning("BS4 fallback error %s: %s", fp, exc)
-                    disposition.update(
-                        {
-                            "status": "failed",
-                            "reason_code": "fallback_cleaning_error",
-                            "error_type": type(exc).__name__,
-                            "content_metrics": selected_metrics.to_dict(),
-                        }
-                    )
-                    dispositions.append(disposition)
-                    continue
+                    if needs_fallback:
+                        disposition.update(
+                            {
+                                "status": "failed",
+                                "reason_code": "fallback_cleaning_error",
+                                "error_type": type(exc).__name__,
+                                "content_metrics": selected_metrics.to_dict(),
+                            }
+                        )
+                        dispositions.append(disposition)
+                        continue
+                    cleaner_warnings.append("bs4_structured_comparison_error")
+
+            fallback_usable = False
+            if fallback_metrics is None and fallback_status is not None:
                 fallback_metrics = visible_content_metrics(fallback_html or "")
                 disposition["fallback_content_metrics"] = fallback_metrics.to_dict()
-                if (
+                fallback_usable = bool(
                     fallback_status == "cleaned"
                     and fallback_html
                     and content_meets_policy(fallback_metrics, policy)
-                ):
+                )
+
+            if needs_fallback:
+                if fallback_usable:
                     text = fallback_html
                     selected_backend = "bs4_fallback"
                     selected_metrics = fallback_metrics
@@ -266,6 +382,19 @@ class TrafilaturaCleaner(CleanerStage):
                     disposition["content_metrics"] = selected_metrics.to_dict()
                     dispositions.append(disposition)
                     continue
+            elif compare_fallback and fallback_usable:
+                comparison = _structured_fallback_comparison(
+                    text or "",
+                    fallback_html or "",
+                    **structured_fallback_options,
+                )
+                disposition["structured_fallback_comparison"] = comparison
+                if comparison["prefer_fallback"]:
+                    text = fallback_html
+                    selected_backend = "bs4_structured_fallback"
+                    selected_metrics = fallback_metrics
+                    fallback_cleaned += 1
+                    structurally_richer_fallbacks += 1
 
             out_path = cleaned_dir / relative
             try:
@@ -283,11 +412,11 @@ class TrafilaturaCleaner(CleanerStage):
                 dispositions.append(disposition)
                 continue
 
-            reason_code = (
-                "accepted_trafilatura"
-                if selected_backend == "trafilatura"
-                else "accepted_bs4_fallback"
-            )
+            reason_code = {
+                "trafilatura": "accepted_trafilatura",
+                "bs4_fallback": "accepted_bs4_fallback",
+                "bs4_structured_fallback": "accepted_bs4_structured_fallback",
+            }[selected_backend]
             disposition.update(
                 {
                     "status": "accepted",
@@ -298,7 +427,9 @@ class TrafilaturaCleaner(CleanerStage):
                 }
             )
             if extraction_error is not None:
-                disposition["warnings"] = ["trafilatura_extraction_error_recovered"]
+                cleaner_warnings.append("trafilatura_extraction_error_recovered")
+            if cleaner_warnings:
+                disposition["warnings"] = cleaner_warnings
             dispositions.append(disposition)
             source_url = sorted(source_urls)[0] if source_urls else ""
             content_artifacts.append(
@@ -375,6 +506,8 @@ class TrafilaturaCleaner(CleanerStage):
             "removed": gate["filtered_count"],
             "errors": gate["failed_count"],
             "fallback_cleaned": fallback_cleaned,
+            "fallback_compared": fallback_compared,
+            "structurally_richer_fallbacks": structurally_richer_fallbacks,
             "route_scoped": route_scoped,
             "retention_ratio": gate["retention_ratio"],
         }

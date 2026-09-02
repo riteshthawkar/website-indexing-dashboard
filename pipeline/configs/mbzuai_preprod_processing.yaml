@@ -31,6 +31,15 @@ cleaner:
   maximum_error_count: 0
   maximum_error_ratio: 0.0
   require_critical_url_survival: true
+  # Trafilatura can return a valid-looking intro while silently dropping card
+  # directories or other repeated structured records. Compare a conservative
+  # main-content fallback and select it only when it recovers both substantial
+  # text and multiple missing headings.
+  compare_bs4_when_structurally_richer: true
+  structured_fallback_max_primary_words: 2000
+  structured_fallback_min_word_gain: 80
+  structured_fallback_min_word_ratio: 1.35
+  structured_fallback_min_missing_headings: 3
 
 formatter:
   # The site owner explicitly authorized complete indexing on 2026-08-30.
