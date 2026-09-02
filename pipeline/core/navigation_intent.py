@@ -53,10 +53,7 @@ def infer_navigation_context(query: str) -> Dict[str, Any]:
         ),
         (
             "download",
-            r"\b(?:download|save|obtain|get)(?:\s+(?:me|a|an|the))?\s+(?:pdf|file|document|brochure|prospectus)\b"
-            r"|\b(?:download|downloadable)\b"
-            r"|تحميل|تنزيل|(?:يحم[ّ]?ل|يحمل)\s+(?:هذا|الزر)"
-            r"|(?:حم[ّ]?ل|نز[ّ]?ل|أريد|اريد)\s+(?:ملف\s+)?(?:pdf|بي دي إف|الكتيب|الدليل)",
+            r"\b(?:download|pdf|brochure|prospectus|downloadable)\b|تحميل|تنزيل|(?:يحم[ّ]?ل|يحمل)\s+(?:هذا|الزر)|ملف pdf|كتيب",
             0.94,
         ),
         (
