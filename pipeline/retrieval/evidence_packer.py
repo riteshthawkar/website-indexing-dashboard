@@ -864,6 +864,12 @@ def _query_dense_excerpt(
         score = (
             len(matched_facets),
             sum(len(phrase) for phrase in matched_facets),
+            # A window centred from the requested facet must outrank an
+            # earlier identity-heavy window that happens to contain only the
+            # facet heading at its final edge. Otherwise long role/program
+            # pages can silently clip the value immediately after headings
+            # such as ``Academic Qualifications`` or ``Experience Required``.
+            1 if is_facet_anchor else 0,
             len(matched_terms),
             sum(len(term) for term in matched_terms),
             -abs(position - (window_start + leading_context)),

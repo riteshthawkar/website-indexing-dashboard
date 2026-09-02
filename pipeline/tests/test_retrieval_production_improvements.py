@@ -577,6 +577,51 @@ def test_evidence_pack_centers_cross_lingual_qualification_chunk_on_answer_block
     assert "equivalent industry experience" in packed_text
 
 
+def test_evidence_pack_does_not_leave_qualification_value_at_window_edge():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://careers.mbzuai.ac.ae/careers/research-engineer-world-modelling"
+    role_identity = "Research Engineer – World Modelling. "
+    early_identity_mentions = (
+        "The Research Engineer will support world model training and work with research teams. "
+        * 7
+    )
+    long_responsibilities = (
+        "Design, implement, and maintain scalable video data pipelines and production systems. "
+        * 30
+    )
+    pack = build_evidence_pack(
+        query=(
+            "ما المؤهل الأكاديمي المطلوب للتقديم على وظيفة "
+            "Research Engineer – World Modelling؟"
+        ),
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:research-engineer-world-modelling:long-page",
+                    "text": (
+                        role_identity
+                        + early_identity_mentions
+                        + long_responsibilities
+                        + "Academic Qualifications: MSc or PhD in Machine Learning "
+                        "or Computer Science, or equivalent industry experience. "
+                        "Professional Experience: practical experience with model training."
+                    ),
+                    "source_url": source_url,
+                    "document_title": "Research Engineer – World Modelling",
+                }
+            ],
+        },
+        max_items=2,
+        max_chars=2400,
+        max_per_source=2,
+    )
+
+    packed_text = " ".join(item["text"] for item in pack["items"])
+    assert "MSc or PhD in Machine Learning or Computer Science" in packed_text
+    assert "equivalent industry experience" in packed_text
+
+
 def test_evidence_pack_preserves_fused_promoted_assertion_for_exact_role_fact():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 
