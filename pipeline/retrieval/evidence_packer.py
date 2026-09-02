@@ -679,6 +679,7 @@ def _evidence_sufficiency(
         query_term_count
         and overlap < minimum_alignment
         and retrieval_confidence < 0.65
+        and not trusted_aggregate_items
     ):
         reasons.append("weak_query_evidence_alignment")
     if (
@@ -1352,6 +1353,18 @@ def _candidate_score(
         # a semantically generic chunk merely because both share page headers.
         rank_after_primary_pair = max(0, retrieval_rank - 1)
         score += max(0.0, 18.0 - (0.3 * (rank_after_primary_pair ** 2)))
+    if bool(doc.get("coverage_dense_evidence")):
+        try:
+            dense_semantic_rank = max(
+                0,
+                int(doc.get("dense_semantic_rank") or 0),
+            )
+        except (TypeError, ValueError):
+            dense_semantic_rank = 0
+        # Preserve an independently ranked dense child after its owning page
+        # has been semantically bound. This is especially important when the
+        # query and source use different languages.
+        score += max(8.0, 34.0 - (3.0 * dense_semantic_rank))
     if _is_official_mbzuai_url(source):
         score += 18.0
     elif not source:
@@ -1645,6 +1658,10 @@ def build_evidence_pack(
                 "confidence": _confidence(doc),
                 "authority_score": _authority_score(doc),
                 "coverage_aggregate": bool(doc.get("coverage_aggregate")),
+                "coverage_dense_evidence": bool(
+                    doc.get("coverage_dense_evidence")
+                ),
+                "dense_semantic_rank": doc.get("dense_semantic_rank"),
             }
         )
         return True

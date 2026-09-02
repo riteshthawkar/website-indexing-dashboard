@@ -371,6 +371,8 @@ def test_required_page_chunk_backfill_preserves_dense_semantic_order():
     )
 
     assert [chunk["id"] for chunk in chunks] == ["chunk:z"]
+    assert chunks[0]["coverage_dense_evidence"] is True
+    assert chunks[0]["dense_semantic_rank"] == 0
 
 
 def test_required_page_span_backfill_follows_linked_dense_chunk_order():
@@ -412,6 +414,57 @@ def test_required_page_span_backfill_follows_linked_dense_chunk_order():
     )
 
     assert [span["id"] for span in spans] == ["span:duration"]
+    assert spans[0]["coverage_dense_evidence"] is True
+    assert spans[0]["dense_semantic_rank"] == 0
+
+
+def test_evidence_pack_keeps_cross_lingual_dense_child_of_bound_page():
+    program_url = "https://www.mbzuai.ac.ae/study/program"
+    exact_chunk_id = "chunk:program:duration"
+    pack = build_evidence_pack(
+        query="هل البرنامج بدوام جزئي وكم تستغرق مدة إكماله؟",
+        result={
+            "retrieval_confidence": 0.60,
+            "fact_documents": [
+                {
+                    "id": "fact:generic",
+                    "text": "The program includes elective courses.",
+                    "source_url": program_url,
+                }
+            ],
+            "retrieval_documents": [
+                {
+                    "id": "parent:program:page",
+                    "text": "Complete official program page and study plan.",
+                    "source_url": program_url,
+                    "coverage_aggregate": True,
+                },
+                {
+                    "id": exact_chunk_id,
+                    "text": (
+                        "The program is part-time, in-person, on campus, and "
+                        "typically takes two years to complete."
+                    ),
+                    "source_url": program_url,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 0,
+                },
+            ],
+        },
+        max_items=5,
+        max_chars=5000,
+        max_per_source=4,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [program_url],
+            "required_entities": [],
+            "required_sections": [],
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    assert exact_chunk_id in [item["id"] for item in pack["items"]]
+    assert pack["coverage_status"] == "complete"
 
 
 def test_production_mode_does_not_inject_prompt_specific_lexical_aliases():

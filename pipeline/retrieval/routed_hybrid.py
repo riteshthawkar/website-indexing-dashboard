@@ -3116,7 +3116,7 @@ class RoutedHybridRetriever:
         limit: int = 2,
         preferred_chunk_ids: Sequence[str] = (),
     ) -> List[Dict[str, Any]]:
-        scored: List[tuple[float, Dict[str, Any]]] = []
+        scored: List[tuple[int, int, float, Dict[str, Any]]] = []
         evidence_span_map = getattr(self.vector, "evidence_span_map", {})
         preferred_rank = {
             str(chunk_id): rank
@@ -3156,14 +3156,36 @@ class RoutedHybridRetriever:
                 for chunk_id in (span.get("linked_chunk_ids") or [])
                 if str(chunk_id) in preferred_rank
             ]
+            best_dense_rank = min(linked_dense_ranks) if linked_dense_ranks else None
             if linked_dense_ranks:
-                score += max(0.35, 1.60 - (0.10 * min(linked_dense_ranks)))
+                score += max(0.35, 1.60 - (0.10 * best_dense_rank))
             if score > 0.0:
-                scored.append((score, span))
-        scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+                scored.append(
+                    (
+                        0 if best_dense_rank is not None else 1,
+                        best_dense_rank if best_dense_rank is not None else 999,
+                        -score,
+                        span,
+                    )
+                )
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                str(item[3].get("id") or ""),
+            )
+        )
         output: List[Dict[str, Any]] = []
-        for _score, span in scored[:limit]:
-            output.append(self._span_payload_from_record(span, required_page=required_page))
+        for _dense_bucket, dense_rank, _negative_score, span in scored[:limit]:
+            span_payload = self._span_payload_from_record(
+                span,
+                required_page=required_page,
+            )
+            if dense_rank != 999:
+                span_payload["coverage_dense_evidence"] = True
+                span_payload["dense_semantic_rank"] = dense_rank
+            output.append(span_payload)
         return output
 
     def _best_required_page_facts(self, query: str, required_page: str, *, limit: int = 1) -> List[Dict[str, Any]]:
@@ -3202,7 +3224,7 @@ class RoutedHybridRetriever:
         limit: int = 2,
         preferred_chunk_ids: Sequence[str] = (),
     ) -> List[Dict[str, Any]]:
-        scored: List[tuple[float, Dict[str, Any]]] = []
+        scored: List[tuple[int, int, float, Dict[str, Any]]] = []
         chunk_map = getattr(self.vector, "chunk_map", {})
         preferred_rank = {
             str(chunk_id): rank
@@ -3250,12 +3272,34 @@ class RoutedHybridRetriever:
                 # compare languages or when a generic reranker discarded one
                 # side of a multi-page answer.
                 score += max(0.35, 1.60 - (0.10 * preferred_rank[chunk_id]))
-            scored.append((score, chunk))
-        scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
-        return [
-            self._chunk_payload_from_record(chunk, required_page=required_page)
-            for _score, chunk in scored[:limit]
-        ]
+            dense_rank = preferred_rank.get(chunk_id)
+            scored.append(
+                (
+                    0 if dense_rank is not None else 1,
+                    dense_rank if dense_rank is not None else 999,
+                    -score,
+                    chunk,
+                )
+            )
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                item[2],
+                str(item[3].get("id") or ""),
+            )
+        )
+        output: List[Dict[str, Any]] = []
+        for _dense_bucket, dense_rank, _negative_score, chunk in scored[:limit]:
+            chunk_payload = self._chunk_payload_from_record(
+                chunk,
+                required_page=required_page,
+            )
+            if dense_rank != 999:
+                chunk_payload["coverage_dense_evidence"] = True
+                chunk_payload["dense_semantic_rank"] = dense_rank
+            output.append(chunk_payload)
+        return output
 
     def _best_required_page_parent(
         self,
