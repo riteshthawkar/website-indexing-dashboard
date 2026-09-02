@@ -19,6 +19,7 @@ from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.media import (
     build_media_embedding_text,
     build_media_manifest,
+    load_media_manifest_items,
     media_chunk_match,
     normalize_media_item,
 )
@@ -26,6 +27,8 @@ from pipeline.core.media_context import build_media_reference_contexts
 from pipeline.core.state import PipelineState, StageState, save_state
 from pipeline.stages.formatters.corpus_merge_formatter import (
     CorpusMergeFormatter,
+    _merge_media_manifest_items,
+    _merge_page_media,
     _source_allows_record,
 )
 from pipeline.stages.formatters.media_semantics_formatter import (
@@ -417,6 +420,171 @@ def test_corpus_merge_can_include_url_less_documents_without_web_leakage(tmp_pat
 
     assert _source_allows_record(source, document) is True
     assert _source_allows_record(source, webpage) is False
+
+
+def test_corpus_merge_keeps_current_media_bytes_and_matching_ocr_overlay(tmp_path: Path):
+    overlay_manifest = tmp_path / "overlay.json"
+    current_manifest = tmp_path / "current.json"
+    matching_url = "https://example.test/matching.png"
+    changed_url = "https://example.test/changed.png"
+    overlay_document_url = "https://assets.example.test/overlay-document-figure.png"
+    current_document_url = "https://assets.example.test/current-document-figure.png"
+    current_document_alias_url = (
+        "https://assets.example.test/current-document-figure-alias.png"
+    )
+    atomic_write_json(
+        overlay_manifest,
+        build_media_manifest(
+            [
+                {
+                    "type": "image",
+                    "url": matching_url,
+                    "source_url": "https://example.test/page",
+                    "content_hash": "same-hash",
+                    "semantic_caption": "stale caption",
+                    "ocr_status": "completed",
+                    "ocr_text": "Exact visible text",
+                },
+                {
+                    "type": "image",
+                    "url": changed_url,
+                    "source_url": "https://example.test/page",
+                    "content_hash": "stale-hash",
+                    "ocr_status": "completed",
+                    "ocr_text": "Stale text",
+                },
+                {
+                    "type": "image",
+                    "url": overlay_document_url,
+                    "source_type": "pdf",
+                    "content_hash": "document-hash",
+                    "ocr_status": "completed",
+                    "ocr_text": "Document text",
+                },
+            ]
+        ),
+    )
+    atomic_write_json(
+        current_manifest,
+        build_media_manifest(
+            [
+                {
+                    "type": "image",
+                    "url": matching_url,
+                    "source_url": "https://example.test/page",
+                    "content_hash": "same-hash",
+                    "semantic_caption": "current caption",
+                },
+                {
+                    "type": "image",
+                    "url": changed_url,
+                    "source_url": "https://example.test/page",
+                    "content_hash": "current-hash",
+                    "semantic_caption": "new bytes",
+                },
+                {
+                    "type": "image",
+                    "url": current_document_url,
+                    "source_type": "pdf",
+                    "content_hash": "document-hash",
+                    "semantic_caption": "current document figure",
+                },
+                {
+                    "type": "image",
+                    "url": current_document_alias_url,
+                    "source_type": "pdf",
+                    "content_hash": "document-hash",
+                    "semantic_caption": "same figure in another occurrence",
+                },
+            ]
+        ),
+    )
+    common = {
+        "include_hosts": [],
+        "include_url_prefixes": [],
+        "exclude_hosts": [],
+        "exclude_url_prefixes": [],
+        "allowed_page_media_hashes": [],
+        "include_url_less_documents": True,
+    }
+    items = _merge_media_manifest_items(
+        [
+            {
+                **common,
+                "run_id": "ocr-overlay",
+                "outputs": {"media_manifest_file": str(overlay_manifest)},
+                "media_metadata_overlay": True,
+            },
+            {
+                **common,
+                "run_id": "current-snapshot",
+                "outputs": {"media_manifest_file": str(current_manifest)},
+                "media_snapshot_authority": True,
+            },
+        ],
+        output_key="media_manifest_file",
+        path_map={},
+    )
+
+    by_url = {item["url"]: item for item in items}
+    assert by_url[matching_url]["content_hash"] == "same-hash"
+    assert by_url[matching_url]["semantic_caption"] == "current caption"
+    assert by_url[matching_url]["ocr_status"] == "completed"
+    assert by_url[matching_url]["ocr_text"] == "Exact visible text"
+    assert by_url[changed_url]["content_hash"] == "current-hash"
+    assert by_url[changed_url]["semantic_caption"] == "new bytes"
+    assert by_url[changed_url]["ocr_status"] == ""
+    assert by_url[changed_url]["ocr_text"] == ""
+    assert overlay_document_url not in by_url
+    assert by_url[current_document_url]["semantic_caption"] == "current document figure"
+    assert by_url[current_document_url]["ocr_status"] == "completed"
+    assert by_url[current_document_url]["ocr_text"] == "Document text"
+    assert by_url[current_document_alias_url]["ocr_status"] == "completed"
+    assert by_url[current_document_alias_url]["ocr_text"] == "Document text"
+
+    page_url = "https://example.test/page"
+    overlay_page_media = tmp_path / "overlay-page-media.json"
+    current_page_media = tmp_path / "current-page-media.json"
+    atomic_write_json(
+        overlay_page_media,
+        {
+            page_url: load_media_manifest_items(
+                load_json_safe(overlay_manifest)
+            )[:2]
+        },
+    )
+    atomic_write_json(
+        current_page_media,
+        {
+            page_url: load_media_manifest_items(
+                load_json_safe(current_manifest)
+            )[:2]
+        },
+    )
+    page_items = _merge_page_media(
+        [
+            {
+                **common,
+                "run_id": "ocr-overlay",
+                "outputs": {"page_media_file": str(overlay_page_media)},
+                "media_metadata_overlay": True,
+            },
+            {
+                **common,
+                "run_id": "current-snapshot",
+                "outputs": {"page_media_file": str(current_page_media)},
+                "media_snapshot_authority": True,
+            },
+        ],
+        output_key="page_media_file",
+        path_map={},
+    )
+    page_by_url = {item["url"]: item for item in page_items[page_url]}
+    assert len(page_by_url) == 2
+    assert page_by_url[matching_url]["semantic_caption"] == "current caption"
+    assert page_by_url[matching_url]["ocr_text"] == "Exact visible text"
+    assert page_by_url[changed_url]["content_hash"] == "current-hash"
+    assert page_by_url[changed_url]["ocr_text"] == ""
 
 
 def test_media_semantics_plan_deduplicates_by_content_hash_and_propagates(tmp_path: Path):

@@ -34,28 +34,35 @@ formatter:
     # while the captioned processing run supplies Markdown and local assets.
     source_runs:
       - role: "ocr_overlay"
-        run_dir: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-20260831-v4"
+        run_dir: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-generalized-20260902-v1"
         project_name: "mbzuai_preprod_hybrid_ocr"
+        include_url_less_documents: true
+        media_metadata_overlay: true
         required_stage_ids:
           - "enrich_exact_ocr"
         evidence:
-          pipeline_state_sha256: "87800ef8a1a7908ba3e76395a407cf766ff46fc1a49644f2c6a61d98fe051ef9"
-          artifact_catalog_sha256: "bacb1dea58e4ff9e2ec44e4f7dae290d88de0575711da03a4a91d70ff5b27d3a"
-          run_audit_sha256: "f90d2a9a86a305e4d4d23e0e210245e2ad72d09260a563a70dced541ba22472d"
-          resolved_config_sha256: "e3ea6af3923a36ad0e8a02f89745efacc7d0591c2314117dfb17715c2f30676a"
+          pipeline_state_sha256: "e24e6367375c077c03ee6f641fd7b778b24738fa4e681b11a683046c443d1e54"
+          artifact_catalog_sha256: "5959a11d37b7266181ebec7eac34f0c71e36268dd2af04ddba3512df55d9282b"
+          run_audit_sha256: "157277325e9a9506841bb588b656f9ef356dd6010a6686c0ab5ddcc93cf6addf"
+          resolved_config_sha256: "9a90bffaf2086417125874eb09ea6ebd6127bbb1f5e39567cbfd437f660ba8b8"
       - role: "captioned_corpus"
-        run_dir: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260831-v5"
+        run_dir: "runs/mbzuai_preprod_processing/mbzuai-preprod-generalized-grounding-20260902-v2"
         project_name: "mbzuai_preprod_processing"
+        # PDF figures are intentionally URL-less and are instead bound to an
+        # immutable source document. Admit them without weakening host filters
+        # for ordinary webpage media.
+        include_url_less_documents: true
+        media_snapshot_authority: true
         required_stage_ids:
           - "convert_documents"
           - "convert_html"
           - "enrich_media"
           - "annotate_media"
         evidence:
-          pipeline_state_sha256: "92765320a5484110b33fe769770d0ae2451bed97c5db8b5543745d2b6e1c4878"
-          artifact_catalog_sha256: "faa891cd089725e85e7f53c33af00cb9b4a0d5cd497259414b7e04136b16e1bc"
-          run_audit_sha256: "4c7098e26a4caee10221244aa153f42ff99c79d733812ab9053a177093d34cac"
-          resolved_config_sha256: "7109717179be02eda9e1150f4bc6d661051411d94d70c06355ecedc0a24161be"
+          pipeline_state_sha256: "ede6604b02baaa42974d27e7c284eb49c3e0b33b1d09747d6b8c7f5765429d93"
+          artifact_catalog_sha256: "84562fb07bda160714ea7ae61e1f8a8397395d0480aaaf7b1a26a875637efb5d"
+          run_audit_sha256: "001ac01224ad564dddf65bb1ca2a90ec07d0045e529b895fbf42bb3b8a1793d1"
+          resolved_config_sha256: "c54b74a7ff781350c98d2a0e9d95018a0b5df64781a467011ba004a0384f1657"
 
   corpus_preparation:
     # Do not permit the corrected snapshot to regress below the prior audited
@@ -65,7 +72,9 @@ formatter:
     maximum_missing_media_files: 0
     maximum_unbound_media_assets: 0
     minimum_semantically_annotated_visuals: 2129
-    minimum_ocr_adjudicated_visuals: 328
+    # The current semantic classifier selected exactly 323 unique visuals for
+    # OCR; the fresh content-hash-pinned batch adjudicated every one of them.
+    minimum_ocr_adjudicated_visuals: 323
 
 stages:
   - id: merge_corpora

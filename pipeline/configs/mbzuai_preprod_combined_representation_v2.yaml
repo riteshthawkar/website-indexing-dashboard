@@ -15,10 +15,10 @@ pipeline:
 
 formatter:
   representation_v2:
-    source_corpus_run_dir: "runs/mbzuai_preprod_combined_corpus_preparation/mbzuai-preprod-combined-corpus-20260831-v4"
-    expected_document_count: 1857
+    source_corpus_run_dir: "runs/mbzuai_preprod_combined_corpus_preparation/mbzuai-preprod-combined-corpus-generalized-20260902-v1"
+    expected_document_count: 1829
     expected_page_count: 1959
-    expected_web_document_count: 1795
+    expected_web_document_count: 1767
     maximum_workers: 4
     maximum_topics_per_page: 24
     template_minimum_page_count: 20

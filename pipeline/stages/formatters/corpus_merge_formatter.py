@@ -49,6 +49,24 @@ _SOURCE_FILTER_KEYS = (
     "exclude_hosts",
     "exclude_url_prefixes",
 )
+_OCR_METADATA_KEYS = (
+    "ocr_text",
+    "ocr_status",
+    "ocr_provider",
+    "ocr_provider_revision",
+    "ocr_model",
+    "ocr_model_revision",
+    "ocr_mode",
+    "ocr_prompt_revision",
+    "ocr_input_hash",
+    "ocr_raw_output_sha256",
+    "ocr_latency_ms",
+    "ocr_attempts",
+    "ocr_quality_score",
+    "ocr_quality_flags",
+    "ocr_error",
+    "ocr_completed_at",
+)
 
 
 def _now_iso() -> str:
@@ -541,13 +559,57 @@ def _merge_page_metadata(
     return dict(sorted(merged.items()))
 
 
-def _media_item_key(item: Mapping[str, Any]) -> Tuple[str, ...]:
+def _missing_media_value(value: Any) -> bool:
+    return value in (None, "", [], {})
+
+
+def _media_source_priority(source: Mapping[str, Any]) -> int:
+    if bool(source.get("media_snapshot_authority", False)):
+        return 2
+    if bool(source.get("media_metadata_overlay", False)):
+        return 0
+    return 1
+
+
+def _media_sources_are_overlay_pair(
+    left: Mapping[str, Any], right: Mapping[str, Any]
+) -> bool:
     return (
-        str(item.get("type") or "image"),
-        str(item.get("content_hash") or ""),
-        str(item.get("url") or ""),
-        str(item.get("local_path") or ""),
+        bool(left.get("media_metadata_overlay", False))
+        and bool(right.get("media_snapshot_authority", False))
+    ) or (
+        bool(right.get("media_metadata_overlay", False))
+        and bool(left.get("media_snapshot_authority", False))
     )
+
+
+def _merge_matching_media_content(
+    existing: Dict[str, Any],
+    incoming: Dict[str, Any],
+    existing_source: Mapping[str, Any],
+    incoming_source: Mapping[str, Any],
+) -> Dict[str, Any]:
+    if _media_source_priority(incoming_source) > _media_source_priority(
+        existing_source
+    ):
+        primary, secondary = dict(incoming), existing
+    else:
+        primary, secondary = dict(existing), incoming
+    for key, value in secondary.items():
+        if _missing_media_value(primary.get(key)) and not _missing_media_value(value):
+            primary[key] = value
+    # Exact OCR is a metadata overlay keyed by immutable visual bytes.  It is
+    # safe to carry only when the content hashes match.
+    for source, value in (
+        (existing_source, existing),
+        (incoming_source, incoming),
+    ):
+        if not bool(source.get("media_metadata_overlay", False)):
+            continue
+        for key in _OCR_METADATA_KEYS:
+            if not _missing_media_value(value.get(key)):
+                primary[key] = value[key]
+    return normalize_media_item(primary)
 
 
 def _merge_page_media(
@@ -557,7 +619,8 @@ def _merge_page_media(
     path_map: Mapping[str, str],
 ) -> Dict[str, List[Dict[str, Any]]]:
     merged: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    seen: Dict[str, set[Tuple[str, ...]]] = defaultdict(set)
+    item_index: Dict[str, Dict[Tuple[str, str], int]] = defaultdict(dict)
+    item_sources: Dict[str, Dict[Tuple[str, str], Dict[str, Any]]] = defaultdict(dict)
     for source in sources:
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
@@ -574,11 +637,40 @@ def _merge_page_media(
                     continue
                 item = normalize_media_item(_remap_paths(raw_item, path_map))
                 item["corpus_source_run_id"] = source["run_id"]
-                key = _media_item_key(item)
-                if key in seen[page_url]:
+                item_url = str(item.get("url") or "")
+                key = (
+                    str(item.get("type") or "image"),
+                    item_url
+                    or str(item.get("content_hash") or "")
+                    or str(item.get("local_path") or ""),
+                )
+                existing_index = item_index[page_url].get(key)
+                if existing_index is None:
+                    item_index[page_url][key] = len(merged[page_url])
+                    item_sources[page_url][key] = source
+                    merged[page_url].append(item)
                     continue
-                seen[page_url].add(key)
-                merged[page_url].append(item)
+                existing = merged[page_url][existing_index]
+                existing_source = item_sources[page_url][key]
+                existing_hash = str(existing.get("content_hash") or "").lower()
+                incoming_hash = str(item.get("content_hash") or "").lower()
+                if existing_hash and existing_hash == incoming_hash:
+                    merged[page_url][existing_index] = _merge_matching_media_content(
+                        existing,
+                        item,
+                        existing_source,
+                        source,
+                    )
+                    if _media_source_priority(source) > _media_source_priority(
+                        existing_source
+                    ):
+                        item_sources[page_url][key] = source
+                    continue
+                if _media_source_priority(source) > _media_source_priority(
+                    existing_source
+                ):
+                    merged[page_url][existing_index] = item
+                    item_sources[page_url][key] = source
     return {key: value for key, value in sorted(merged.items())}
 
 
@@ -588,7 +680,16 @@ def _merge_media_manifest_items(
     output_key: str,
     path_map: Mapping[str, str],
 ) -> List[Dict[str, Any]]:
+    # ``build_media_manifest`` deduplicates on media type + URL.  Resolve that
+    # collision here so an older metadata overlay can enrich matching bytes,
+    # but can never shadow changed bytes downloaded by the authoritative
+    # content snapshot at the same URL.
     items: List[Dict[str, Any]] = []
+    item_sources: List[Dict[str, Any]] = []
+    item_index_by_url: Dict[Tuple[str, str], int] = {}
+    item_indices_by_hash: Dict[Tuple[str, str], List[int]] = defaultdict(list)
+    ocr_overlay_by_hash: Dict[str, Dict[str, Any]] = defaultdict(dict)
+
     for source in sources:
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
@@ -613,7 +714,74 @@ def _merge_media_manifest_items(
                 _remap_paths(_filtered_record_metadata(source, raw_item), path_map)
             )
             item["corpus_source_run_id"] = source["run_id"]
-            items.append(item)
+            item_key = (str(item.get("type") or "image"), str(item.get("url") or ""))
+            existing_index = item_index_by_url.get(item_key)
+            incoming_hash = str(item.get("content_hash") or "").lower()
+            if incoming_hash and bool(source.get("media_metadata_overlay", False)):
+                overlay = ocr_overlay_by_hash[incoming_hash]
+                for key in _OCR_METADATA_KEYS:
+                    value = item.get(key)
+                    if not _missing_media_value(value) and _missing_media_value(
+                        overlay.get(key)
+                    ):
+                        overlay[key] = value
+            hash_key = (item_key[0], incoming_hash)
+            if existing_index is None and incoming_hash:
+                for candidate_index in item_indices_by_hash.get(hash_key, []):
+                    candidate = items[candidate_index]
+                    if str(candidate.get("content_hash") or "").lower() != incoming_hash:
+                        continue
+                    if _media_sources_are_overlay_pair(
+                        item_sources[candidate_index], source
+                    ):
+                        existing_index = candidate_index
+                        break
+            if existing_index is None or not item_key[1]:
+                item_index_by_url[item_key] = len(items)
+                items.append(item)
+                item_sources.append(source)
+                if incoming_hash:
+                    item_indices_by_hash[hash_key].append(len(items) - 1)
+                continue
+
+            existing = items[existing_index]
+            existing_source = item_sources[existing_index]
+            existing_hash = str(existing.get("content_hash") or "").lower()
+            if existing_hash and existing_hash == incoming_hash:
+                items[existing_index] = _merge_matching_media_content(
+                    existing,
+                    item,
+                    existing_source,
+                    source,
+                )
+                if _media_source_priority(source) > _media_source_priority(
+                    existing_source
+                ):
+                    item_sources[existing_index] = source
+                item_index_by_url[item_key] = existing_index
+                continue
+
+            if _media_source_priority(source) > _media_source_priority(
+                existing_source
+            ):
+                items[existing_index] = item
+                item_sources[existing_index] = source
+                if incoming_hash:
+                    item_indices_by_hash[hash_key].append(existing_index)
+    # OCR describes immutable bytes, not a particular page occurrence. Apply
+    # the governed overlay to every retained URL occurrence for that hash so a
+    # later alias cannot erase a terminal OCR status during corpus validation.
+    for index, item in enumerate(items):
+        overlay = ocr_overlay_by_hash.get(
+            str(item.get("content_hash") or "").lower()
+        )
+        if not overlay:
+            continue
+        merged = dict(item)
+        for key, value in overlay.items():
+            if not _missing_media_value(value):
+                merged[key] = value
+        items[index] = normalize_media_item(merged)
     return items
 
 
@@ -926,6 +1094,17 @@ class CorpusMergeFormatter(FormatterStage):
                     f"formatter.corpus_merge.source_runs[{index}]."
                     "preserve_media_ids_by_content_hash must be a boolean"
                 )
+            for media_contract_key in (
+                "media_metadata_overlay",
+                "media_snapshot_authority",
+            ):
+                if raw.get(media_contract_key) is not None and not isinstance(
+                    raw.get(media_contract_key), bool
+                ):
+                    errors.append(
+                        f"formatter.corpus_merge.source_runs[{index}]."
+                        f"{media_contract_key} must be a boolean"
+                    )
             for prefix_key in ("include_url_prefixes", "exclude_url_prefixes"):
                 for value in raw.get(prefix_key) or []:
                     normalized = _normalized_url(value)
@@ -1008,6 +1187,12 @@ class CorpusMergeFormatter(FormatterStage):
                 )
                 descriptor["preserve_media_ids_by_content_hash"] = bool(
                     raw_spec.get("preserve_media_ids_by_content_hash", False)
+                )
+                descriptor["media_metadata_overlay"] = bool(
+                    raw_spec.get("media_metadata_overlay", False)
+                )
+                descriptor["media_snapshot_authority"] = bool(
+                    raw_spec.get("media_snapshot_authority", False)
                 )
                 allowed_page_media = _allowed_page_media_associations(descriptor)
                 descriptor["allowed_page_urls_by_media_hash"] = allowed_page_media
