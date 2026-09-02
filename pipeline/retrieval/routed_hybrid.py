@@ -2134,6 +2134,11 @@ class RoutedHybridRetriever:
                 and dense_source_rank[normalized] <= 5
                 and binding_coverage >= 0.20
             )
+            top_dense_partial_identity = bool(
+                normalized in dense_source_rank
+                and dense_source_rank[normalized] <= 1
+                and binding_coverage >= 0.12
+            )
             # A required page is a hard evidence constraint. Bind only when its
             # identity covers most requested concepts, or when independent
             # dense Page Card/chunk representations agree. The latter is the
@@ -2145,6 +2150,7 @@ class RoutedHybridRetriever:
                 binding_coverage >= 0.50
                 or page_card_dense_agreement
                 or dense_identity_agreement
+                or top_dense_partial_identity
             ):
                 continue
             # A planner-provided translation/expansion can bridge languages, but
@@ -2177,7 +2183,7 @@ class RoutedHybridRetriever:
                 page_card_dense_agreement and total_score >= 0.58
             )
             dense_partial_binding = (
-                dense_identity_agreement
+                (dense_identity_agreement or top_dense_partial_identity)
                 and semantic_score >= 0.30
                 and total_score >= 0.54
             )
@@ -2209,11 +2215,21 @@ class RoutedHybridRetriever:
         )
         compound_facet_request = _is_compound_facet_query(query)
         max_pages = 4 if comparison_request else 2 if compound_facet_request else 1
-        score_margin = 0.20 if comparison_request else 0.16 if compound_facet_request else 0.0
+        score_margin = 0.20 if comparison_request else 0.0
         pages = [
             str(page.get("source_url") or "")
             for score, _semantic_score, page in scored
-            if score >= max(0.66, top_score - score_margin)
+            if score
+            >= (
+                0.66
+                if compound_facet_request and not comparison_request
+                else max(0.66, top_score - score_margin)
+            )
+            and (
+                not compound_facet_request
+                or comparison_request
+                or _semantic_score >= 0.50
+            )
         ][:max_pages]
         pages = self._dedupe_explicit_pages_by_family(pages, query=query)
         return {

@@ -346,6 +346,79 @@ def test_generalized_compound_question_retains_two_complementary_pages():
     assert set(inferred["required_pages"]) == {tuition_url, aid_url}
 
 
+def test_generalized_compound_question_keeps_top_dense_partial_identity_page():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    faq_url = "https://www.example.edu/faq/annual-undergraduate-tuition"
+    admissions_url = "https://www.example.edu/admissions/undergraduate"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:faq": {"id": "card:faq", "source_url": faq_url},
+        },
+        chunk_map={
+            "chunk:admissions": {
+                "id": "chunk:admissions",
+                "source_url": admissions_url,
+            },
+            "chunk:faq": {"id": "chunk:faq", "source_url": faq_url},
+        },
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": faq_url,
+            "normalized_url": faq_url,
+            "identity_text": "annual undergraduate tuition scholarship",
+            "identity_tokens": {
+                "annual",
+                "undergraduate",
+                "tuition",
+                "scholarship",
+            },
+            "tokens": {
+                "annual",
+                "undergraduate",
+                "tuition",
+                "scholarship",
+            },
+        },
+        {
+            "source_url": admissions_url,
+            "normalized_url": admissions_url,
+            "identity_text": "undergraduate admissions",
+            "identity_tokens": {"undergraduate", "admissions"},
+            "tokens": {
+                "undergraduate",
+                "tuition",
+                "scholarship",
+                "available",
+            },
+        },
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "How much is undergraduate tuition per year, and what scholarships are available?",
+        "multi_page_aggregation",
+        {
+            "planner_confidence": 0.75,
+            "query_retrieval_expansion": (
+                "undergraduate tuition per year scholarships"
+            ),
+            "dense_page_card_ids": ["card:faq"],
+            "dense_chunk_ids": ["chunk:admissions", "chunk:faq"],
+            "retrieval_documents": [
+                {
+                    "id": "chunk:admissions",
+                    "source_url": admissions_url,
+                }
+            ],
+        },
+    )
+
+    assert set(inferred["required_pages"]) == {faq_url, admissions_url}
+
+
 def test_financial_detail_pack_reserves_complete_leaf_and_drops_fragment_facts():
     program_url = "https://www.example.edu/study/applied-ai"
     exact_chunk_id = "chunk:c650:document-revision:program:00014:fees"
