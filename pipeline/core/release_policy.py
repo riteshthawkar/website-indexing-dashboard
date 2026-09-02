@@ -40,7 +40,11 @@ LEGACY_PREPROD_EVAL_POLICY_ID = "mbzuai-preprod-current-eval-v1"
 LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256 = (
     "671844a284042ca0cede5393f419bf017b471de6ecc5021c0f9f370a96d45135"
 )
-PREPROD_EVAL_POLICY_ID = "mbzuai-preprod-current-eval-v2"
+LEGACY_PREPROD_EVAL_POLICY_ID_V2 = "mbzuai-preprod-current-eval-v2"
+LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V2 = (
+    "a799c89d4930b2565aa139961389b8febe2cf617e36313abfce9fc8511487542"
+)
+PREPROD_EVAL_POLICY_ID = "mbzuai-preprod-current-eval-v3"
 PREPROD_RETRIEVAL_DATASET = (
     PROJECT_ROOT
     / "eval"
@@ -55,7 +59,7 @@ PREPROD_ANSWER_GATES = (
     PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.preprod_current_v1.json"
 )
 PREPROD_RETRIEVAL_DATASET_SHA256 = (
-    "a799c89d4930b2565aa139961389b8febe2cf617e36313abfce9fc8511487542"
+    "01e28bf4b588d83404dfad2191ae33e39641d21fcf248b2a1b88cea9209b4fb2"
 )
 PREPROD_RETRIEVAL_GATES_SHA256 = (
     "08299b4953ac1075624ecf07cbe40c410502df0e5993f58272eae1565407b304"
@@ -103,6 +107,18 @@ _PRODUCTION_EVAL_POLICIES: dict[str, dict[str, Any]] = {
         "retrieval_dataset_sha256": LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256,
         "retrieval_gates_sha256": PREPROD_RETRIEVAL_GATES_SHA256,
         "answer_dataset_sha256": LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256,
+        "answer_gates_sha256": PREPROD_ANSWER_GATES_SHA256,
+        "minimum_retrieval_queries": PREPROD_MIN_RETRIEVAL_QUERIES,
+        "minimum_answer_queries": PREPROD_MIN_ANSWER_QUERIES,
+    },
+    LEGACY_PREPROD_EVAL_POLICY_ID_V2: {
+        "retrieval_dataset": PREPROD_RETRIEVAL_DATASET,
+        "retrieval_gates": PREPROD_RETRIEVAL_GATES,
+        "answer_dataset": PREPROD_ANSWER_DATASET,
+        "answer_gates": PREPROD_ANSWER_GATES,
+        "retrieval_dataset_sha256": LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V2,
+        "retrieval_gates_sha256": PREPROD_RETRIEVAL_GATES_SHA256,
+        "answer_dataset_sha256": LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V2,
         "answer_gates_sha256": PREPROD_ANSWER_GATES_SHA256,
         "minimum_retrieval_queries": PREPROD_MIN_RETRIEVAL_QUERIES,
         "minimum_answer_queries": PREPROD_MIN_ANSWER_QUERIES,
