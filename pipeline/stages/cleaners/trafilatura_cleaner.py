@@ -20,7 +20,10 @@ from pipeline.core.io import (
     reset_stage_output_directory,
 )
 from pipeline.core.registry import register_stage
-from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+from pipeline.stages.cleaners.bs4_cleaner import (
+    clean_html_content,
+    prepare_html_for_content_extraction,
+)
 from pipeline.stages.cleaners.common import (
     CleaningPolicy,
     content_meets_policy,
@@ -225,6 +228,7 @@ class TrafilaturaCleaner(CleanerStage):
         fallback_compared = 0
         structurally_richer_fallbacks = 0
         route_scoped = 0
+        preserved_disclosures = 0
         content_artifacts = []
         dispositions: List[Dict[str, Any]] = []
 
@@ -283,6 +287,14 @@ class TrafilaturaCleaner(CleanerStage):
             if scope_result.applied:
                 route_scoped += 1
                 disposition["route_scope_method"] = scope_result.method
+
+            if config.get("preserve_disclosure_content", True):
+                extraction_input, disclosure_count = prepare_html_for_content_extraction(
+                    extraction_input
+                )
+                preserved_disclosures += disclosure_count
+                if disclosure_count:
+                    disposition["preserved_disclosure_count"] = disclosure_count
 
             extraction_error = None
             try:
@@ -487,11 +499,12 @@ class TrafilaturaCleaner(CleanerStage):
         )
 
         logger.info(
-            "Trafilatura cleaner done: accepted=%d filtered=%d failed=%d retention=%.3f",
+            "Trafilatura cleaner done: accepted=%d filtered=%d failed=%d retention=%.3f disclosures=%d",
             gate["accepted_count"],
             gate["filtered_count"],
             gate["failed_count"],
             gate["retention_ratio"],
+            preserved_disclosures,
         )
 
         outputs = {
@@ -506,6 +519,7 @@ class TrafilaturaCleaner(CleanerStage):
             "removed": gate["filtered_count"],
             "errors": gate["failed_count"],
             "fallback_cleaned": fallback_cleaned,
+            "preserved_disclosures": preserved_disclosures,
             "fallback_compared": fallback_compared,
             "structurally_richer_fallbacks": structurally_richer_fallbacks,
             "route_scoped": route_scoped,

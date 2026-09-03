@@ -23,6 +23,10 @@ quality:
   maximum_error_ratio: 0.0
 
 cleaner:
+  # Public PrimeVue accordion bodies are rendered in the crawl artifact but
+  # collapsed with display:none until a visitor opens them. They are document
+  # content, not hidden boilerplate, and must survive the cleaning checkpoint.
+  preserve_disclosure_content: true
   fail_on_empty_input: true
   fail_on_zero_output: true
   minimum_retention_ratio: 0.75
@@ -111,7 +115,9 @@ formatter:
     context_following_heading_max_distance: 4
     context_html_fallback: true
     max_reference_contexts_per_annotation: 12
-    concurrency: 4
+    # Paid Gemini quota comfortably supports eight bounded workers for this
+    # offline stage; retries and request timeouts still provide backpressure.
+    concurrency: 8
     request_timeout_sec: 90
     retry_attempts: 3
     retry_backoff_sec: 1.0
@@ -130,6 +136,11 @@ formatter:
     reuse_annotation_manifest_files:
       - path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260831-v4/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
         sha256: "d408a28bfc6fa03d30df79fb4e9b0354749da4b79a096c02b60a5c6dbb815774"
+      # Prefer the most recent completed annotation snapshot when the image
+      # occurrence and surrounding-context hash are unchanged. Context altered
+      # by disclosure expansion is deliberately rejected and re-captioned.
+      - path: "runs/mbzuai_preprod_processing/mbzuai-preprod-generalized-grounding-20260902-v2/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
+        sha256: "18e6ad57b6c931ef0518d602f107d7e58a8cc9ce638aa8a67bcf550adc4110dc"
 
 stages:
   - id: crawl_web

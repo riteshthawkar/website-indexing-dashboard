@@ -35,6 +35,22 @@ _TITLED_APPLY_RE = re.compile(
     r"\b(?:titled|called|named)\s+[\"'“‘][^\"'”’]{0,180}\bapply(?:ing)?\b",
     flags=re.IGNORECASE,
 )
+_ADMISSIONS_INFORMATION_RE = re.compile(
+    r"\b(?:admissions?|entry requirements?|admission requirements?|eligibility|eligible|"
+    r"application documents?|supporting documents?|academic requirements?|english proficiency|"
+    r"ielts|toefl|gre|graduate record examination|referees?|recommendation letters?|"
+    r"screening exam|admission interview)\b"
+    r"|(?:القبول|متطلبات القبول|شروط القبول|المتطلبات|الشروط|الأهلية|اهلية|المؤهلات الأكاديمية|"
+    r"الوثائق|المستندات|الوثائق المطلوبة|المستندات المطلوبة|أوراق التقديم|إثبات اللغة الإنجليزية|"
+    r"اختبار اللغة الإنجليزية|اختبار القبول|المقابلة|خطابات التوصية|المراجع)",
+    flags=re.IGNORECASE,
+)
+_DEGREE_AUDIENCE_RE = re.compile(
+    r"\b(?:undergraduate|bachelor|bsc|b\.sc|graduate|master|masters|msc|m\.sc|"
+    r"phd|ph\.d|doctorate|doctoral|applicant)\b"
+    r"|(?:البكالوريوس|الجامعية|الدراسات العليا|الماجستير|ماجستير|الدكتوراه|دكتوراه|متقدم)",
+    flags=re.IGNORECASE,
+)
 
 
 def admissions_workflow_audience(query: Any) -> str:
@@ -65,11 +81,50 @@ def admissions_workflow_audience(query: Any) -> str:
     return ""
 
 
+def admissions_information_audience(query: Any) -> str:
+    """Classify an admissions-information query without encoding an answer.
+
+    Users often ask about eligibility, documents, tests, or interviews without
+    using the verb ``apply``. Those questions still need authoritative
+    admissions/program pages rather than a news story that merely mentions an
+    intake. Requiring either explicit admissions language or a degree audience
+    plus an admissions facet keeps unrelated uses of words such as
+    ``requirements`` out of this route.
+    """
+
+    text = " ".join(str(query or "").split()).casefold()
+    if not text or _NON_ADMISSIONS_APPLICATION_RE.search(text):
+        return ""
+    direct_admissions = bool(re.search(r"\badmissions?\b|(?:القبول)", text))
+    if not _ADMISSIONS_INFORMATION_RE.search(text):
+        return ""
+    if not direct_admissions and not _DEGREE_AUDIENCE_RE.search(text):
+        return ""
+    if re.search(r"\b(?:undergraduate|bachelor|bsc|b\.sc)\b|(?:البكالوريوس|الجامعية)", text):
+        return "undergraduate"
+    if re.search(r"\b(?:phd|ph\.d|doctorate|doctoral)\b|(?:الدكتوراه|دكتوراه)", text):
+        return "phd"
+    if re.search(r"\b(?:master|masters|msc|m\.sc)\b|(?:الماجستير|ماجستير)", text):
+        return "masters"
+    if re.search(r"\bgraduate\b|(?:الدراسات العليا|برامج الدراسات العليا)", text):
+        return "graduate"
+    return "generic"
+
+
+def admissions_query_audience(query: Any) -> str:
+    """Return the audience for workflow or informational admissions queries."""
+
+    return admissions_workflow_audience(query) or admissions_information_audience(query)
+
+
 def is_time_bound_admissions_query(query: Any) -> bool:
     return bool(_TIME_BOUND_RE.search(" ".join(str(query or "").split()).casefold()))
 
 
 def canonical_admissions_marker(query: Any) -> str:
+    # URL pinning is retained only for explicit workflow requests. Informational
+    # questions use the authority score below so retrieval stays semantic and
+    # does not acquire a new query-to-route shortcut.
     audience = admissions_workflow_audience(query)
     return {
         "phd": "/admissions/graduate-phd-admissions",
@@ -89,7 +144,7 @@ def admissions_surface_preference(
 ) -> float:
     """Return a bounded preference for canonical workflow vs. news surfaces."""
 
-    audience = admissions_workflow_audience(query)
+    audience = admissions_query_audience(query)
     if not audience:
         return 0.0
     url = str(source_url or "").casefold().rstrip("/")

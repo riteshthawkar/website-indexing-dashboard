@@ -19,27 +19,27 @@ formatter:
     model_revision: "paddleocr-3.7.0/paddle-3.2.0 + 07dea832e22aefee32ad281d4b80551282e1c168"
     provider_revision: "paddleocr-3.7.0 + transformers-direct"
     quality_revision: "hybrid-exact-ocr-quality-v1"
-    batch_contract_sha256: "4d990f8a9d52df5891d7edddaa1f1ca5a146ba21611d315c6fc2ddbc1309e3ca"
+    batch_contract_sha256: "a5f1cc3e977a23c048b01de9798dfffbe527b2df0041b2fe9cf8ee652645b94a"
     batch_results:
-      path: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-generalized-20260902-v1/results/adjudicated.json"
-      sha256: "0b29d0f5140423e4f892a67dd4ea194d394c3ddf6bbb4b1144b0200f9f1d796b"
+      path: "runs/mbzuai_preprod_hybrid_ocr/mbzuai-preprod-hybrid-ocr-disclosure-fix-20260903-v1/results/adjudicated.json"
+      sha256: "99420502f36e3b9f189b95e88a57832fb61ebd22de0ddbfb45781954b55b9142"
     # A refreshed corpus may remove old visuals. Ignore adjudicated results
     # that are no longer selected, but continue to fail if any current
     # OCR-required content hash is missing from the pinned batch.
     allow_unused_batch_results: true
     input_artifacts:
       page_media_file:
-        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-generalized-grounding-20260902-v2/stage_outputs/annotate_media/semantically_annotated_page_media.json"
-        sha256: "cb3cd877a1296d92f194b1a831a6381418a84ff0433019ea878e126312158a66"
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-disclosure-fix-20260903-v3/stage_outputs/annotate_media/semantically_annotated_page_media.json"
+        sha256: "6b4943a496f457d17470812f7387cca84c14937b0e57168402928e46858bcbb8"
       page_images_file:
-        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-generalized-grounding-20260902-v2/stage_outputs/annotate_media/semantically_annotated_page_images.json"
-        sha256: "18bf12a690ec98a560d35eed8ae088bc4176e8a3651bea684268fb82aa170be8"
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-disclosure-fix-20260903-v3/stage_outputs/annotate_media/semantically_annotated_page_images.json"
+        sha256: "9732ee8040fb77df51aead55b1f1345a823b5ab3949a6279f54633b9064dce1e"
       extracted_images_index_file:
-        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-generalized-grounding-20260902-v2/stage_outputs/annotate_media/semantically_annotated_document_media.json"
-        sha256: "5e6ddea5819d11a86575de26a08be5c6e9be1b190f6f77348294f77f20d394e0"
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-disclosure-fix-20260903-v3/stage_outputs/annotate_media/semantically_annotated_document_media.json"
+        sha256: "abcad2b109c2a60a1f81df2c28182be1e7a6ff672788e63157bc083ac2da3654"
       media_manifest_file:
-        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-generalized-grounding-20260902-v2/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
-        sha256: "18e6ad57b6c931ef0518d602f107d7e58a8cc9ce638aa8a67bcf550adc4110dc"
+        path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-disclosure-fix-20260903-v3/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
+        sha256: "49003ddb0570d7b9a84a7ef9fdb795c2842d13f80446c84570b0c3b7e404035d"
     scope: "all"
     needs_ocr_only: true
     concurrency: 1

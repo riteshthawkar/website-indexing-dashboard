@@ -37,6 +37,51 @@ def test_release_dataset_manifest_matches_multilingual_dataset():
     assert coverage["source_group_split_leak_count"] == 0
 
 
+def test_preprod_release_manifest_and_gate_counts_match_the_committed_dataset():
+    dataset_path = (
+        REPO_ROOT
+        / "eval"
+        / "mbzuai_gold"
+        / "mbzuai_preprod_multilingual_current_v1.jsonl"
+    )
+    manifest = json.loads(
+        (
+            REPO_ROOT
+            / "eval"
+            / "mbzuai_gold"
+            / "mbzuai_preprod_multilingual_current_v1.manifest.json"
+        ).read_text(encoding="utf-8")
+    )
+    examples = load_eval_examples(dataset_path)
+    language_counts = Counter(example.language for example in examples)
+    query_type_counts = Counter(example.query_type for example in examples)
+    answerable_count = sum(not example.no_answer for example in examples)
+    no_answer_count = sum(example.no_answer for example in examples)
+    dataset_manifest = manifest["dataset"]
+
+    assert dataset_manifest["sha256"] == hashlib.sha256(dataset_path.read_bytes()).hexdigest()
+    assert dataset_manifest["query_count"] == len(examples)
+    assert dataset_manifest["answerable_query_count"] == answerable_count
+    assert dataset_manifest["no_answer_query_count"] == no_answer_count
+    assert dataset_manifest["languages"] == dict(language_counts)
+    assert dataset_manifest["query_types"] == dict(query_type_counts)
+
+    for gate_name in (
+        "retrieval_gate.preprod_current_v1.json",
+        "answer_readiness_gate.preprod_current_v1.json",
+    ):
+        gates = json.loads(
+            (REPO_ROOT / "eval" / "gates" / gate_name).read_text(encoding="utf-8")
+        )
+        assert gates["overall"]["query_count"]["min"] == len(examples)
+        assert gates["overall"]["answerable_query_count"]["min"] == answerable_count
+        assert gates["overall"]["no_answer_query_count"]["min"] == no_answer_count
+        for language, count in language_counts.items():
+            assert gates["by_language"][language]["query_count"]["min"] == count
+        for query_type, count in query_type_counts.items():
+            assert gates["by_query_type"][query_type]["query_count"]["min"] == count
+
+
 def test_eval_example_normalizes_supported_language_aliases():
     assert EvalExample(id="ar", query="سؤال", query_type="fact", language="ar").normalized().language == "Arabic"
     assert EvalExample(id="en", query="Question", query_type="fact", language="en").normalized().language == "English"

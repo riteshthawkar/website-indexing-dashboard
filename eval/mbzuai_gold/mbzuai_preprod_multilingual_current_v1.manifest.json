@@ -2,31 +2,33 @@
   "schema_version": 1,
   "suite": "mbzuai_preprod_multilingual_current_v1",
   "created_at": "2026-08-31T16:45:00Z",
-  "purpose": "Release-gating subset of the governed multilingual v2 suite whose complete gold evidence contract exists in the 2026-08-31 preproduction corpus.",
+  "purpose": "Release-gating subset of the governed multilingual v2 suite whose complete gold evidence contract exists in the preproduction corpus, plus the current divisions incident regression.",
   "selection_policy": {
-    "method": "deterministic_gold_id_intersection",
+    "method": "deterministic_gold_id_intersection_plus_incident_regression",
     "source_dataset_rows": 160,
     "retained_rows": 94,
+    "incident_regression_rows": 1,
+    "total_rows": 95,
     "removed_rows": 66,
-    "rule": "Retain a row only when every non-empty gold document, page, section, action, and media identifier resolves in the current immutable retrieval bundle. Preserve the original row and split unchanged.",
+    "rule": "Retain a multilingual-v2 row only when every non-empty gold document, page, section, action, and media identifier resolves in the current immutable retrieval bundle. Preserve those rows and splits unchanged, then add the source-grounded current-divisions incident regression.",
     "quality_thresholds_relaxed": false,
     "holdout_labels_modified": false
   },
   "dataset": {
     "path": "eval/mbzuai_gold/mbzuai_preprod_multilingual_current_v1.jsonl",
-    "sha256": "d48b847fa1a12d49d5f10009988dfc1c47f9e7fb813cde365993f6d3c4762f5c",
-    "query_count": 94,
-    "answerable_query_count": 70,
+    "sha256": "01e28bf4b588d83404dfad2191ae33e39641d21fcf248b2a1b88cea9209b4fb2",
+    "query_count": 95,
+    "answerable_query_count": 71,
     "no_answer_query_count": 24,
     "languages": {
       "Arabic": 31,
-      "English": 63
+      "English": 64
     },
     "query_types": {
       "fact": 52,
       "multimodal": 18,
       "scoped": 20,
-      "synthesis": 4
+      "synthesis": 5
     }
   },
   "source_dataset": {
@@ -34,12 +36,12 @@
     "sha256": "fa400a69bcb9f1a61b6cdb9c8033fed3b16426d2d58b8cec1b427fe097499ac8"
   },
   "source_snapshot": {
-    "representation_bundle": "runs/mbzuai_preprod_combined_representation_v2/mbzuai-preprod-combined-representation-v2-20260831-v3/stage_outputs/extract_page_cards_and_actions/representation_v2_bundle.json",
-    "representation_bundle_sha256": "15068c57c307b706caef1da19e126f3944c0c1a8609416d0f7beb3df720c49cf",
-    "media_manifest": "runs/mbzuai_preprod_combined_corpus_preparation/mbzuai-preprod-combined-corpus-20260831-v4/stage_outputs/prepare_corpus_boundary/prepared_media_manifest.json",
-    "media_manifest_sha256": "7b3a4e1d7955a3534fc24e0758dd07fa776c9ea0e66c084274b8795c2e9ff3c0",
-    "navigation_catalog": "runs/mbzuai_preprod_combined_selected_index_prep_readable_titles/mbzuai-preprod-combined-selected-index-prep-readable-titles-20260831-v3/stage_outputs/bridge_page_graph/page_graph_navigation_catalog.json",
-    "navigation_catalog_sha256": "79d10f71f21f24a59ec57ae433294b6b2e958934418454deff3b71c31b32ce2c",
-    "candidate_records_sha256": "bee4034155a5ef2c4b8ec5af5dbc5e19c345fdf8583bdb92818c21a5d94b8e66"
+    "representation_bundle": "runs/mbzuai_preprod_combined_representation_v2/mbzuai-preprod-combined-representation-disclosure-fix-20260903-v1/stage_outputs/extract_page_cards_and_actions/representation_v2_bundle.json",
+    "representation_bundle_sha256": "82c599d50d5da27446d0b0d5bbecc8a05183ad70edc193e300874d9f3c7b3e81",
+    "media_manifest": "runs/mbzuai_preprod_combined_corpus_preparation/mbzuai-preprod-combined-corpus-disclosure-fix-20260903-v1/stage_outputs/prepare_corpus_boundary/prepared_media_manifest.json",
+    "media_manifest_sha256": "af0b2f102ae93271f9690ef00e9b46a851989365b6bfb8162851d1d9e0eedd71",
+    "navigation_catalog": "runs/mbzuai_preprod_combined_selected_index_prep_readable_titles/mbzuai-preprod-combined-selected-index-prep-disclosure-fix-20260904-v1/stage_outputs/bridge_page_graph/page_graph_navigation_catalog.json",
+    "navigation_catalog_sha256": "464caa6401e12607423a9dd834e02148ac1a4f23cd019a318487d079befc4fe6",
+    "candidate_records_sha256": "c13828383e9f1b22f5c24f46396fc983551d8bea841dc201f6e20887b1063268"
   }
 }

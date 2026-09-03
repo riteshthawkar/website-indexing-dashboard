@@ -4,8 +4,10 @@ from pipeline.core.release import _validation_config_for_release
 from pipeline.core.release_policy import (
     LEGACY_PREPROD_EVAL_POLICY_ID,
     LEGACY_PREPROD_EVAL_POLICY_ID_V2,
+    LEGACY_PREPROD_EVAL_POLICY_ID_V3,
     LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256,
     LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V2,
+    LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V3,
     PREPROD_ANSWER_DATASET,
     PREPROD_ANSWER_GATES,
     PREPROD_EVAL_POLICY_ID,
@@ -92,6 +94,7 @@ def test_previous_preprod_policies_remain_valid_rollback_contracts() -> None:
     legacy_policies = (
         (LEGACY_PREPROD_EVAL_POLICY_ID, LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256),
         (LEGACY_PREPROD_EVAL_POLICY_ID_V2, LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V2),
+        (LEGACY_PREPROD_EVAL_POLICY_ID_V3, LEGACY_PREPROD_RETRIEVAL_DATASET_SHA256_V3),
     )
     for policy_id, dataset_sha256 in legacy_policies:
         retrieval = {

@@ -1,7 +1,7 @@
 {
   "overall": {
-    "query_count": {"min": 94},
-    "answerable_query_count": {"min": 70},
+    "query_count": {"min": 95},
+    "answerable_query_count": {"min": 71},
     "no_answer_query_count": {"min": 24},
     "pass_rate": {"min": 0.9},
     "answerable_pass_rate": {"min": 0.9},
@@ -47,7 +47,7 @@
       "llm_groundedness_mean": {"min": 0.8}
     },
     "synthesis": {
-      "query_count": {"min": 4},
+      "query_count": {"min": 5},
       "pass_rate": {"min": 0.88},
       "llm_completeness_mean": {"min": 0.8},
       "llm_helpfulness_mean": {"min": 0.8}
@@ -83,8 +83,8 @@
   },
   "by_language": {
     "English": {
-      "query_count": {"min": 63},
-      "answerable_query_count": {"min": 51},
+      "query_count": {"min": 64},
+      "answerable_query_count": {"min": 52},
       "no_answer_query_count": {"min": 12},
       "pass_rate": {"min": 0.9},
       "support_present_rate": {"min": 0.92},

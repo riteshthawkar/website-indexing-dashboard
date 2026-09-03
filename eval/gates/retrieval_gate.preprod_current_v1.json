@@ -1,7 +1,7 @@
 {
   "overall": {
-    "query_count": {"min": 94},
-    "answerable_query_count": {"min": 70},
+    "query_count": {"min": 95},
+    "answerable_query_count": {"min": 71},
     "no_answer_query_count": {"min": 24},
     "retrieval_error_count": {"max": 0},
     "successful_query_count": {"min": 94},
@@ -46,8 +46,8 @@
       "evidence_quote_coverage_at_10": {"min": 0.54}
     },
     "English": {
-      "query_count": {"min": 63},
-      "answerable_query_count": {"min": 51},
+      "query_count": {"min": 64},
+      "answerable_query_count": {"min": 52},
       "no_answer_query_count": {"min": 12},
       "no_answer_violation_rate": {"max": 0.0},
       "unsupported_abstention_rate": {"min": 1.0},
@@ -78,7 +78,7 @@
       "navigation_page_hit_at_1": {"min": 1.0}
     },
     "synthesis": {
-      "query_count": {"min": 4},
+      "query_count": {"min": 5},
       "chunk_source_hit_at_10": {"min": 0.75},
       "document_hit_at_10": {"min": 0.95},
       "page_card_hit_at_5": {"min": 0.90},

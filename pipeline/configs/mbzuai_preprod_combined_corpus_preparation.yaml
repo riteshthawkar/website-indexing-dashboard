@@ -56,15 +56,15 @@ formatter:
           run_audit_sha256: "a10fb89bba682972fa06c8ac678d3f4cc22658a76ec15b408fe78e86e6cce2ec"
           resolved_config_sha256: "34210b98f44ebbd9351fdb09ea4e03ce235a17524286ba9fdf220aef92809a95"
       - role: "refreshed_preproduction_main_site"
-        run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-generalized-20260902-v6"
+        run_dir: "runs/mbzuai_preprod_corpus_preparation/mbzuai-preprod-corpus-disclosure-fix-20260903-v4"
         project_name: "mbzuai_preprod_corpus_preparation"
         required_stage_ids:
           - "prepare_corpus_boundary"
         evidence:
-          pipeline_state_sha256: "e4514c9425feaf314d1dfa396fd480f121e1e7edda4fdc79928fa0965159cb46"
-          artifact_catalog_sha256: "299af76237d4e2948fd2a3ae0672600cdbfdecea64e8120ec73b5ad7b5113f5d"
-          run_audit_sha256: "4be30799ef045127fb55b83dd2f3d3fa72f4f2453e398ee49c52de5852a29672"
-          resolved_config_sha256: "86aebdafa943725f88bda0710f726ea2a7b0f7bba733dcb8fc608478f7c28bd3"
+          pipeline_state_sha256: "2a1c62b32c3817bf86dea5edd9dd838d37cc91558a33752aa2e1b158bcf09e21"
+          artifact_catalog_sha256: "d89cb31dd52aa23894e6927e37918783bff633e2794daa580d333839ecc1b945"
+          run_audit_sha256: "285bc5bdac0a4f0929d42eb5294f213566f172088bdd8671d834f2eeda4c9fb2"
+          resolved_config_sha256: "db71317ba64f2088b73923025ef823bc7f0c6d54ecb9803ea630b15ab7cc9106"
 
   corpus_preparation:
     minimum_document_count: 1800

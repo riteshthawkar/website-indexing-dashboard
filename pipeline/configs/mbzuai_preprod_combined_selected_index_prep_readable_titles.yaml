@@ -7,4 +7,4 @@ project_name: "mbzuai_preprod_combined_selected_index_prep_readable_titles"
 
 formatter:
   page_graph_bridge:
-    source_representation_run_dir: "runs/mbzuai_preprod_combined_representation_v2/mbzuai-preprod-combined-representation-generalized-20260902-v1"
+    source_representation_run_dir: "runs/mbzuai_preprod_combined_representation_v2/mbzuai-preprod-combined-representation-disclosure-fix-20260903-v1"

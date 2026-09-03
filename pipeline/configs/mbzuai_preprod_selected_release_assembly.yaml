@@ -8,24 +8,26 @@ project_name: "mbzuai_preprod_combined_selected_release_assembly"
 formatter:
   selected_release_assembly:
     excluded_document_revision_ids:
+      # Internal preproduction component showcase; not public university content.
+      - "document-revision:a26841511965d6bb16830ac2"
       - "document-revision:7ddc4c25b58b1a46bcaf730d"
       - "document-revision:eb7e6316bae431c75a332663"
       - "document-revision:41ff7ff60291e89cc7ae2289"
       - "document-revision:9dcb343a8590e5cb253ff6fb"
       - "document-revision:16b53c2b81c101733fde1eea"
-    checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep_readable_titles/mbzuai-preprod-combined-selected-index-prep-generalized-20260902-v1"
-    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-generalized-20260902-v1/candidates/c650/manifest.json"
-    candidate_manifest_sha256: "5bcde3f15dfb94e1fb3adac80bbbf35990da26dee29c45a220e9629c3ed18d98"
-    candidate_records_file: "runs/evaluation/mbzuai-preprod-combined-c650-generalized-20260902-v1/candidates/c650/records.jsonl"
-    candidate_records_sha256: "7bf419fc2517507b5f10cfad9c646c260ef5a2cf626485e1c97171ee84a9506c"
+    checkpoint_run_dir: "runs/mbzuai_preprod_combined_selected_index_prep_readable_titles/mbzuai-preprod-combined-selected-index-prep-disclosure-fix-20260904-v1"
+    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-combined-c650-disclosure-fix-20260904-v1/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "7951790d32ac3cabbc0a0612b259f7eb97ec513ab76f74b935b661e458047d94"
+    candidate_records_file: "runs/evaluation/mbzuai-preprod-combined-c650-disclosure-fix-20260904-v1/candidates/c650/records.jsonl"
+    candidate_records_sha256: "c13828383e9f1b22f5c24f46396fc983551d8bea841dc201f6e20887b1063268"
     checkpoint_evidence:
-      pipeline_state_sha256: "00464742d68baa03a2d696699356c6561765f9f6372996f0b0463ecac7216c3e"
-      artifact_catalog_sha256: "e89fd8d995f4d4ec972be5f45686869f220c1495b8d2ad3cc0be8dabd2dd180f"
-      run_audit_sha256: "5e6394f90a3b3c30ca8bf262677fb6d241c3fcd7035fae8469d5a50d7f2f3912"
-      resolved_config_sha256: "e33278bb8123388c4d0dc17501556d579516572cb69425ffa3aac2872fa96008"
-      chunk_index_sha256: "f0a5dc7a3d6e3e9a6268ee02776054df1697bca8ce6c458f86ddae513cf99040"
-      page_graph_bridge_sha256: "014e53798cd46119646ea8e553a2ed6a0e275a9207458fdaa26b4bd971a845b0"
-      navigation_catalog_sha256: "ad57a60dfaf915332c83bf9e51392dde87e4bdc67dfbba4448c3b8f85a269a97"
+      pipeline_state_sha256: "0812427d9938e944003be5de3237eb6b749fe9e169a977b988f0566386e39b1f"
+      artifact_catalog_sha256: "2ab48effc2149064ebb31c98e895dad32c5cf98bad5f3f9e6c7d9d88d2d62c3f"
+      run_audit_sha256: "b25972b0921dee3086bb7020620ee4025951a4089384c5085b29f985bfde4bbe"
+      resolved_config_sha256: "f5b1d3bcf7d0638519a86391ca41d74cb6fb5be1b374c4453a148db7f0e331a5"
+      chunk_index_sha256: "47b44ea52bf40a54ae3dda74e3ae33e6238473353fdd4239954f2667a91f81d1"
+      page_graph_bridge_sha256: "d466d70010460993c57e5e602070ca8d57807f6cf0b2de958896716bf2092246"
+      navigation_catalog_sha256: "464caa6401e12607423a9dd834e02148ac1a4f23cd019a318487d079befc4fe6"
 
 stages:
   - id: verify_selected_profile

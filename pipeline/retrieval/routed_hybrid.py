@@ -19,6 +19,7 @@ from pipeline.core.evidence_adjudicator import (
 )
 from pipeline.core.admissions_routing import (
     admissions_surface_preference,
+    admissions_query_audience,
     canonical_admissions_marker,
 )
 from pipeline.core.navigation_intent import normalize_navigation_context
@@ -78,6 +79,481 @@ def _is_compound_facet_query(query: str) -> bool:
     """
 
     return len(_INTERROGATIVE_CLAUSE_RE.findall(str(query or ""))) >= 2
+
+
+_ARABIC_DIACRITICS_RE = re.compile(r"[\u064b-\u065f\u0670\u06d6-\u06ed\u0640]")
+
+
+def _normalized_intent_text(query: Any) -> str:
+    return " ".join(
+        _ARABIC_DIACRITICS_RE.sub("", str(query or "").casefold()).split()
+    )
+
+
+def _multilingual_retrieval_bridge_tokens(query: str) -> List[str]:
+    """Return category/facet translations for cross-script lexical recall.
+
+    These are vocabulary bridges, not query-to-page mappings and not answer
+    values. They remain enabled when legacy query-specific shortcuts are off,
+    so an Arabic request can still match English-only Page Cards and chunks.
+    """
+
+    normalized = _normalized_intent_text(query)
+    if not re.search(r"[\u0600-\u06ff]", normalized):
+        return []
+    aliases: List[str] = []
+    contracts = (
+        (("القبول", "التقديم", "للتقديم", "تقديم", "طلب الالتحاق"), ("admissions", "application")),
+        (("متطلبات", "المتطلبات", "شروط", "الشروط", "معايير"), ("requirements", "eligibility", "criteria")),
+        (("وثائق", "الوثائق", "مستندات", "المستندات", "اوراق", "الأوراق"), ("documents", "transcript", "certificate")),
+        (("الماجستير", "ماجستير"), ("masters", "msc", "graduate")),
+        (("الدكتوراه", "دكتوراه"), ("phd", "doctoral", "graduate")),
+        (("البكالوريوس", "الجامعية"), ("undergraduate", "bachelor")),
+        (("اللغة الانجليزية", "اللغة الإنجليزية", "اتقان اللغة", "إتقان اللغة"), ("english", "proficiency", "ielts", "toefl")),
+        (("التوصية", "المراجع", "المعرفين"), ("recommendation", "referees", "references")),
+        (("اختبار الفرز", "اختبار القبول", "الاختبار"), ("screening", "exam")),
+        (("المقابلة", "مقابلة"), ("interview",)),
+        (("المنح", "منح", "المنحة", "تمويل"), ("scholarship", "funding")),
+        (("الرسوم الدراسية", "الرسوم", "تكاليف الدراسة"), ("tuition", "fees")),
+        (("السكن", "الاقامة", "الإقامة"), ("accommodation", "housing")),
+        (("راتب", "المخصص الشهري", "المكافاة", "المكافأة"), ("stipend", "monthly")),
+        (("التامين الصحي", "التأمين الصحي", "الرعاية الصحية"), ("healthcare", "insurance")),
+        (("التاشيرة", "التأشيرة"), ("visa",)),
+        (("البرامج", "برامج", "التخصصات", "تخصصات"), ("programs", "disciplines")),
+        (("الشعب", "الاقسام", "الأقسام", "القطاعات"), ("divisions", "departments")),
+    )
+    for markers, terms in contracts:
+        if any(marker in normalized for marker in markers):
+            aliases.extend(terms)
+    return list(dict.fromkeys(aliases))
+
+
+def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
+    """Infer answer facets that evidence must cover before it is complete.
+
+    The contract is intentionally semantic: it names common information
+    fields and synonyms, never a page URL or the value that should be returned.
+    """
+
+    normalized = _normalized_intent_text(query)
+    facets: List[Dict[str, Any]] = []
+
+    def add(
+        name: str,
+        aliases: Sequence[str],
+        *,
+        min_alias_matches: int = 1,
+        min_sources: int = 1,
+        same_source: bool = False,
+        report_in_answer: bool = True,
+    ) -> None:
+        if any(str(item.get("name") or "") == name for item in facets):
+            return
+        clean_aliases = list(
+            dict.fromkeys(str(value).strip() for value in aliases if str(value).strip())
+        )
+        if clean_aliases:
+            facets.append(
+                {
+                    "name": name,
+                    "aliases": clean_aliases,
+                    "min_alias_matches": max(1, min(int(min_alias_matches), len(clean_aliases))),
+                    "min_sources": max(1, int(min_sources)),
+                    "same_source": bool(same_source),
+                    "report_in_answer": bool(report_in_answer),
+                }
+            )
+
+    admissions_context = bool(
+        re.search(
+            r"\b(?:admissions?|applicants?|application|entry requirements?|eligibility|"
+            r"english proficiency|ielts|toefl|gre|referees?|screening exam|admission interview)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "القبول",
+                "التقديم",
+                "للتقديم",
+                "تقديم",
+                "طلب الالتحاق",
+                "الوثائق",
+                "المستندات",
+                "المتطلبات",
+                "الوثائق المطلوبة",
+                "المستندات المطلوبة",
+            )
+        )
+    ) and bool(
+        re.search(r"\b(?:admissions?|applicants?|application|undergraduate|bachelor|graduate|master|masters|msc|phd|doctoral)\b", normalized)
+        or any(marker in normalized for marker in ("القبول", "التقديم", "للتقديم", "الماجستير", "الدكتوراه", "البكالوريوس", "الدراسات العليا"))
+    )
+    broad_admissions = admissions_context and bool(
+        re.search(r"\b(?:all|complete|full|detailed|requirements?|documents?)\b", normalized)
+        or any(
+            marker in normalized
+            for marker in (
+                "كل المتطلبات",
+                "جميع المتطلبات",
+                "المتطلبات المطلوبة",
+                "الوثائق والمتطلبات",
+                "كافة الوثائق",
+                "بالتفصيل",
+            )
+        )
+    )
+    if admissions_context:
+        if broad_admissions or re.search(r"\b(?:academic|degree|gpa|cgpa|eligibility)\b", normalized) or "المؤهل" in normalized:
+            add(
+                "academic eligibility",
+                ("academic eligibility", "completed degree", "bachelor's degree", "bachelors degree", "cgpa", "gpa"),
+            )
+        if broad_admissions or re.search(r"\b(?:english|ielts|toefl|proficiency)\b", normalized) or "اللغة الانجليزية" in normalized or "اللغة الإنجليزية" in normalized:
+            add(
+                "English-language proficiency",
+                ("english language proficiency", "english proficiency", "ielts", "toefl", "emsat"),
+            )
+        if broad_admissions or re.search(r"\b(?:gre|graduate record examination|standardi[sz]ed test)\b", normalized):
+            add("standardized-test policy", ("gre", "graduate record examination"))
+        if broad_admissions or re.search(r"\b(?:documents?|transcripts?|certificates?)\b", normalized) or any(marker in normalized for marker in ("الوثائق", "المستندات", "الأوراق")):
+            add(
+                "application documents",
+                ("official transcript", "transcript", "degree certificate", "completed degree certificate", "certificate of recognition"),
+            )
+            add(
+                "statement of purpose",
+                ("statement of purpose", "500-1000 word essay", "motivation for applying", "personal statement"),
+            )
+        if broad_admissions or re.search(r"\b(?:references?|referees?|recommendation)\b", normalized) or any(marker in normalized for marker in ("التوصية", "المراجع", "المعرفين")):
+            add(
+                "references",
+                ("referees", "referee", "recommendation", "reference letter"),
+            )
+        if broad_admissions or re.search(r"\b(?:screening|assessment)\b", normalized) or "اختبار" in normalized:
+            add("screening", ("screening exam", "online screening", "screening process"))
+        if broad_admissions or re.search(r"\binterview\b", normalized) or "المقابلة" in normalized:
+            add("interview", ("admission interview", "interview with faculty", "interview"))
+        if broad_admissions:
+            add(
+                "coherent admissions criteria",
+                (
+                    "completed degree",
+                    "english language proficiency",
+                    "gre",
+                    "official transcript",
+                    "statement of purpose",
+                    "referees",
+                    "screening exam",
+                    "interview",
+                ),
+                min_alias_matches=6,
+                same_source=True,
+                report_in_answer=False,
+            )
+
+    scholarship_context = bool(
+        re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
+        or any(marker in normalized for marker in ("المنح", "المنحة", "تمويل"))
+    )
+    scholarship_coverage = scholarship_context and bool(
+        re.search(r"\b(?:cover|covers|coverage|include|includes|benefits?|support|full|detail)\b", normalized)
+        or any(marker in normalized for marker in ("تغطي", "التغطية", "تشمل", "المزايا", "الدعم"))
+    )
+    if scholarship_context:
+        add(
+            "scholarship availability and scope",
+            ("scholarship", "financial aid", "funding", "eligible", "available", "offer", "full"),
+            min_alias_matches=2,
+        )
+    if scholarship_coverage:
+        add("tuition coverage", ("tuition", "tuition coverage", "tuition fees"))
+        add("living stipend", ("monthly stipend", "stipend", "living allowance"))
+        add("accommodation support", ("accommodation", "housing"))
+        add("health coverage", ("healthcare", "health insurance", "medical insurance"))
+        add("visa support", ("student visa", "visa sponsorship", "visa"))
+        add(
+            "coherent scholarship coverage",
+            ("tuition", "stipend", "accommodation", "healthcare", "student visa"),
+            min_alias_matches=5,
+            same_source=True,
+            report_in_answer=False,
+        )
+
+    tuition_amount_query = bool(
+        re.search(r"\b(?:tuition|fees?|costs?|charges?|price|how much|per year|per credit)\b", normalized)
+        or any(marker in normalized for marker in ("الرسوم", "التكلفة", "التكاليف", "كم تبلغ"))
+    )
+    if tuition_amount_query:
+        add(
+            "tuition amount",
+            ("annual tuition", "tuition fee", "per year", "per credit", "cost", "aed", "usd"),
+        )
+
+    division_program_mapping = bool(
+        (
+            re.search(r"\b(?:divisions?|departments?|schools?)\b", normalized)
+            or any(marker in normalized for marker in ("الأقسام", "الاقسام", "الشعب", "القطاعات"))
+        )
+        and (
+            re.search(r"\b(?:programs?|degrees?|disciplines?|offerings?)\b", normalized)
+            or any(marker in normalized for marker in ("البرامج", "التخصصات", "الدرجات"))
+        )
+        and (
+            re.search(r"\b(?:each|per|belong|under|map|mapped|across)\b", normalized)
+            or any(marker in normalized for marker in ("كل قسم", "لكل قسم", "تتبع", "ضمن"))
+        )
+    )
+    if division_program_mapping:
+        add(
+            "program-to-division mapping",
+            ("under our division", "our division currently offers", "programs across", "graduate programs", "programs"),
+            min_sources=2,
+        )
+    return facets
+
+
+def _durable_information_surface_preference(query: str, page: Mapping[str, Any]) -> float:
+    """Prefer durable institutional pages over incidental news mentions."""
+
+    normalized = _normalized_intent_text(query)
+    source_url = str(page.get("normalized_url") or page.get("source_url") or "").casefold()
+    page_type = str(page.get("page_type") or "").casefold()
+    identity = str(page.get("identity_text") or "").casefold()
+    search_text = str(page.get("search_text") or "").casefold()
+    is_news = page_type == "news_or_event" or "/knowledge-center/the-node/" in source_url
+    asks_news = bool(
+        re.search(r"\b(?:news|announcement|announced|latest|current|today|20\d{2})\b", normalized)
+        or any(marker in normalized for marker in ("خبر", "أخبار", "احدث", "أحدث", "اعلان", "إعلان"))
+    )
+    durable_topic = bool(
+        re.search(
+            r"\b(?:admissions?|requirements?|eligibility|documents?|scholarships?|funding|"
+            r"tuition|programs?|curriculum|divisions?|departments?|leadership|governance)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "القبول",
+                "المتطلبات",
+                "الوثائق",
+                "المنح",
+                "الرسوم",
+                "البرامج",
+                "الأقسام",
+                "القيادة",
+            )
+        )
+    )
+    score = -1.05 if durable_topic and is_news and not asks_news else 0.0
+    admissions_or_program = page_type == "admissions_or_program" or any(
+        marker in source_url for marker in ("/admissions", "/study/", "/program")
+    )
+    if durable_topic and admissions_or_program and not is_news:
+        score += 0.36
+
+    scholarship_query = bool(
+        re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
+        or any(marker in normalized for marker in ("المنح", "المنحة", "تمويل"))
+    )
+    if scholarship_query and not is_news:
+        if any(term in f"{identity} {search_text}" for term in ("scholarship", "financial aid", "funding")):
+            score += 0.62
+        if re.search(r"\b(?:master|masters|msc|m\.sc)\b", normalized) or "الماجستير" in normalized:
+            if any(marker in source_url for marker in ("/msc-programs", "/master")):
+                score += 0.32
+            elif any(marker in source_url for marker in ("/phd", "undergraduate")):
+                score -= 0.45
+
+    division_mapping_query = bool(
+        re.search(r"\b(?:divisions?|departments?)\b", normalized)
+        and re.search(r"\b(?:programs?|degrees?|disciplines?|offerings?)\b", normalized)
+    )
+    if division_mapping_query and not is_news:
+        if "division" in identity:
+            score += 0.30
+        if "program" in search_text:
+            score += 0.44
+        if "research division" in normalized and "undergraduate" in identity:
+            score -= 0.90
+    return score
+
+
+def _durable_page_candidate_allowed(query: str, page: Mapping[str, Any]) -> bool:
+    """Reject a dense-consensus page that does not discuss the requested topic."""
+
+    normalized = _normalized_intent_text(query)
+    source_url = str(page.get("normalized_url") or page.get("source_url") or "").casefold()
+    page_type = str(page.get("page_type") or "").casefold()
+    identity = str(page.get("identity_text") or "").casefold()
+    search_text = str(page.get("search_text") or "").casefold()
+    token_text = " ".join(str(value) for value in (page.get("tokens") or []))
+    blob = f"{source_url} {identity} {search_text} {token_text}"
+
+    scholarship_query = bool(
+        re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
+        or any(marker in normalized for marker in ("المنح", "المنحة", "تمويل"))
+    )
+    if scholarship_query:
+        scholarship_surface = any(
+            marker in blob
+            for marker in (
+                "scholarship",
+                "financial aid",
+                "funding",
+                "منحة",
+                "المنح",
+                "تمويل",
+            )
+        )
+        separate_financial_facet = bool(
+            _is_compound_facet_query(query)
+            and (
+                re.search(r"\b(?:tuition|fees?|costs?|charges?)\b", normalized)
+                or any(marker in normalized for marker in ("الرسوم", "التكلفة", "التكاليف"))
+            )
+            and (
+                re.search(r"\b(?:tuition|fees?|costs?|charges?|annual)\b", blob)
+                or any(marker in blob for marker in ("الرسوم", "التكلفة", "التكاليف"))
+            )
+        )
+        if not scholarship_surface and not separate_financial_facet:
+            return False
+        masters_query = bool(
+            re.search(r"\b(?:master|masters|msc|m\.sc)\b", normalized)
+            or "الماجستير" in normalized
+        )
+        doctoral_query = bool(
+            re.search(r"\b(?:phd|ph\.d|doctoral|doctorate)\b", normalized)
+            or "الدكتوراه" in normalized
+        )
+        if masters_query and not doctoral_query and scholarship_surface:
+            masters_surface = bool(
+                re.search(r"\b(?:master|masters|msc|m\.sc|graduate programs?)\b", blob)
+                or "الماجستير" in blob
+            )
+            if not masters_surface:
+                return False
+            if "undergraduate" in identity and not re.search(
+                r"\b(?:master|masters|msc|m\.sc)\b", identity
+            ):
+                return False
+
+    admissions_audience = admissions_query_audience(query)
+    if admissions_audience:
+        admissions_identity = bool(
+            "admission" in source_url
+            or "admission" in identity
+            or page_type == "admissions_or_program"
+            or any(marker in identity for marker in ("القبول", "التقديم"))
+        )
+        applicant_requirements = bool(
+            re.search(r"\bapplicants?\b", blob)
+            and re.search(
+                r"\b(?:requirements?|eligibility|transcripts?|degree certificate|english proficiency|"
+                r"ielts|toefl|gre|referees?|screening exam|admission interview)\b",
+                blob,
+            )
+        )
+        if not (admissions_identity or applicant_requirements):
+            return False
+        if admissions_audience == "masters":
+            if "undergraduate" in identity or "/undergraduate" in source_url:
+                return False
+            if not (
+                re.search(r"\b(?:master|masters|msc|m\.sc|graduate)\b", blob)
+                or "الماجستير" in blob
+            ):
+                return False
+        elif admissions_audience == "undergraduate":
+            if not (
+                re.search(r"\b(?:undergraduate|bachelor|bsc|b\.sc)\b", blob)
+                or any(marker in blob for marker in ("البكالوريوس", "الجامعية"))
+            ):
+                return False
+
+    division_mapping = bool(
+        (
+            re.search(r"\b(?:divisions?|departments?|schools?)\b", normalized)
+            or any(marker in normalized for marker in ("الأقسام", "الاقسام", "الشعب"))
+        )
+        and (
+            re.search(r"\b(?:programs?|degrees?|disciplines?|offerings?)\b", normalized)
+            or any(marker in normalized for marker in ("البرامج", "التخصصات", "الدرجات"))
+        )
+    )
+    if division_mapping:
+        if not (
+            re.search(r"\b(?:division|department|school)\b", blob)
+            and re.search(r"\b(?:programs?|degrees?|disciplines?|offerings?)\b", blob)
+        ):
+            return False
+    return True
+
+
+def _page_facet_coverage_score(
+    facets: Sequence[Mapping[str, Any]],
+    page: Mapping[str, Any],
+) -> float:
+    """Reward pages whose own content can satisfy a multi-aspect contract."""
+
+    if not facets:
+        return 0.0
+    blob = " ".join(
+        (
+            str(page.get("identity_text") or ""),
+            str(page.get("search_text") or ""),
+            " ".join(str(value) for value in (page.get("tokens") or [])),
+        )
+    ).casefold()
+    page_tokens = set(_tokenize(blob))
+    score = 0.0
+    for facet in facets:
+        aliases = [str(value).strip().casefold() for value in facet.get("aliases") or [] if str(value).strip()]
+        if not aliases:
+            continue
+        hits = 0
+        for alias in aliases:
+            alias_tokens = set(_tokenize(alias))
+            if alias in blob or (alias_tokens and alias_tokens <= page_tokens):
+                hits += 1
+        required = max(1, int(facet.get("min_alias_matches") or 1))
+        if hits >= required:
+            score += 0.34
+        elif hits:
+            score += min(0.22, 0.18 * hits / float(required))
+    return min(2.4, score)
+
+
+def _page_satisfies_required_facets(
+    facets: Sequence[Mapping[str, Any]],
+    page: Mapping[str, Any],
+) -> bool:
+    if not facets:
+        return False
+    blob = " ".join(
+        (
+            str(page.get("identity_text") or ""),
+            str(page.get("search_text") or ""),
+            " ".join(str(value) for value in (page.get("tokens") or [])),
+        )
+    ).casefold()
+    page_tokens = set(_tokenize(blob))
+    for facet in facets:
+        if int(facet.get("min_sources") or 1) > 1:
+            return False
+        hits = 0
+        for raw_alias in facet.get("aliases") or []:
+            alias = str(raw_alias).strip().casefold()
+            if not alias:
+                continue
+            alias_tokens = set(_tokenize(alias))
+            if alias in blob or (alias_tokens and alias_tokens <= page_tokens):
+                hits += 1
+        if hits < max(1, int(facet.get("min_alias_matches") or 1)):
+            return False
+    return True
 _GENERALIZED_PAGE_STOPWORDS = {
     "a", "about", "all", "an", "and", "are", "at", "be", "does", "do",
     "every", "for", "from", "have", "how", "in", "include", "is", "it",
@@ -557,15 +1033,33 @@ class RoutedHybridRetriever:
         if (
             self.parallel_query_rewriting_enabled
             and not generic_contact_query
-            and getattr(self, "query_specific_retrieval_rules_enabled", True)
         ):
-            semantic_aliases = _semantic_query_alias_tokens(query)
+            multilingual_aliases = _multilingual_retrieval_bridge_tokens(query)
+            if multilingual_aliases:
+                candidate = self._append_alias_tokens(
+                    vector_query,
+                    multilingual_aliases,
+                    max_new_tokens=18,
+                )
+                if candidate != vector_query:
+                    vector_query = candidate
+                    graph_query = self._append_alias_tokens(
+                        graph_query,
+                        multilingual_aliases,
+                        max_new_tokens=18,
+                    )
+                    labels.append("multilingual_semantic_bridge")
+            semantic_aliases = (
+                _semantic_query_alias_tokens(query)
+                if getattr(self, "query_specific_retrieval_rules_enabled", True)
+                else []
+            )
             if semantic_aliases:
                 candidate = self._append_alias_tokens(vector_query, semantic_aliases, max_new_tokens=6)
                 if candidate != vector_query:
                     vector_query = candidate
                     labels.append("semantic_alias_expansion")
-            graph_query = vector_query
+                    graph_query = vector_query
             if relation_plan is not None and self.graph is not None:
                 candidate = self.graph._expanded_relation_query(graph_query, relation_plan)
                 if candidate != graph_query:
@@ -1123,6 +1617,11 @@ class RoutedHybridRetriever:
             for value in (plan.get("required_sections") or [])
             if str(value).strip()
         ]
+        required_facets = [
+            dict(value)
+            for value in (plan.get("required_facets") or [])
+            if isinstance(value, Mapping) and str(value.get("name") or "").strip()
+        ]
         selected_span_ids = [
             str(value)
             for value in (payload.get("selected_evidence_span_ids") or [])
@@ -1144,7 +1643,7 @@ class RoutedHybridRetriever:
             ]
             if missing_pages:
                 coverage_status = "partial" if has_evidence else "insufficient"
-        elif (required_entities or required_sections) and not selected_span_ids:
+        elif (required_entities or required_sections or required_facets) and not selected_span_ids:
             coverage_status = "partial" if has_evidence else "insufficient"
         plan["selected_span_ids"] = selected_span_ids
         plan["coverage_status"] = coverage_status
@@ -1216,12 +1715,23 @@ class RoutedHybridRetriever:
             for value in (payload.get("required_sections") or inferred.get("required_sections") or [])
             if str(value).strip()
         ]
+        raw_required_facets = (
+            payload.get("required_facets")
+            or inferred.get("required_facets")
+            or _required_evidence_facets(query)
+        )
+        required_facets = [
+            dict(value)
+            for value in (raw_required_facets or [])
+            if isinstance(value, Mapping) and str(value.get("name") or "").strip()
+        ]
         return self._refresh_coverage_plan_status({
             "intent": intent,
             "required_entities": required_entities,
             "required_pages": required_pages,
             "required_pages_source": required_pages_source,
             "required_sections": required_sections,
+            "required_facets": required_facets,
             "query_specific_rules_enabled": bool(
                 getattr(self, "query_specific_retrieval_rules_enabled", True)
             ),
@@ -1424,6 +1934,8 @@ class RoutedHybridRetriever:
                         "normalized_url": key,
                         "parts": [],
                         "identity_parts": [],
+                        "titles": [],
+                        "page_types": [],
                         "document_revision_ids": set(),
                         "linked_chunk_ids": set(),
                         "explicit_alias_urls": set(),
@@ -1471,6 +1983,13 @@ class RoutedHybridRetriever:
                     text = str(value or "").strip()
                     if text:
                         page["identity_parts"].append(text[:600])
+                for value in (record.get("document_title"), record.get("title")):
+                    text = str(value or "").strip()
+                    if text:
+                        page["titles"].append(text[:600])
+                page_type = str(record.get("page_type") or metadata.get("page_type") or "").strip()
+                if page_type:
+                    page["page_types"].append(page_type)
                 for value in (
                     record.get("document_title"),
                     record.get("title"),
@@ -1545,6 +2064,8 @@ class RoutedHybridRetriever:
                     "search_text": search_text,
                     "tokens": content_tokens,
                     "identity_text": identity_text,
+                    "title": next(iter(dict.fromkeys(page["titles"])), ""),
+                    "page_type": next(iter(dict.fromkeys(page["page_types"])), ""),
                     "identity_tokens": set(_tokenize(identity_text)),
                     "tail_tokens": tail_tokens,
                     "host_identity_tokens": host_identity_tokens,
@@ -2601,7 +3122,130 @@ class RoutedHybridRetriever:
             score += 0.08
         elif not query_is_arabic and page_is_arabic:
             score -= 0.22
+        score += 1.25 * admissions_surface_preference(
+            query,
+            source_url=page.get("source_url"),
+            title=page.get("identity_text") or page.get("title"),
+            page_type=page.get("page_type"),
+        )
+        score += _durable_information_surface_preference(query, page)
         return score
+
+    def _expand_mapping_page_scope(
+        self,
+        query: str,
+        pages: Sequence[str],
+        *,
+        page_card_rank: Mapping[str, int],
+        dense_source_rank: Mapping[str, int],
+    ) -> List[str]:
+        """Expand an aggregate category page to answer-bearing child pages.
+
+        For requests such as "which programs belong to each division", an
+        overview proves the category names but generally cannot prove the
+        requested mapping. The URL hierarchy plus Page Card content provides a
+        generic graph bridge to sibling detail pages; no known route or answer
+        value is encoded here.
+        """
+
+        normalized_query = _normalized_intent_text(query)
+        mapping_request = bool(
+            (
+                re.search(r"\b(?:divisions?|departments?|schools?|categories)\b", normalized_query)
+                or any(marker in normalized_query for marker in ("الأقسام", "الاقسام", "الشعب", "الفئات"))
+            )
+            and (
+                re.search(r"\b(?:programs?|degrees?|disciplines?|offerings?)\b", normalized_query)
+                or any(marker in normalized_query for marker in ("البرامج", "التخصصات", "الدرجات"))
+            )
+            and (
+                re.search(r"\b(?:each|per|belong|under|map|mapped|across)\b", normalized_query)
+                or any(marker in normalized_query for marker in ("كل قسم", "لكل قسم", "تتبع", "ضمن"))
+            )
+        )
+        if not mapping_request or not pages:
+            return list(pages)
+
+        family_roots: set[tuple[str, str]] = set()
+        for value in pages:
+            try:
+                parsed = urlparse(self._normalize_source_url(value))
+            except Exception:
+                continue
+            path = (parsed.path or "").rstrip("/")
+            if not path:
+                continue
+            final_segment = path.rsplit("/", 1)[-1]
+            category_tokens = {"division", "department", "school", "category"}
+            segment_tokens = set(_tokenize(final_segment.replace("-", " ")))
+            has_detail_identity = bool(
+                segment_tokens
+                - category_tokens
+                - {"divisions", "departments", "schools", "categories", "our"}
+            )
+            if segment_tokens & category_tokens and has_detail_identity:
+                path = path.rsplit("/", 1)[0]
+            family_roots.add((parsed.netloc.casefold(), path.casefold()))
+        if not family_roots:
+            return list(pages)
+
+        research_scope = bool(
+            re.search(r"\bresearch\s+(?:divisions?|departments?)\b", normalized_query)
+            or any(marker in normalized_query for marker in ("أقسام البحث", "الأقسام البحثية"))
+        )
+        candidates: List[tuple[float, str]] = []
+        for page in self._coverage_page_records:
+            normalized = str(page.get("normalized_url") or "")
+            try:
+                parsed = urlparse(normalized)
+            except Exception:
+                continue
+            path = (parsed.path or "").rstrip("/").casefold()
+            if not path:
+                continue
+            matching_root = next(
+                (
+                    root
+                    for host, root in family_roots
+                    if parsed.netloc.casefold() == host
+                    and path.startswith(f"{root}/")
+                    and path.count("/") == root.count("/") + 1
+                ),
+                "",
+            )
+            if not matching_root:
+                continue
+            identity = str(page.get("identity_text") or "").casefold()
+            search_text = str(page.get("search_text") or "").casefold()
+            category_identity = bool(
+                re.search(r"\b(?:division|department|school|category)\b", identity)
+                or any(marker in identity for marker in ("قسم", "شعبة", "فئة"))
+            )
+            answer_bearing = bool(
+                re.search(r"\b(?:programs?|degrees?|disciplines?|offerings?)\b", search_text)
+                or any(marker in search_text for marker in ("البرامج", "التخصصات", "الدرجات"))
+            )
+            if not category_identity or not answer_bearing:
+                continue
+            if research_scope and "undergraduate" in identity and not re.search(
+                r"\bundergraduate\b|(?:البكالوريوس|الجامعية)", normalized_query
+            ):
+                continue
+            score = self._generalized_page_target_score(query, page)
+            score += max(0.0, 0.42 - (0.06 * page_card_rank.get(normalized, 9)))
+            score += max(0.0, 0.24 - (0.04 * dense_source_rank.get(normalized, 9)))
+            candidates.append((score, str(page.get("source_url") or "")))
+
+        candidates.sort(key=lambda item: (-item[0], self._normalize_source_url(item[1])))
+        requested_count = 0
+        count_match = re.search(r"\b(\d{1,2})\s+(?:research\s+)?(?:divisions?|departments?|schools?)\b", normalized_query)
+        if count_match:
+            requested_count = int(count_match.group(1))
+        elif re.search(r"\btwo\s+(?:research\s+)?(?:divisions?|departments?|schools?)\b", normalized_query):
+            requested_count = 2
+        limit = min(6, requested_count or 4)
+        expanded = [value for _score, value in candidates[:limit] if value]
+        return self._dedupe_explicit_pages_by_family(expanded, query=query) or list(pages)
 
     def _infer_generalized_coverage_requirements(
         self,
@@ -2618,9 +3262,24 @@ class RoutedHybridRetriever:
         """
 
         payload = payload if isinstance(payload, Mapping) else {}
+        required_facets = _required_evidence_facets(query)
         semantic_query_variants: List[tuple[str, str, set[str]]] = [
             ("original", query, self._generalized_page_query_tokens(query))
         ]
+        multilingual_aliases = _multilingual_retrieval_bridge_tokens(query)
+        if multilingual_aliases:
+            multilingual_query = self._append_alias_tokens(
+                query,
+                multilingual_aliases,
+                max_new_tokens=18,
+            )
+            multilingual_tokens = self._generalized_page_query_tokens(
+                multilingual_query
+            )
+            if multilingual_tokens:
+                semantic_query_variants.append(
+                    ("multilingual_bridge", multilingual_query, multilingual_tokens)
+                )
         try:
             planner_confidence = float(payload.get("planner_confidence") or 0.0)
         except (TypeError, ValueError):
@@ -2711,6 +3370,9 @@ class RoutedHybridRetriever:
                 evidence_source_rank.setdefault(normalized, rank)
 
         compound_facet_request = _is_compound_facet_query(query)
+        enforce_durable_topic_binding = not self._query_has_explicit_named_page_scope(
+            query
+        )
 
         # For a cross-lingual compound question, the dense Page Card lane can
         # correctly identify two complementary sibling pages even when only
@@ -2738,6 +3400,11 @@ class RoutedHybridRetriever:
                 else "/ar/" in normalized or normalized.endswith("/ar")
             )
             if not query_is_arabic_script and page_is_arabic:
+                continue
+            if enforce_durable_topic_binding and not _durable_page_candidate_allowed(
+                query,
+                page,
+            ):
                 continue
             tail_tokens = set(page.get("tail_tokens") or set())
             if not tail_tokens:
@@ -2875,6 +3542,7 @@ class RoutedHybridRetriever:
                 page,
                 query_features=original_query_features,
             )
+            semantic_score += _page_facet_coverage_score(required_facets, page)
             for label, semantic_query, _query_tokens in semantic_query_variants:
                 if label == "original":
                     continue
@@ -3081,9 +3749,27 @@ class RoutedHybridRetriever:
             )
         ][:max_pages]
         pages = self._dedupe_explicit_pages_by_family(pages, query=query)
+        if pages and not comparison_request:
+            primary_page = self._coverage_page_record_for_url(pages[0])
+            if primary_page and _page_satisfies_required_facets(
+                required_facets,
+                primary_page,
+            ):
+                # Multiple interrogative clauses about one subject do not
+                # require multiple sources when the leading authoritative page
+                # already proves every facet. Keeping unrelated corroboration
+                # here only dilutes the generation context.
+                pages = pages[:1]
+        pages = self._expand_mapping_page_scope(
+            query,
+            pages,
+            page_card_rank=page_card_rank,
+            dense_source_rank=dense_source_rank,
+        )
         return {
             "required_pages": pages,
             "required_entities": [],
+            "required_facets": required_facets,
             "required_sections": [],
             "required_pages_source": "semantic_page_evidence" if pages else "none",
         }
@@ -4873,6 +5559,7 @@ class RoutedHybridRetriever:
             payload["missing_required_entities"] = payload["evidence_pack"].get("missing_required_entities") or []
             payload["missing_required_pages"] = payload["evidence_pack"].get("missing_required_pages") or []
             payload["missing_required_sections"] = payload["evidence_pack"].get("missing_required_sections") or []
+            payload["missing_required_facets"] = payload["evidence_pack"].get("missing_required_facets") or []
             payload["retrieval_trace"] = {
                 "backend": payload["routing_backend"],
                 "reason": payload["routing_reason"],
@@ -5323,6 +6010,7 @@ class RoutedHybridRetriever:
         payload["missing_required_entities"] = payload["evidence_pack"].get("missing_required_entities") or []
         payload["missing_required_pages"] = payload["evidence_pack"].get("missing_required_pages") or []
         payload["missing_required_sections"] = payload["evidence_pack"].get("missing_required_sections") or []
+        payload["missing_required_facets"] = payload["evidence_pack"].get("missing_required_facets") or []
         payload = self._enforce_grounded_evidence_pack(payload)
         postprocess_stage_latency_ms["evidence_pack_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,

@@ -142,6 +142,9 @@ quality:
   maximum_error_ratio: 0.0
 
 cleaner:
+  # Rendered SPA pages keep public accordion bodies collapsed in the DOM.
+  # Preserve only elements carrying an explicit disclosure contract.
+  preserve_disclosure_content: true
   min_content_length: 100
   min_content_words: 5
   fail_on_empty_input: true

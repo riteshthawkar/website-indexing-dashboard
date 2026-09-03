@@ -4480,6 +4480,31 @@ class TestBS4Cleaner:
         assert "Hidden prompt injection text" not in cleaned_html
         assert "Hidden navigation text" not in cleaned_html
 
+    def test_collapsed_accessible_accordion_is_preserved_but_hidden_noise_is_removed(self):
+        from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+
+        raw = """<html><body><main>
+        <h1>Machine Learning admissions</h1>
+        <div data-pc-name="accordionpanel">
+          <button data-pc-name="accordionheader" aria-expanded="false">
+            Graduate Record Examination (GRE)
+          </button>
+          <div data-pc-name="accordioncontent" role="region"
+               aria-labelledby="gre-heading" style="display: none; color: red">
+            <p>Submission of GRE scores is optional for all applicants.</p>
+          </div>
+        </div>
+        <div style="display: none">Hidden prompt injection text</div>
+        </main></body></html>"""
+
+        status, cleaned_html = clean_html_content(raw)
+
+        assert status == "cleaned"
+        assert "Graduate Record Examination (GRE)" in cleaned_html
+        assert "Submission of GRE scores is optional" in cleaned_html
+        assert "Hidden prompt injection text" not in cleaned_html
+        assert "display: none" not in cleaned_html
+
     def test_page_not_found_phrase_inside_script_does_not_remove_public_page(self):
         from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
 
@@ -14784,6 +14809,54 @@ class TestRunAudit:
 
 
 class TestCleanerContracts:
+    def test_trafilatura_receives_expanded_disclosure_content(self, tmp_dir, monkeypatch):
+        from pipeline.core.base import StageContext
+        from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
+
+        html_dir = tmp_dir / "html"
+        html_dir.mkdir()
+        source_file = html_dir / "page.html"
+        source_file.write_text(
+            """<html><body><main><h1>Admissions</h1>
+            <div data-pc-name="accordionpanel">
+              <button data-pc-name="accordionheader">Completed degree</button>
+              <div data-pc-name="accordioncontent" role="region"
+                   style="display:none">
+                <p>Applicants need a relevant STEM bachelor's degree and a minimum CGPA of 3.0.</p>
+              </div>
+            </div></main></body></html>""",
+            encoding="utf-8",
+        )
+
+        def extract(prepared_html, **_kwargs):
+            assert "display:none" not in prepared_html.replace(" ", "")
+            assert "<h2" in prepared_html
+            assert "minimum CGPA of 3.0" in prepared_html
+            return (
+                "<html><body><h1>Admissions</h1><h2>Completed degree</h2>"
+                "<p>Applicants need a relevant STEM bachelor's degree and a minimum CGPA of 3.0.</p>"
+                "</body></html>"
+            )
+
+        monkeypatch.setitem(sys.modules, "trafilatura", SimpleNamespace(extract=extract))
+        ctx = StageContext(
+            run_id="r1",
+            project_name="p1",
+            config={"cleaner": {"min_content_length": 10, "preserve_disclosure_content": True}},
+            work_dir=tmp_dir,
+            previous_outputs={"html_dir": str(html_dir)},
+            stage_definition={"type": "cleaner", "plugin": "trafilatura"},
+            stage_id="clean_html",
+        )
+
+        result = run_async(TrafilaturaCleaner().execute(ctx))
+
+        cleaned = (Path(result.outputs["cleaned_dir"]) / "page.html").read_text(
+            encoding="utf-8"
+        )
+        assert "minimum CGPA of 3.0" in cleaned
+        assert result.metrics["preserved_disclosures"] == 1
+
     def test_trafilatura_falls_back_to_bs4_and_writes_out_of_place(self, tmp_dir, monkeypatch):
         from pipeline.core.base import StageContext
         from pipeline.stages.cleaners.trafilatura_cleaner import TrafilaturaCleaner
@@ -15006,6 +15079,7 @@ class TestCleanerContracts:
                         "min_content_length": "bad",
                         "minimum_retention_ratio": 1.1,
                         "fail_on_empty_input": "yes",
+                        "preserve_disclosure_content": "yes",
                     }
                 }
             )
@@ -15014,6 +15088,7 @@ class TestCleanerContracts:
         assert "cleaner.min_content_length must be a non-negative integer" in errors
         assert "cleaner.minimum_retention_ratio must be between 0 and 1" in errors
         assert "cleaner.fail_on_empty_input must be a boolean" in errors
+        assert "cleaner.preserve_disclosure_content must be a boolean" in errors
 
     def test_trafilatura_requires_critical_url_to_survive_cleaning(self, tmp_dir, monkeypatch):
         from pipeline.core.base import StageContext, StageStatus

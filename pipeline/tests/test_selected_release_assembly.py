@@ -144,10 +144,11 @@ def test_assembly_preserves_frozen_record_bytes_and_remaps_navigation(real_assem
     assert all(chunk_id.startswith("chunk:c650:") for chunk_id in candidate_ids)
 
 
-def test_preprod_content_policy_removes_all_historical_catalogue_lanes(
+def test_preprod_content_policy_removes_superseded_and_internal_content_lanes(
     curated_preprod_assembly: dict,
 ) -> None:
     excluded = {
+        "document-revision:a26841511965d6bb16830ac2",
         "document-revision:7ddc4c25b58b1a46bcaf730d",
         "document-revision:eb7e6316bae431c75a332663",
         "document-revision:41ff7ff60291e89cc7ae2289",
@@ -159,23 +160,23 @@ def test_preprod_content_policy_removes_all_historical_catalogue_lanes(
 
     assert set(policy["excluded_document_revision_ids"]) == excluded
     assert policy["removed_record_kind_counts"] == {
-        "chunk": 1673,
-        "parent": 5,
-        "parent_section": 1634,
-        "media": 109,
-        "page_card": 0,
-        "action": 0,
+        "chunk": 1693,
+        "parent": 6,
+        "parent_section": 1654,
+        "media": 113,
+        "page_card": 1,
+        "action": 2,
     }
-    assert policy["removed_record_count"] == 3421
+    assert policy["removed_record_count"] == 3469
     assert curated_preprod_assembly["record_kind_counts"] == {
-        "chunk": 10388,
-        "parent": 1852,
-        "parent_section": 7696,
-        "media": 3009,
-        "page_card": 1879,
-        "action": 442,
+        "chunk": 11333,
+        "parent": 1820,
+        "parent_section": 9109,
+        "media": 3058,
+        "page_card": 1865,
+        "action": 440,
     }
-    assert curated_preprod_assembly["coverage"]["mapped_chunk_count"] == 10388
+    assert curated_preprod_assembly["coverage"]["mapped_chunk_count"] == 11333
     assert curated_preprod_assembly["coverage"]["all_candidate_chunks_mapped"] is True
     assert curated_preprod_assembly["coverage"]["all_navigation_chunks_remapped"] is True
 
@@ -190,7 +191,9 @@ def test_preprod_content_policy_removes_all_historical_catalogue_lanes(
         if line
         for record in (json.loads(line),)
     }
+    records_text = records_file.read_text(encoding="utf-8")
     assert not (observed_revisions & excluded)
+    assert "/test-jane-landing-page" not in records_text
     assert current in observed_revisions
 
 

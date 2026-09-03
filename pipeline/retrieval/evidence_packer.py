@@ -365,6 +365,76 @@ def _entity_match_text(value: str) -> str:
     return text
 
 
+def _coverage_facets(coverage_plan: Dict[str, Any]) -> List[Dict[str, Any]]:
+    facets: List[Dict[str, Any]] = []
+    for raw in coverage_plan.get("required_facets") or []:
+        if not isinstance(raw, dict):
+            continue
+        name = _clean_text(raw.get("name"))
+        aliases = list(
+            dict.fromkeys(
+                normalized
+                for value in (raw.get("aliases") or [])
+                if (normalized := _entity_match_text(value))
+            )
+        )
+        if not name or not aliases:
+            continue
+        try:
+            min_alias_matches = int(raw.get("min_alias_matches") or 1)
+        except (TypeError, ValueError):
+            min_alias_matches = 1
+        try:
+            min_sources = int(raw.get("min_sources") or 1)
+        except (TypeError, ValueError):
+            min_sources = 1
+        facets.append(
+            {
+                "name": name,
+                "aliases": aliases,
+                "min_alias_matches": max(1, min(min_alias_matches, len(aliases))),
+                "min_sources": max(1, min_sources),
+                "same_source": bool(raw.get("same_source", False)),
+                "report_in_answer": bool(raw.get("report_in_answer", True)),
+            }
+        )
+    return facets
+
+
+def _facet_evidence(
+    facet: Dict[str, Any],
+    items: Sequence[Dict[str, Any]],
+) -> tuple[bool, List[str], List[str]]:
+    matched_aliases: set[str] = set()
+    matched_sources: set[str] = set()
+    aliases_by_source: Dict[str, set[str]] = {}
+    aliases = [str(value) for value in facet.get("aliases") or [] if str(value)]
+    for index, item in enumerate(items):
+        item_blob = _entity_match_text(_item_search_text(item))
+        item_matches = {alias for alias in aliases if alias in item_blob}
+        if not item_matches:
+            continue
+        matched_aliases.update(item_matches)
+        source = _normalize_url_for_match(item.get("source_url")) or f"local:{index}"
+        matched_sources.add(source)
+        aliases_by_source.setdefault(source, set()).update(item_matches)
+    required_aliases = int(facet.get("min_alias_matches") or 1)
+    required_sources = int(facet.get("min_sources") or 1)
+    if bool(facet.get("same_source")):
+        qualifying_sources = {
+            source
+            for source, source_aliases in aliases_by_source.items()
+            if len(source_aliases) >= required_aliases
+        }
+        complete = len(qualifying_sources) >= required_sources
+    else:
+        complete = (
+            len(matched_aliases) >= required_aliases
+            and len(matched_sources) >= required_sources
+        )
+    return complete, sorted(matched_aliases), sorted(matched_sources)
+
+
 def _normalize_match_token(value: Any) -> str:
     token = re.sub(r"[\u064B-\u065F\u0670\u0640]", "", str(value or "").casefold())
     if _ARABIC_TEXT_RE.search(token) and len(token) >= 5:
@@ -1443,6 +1513,7 @@ def _candidate_score(
     doc: Dict[str, Any],
     required_pages: Sequence[str],
     required_entities: Sequence[str],
+    required_facets: Sequence[Dict[str, Any]] = (),
     query_specific_rules_enabled: bool = True,
 ) -> float:
     raw_text = str(doc.get("text") or doc.get("value") or _doc_metadata(doc).get("context") or "")
@@ -1539,6 +1610,14 @@ def _candidate_score(
     for entity in required_entities:
         if entity and entity in item_blob:
             score += 16.0
+    for facet in required_facets:
+        alias_hits = sum(
+            1
+            for alias in (facet.get("aliases") or [])
+            if str(alias) and str(alias) in _entity_match_text(item_blob)
+        )
+        if alias_hits:
+            score += min(24.0, 8.0 + (4.0 * alias_hits))
     score += _named_source_identity_bonus(
         query,
         source_url=source,
@@ -1617,6 +1696,7 @@ def build_evidence_pack(
         coverage_plan.get("query_specific_rules_enabled", True)
     )
     required_entities = _coverage_values(coverage_plan, "required_entities")
+    required_facets = _coverage_facets(coverage_plan)
     required_pages = [
         value
         for value in (
@@ -1683,6 +1763,7 @@ def build_evidence_pack(
                     doc=doc,
                     required_pages=required_pages,
                     required_entities=required_entities,
+                    required_facets=required_facets,
                     query_specific_rules_enabled=query_specific_rules_enabled,
                 ),
                 kind,
@@ -2095,6 +2176,22 @@ def build_evidence_pack(
             for _score, kind, doc in candidates:
                 if _candidate_matches_requirement(doc, required_entity, page=False) and _append_candidate(kind, doc):
                     break
+    for facet in required_facets:
+        if _facet_evidence(facet, items)[0]:
+            continue
+        aliases = [str(value) for value in facet.get("aliases") or [] if str(value)]
+        for _score, kind, doc in candidates:
+            if len(items) >= max_items or used_chars >= max_chars:
+                truncated = True
+                break
+            if specific_required_page_mode and not _candidate_matches_any_required_page(doc):
+                continue
+            candidate_blob = _entity_match_text(_item_search_text(doc))
+            if not any(alias in candidate_blob for alias in aliases):
+                continue
+            _append_candidate(kind, doc)
+            if _facet_evidence(facet, items)[0]:
+                break
     for _score, kind, doc in candidates:
         if len(items) >= max_items or used_chars >= max_chars:
             truncated = True
@@ -2221,6 +2318,23 @@ def build_evidence_pack(
     missing_required_sections = [
         value for value in required_sections if value and value not in item_text
     ]
+    facet_coverage: List[Dict[str, Any]] = []
+    missing_required_facets: List[str] = []
+    for facet in required_facets:
+        complete, matched_aliases, matched_sources = _facet_evidence(facet, items)
+        facet_coverage.append(
+            {
+                "name": facet["name"],
+                "complete": complete,
+                "matched_aliases": matched_aliases,
+                "matched_source_count": len(matched_sources),
+                "required_alias_matches": facet["min_alias_matches"],
+                "required_sources": facet["min_sources"],
+                "report_in_answer": bool(facet.get("report_in_answer", True)),
+            }
+        )
+        if not complete:
+            missing_required_facets.append(str(facet["name"]))
     semantic_sufficiency_enabled = bool(
         coverage_plan.get("semantic_sufficiency_enabled", False)
     )
@@ -2240,7 +2354,12 @@ def build_evidence_pack(
         }
     if bool(result.get("abstained")) or not items:
         coverage_status = "insufficient"
-    elif missing_required_entities or missing_required_pages or missing_required_sections:
+    elif (
+        missing_required_entities
+        or missing_required_pages
+        or missing_required_sections
+        or missing_required_facets
+    ):
         coverage_status = "partial"
     elif not evidence_sufficient:
         coverage_status = "partial"
@@ -2265,6 +2384,8 @@ def build_evidence_pack(
         "missing_required_entities": missing_required_entities,
         "missing_required_pages": missing_required_pages,
         "missing_required_sections": missing_required_sections,
+        "missing_required_facets": missing_required_facets,
+        "facet_coverage": facet_coverage,
         "sufficiency": sufficiency,
         "citation_candidates": citation_candidates,
         "budget": {
