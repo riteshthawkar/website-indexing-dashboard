@@ -145,7 +145,10 @@ def extract_premise_requirements(
     # Academic-offering premises: "PhD in marine biology", "veterinary
     # medicine degree", and their Arabic equivalents.
     for match in re.finditer(
-        r"\b(ph\.?d\.?|doctorate|master(?:'s)?|bachelor(?:'s)?)\s+in\s+([a-z][a-z\- ]{1,60}?)(?=\s+(?:at|from|within|offered|require)|[?.,]|$)",
+        r"\b(ph\.?d\.?|doctorate|master(?:'s)?|bachelor(?:'s)?)\s+in\s+([a-z][a-z\- ]{1,60}?)"
+        r"(?=\s+(?:at|from|within|offer(?:ed|s)?|require(?:d|s|ments)?|"
+        r"include(?:d|s)?|cover(?:ed|s)?|eligible|available|fund(?:ed|s)?|"
+        r"support(?:ed|s)?|part\s+of)\b|[?.,]|$)",
         text.casefold(),
         flags=re.IGNORECASE,
     ):
@@ -751,6 +754,25 @@ def adjudicate_factual_evidence(
             per_request_delay_sec=per_request_delay_sec,
         )
     except Exception:
+        return fallback
+
+    # Provider adjudication may recognize nuanced positive support, but it
+    # must not weaken the deterministic closed-world premise guard.  If no
+    # candidate contains the requested entity/location/unit/attribute as one
+    # supported scope, a nearby generic value is not a valid answer.  This is
+    # especially important for questions such as a phone number for a
+    # nonexistent office or opening hours for a nonexistent research center.
+    premise_requirements = extract_premise_requirements(query, intent_summary)
+    if (
+        premise_requirements
+        and bool(fallback.get("abstain"))
+        and str(fallback.get("reason") or "")
+        in {
+            "presupposed_claim_explicitly_refuted",
+            "presupposed_entity_or_scope_not_supported",
+        }
+        and not bool(payload.get("abstain"))
+    ):
         return fallback
 
     allowed_answer_ids = {

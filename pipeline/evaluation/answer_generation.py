@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from pathlib import Path
@@ -14,6 +15,99 @@ from pipeline.retrieval import AdaptiveHybridRetriever
 from pipeline.retrieval.adaptive_hybrid import _ROLE_QUERY_LABELS, _clean_text, _query_intent, _tokenize
 
 _EXACT_LOOKUP_ANSWER_TYPES = {"email", "phone", "website", "hours", "date", "service_availability"}
+
+
+def _query_requires_contextual_answer(query: str) -> bool:
+    """Return whether an atomic record cannot satisfy the requested fields.
+
+    A promoted answer record can be a useful low-latency fact, but it is not a
+    substitute for the surrounding page when the user explicitly requests a
+    displayed title, designation, label, or person-to-category mapping.  In
+    those cases generation must inspect the packed evidence rather than stop
+    after the first matching name.
+    """
+
+    normalized = " ".join(str(query or "").casefold().split())
+    return bool(
+        re.search(
+            r"\b(?:full|official|displayed|shown)\s+(?:title|designation|position|label)\b"
+            r"|\bwhat\s+(?:title|designation|position|label)\b"
+            r"|\bwhich\s+(?:division|department|school|unit|category)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "المسمى الرسمي",
+                "المسمى الوظيفي",
+                "ما المسمى",
+                "ما اللقب",
+                "أي قسم",
+                "اي قسم",
+                "أي إدارة",
+                "اي ادارة",
+            )
+        )
+    )
+
+
+def _compose_abstention_answer(query: str, retrieval_result: Dict[str, Any]) -> str:
+    """Produce a useful fail-closed answer without inventing missing facts."""
+
+    normalized = " ".join(str(query or "").casefold().split())
+    reason = str(retrieval_result.get("adjudication_reason") or "").casefold()
+    is_arabic = bool(re.search(r"[\u0600-\u06ff]", str(query or "")))
+    # Trust the retriever's temporal guard rather than guessing from a year in
+    # the query; an exact historical-year question is not a future request.
+    future_fact = reason == "unsupported_future_mutable_fact"
+    fee_request = bool(
+        re.search(r"\b(?:tuition|fees?|cost|price)\b", normalized)
+        or any(marker in normalized for marker in ("الرسوم", "التكلفة", "السعر"))
+    )
+    program_request = bool(
+        re.search(r"\b(?:program|degree|course|admissions?|requirements?)\b", normalized)
+        or any(
+            marker in normalized
+            for marker in ("برنامج", "درجة", "تخصص", "القبول", "المتطلبات")
+        )
+    )
+
+    if is_arabic:
+        if future_fact and fee_request:
+            return (
+                "لا توجد أدلة كافية. لا تحدد مصادر MBZUAI المتاحة الرسوم الدراسية أو "
+                "التكلفة المستقبلية الدقيقة المطلوبة، لذلك لا يمكنني تقديم قيمة موثقة."
+            )
+        if reason in {
+            "presupposed_claim_explicitly_refuted",
+            "presupposed_entity_or_scope_not_supported",
+        } and program_request:
+            return (
+                "لا توجد أدلة كافية. لم أتمكن من التحقق من وجود البرنامج أو الدرجة المطلوبة "
+                "في مصادر MBZUAI المتاحة، لذلك لا يمكنني تقديم متطلبات خاصة بها."
+            )
+        return (
+            "لا توجد أدلة كافية. لم أتمكن من التحقق من المعلومة المطلوبة مباشرةً في "
+            "مصادر MBZUAI المتاحة، لذلك لا يمكنني تقديم إجابة موثقة."
+        )
+
+    if future_fact and fee_request:
+        return (
+            "Insufficient evidence. The available MBZUAI sources do not establish the exact "
+            "future tuition or fee requested, so I cannot provide a source-grounded amount."
+        )
+    if reason in {
+        "presupposed_claim_explicitly_refuted",
+        "presupposed_entity_or_scope_not_supported",
+    } and program_request:
+        return (
+            "Insufficient evidence. I could not verify that the requested program or degree "
+            "exists in the available MBZUAI sources, so I cannot provide program-specific requirements."
+        )
+    return (
+        "Insufficient evidence. I could not verify the requested fact directly in the available "
+        "MBZUAI sources, so I cannot provide a source-grounded answer."
+    )
 
 
 def _make_gemini_client():
@@ -224,12 +318,14 @@ def _compose_structured_answer(
     retriever: Any,
     retrieval_result: Dict[str, Any],
 ) -> Optional[str]:
+    if _query_requires_contextual_answer(query):
+        return None
     query_intent = _query_intent(query)
     if not query_intent.answer_types:
         return None
     answer_records = _rank_answer_records(query, retriever, _selected_answer_records(retriever, retrieval_result))
     if not answer_records:
-        return "Insufficient evidence."
+        return None
     requested_types = list(dict.fromkeys(query_intent.answer_types))
     exact_lookup_only = bool(requested_types) and set(requested_types) <= _EXACT_LOOKUP_ANSWER_TYPES
     if exact_lookup_only:
@@ -237,7 +333,7 @@ def _compose_structured_answer(
     else:
         supported_answers = [answer for answer in answer_records if _answer_supports_query_subject(query, answer)]
     if not supported_answers:
-        return "Insufficient evidence."
+        return None
 
     requested_roles = list(query_intent.requested_role_subtypes)
     if requested_roles:
@@ -250,11 +346,11 @@ def _compose_structured_answer(
                 and str(answer.get("answer_subtype") or "") == role
             ]
             if not matching:
-                return "Insufficient evidence."
+                return None
             best_answer = matching[0]
             sentence = _compose_role_holder_sentence(query, best_answer)
             if not sentence:
-                return "Insufficient evidence."
+                return None
             sentences.append(sentence)
         return " ".join(dict.fromkeys(sentences))
 
@@ -269,18 +365,18 @@ def _compose_structured_answer(
                 if str(answer.get("answer_type") or "") == answer_type
             ]
             if not matching:
-                return "Insufficient evidence."
+                return None
             best_answer = matching[0]
             sentence = _compose_atomic_structured_answer(query, best_answer)
             if not sentence:
-                return "Insufficient evidence."
+                return None
             sentences.append(sentence)
         return " ".join(dict.fromkeys(sentences))
 
     best_answers = [answer for answer in supported_answers if str(answer.get("answer_type") or "") in requested_types]
     if not best_answers:
-        return "Insufficient evidence."
-    return _compose_atomic_structured_answer(query, best_answers[0]) or "Insufficient evidence."
+        return None
+    return _compose_atomic_structured_answer(query, best_answers[0])
 
 
 def _bundle_maps(work_dir: str | Path) -> Dict[str, Dict[str, Dict[str, Any]]]:
@@ -339,6 +435,16 @@ def _build_answer_prompt(
 ) -> str:
     structured_blocks = []
     context_blocks = []
+    coverage_requirements: List[str] = []
+    if isinstance(evidence_pack, dict):
+        for raw_facet in evidence_pack.get("facet_coverage") or []:
+            if not isinstance(raw_facet, dict):
+                continue
+            name = str(raw_facet.get("name") or "").strip()
+            if not name or not bool(raw_facet.get("report_in_answer", True)):
+                continue
+            coverage_requirements.append(name)
+    coverage_requirements = list(dict.fromkeys(coverage_requirements))
     pack_items = (
         list(evidence_pack.get("items") or [])
         if isinstance(evidence_pack, dict)
@@ -375,13 +481,48 @@ def _build_answer_prompt(
             context_blocks.append(f"[Source {i}: {source}]\n{text}")
     joined_context = "\n\n".join(context_blocks)
     joined_structured = "\n".join(structured_blocks)
+    joined_requirements = "\n".join(
+        f"- {name}" for name in coverage_requirements
+    )
     return (
         "Answer the user question using only the supplied context.\n"
-        "Use structured evidence first when it is present.\n"
-        "If the context does not support a grounded answer, say exactly: Insufficient evidence.\n"
-        "If the question asks for multiple items, answer all of them only when the context supports each requested item.\n"
-        "Keep the answer concise and factual.\n\n"
+        "Respond in the same language as the user's question.\n"
+        "Use structured evidence first when it is present, but do not assume one atomic fact is a complete "
+        "answer: inspect the surrounding evidence for every field the user explicitly requested.\n"
+        "If the context does not support a grounded answer, begin with 'Insufficient evidence.' and briefly "
+        "identify which requested fact could not be verified without guessing.\n"
+        "Silently identify every requested field before drafting; answer each supported field explicitly and "
+        "state any unsupported field as unavailable.\n"
+        "If the question asks for multiple items, answer every supported item explicitly.\n"
+        "When the user asks for an official title, designation, label, count, or mapping, preserve the complete "
+        "source wording. For person-to-unit mappings, prefer the canonical organizational-unit heading over "
+        "a shortened nearby role caption, and do not repeat a conflicting shorthand label as a second name.\n"
+        "For a types-or-categories question, list only items the source explicitly classifies as that requested "
+        "type; do not promote adjacent sponsorship mechanisms, seats, optional benefits, or examples into the "
+        "classification. For a maximum-or-extent question, state the maximum and what it applies to without "
+        "expanding into other optional benefits unless the user also asks what is included.\n"
+        "When asked about an organization's, board's, committee's, or unit's role, include all distinct "
+        "source-stated functions and any composition or mission contribution that materially explains that role.\n"
+        "For each requested value, preserve closely attached conditions, timing, scope, exceptions, "
+        "dependencies, reimbursements, credits, or limitations that are needed to use the answer correctly.\n"
+        "A qualifier belongs in the response only when it changes how a requested value should be interpreted or "
+        "used; a separate optional benefit is not a qualifier for an otherwise complete requested maximum.\n"
+        "Treat the answer coverage checklist as the response scope: cover every supported checklist facet, but "
+        "do not add adjacent programs, benefits, funding mechanisms, people, or categories merely because they "
+        "appear in the context.\n"
+        "Treat Page Card PURPOSE, TOPICS, AUDIENCES, and SECTIONS fields, plus standalone headings, as discovery "
+        "metadata rather than proof of a factual claim. A label only shows that a topic exists; state a requirement, "
+        "eligibility rule, benefit, or policy only when an evidence sentence explicitly supports it.\n"
+        "Preserve polarity and modality exactly: required, not required, optional, recommended, preferred, may, "
+        "and must are materially different. Never infer one of them from a heading or topic label.\n"
+        "For a duration or timeline question, include the ordinary or typical duration and any source-stated "
+        "minimum, maximum, or completion deadline that materially limits it.\n"
+        "Before returning the answer, silently check every factual clause against an explicit evidence sentence "
+        "and remove or qualify any clause that is not directly entailed.\n"
+        "Use compact bullets when they make a multi-part answer clearer.\n"
+        "Be concise but complete; do not omit a supported qualification merely to shorten the answer.\n\n"
         f"Question:\n{query}\n\n"
+        f"Answer coverage checklist:\n{joined_requirements or 'No additional structured checklist.'}\n\n"
         f"Structured evidence:\n{joined_structured or 'None'}\n\n"
         f"Context:\n{joined_context}"
     )
@@ -481,7 +622,7 @@ def generate_answer_predictions(
         try:
             retrieval_result = retriever.retrieve(example.query)
             if retrieval_result.get("abstained"):
-                answer = "Insufficient evidence."
+                answer = _compose_abstention_answer(example.query, retrieval_result)
             else:
                 structured_answer = _compose_structured_answer(
                     query=example.query,
@@ -508,8 +649,26 @@ def generate_answer_predictions(
             answer = ""
             error = str(exc)
         latency_ms = round((time.perf_counter() - started) * 1000.0, 3)
+        response_evidence_pack = (
+            retrieval_result.get("evidence_pack")
+            if isinstance(retrieval_result.get("evidence_pack"), dict)
+            else {}
+        )
         metadata = {
             "mode": retrieval_result.get("mode"),
+            "abstained": bool(retrieval_result.get("abstained")),
+            "verification_status": retrieval_result.get("verification_status"),
+            "adjudication_reason": retrieval_result.get("adjudication_reason"),
+            "coverage_status": retrieval_result.get("coverage_status"),
+            "missing_required_facets": list(
+                retrieval_result.get("missing_required_facets")
+                or response_evidence_pack.get("missing_required_facets")
+                or []
+            ),
+            "facet_coverage": list(
+                response_evidence_pack.get("facet_coverage")
+                or []
+            ),
             "seed_chunk_ids": list(retrieval_result.get("seed_chunk_ids") or []),
             "selected_answer_ids": list(retrieval_result.get("selected_answer_ids") or []),
             "dense_parent_ids": list(retrieval_result.get("dense_parent_ids") or []),

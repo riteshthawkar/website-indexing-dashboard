@@ -88,6 +88,117 @@ def test_complete_admissions_request_creates_an_evidence_contract_for_every_aspe
     assert coherence["report_in_answer"] is False
 
 
+def test_program_format_question_requires_mode_delivery_and_bounded_duration():
+    query = (
+        "Is the master's program full-time or part-time, how is it delivered, "
+        "and how long does it typically take?"
+    )
+
+    contract = _required_evidence_facets(query)
+    names = {facet["name"] for facet in contract}
+
+    assert {
+        "study mode",
+        "delivery method",
+        "completion duration and any source-stated bounds",
+    } <= names
+    duration = next(
+        facet
+        for facet in contract
+        if facet["name"] == "completion duration and any source-stated bounds"
+    )
+    assert duration["min_alias_matches"] == 2
+    assert {"typical time to completion", "maximum", "must complete"} <= set(
+        duration["aliases"]
+    )
+
+
+def test_detailed_facet_contract_scales_evidence_budget_within_aggregation_cap():
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.evidence_budget_items = 8
+    retriever.evidence_budget_chars = 8000
+    retriever.evidence_budget_max_per_source = 2
+    retriever.aggregation_evidence_budget_items = 12
+    retriever.aggregation_evidence_budget_chars = 10000
+    retriever.large_page_evidence_budget_items = 12
+    retriever.large_page_evidence_budget_chars = 10000
+    facets = [
+        {"name": f"facet-{index}", "aliases": [f"value-{index}"]}
+        for index in range(10)
+    ]
+
+    budget = retriever._evidence_budget_for_plan(
+        {"intent": "broad_synthesis", "required_facets": facets}
+    )
+
+    assert budget == (12, 10000, 2)
+
+
+def test_detailed_pack_prioritizes_all_facets_before_generic_page_fill():
+    source_url = "https://www.mbzuai.ac.ae/study/program"
+    facets = [
+        {
+            "name": name,
+            "aliases": [alias],
+            "min_alias_matches": 1,
+            "min_sources": 1,
+        }
+        for name, alias in (
+            ("degree", "bachelor degree"),
+            ("English", "IELTS"),
+            ("documents", "transcript"),
+            ("references", "two referees"),
+            ("screening", "screening exam"),
+            ("interview", "technical interview"),
+            ("fees", "application fee"),
+        )
+    ]
+    generic_docs = [
+        {
+            "id": f"chunk:generic:{index:05d}:value",
+            "text": (
+                "Detailed admission requirements and application process for "
+                "the program."
+            ),
+            "source_url": source_url,
+        }
+        for index in range(4)
+    ]
+    facet_docs = [
+        {
+            "id": f"chunk:facet:{index:05d}:value",
+            "text": f"Official requirement: {facet['aliases'][0]}.",
+            "source_url": source_url,
+        }
+        for index, facet in enumerate(facets)
+    ]
+
+    pack = build_evidence_pack(
+        query=(
+            "Give me detailed admission requirements including degree, English, "
+            "documents, references, screening, interview, and fees."
+        ),
+        result={
+            "retrieval_confidence": 0.6,
+            "retrieval_documents": [*generic_docs, *facet_docs],
+        },
+        max_items=9,
+        max_chars=9000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [source_url],
+            "required_facets": facets,
+            "semantic_sufficiency_enabled": True,
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    assert pack["coverage_status"] == "complete"
+    assert pack["missing_required_facets"] == []
+    assert any("technical interview" in item["text"] for item in pack["items"])
+
+
 def test_scholarship_coverage_is_partial_until_all_requested_benefits_are_supported():
     query = "What scholarships are available for master's students, and what does the scholarship cover?"
     coverage_plan = {
@@ -145,6 +256,227 @@ def test_scholarship_coverage_is_partial_until_all_requested_benefits_are_suppor
         for facet in complete["facet_coverage"]
         if facet["name"] == "coherent scholarship coverage"
     )["report_in_answer"] is False
+
+
+def test_multi_part_fee_question_requires_every_explicit_fee_facet():
+    query = (
+        "What are the MAAI application fee, fee-waiver conditions, "
+        "seat-holding fee, per-credit tuition, and total tuition?"
+    )
+    facets = _required_evidence_facets(query)
+    names = {facet["name"] for facet in facets}
+
+    assert {
+        "application fee",
+        "fee-waiver conditions",
+        "seat-holding deposit",
+        "per-credit tuition rate",
+        "total tuition",
+        "tuition amount",
+    } <= names
+
+    partial = build_evidence_pack(
+        query=query,
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "chunk:generic-fee",
+                    "text": "Applicants pay an application fee of AED 200.",
+                    "source_url": "https://example.edu/faq/application-fee",
+                }
+            ]
+        },
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_facets": facets,
+            "semantic_sufficiency_enabled": False,
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    assert partial["coverage_status"] == "partial"
+    assert {
+        "fee-waiver conditions",
+        "seat-holding deposit",
+        "per-credit tuition rate",
+        "total tuition",
+    } <= set(partial["missing_required_facets"])
+
+
+def test_scholarship_types_and_maximum_do_not_invent_unrequested_benefits():
+    query = (
+        "كم تبلغ الرسوم الدراسية السنوية لبرنامج البكالوريوس، "
+        "وما أنواع المنح المتاحة وما الحد الأقصى لتغطيتها؟"
+    )
+
+    facets = _required_evidence_facets(query)
+    names = {facet["name"] for facet in facets}
+
+    assert {
+        "scholarship availability and scope",
+        "scholarship types",
+        "maximum scholarship coverage",
+        "tuition coverage",
+        "tuition amount",
+    } <= names
+    assert {
+        "living stipend",
+        "accommodation support",
+        "health coverage",
+        "visa support",
+    }.isdisjoint(names)
+    assert next(
+        facet
+        for facet in facets
+        if facet["name"] == "scholarship availability and scope"
+    )["report_in_answer"] is False
+
+
+def test_explicit_title_request_requires_the_complete_official_designation():
+    query = (
+        "Who is the current president, and what title is shown for that person "
+        "on the leadership page?"
+    )
+
+    facets = _required_evidence_facets(query)
+    title_facet = next(
+        facet
+        for facet in facets
+        if facet["name"] == "complete official title or designation"
+    )
+
+    assert title_facet["min_alias_matches"] == 2
+    assert {"president", "professor"} <= set(title_facet["aliases"])
+
+
+def test_person_to_division_question_creates_a_mapping_coverage_facet():
+    english = _required_evidence_facets(
+        "Who are the deans, and which division does each person lead?"
+    )
+    arabic = _required_evidence_facets(
+        "من هم العمداء، وأي قسم يقود كل منهم؟"
+    )
+
+    for facets in (english, arabic):
+        mapping = next(
+            facet
+            for facet in facets
+            if facet["name"] == "complete person-to-division mappings"
+        )
+        assert mapping["min_alias_matches"] == 3
+        assert {"dean", "led by", "division of"} <= set(mapping["aliases"])
+
+
+def test_person_to_division_pack_reserves_every_relation_bearing_section():
+    page_url = "https://example.edu/research/divisions"
+    query = "Who are the three deans, and which division does each lead?"
+    records = [
+        {
+            "id": "page-card",
+            "text": "Our divisions. Meet our deans and learn about their work.",
+            "source_url": page_url,
+            "coverage_page_card": True,
+        },
+        *[
+            {
+                "id": f"chunk:{slug}",
+                "text": f"SECTION: {division}\n## {division}\nLed by Dean {person}.",
+                "source_url": page_url,
+            }
+            for slug, division, person in (
+                ("biology", "Division of Biological Sciences", "Amina Noor"),
+                ("computing", "Division of Computing Sciences", "Ben Chen"),
+                ("undergraduate", "Division of Undergraduate Studies", "Carla Diaz"),
+            )
+        ],
+    ]
+
+    pack = build_evidence_pack(
+        query=query,
+        result={"retrieval_documents": records},
+        max_items=4,
+        max_chars=8000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [page_url],
+            "required_facets": _required_evidence_facets(query),
+            "semantic_sufficiency_enabled": False,
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    selected_ids = {item["id"] for item in pack["items"]}
+    assert {
+        "chunk:biology",
+        "chunk:computing",
+        "chunk:undergraduate",
+    } <= selected_ids
+
+
+def test_academic_level_scope_rejects_cross_level_funding_pages():
+    query = "What scholarships and tuition apply to undergraduate students?"
+    masters_page = {
+        "source_url": "https://example.edu/study/msc-programs",
+        "normalized_url": "https://example.edu/study/msc-programs",
+        "page_type": "admissions_or_program",
+        "identity_text": "Master's programs and scholarships",
+        "search_text": "Full scholarship including tuition and a stipend",
+        "tokens": {"masters", "scholarship", "tuition", "stipend"},
+    }
+    undergraduate_page = {
+        "source_url": "https://example.edu/admissions/undergraduate-admissions",
+        "normalized_url": "https://example.edu/admissions/undergraduate-admissions",
+        "page_type": "admissions_or_program",
+        "identity_text": "Undergraduate admissions and scholarships",
+        "search_text": "Merit-based and need-based scholarships cover tuition",
+        "tokens": {"undergraduate", "scholarship", "tuition"},
+    }
+
+    assert not _durable_page_candidate_allowed(query, masters_page)
+    assert _durable_page_candidate_allowed(query, undergraduate_page)
+
+
+def test_named_acronym_scope_beats_a_single_facet_faq():
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    query = (
+        "What are the MAAI application fee, waiver conditions, seat-holding "
+        "fee, per-credit tuition, and total tuition?"
+    )
+
+    def page(url, title, text):
+        identity = f"{url} {title}".casefold()
+        content = f"{title} {text}".casefold()
+        return {
+            "source_url": url,
+            "normalized_url": url,
+            "page_type": "admissions_or_program",
+            "identity_text": identity,
+            "identity_tokens": set(identity.replace("/", " ").replace("-", " ").split()),
+            "tail_tokens": set(url.rsplit("/", 1)[-1].replace("-", " ").split()),
+            "host_identity_tokens": set(),
+            "search_text": content,
+            "tokens": set(content.replace("-", " ").split()),
+            "page_is_arabic": False,
+        }
+
+    faq = page(
+        "https://example.edu/faq/application-fee",
+        "Application fee",
+        "Applicants pay an application fee.",
+    )
+    program = page(
+        "https://example.edu/study/master-in-applied-ai",
+        "Master in Applied AI",
+        (
+            "The MAAI application fee has waiver conditions. A seat-holding "
+            "deposit is credited toward the per-credit and total tuition."
+        ),
+    )
+
+    assert retriever._generalized_page_target_score(
+        query, program
+    ) > retriever._generalized_page_target_score(query, faq) + 0.5
 
 
 def test_program_mapping_expands_overview_to_answer_bearing_category_children():

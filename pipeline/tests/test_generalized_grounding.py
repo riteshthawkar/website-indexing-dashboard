@@ -1435,6 +1435,143 @@ def test_required_page_chunk_backfill_preserves_dense_semantic_order():
     assert chunks[0]["dense_semantic_rank"] == 0
 
 
+def test_required_page_chunk_backfill_prioritizes_cross_lingual_facet_coverage():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    program_url = "https://www.example.edu/study/program"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        chunk_map={
+            "chunk:generic": {
+                "id": "chunk:generic",
+                "source_url": program_url,
+                "text": "General graduate admissions information.",
+            },
+            "chunk:interview": {
+                "id": "chunk:interview",
+                "source_url": program_url,
+                "text": "A subset of applicants may receive a technical interview.",
+            },
+            "chunk:fee": {
+                "id": "chunk:fee",
+                "source_url": program_url,
+                "text": "The application fee is AED 200.",
+            },
+        },
+        _score_text_match=lambda _query, _text: 0.0,
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": program_url,
+            "normalized_url": program_url,
+            "document_revision_ids": set(),
+            "linked_chunk_ids": {
+                "chunk:generic",
+                "chunk:interview",
+                "chunk:fee",
+            },
+        }
+    ]
+
+    chunks = retriever._best_required_page_chunks(
+        "ما المقابلة والرسوم المطلوبة؟",
+        program_url,
+        limit=2,
+        preferred_chunk_ids=["chunk:generic"],
+        required_facets=[
+            {
+                "name": "interview",
+                "aliases": ["technical interview", "مقابلة"],
+                "min_alias_matches": 1,
+            },
+            {
+                "name": "fee",
+                "aliases": ["application fee", "رسوم"],
+                "min_alias_matches": 1,
+            },
+        ],
+    )
+
+    assert {chunk["id"] for chunk in chunks} == {
+        "chunk:interview",
+        "chunk:fee",
+    }
+
+
+def test_required_page_mapping_backfill_reserves_each_relation_bearing_unit_section():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://www.example.edu/research/divisions"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        chunk_map={
+            "chunk:cards": {
+                "id": "chunk:cards",
+                "source_url": page_url,
+                "text": "SECTION: Meet our deans\nDean profiles and biographies.",
+            },
+            "chunk:biology": {
+                "id": "chunk:biology",
+                "source_url": page_url,
+                "text": (
+                    "SECTION: Division of Biological Sciences\n"
+                    "## Division of Biological Sciences\nLed by Dean Amina Noor."
+                ),
+            },
+            "chunk:computing": {
+                "id": "chunk:computing",
+                "source_url": page_url,
+                "text": (
+                    "SECTION: Division of Computing Sciences\n"
+                    "## Division of Computing Sciences\nLed by Dean Ben Chen."
+                ),
+            },
+            "chunk:undergraduate": {
+                "id": "chunk:undergraduate",
+                "source_url": page_url,
+                "text": (
+                    "SECTION: Division of Undergraduate Studies\n"
+                    "## Division of Undergraduate Studies\nLed by Dean Carla Diaz."
+                ),
+            },
+        },
+        _score_text_match=lambda _query, text: 1.0 if "Meet our deans" in text else 0.1,
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": page_url,
+            "normalized_url": page_url,
+            "document_revision_ids": set(),
+            "linked_chunk_ids": {
+                "chunk:cards",
+                "chunk:biology",
+                "chunk:computing",
+                "chunk:undergraduate",
+            },
+        }
+    ]
+
+    chunks = retriever._best_required_page_chunks(
+        "Who are the three deans and which division does each lead?",
+        page_url,
+        limit=3,
+        preferred_chunk_ids=["chunk:cards"],
+        required_facets=[
+            {
+                "name": "complete person-to-division mappings",
+                "aliases": ["dean", "led by", "division of"],
+                "min_alias_matches": 3,
+            }
+        ],
+    )
+
+    assert {chunk["id"] for chunk in chunks} == {
+        "chunk:biology",
+        "chunk:computing",
+        "chunk:undergraduate",
+    }
+
+
 def test_required_page_span_backfill_follows_linked_dense_chunk_order():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -1614,6 +1751,51 @@ def test_semantic_sufficiency_accepts_relevant_complete_page_aggregate():
     assert pack["coverage_status"] == "complete"
     assert pack["sufficiency"]["aggregate_item_count"] == 1
     assert pack["sufficiency"]["trusted_aggregate_item_count"] == 1
+
+
+def test_semantic_sufficiency_accepts_complete_facets_from_bound_official_page():
+    source_url = "https://www.mbzuai.ac.ae/study/masters"
+    pack = build_evidence_pack(
+        query="What scholarship support is provided and which programs are excluded?",
+        result={
+            "retrieval_confidence": 0.0,
+            "retrieval_documents": [
+                {
+                    "id": "chunk:scholarship-scope",
+                    "text": (
+                        "All eligible programs receive a full scholarship with "
+                        "tuition and a monthly stipend. The applied program is excluded."
+                    ),
+                    "source_url": source_url,
+                }
+            ],
+        },
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "semantic_sufficiency_enabled": True,
+            "query_specific_rules_enabled": False,
+            "required_pages": [source_url],
+            "required_facets": [
+                {
+                    "name": "scholarship scope",
+                    "aliases": ["scholarship", "eligible", "excluded"],
+                    "min_alias_matches": 3,
+                    "min_sources": 1,
+                },
+                {
+                    "name": "benefits",
+                    "aliases": ["tuition", "monthly stipend"],
+                    "min_alias_matches": 2,
+                    "min_sources": 1,
+                },
+            ],
+        },
+    )
+
+    assert pack["coverage_status"] == "complete"
+    assert pack["sufficiency"]["all_required_pages_have_evidence"] is True
+    assert pack["sufficiency"]["complete_required_facet_count"] == 2
+    assert pack["sufficiency"]["trusted_faceted_evidence"] is True
 
 
 def test_semantic_sufficiency_does_not_trust_unbound_page_aggregate():

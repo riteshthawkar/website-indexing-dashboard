@@ -721,6 +721,57 @@ def test_premise_grounding_fallback_rejects_generic_scoped_evidence():
     assert result["reason"] == "presupposed_entity_or_scope_not_supported"
 
 
+def test_provider_cannot_override_fail_closed_scoped_premise(monkeypatch):
+    import pipeline.core.evidence_adjudicator as module
+
+    monkeypatch.setattr(module, "make_openai_client", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        module,
+        "json_completion",
+        lambda **_kwargs: {
+            "abstain": False,
+            "selected_answer_ids": ["generic-phone"],
+            "selected_fact_ids": ["singapore-visit"],
+            "selected_chunk_ids": [],
+            "reason": "related evidence appears sufficient",
+            "confidence": 0.92,
+        },
+    )
+
+    result = module.adjudicate_factual_evidence(
+        query="What is the phone number for MBZUAI's Singapore office?",
+        intent_summary={
+            "answer_types": ["phone"],
+            "requested_roles": [],
+            "subject_tokens": ["mbzuai", "singapore"],
+            "subject_phrases": ["mbzuai's singapore"],
+            "strict_answer_required": True,
+        },
+        answer_documents=[
+            {
+                "id": "generic-phone",
+                "answer_type": "phone",
+                "subject_text": "MBZUAI control room",
+                "value": "02811 3100",
+                "text": "The phone number for the MBZUAI control room is 02811 3100.",
+            }
+        ],
+        fact_documents=[
+            {
+                "id": "singapore-visit",
+                "text": "A delegation from Singapore visited MBZUAI in Abu Dhabi.",
+            }
+        ],
+        retrieval_documents=[],
+        model="test-model",
+    )
+
+    assert result["abstain"] is True
+    assert result["method"] == "heuristic"
+    assert result["reason"] == "presupposed_entity_or_scope_not_supported"
+    assert result["selected_answer_ids"] == []
+
+
 def test_existing_abstention_keeps_premise_grounding_guard_for_later_backfill():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -815,6 +866,45 @@ def test_premise_fallback_verifies_arabic_offering_against_english_source():
 
     assert result["abstain"] is False
     assert result["selected_chunk_ids"] == ["maai-study-plan"]
+
+
+def test_premise_fallback_treats_inclusion_as_question_predicate():
+    from pipeline.core.evidence_adjudicator import (
+        extract_premise_requirements,
+        heuristic_adjudicate_factual_evidence,
+    )
+
+    query = (
+        "What scholarship support do master's students receive, and is the "
+        "Master in Applied Artificial Intelligence included?"
+    )
+
+    assert extract_premise_requirements(query) == ["applied master"]
+
+    result = heuristic_adjudicate_factual_evidence(
+        query=query,
+        intent_summary={
+            "answer_types": [],
+            "requested_roles": [],
+            "subject_tokens": [],
+            "subject_phrases": [],
+            "strict_answer_required": False,
+        },
+        answer_documents=[],
+        fact_documents=[],
+        retrieval_documents=[
+            {
+                "id": "scholarship-scope",
+                "text": (
+                    "Except for the Master in Applied Artificial Intelligence, "
+                    "all M.Sc. programs receive the listed scholarship benefits."
+                ),
+            }
+        ],
+    )
+
+    assert result["abstain"] is False
+    assert result["selected_chunk_ids"] == ["scholarship-scope"]
 
 
 def test_premise_fallback_still_rejects_unsupported_arabic_offering():

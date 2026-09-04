@@ -659,6 +659,7 @@ def _evidence_sufficiency(
     intent: str,
     result: Dict[str, Any],
     required_pages: Sequence[str] = (),
+    required_facets: Sequence[Dict[str, Any]] = (),
 ) -> Tuple[bool, Dict[str, Any]]:
     """Assess whether selected evidence is substantively related and complete.
 
@@ -733,8 +734,25 @@ def _evidence_sufficiency(
         required_page_set
         and required_page_set <= trusted_page_card_sources
     )
+    all_required_pages_have_evidence = bool(
+        required_page_set
+        and required_page_set <= official_sources
+    )
+    complete_required_facet_count = sum(
+        1 for facet in required_facets if _facet_evidence(facet, items)[0]
+    )
+    all_required_facets_complete = bool(required_facets) and (
+        complete_required_facet_count == len(required_facets)
+    )
+    trusted_faceted_evidence = bool(
+        all_required_facets_complete
+        and official_sources
+        and (not required_page_set or all_required_pages_have_evidence)
+    )
     trusted_bound_representation = bool(
-        trusted_aggregate_items or all_required_pages_have_page_cards
+        trusted_aggregate_items
+        or all_required_pages_have_page_cards
+        or trusted_faceted_evidence
     )
 
     alignment_variants = [
@@ -809,6 +827,10 @@ def _evidence_sufficiency(
         "trusted_aggregate_item_count": trusted_aggregate_items,
         "trusted_page_card_source_count": len(trusted_page_card_sources),
         "all_required_pages_have_page_cards": all_required_pages_have_page_cards,
+        "all_required_pages_have_evidence": all_required_pages_have_evidence,
+        "complete_required_facet_count": complete_required_facet_count,
+        "required_facet_count": len(required_facets),
+        "trusted_faceted_evidence": trusted_faceted_evidence,
         "retrieval_confidence": round(retrieval_confidence, 4),
         "reasons": reasons,
     }
@@ -1818,7 +1840,10 @@ def build_evidence_pack(
             # official page. The default two-items-per-source diversity cap
             # can retain the page parent plus only the first leaf, silently
             # dropping later stages, requirements, or list entries.
-            source_cap = max(source_cap, 6)
+            source_cap = max(
+                source_cap,
+                min(max_items, max(6, len(required_facets) + 2)),
+            )
         if normalized_source in required_page_set:
             source_cap = max(source_cap, 4 if specific_required_page_mode else 3)
         if source_counts.get(source, 0) >= source_cap:
@@ -1928,6 +1953,51 @@ def build_evidence_pack(
         for _score, kind, doc in media_candidates:
             _append_candidate(kind, doc)
             if sum(1 for item in items if item.get("kind") == "media") >= media_reserve:
+                break
+
+    person_unit_mapping_requested = any(
+        str(facet.get("name") or "") == "complete person-to-division mappings"
+        for facet in required_facets
+    )
+    if person_unit_mapping_requested and not explicit_media_query:
+        # A shared word-level facet can be marked complete after one division
+        # section even though the answer requires several distinct mappings.
+        # Reserve each canonical unit section that contains an explicit leader
+        # relation before aggregate parents or generic profile cards consume
+        # the single-page evidence budget.
+        seen_mapping_units: set[str] = set()
+        for _score, kind, doc in candidates:
+            if kind != "chunk" or not _doc_id(doc).startswith("chunk:"):
+                continue
+            if required_page_set and not _candidate_matches_any_required_page(doc):
+                continue
+            raw_text = str(
+                doc.get("text")
+                or doc.get("dense_text")
+                or doc.get("sparse_text")
+                or ""
+            )
+            normalized_text = raw_text.casefold()
+            relation_present = bool(
+                re.search(
+                    r"\bled\s+by\s+(?:the\s+)?(?:dean|head|director)\b"
+                    r"|\b(?:dean|head|director)\b.{0,80}\bleads?\b",
+                    normalized_text,
+                )
+            )
+            unit_match = re.search(
+                r"(?:section\s*:|#{1,6})\s*"
+                r"((?:division|department|school|unit)\s+of\s+[^\n|]{2,100})",
+                normalized_text,
+            )
+            if not relation_present or unit_match is None:
+                continue
+            unit_label = " ".join(unit_match.group(1).split()).strip()
+            if not unit_label or unit_label in seen_mapping_units:
+                continue
+            if _append_candidate(kind, doc):
+                seen_mapping_units.add(unit_label)
+            if len(items) >= max_items:
                 break
 
     if structured_detail_query and not explicit_media_query:
@@ -2163,14 +2233,6 @@ def build_evidence_pack(
                     and _append_candidate(kind, doc)
                 ):
                     break
-    if specific_required_page_mode:
-        for required_page in required_pages:
-            for _score, kind, doc in candidates:
-                if len(items) >= max_items or used_chars >= max_chars:
-                    truncated = True
-                    break
-                if _candidate_matches_requirement(doc, required_page, page=True):
-                    _append_candidate(kind, doc)
     for required_entity in required_entities:
         if required_entity and required_entity not in "\n".join(_item_search_text(item) for item in items):
             for _score, kind, doc in candidates:
@@ -2192,6 +2254,18 @@ def build_evidence_pack(
             _append_candidate(kind, doc)
             if _facet_evidence(facet, items)[0]:
                 break
+    if specific_required_page_mode:
+        # Fill the remaining page-local budget only after required entities
+        # and semantic facets. Previously, generic high-ranked snippets could
+        # consume the per-source cap before a lower-ranked requested clause
+        # (for example an interview or exception) was considered.
+        for required_page in required_pages:
+            for _score, kind, doc in candidates:
+                if len(items) >= max_items or used_chars >= max_chars:
+                    truncated = True
+                    break
+                if _candidate_matches_requirement(doc, required_page, page=True):
+                    _append_candidate(kind, doc)
     for _score, kind, doc in candidates:
         if len(items) >= max_items or used_chars >= max_chars:
             truncated = True
@@ -2345,6 +2419,7 @@ def build_evidence_pack(
             intent=intent,
             result=result,
             required_pages=required_pages,
+            required_facets=required_facets,
         )
     else:
         evidence_sufficient = bool(items)

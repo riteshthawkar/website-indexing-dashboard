@@ -4377,7 +4377,11 @@ def test_answer_prompt_prefers_evidence_pack_context():
             "items": [
                 {"rank": 1, "kind": "answer", "text": "Packed answer.", "source_url": "https://example.com/answer"},
                 {"rank": 2, "kind": "chunk", "text": "Packed chunk.", "source_url": "https://example.com/chunk"},
-            ]
+            ],
+            "facet_coverage": [
+                {"name": "application fee", "complete": True, "report_in_answer": True},
+                {"name": "internal coherence", "complete": True, "report_in_answer": False},
+            ],
         },
         "retrieval_documents": [{"id": "raw", "text": "Raw context should not be used."}],
     }
@@ -4391,7 +4395,78 @@ def test_answer_prompt_prefers_evidence_pack_context():
     assert "Packed answer." in prompt
     assert "Packed chunk." in prompt
     assert "Raw context should not be used." not in prompt
+    assert "- application fee" in prompt
+    assert "internal coherence" not in prompt
+    assert "conditions, timing, scope, exceptions" in prompt
+    assert "same language as the user's question" in prompt
+    assert "do not assume one atomic fact is a complete answer" in prompt
+    assert "canonical organizational-unit heading" in prompt
+    assert "do not promote adjacent sponsorship mechanisms" in prompt
+    assert "For a maximum-or-extent question" in prompt
+    assert "a separate optional benefit is not a qualifier" in prompt
+    assert "Treat the answer coverage checklist as the response scope" in prompt
+    assert "Page Card PURPOSE, TOPICS, AUDIENCES, and SECTIONS" in prompt
+    assert "Preserve polarity and modality exactly" in prompt
+    assert "minimum, maximum, or completion deadline" in prompt
+    assert "silently check every factual clause" in prompt
     assert _retrieved_contexts_from_result(retrieval_result) == ["Packed answer.", "Packed chunk."]
+
+
+def test_contextual_requested_fields_bypass_an_atomic_structured_answer():
+    from pipeline.evaluation.answer_generation import _compose_structured_answer
+
+    assert (
+        _compose_structured_answer(
+            query=(
+                "Who is the current president, and what title is shown for that person "
+                "on the leadership page?"
+            ),
+            retriever=SimpleNamespace(answer_map={}),
+            retrieval_result={"selected_answer_ids": []},
+        )
+        is None
+    )
+
+
+def test_missing_optional_structured_record_falls_back_to_packed_context():
+    from pipeline.evaluation.answer_generation import _compose_structured_answer
+
+    assert (
+        _compose_structured_answer(
+            query="What is the admissions email address?",
+            retriever=SimpleNamespace(answer_map={}),
+            retrieval_result={"selected_answer_ids": [], "answer_documents": []},
+        )
+        is None
+    )
+
+
+def test_abstention_answer_explains_the_unsupported_semantic_class():
+    from pipeline.evaluation.answer_generation import _compose_abstention_answer
+
+    unsupported_program = _compose_abstention_answer(
+        "What are the admission requirements for the university's veterinary degree?",
+        {"adjudication_reason": "presupposed_entity_or_scope_not_supported"},
+    )
+    future_fee = _compose_abstention_answer(
+        "What will the exact tuition fee be for the 2032-2033 academic year?",
+        {"adjudication_reason": "unsupported_future_mutable_fact"},
+    )
+    arabic = _compose_abstention_answer(
+        "ما الرسوم الدراسية الدقيقة لعام 2032-2033؟",
+        {"adjudication_reason": "unsupported_future_mutable_fact"},
+    )
+    historical = _compose_abstention_answer(
+        "What was the exact tuition fee for 2021-2022?",
+        {"adjudication_reason": "presupposed_entity_or_scope_not_supported"},
+    )
+
+    assert unsupported_program.startswith("Insufficient evidence.")
+    assert "could not verify that the requested program or degree exists" in unsupported_program
+    assert "exact future tuition or fee" in future_fee
+    assert arabic.startswith("لا توجد أدلة كافية.")
+    assert "المستقبلية الدقيقة" in arabic
+    assert "future tuition" not in historical
 
 
 def test_answer_readiness_scores_generated_answers(tmp_path, monkeypatch):

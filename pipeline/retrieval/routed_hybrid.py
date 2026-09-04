@@ -90,6 +90,34 @@ def _normalized_intent_text(query: Any) -> str:
     )
 
 
+def _academic_level_scope(value: Any) -> set[str]:
+    """Return explicit study levels without treating generic graduate text as a level.
+
+    Page selection must preserve the audience named by the user.  This small
+    bilingual vocabulary is a category bridge, not a query-to-page rule: it
+    prevents an undergraduate funding question from becoming a master's or
+    doctoral funding question merely because those pages rank well for the
+    shared word ``scholarship``.
+    """
+
+    normalized = _normalized_intent_text(value)
+    levels: set[str] = set()
+    if re.search(r"\b(?:undergraduate|bachelors?|b\.sc|bsc)\b", normalized) or any(
+        marker in normalized
+        for marker in ("البكالوريوس", "الدراسات الجامعية", "المرحلة الجامعية")
+    ):
+        levels.add("undergraduate")
+    if re.search(r"\b(?:masters?|m\.sc|msc)\b", normalized) or any(
+        marker in normalized for marker in ("الماجستير", "ماجستير")
+    ):
+        levels.add("masters")
+    if re.search(r"\b(?:ph\.?d|doctoral|doctorate)\b", normalized) or any(
+        marker in normalized for marker in ("الدكتوراه", "دكتوراه")
+    ):
+        levels.add("doctoral")
+    return levels
+
+
 def _multilingual_retrieval_bridge_tokens(query: str) -> List[str]:
     """Return category/facet translations for cross-script lexical recall.
 
@@ -252,22 +280,134 @@ def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
                 report_in_answer=False,
             )
 
+    program_study_context = bool(
+        re.search(
+            r"\b(?:programs?|programmes?|degrees?|courses?|masters?|msc|phd|doctoral|undergraduate|bachelors?)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "برنامج",
+                "البرنامج",
+                "البرامج",
+                "درجة",
+                "الدرجة",
+                "الماجستير",
+                "الدكتوراه",
+                "البكالوريوس",
+            )
+        )
+    )
+    study_mode_query = program_study_context and bool(
+        re.search(r"\b(?:full[- ]?time|part[- ]?time|study mode)\b", normalized)
+        or any(marker in normalized for marker in ("دوام كامل", "دوام جزئي", "نمط الدراسة"))
+    )
+    delivery_method_query = program_study_context and bool(
+        re.search(
+            r"\b(?:deliver(?:ed|y)|in[- ]?person|on[- ]?campus|online|hybrid|remote)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in ("طريقة التقديم", "طريقة الدراسة", "حضوري", "عن بعد", "الحرم الجامعي")
+        )
+    )
+    completion_duration_query = program_study_context and bool(
+        re.search(
+            r"\b(?:duration|how long|time to completion|completion time|how many years|how many semesters|typically take)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in ("مدة", "المدة", "كم يستغرق", "وقت الإكمال", "مدة الإكمال")
+        )
+    )
+    if study_mode_query:
+        add(
+            "study mode",
+            ("study mode", "full-time", "full time", "part-time", "part time"),
+        )
+    if delivery_method_query:
+        add(
+            "delivery method",
+            ("delivery", "in-person", "in person", "on campus", "on-campus", "online", "hybrid"),
+        )
+    if completion_duration_query:
+        add(
+            "completion duration and any source-stated bounds",
+            (
+                "typical time to completion",
+                "time to completion",
+                "completion time",
+                "maximum",
+                "minimum",
+                "must complete",
+                "academic years",
+                "years",
+                "semesters",
+            ),
+            min_alias_matches=2,
+        )
+
     scholarship_context = bool(
         re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
         or any(marker in normalized for marker in ("المنح", "المنحة", "تمويل"))
     )
-    scholarship_coverage = scholarship_context and bool(
-        re.search(r"\b(?:cover|covers|coverage|include|includes|benefits?|support|full|detail)\b", normalized)
-        or any(marker in normalized for marker in ("تغطي", "التغطية", "تشمل", "المزايا", "الدعم"))
+    scholarship_extent = scholarship_context and bool(
+        re.search(r"\b(?:maximum|max(?:imum)?|up to|percentage|extent|how much)\b", normalized)
+        or any(
+            marker in normalized
+            for marker in ("الحد الاقصى", "الحد الأقصى", "حتى", "نسبة", "مقدار")
+        )
+    )
+    scholarship_itemized_coverage = scholarship_context and bool(
+        re.search(
+            r"\b(?:cover|covers|include|includes|benefits?|support|full|detail)\b",
+            normalized,
+        )
+        or any(marker in normalized for marker in ("تشمل", "المزايا", "الدعم"))
+        or ("تغطي" in normalized and not scholarship_extent)
+        or (
+            bool(re.search(r"\bcoverage\b", normalized) or "التغطية" in normalized)
+            and not scholarship_extent
+        )
+    )
+    scholarship_types = scholarship_context and bool(
+        re.search(r"\b(?:types?|kinds?|basis|merit|need-based|needs-based)\b", normalized)
+        or any(marker in normalized for marker in ("انواع", "أنواع", "نوع", "الجدارة", "الحاجة"))
     )
     if scholarship_context:
         add(
             "scholarship availability and scope",
             ("scholarship", "financial aid", "funding", "eligible", "available", "offer", "full"),
             min_alias_matches=2,
+            # This broad facet verifies that the evidence is about an actual
+            # scholarship offering.  A question scoped to explicit types or a
+            # maximum should not turn the broad verification facet into an
+            # invitation to enumerate every adjacent benefit.
+            report_in_answer=not (scholarship_types or scholarship_extent),
         )
-    if scholarship_coverage:
+    if scholarship_types:
+        add(
+            "scholarship types",
+            ("merit-based", "need-based", "needs-based", "academic merit", "financial need"),
+            min_alias_matches=2,
+        )
+    if scholarship_extent:
+        add(
+            "maximum scholarship coverage",
+            ("up to", "maximum", "covering", "tuition and cost of attendance", "percentage"),
+            min_alias_matches=2,
+        )
+    if scholarship_context and (
+        scholarship_itemized_coverage
+        or scholarship_extent
+        or re.search(r"\btuition\b", normalized)
+        or "الرسوم الدراسية" in normalized
+    ):
         add("tuition coverage", ("tuition", "tuition coverage", "tuition fees"))
+    if scholarship_itemized_coverage:
         add("living stipend", ("monthly stipend", "stipend", "living allowance"))
         add("accommodation support", ("accommodation", "housing"))
         add("health coverage", ("healthcare", "health insurance", "medical insurance"))
@@ -278,6 +418,61 @@ def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
             min_alias_matches=5,
             same_source=True,
             report_in_answer=False,
+        )
+
+    application_fee_query = bool(
+        re.search(r"\bapplication fees?\b", normalized)
+        or any(
+            marker in normalized
+            for marker in ("رسوم التقديم", "رسوم الطلب", "رسم التقديم", "رسم الطلب")
+        )
+    )
+    if application_fee_query:
+        add(
+            "application fee",
+            ("application fee", "application charge", "fee after the screening exam"),
+        )
+
+    fee_waiver_query = bool(
+        re.search(r"\b(?:fee[- ]?waivers?|waiv(?:e|ed|er)|reimburs(?:e|ed|ement))\b", normalized)
+        or any(marker in normalized for marker in ("اعفاء", "إعفاء", "استرداد", "رد الرسوم"))
+    )
+    if fee_waiver_query:
+        add(
+            "fee-waiver conditions",
+            ("fee waiver", "fee waivers", "waived", "reimbursed", "screening exam score", "enrollment"),
+            min_alias_matches=2,
+        )
+
+    seat_holding_query = bool(
+        re.search(r"\b(?:seat[- ]holding|registration deposit|seat deposit)\b", normalized)
+        or any(marker in normalized for marker in ("حجز المقعد", "تثبيت المقعد", "وديعة التسجيل"))
+    )
+    if seat_holding_query:
+        add(
+            "seat-holding deposit",
+            ("seat-holding fee", "seat holding fee", "registration fee", "deposit", "hold their place", "credited toward"),
+            min_alias_matches=2,
+        )
+
+    per_credit_query = bool(
+        re.search(r"\bper[- ]credit\b", normalized)
+        or any(marker in normalized for marker in ("لكل ساعة معتمدة", "لكل رصيد", "لكل وحدة دراسية"))
+    )
+    if per_credit_query:
+        add(
+            "per-credit tuition rate",
+            ("per credit", "per-credit", "credit hour", "paid each semester"),
+        )
+
+    total_tuition_query = bool(
+        re.search(r"\b(?:total|full|overall)\s+(?:tuition|program fees?|cost)\b", normalized)
+        or any(marker in normalized for marker in ("إجمالي الرسوم", "اجمالي الرسوم", "التكلفة الإجمالية", "التكلفة الاجمالية"))
+    )
+    if total_tuition_query:
+        add(
+            "total tuition",
+            ("total", "full tuition fee", "total tuition", "complete the program"),
         )
 
     tuition_amount_query = bool(
@@ -309,6 +504,59 @@ def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
             "program-to-division mapping",
             ("under our division", "our division currently offers", "programs across", "graduate programs", "programs"),
             min_sources=2,
+        )
+
+    explicit_title_query = bool(
+        re.search(
+            r"\b(?:full|official|displayed|shown)\s+(?:title|designation|position|label)\b"
+            r"|\bwhat\s+(?:title|designation|position|label)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "المسمى الرسمي",
+                "المسمى الوظيفي",
+                "ما المسمى",
+                "ما اللقب",
+            )
+        )
+    )
+    if explicit_title_query:
+        add(
+            "complete official title or designation",
+            (
+                "title",
+                "designation",
+                "position",
+                "president",
+                "professor",
+                "dean of",
+                "director of",
+                "chairman of",
+            ),
+            min_alias_matches=2,
+        )
+
+    person_division_mapping = bool(
+        (
+            re.search(r"\b(?:deans?|leaders?|heads?)\b", normalized)
+            or any(marker in normalized for marker in ("عمداء", "العمداء", "عميد", "يقود"))
+        )
+        and (
+            re.search(r"\b(?:divisions?|departments?|schools?|units?)\b", normalized)
+            or any(marker in normalized for marker in ("الأقسام", "الاقسام", "قسم", "الشعب"))
+        )
+        and (
+            re.search(r"\b(?:each|which|lead|leads|mapping)\b", normalized)
+            or any(marker in normalized for marker in ("كل منهم", "أي قسم", "اي قسم", "يقود"))
+        )
+    )
+    if person_division_mapping:
+        add(
+            "complete person-to-division mappings",
+            ("dean", "led by", "leads", "division of", "meet our deans"),
+            min_alias_matches=3,
         )
     return facets
 
@@ -390,6 +638,15 @@ def _durable_page_candidate_allowed(query: str, page: Mapping[str, Any]) -> bool
     search_text = str(page.get("search_text") or "").casefold()
     token_text = " ".join(str(value) for value in (page.get("tokens") or []))
     blob = f"{source_url} {identity} {search_text} {token_text}"
+
+    requested_levels = _academic_level_scope(normalized)
+    candidate_levels = _academic_level_scope(f"{source_url} {identity}")
+    if (
+        len(requested_levels) == 1
+        and candidate_levels
+        and requested_levels.isdisjoint(candidate_levels)
+    ):
+        return False
 
     scholarship_query = bool(
         re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
@@ -1765,6 +2022,40 @@ class RoutedHybridRetriever:
                 self.large_page_evidence_budget_chars,
                 self.evidence_budget_max_per_source,
             )
+        required_facet_count = len(
+            [
+                facet
+                for facet in (coverage_plan or {}).get("required_facets") or []
+                if isinstance(facet, Mapping)
+                and str(facet.get("name") or "").strip()
+            ]
+        )
+        if required_facet_count >= 5:
+            # A detailed request needs room for the evidence contract it asks
+            # us to satisfy. Keep this bounded by the existing aggregation
+            # budget so arbitrary long prompts cannot grow the context
+            # without limit.
+            item_cap = max(
+                self.evidence_budget_items,
+                self.aggregation_evidence_budget_items,
+            )
+            item_budget = min(
+                item_cap,
+                max(self.evidence_budget_items, required_facet_count + 2),
+            )
+            char_cap = max(
+                self.evidence_budget_chars,
+                self.aggregation_evidence_budget_chars,
+            )
+            char_budget = min(
+                char_cap,
+                max(self.evidence_budget_chars, item_budget * 1000),
+            )
+            return (
+                item_budget,
+                char_budget,
+                self.evidence_budget_max_per_source,
+            )
         return (
             self.evidence_budget_items,
             self.evidence_budget_chars,
@@ -2945,6 +3236,30 @@ class RoutedHybridRetriever:
         content_ratio = len(content_overlap) / float(len(query_tokens))
         score = (1.15 * identity_ratio) + (0.42 * content_ratio)
         score += min(0.24, 0.08 * len(identity_overlap))
+
+        # A capitalized acronym that is not part of the site's hostname often
+        # identifies a program, unit, system, or initiative.  Reward ordinary
+        # corpus evidence that contains that scope token so a broad FAQ about
+        # one shared facet cannot outrank the named subject's complete page.
+        # Host tokens are excluded because an institutional acronym naturally
+        # appears across every page on that site.
+        try:
+            source_host_tokens = set(
+                _tokenize(urlparse(str(page.get("source_url") or "")).hostname or "")
+            )
+        except Exception:
+            source_host_tokens = set()
+        emphasized_scope_tokens = set(
+            features.get("emphasized_host_tokens") or set()
+        ) - source_host_tokens
+        emphasized_identity_overlap = emphasized_scope_tokens & (
+            identity_tokens | tail_tokens
+        )
+        emphasized_content_overlap = emphasized_scope_tokens & content_tokens
+        if emphasized_identity_overlap:
+            score += min(1.35, 0.90 + (0.20 * len(emphasized_identity_overlap)))
+        elif emphasized_content_overlap:
+            score += min(1.45, 1.10 + (0.18 * len(emphasized_content_overlap)))
         if query_tokens & host_identity_tokens:
             # A user who explicitly names a site/institute token should prefer
             # that official host over a mirrored institutional summary.  This
@@ -4795,6 +5110,7 @@ class RoutedHybridRetriever:
         *,
         limit: int = 2,
         preferred_chunk_ids: Sequence[str] = (),
+        required_facets: Sequence[Mapping[str, Any]] = (),
     ) -> List[Dict[str, Any]]:
         scored: List[tuple[int, int, float, Dict[str, Any]]] = []
         chunk_map = getattr(self.vector, "chunk_map", {})
@@ -4882,8 +5198,167 @@ class RoutedHybridRetriever:
                 str(item[3].get("id") or ""),
             )
         )
+        ordered_scored = list(scored)
+        person_unit_mapping_requested = any(
+            str(facet.get("name") or "")
+            == "complete person-to-division mappings"
+            for facet in required_facets
+            if isinstance(facet, Mapping)
+        )
+        if person_unit_mapping_requested and limit > 1:
+            # A mapping question needs the relation-bearing section for every
+            # unit, not just one generic "Meet our deans" card that happens to
+            # satisfy the shared words. Reserve distinct canonical unit
+            # sections that explicitly state their leader, then retain the
+            # normal dense/lexical order for remaining capacity.
+            mapping_rows: List[tuple[int, int, float, Dict[str, Any]]] = []
+            seen_unit_labels: set[str] = set()
+            for item in scored:
+                chunk = item[3]
+                blob = " ".join(
+                    str(chunk.get(key) or "")
+                    for key in (
+                        "section_heading",
+                        "heading",
+                        "breadcrumb",
+                        "text",
+                        "dense_text",
+                    )
+                ).casefold()
+                relation_present = bool(
+                    re.search(
+                        r"\bled\s+by\s+(?:the\s+)?(?:dean|head|director)\b"
+                        r"|\b(?:dean|head|director)\b.{0,80}\bleads?\b",
+                        blob,
+                    )
+                )
+                unit_match = re.search(
+                    r"(?:section\s*:|#{1,6})\s*"
+                    r"((?:division|department|school|unit)\s+of\s+[^\n|]{2,100})",
+                    blob,
+                )
+                if not relation_present or unit_match is None:
+                    continue
+                unit_label = " ".join(unit_match.group(1).split()).strip()
+                if not unit_label or unit_label in seen_unit_labels:
+                    continue
+                seen_unit_labels.add(unit_label)
+                mapping_rows.append(item)
+                if len(mapping_rows) >= limit:
+                    break
+            if len(mapping_rows) >= 2:
+                mapping_ids = {
+                    str(item[3].get("id") or "") for item in mapping_rows
+                }
+                ordered_scored = [
+                    *mapping_rows,
+                    *[
+                        item
+                        for item in scored
+                        if str(item[3].get("id") or "") not in mapping_ids
+                    ],
+                ]
+        if required_facets and limit > 0:
+            # Dense rank is an excellent relevance seed, but a cross-lingual
+            # query may place one requested page-local clause below the dense
+            # cutoff. Greedily reserve chunks that add new semantic-facet
+            # aliases, then fill any remaining slots in the original dense /
+            # lexical order. This uses the planner's structured contract and
+            # does not depend on prompt-specific answer text.
+            facet_aliases: List[List[tuple[str, set[str]]]] = []
+            facet_required: List[int] = []
+            for facet in required_facets:
+                aliases: List[tuple[str, set[str]]] = []
+                for raw_alias in facet.get("aliases") or []:
+                    alias = str(raw_alias or "").strip().casefold()
+                    if not alias:
+                        continue
+                    aliases.append((alias, set(_tokenize(alias))))
+                facet_aliases.append(aliases)
+                facet_required.append(
+                    max(1, int(facet.get("min_alias_matches") or 1))
+                )
+
+            def matched_aliases(chunk: Mapping[str, Any]) -> List[set[str]]:
+                blob = " ".join(
+                    str(chunk.get(key) or "")
+                    for key in (
+                        "document_title",
+                        "section_heading",
+                        "heading",
+                        "breadcrumb",
+                        "text",
+                        "dense_text",
+                        "sparse_text",
+                    )
+                ).casefold()
+                blob_tokens = set(_tokenize(blob))
+                return [
+                    {
+                        alias
+                        for alias, alias_tokens in aliases
+                        if alias in blob
+                        or (alias_tokens and alias_tokens <= blob_tokens)
+                    }
+                    for aliases in facet_aliases
+                ]
+
+            matched_by_candidate = [
+                matched_aliases(item[3]) for item in scored
+            ]
+            covered: List[set[str]] = [set() for _facet in required_facets]
+            remaining = set(range(len(scored)))
+            facet_first: List[tuple[int, int, float, Dict[str, Any]]] = []
+            while remaining and len(facet_first) < limit:
+                best_index = -1
+                best_key: tuple[int, int, int] | None = None
+                for index in remaining:
+                    completion_gain = 0
+                    alias_gain = 0
+                    for facet_index, matches in enumerate(
+                        matched_by_candidate[index]
+                    ):
+                        before = len(covered[facet_index])
+                        after = len(covered[facet_index] | matches)
+                        if after <= before:
+                            continue
+                        alias_gain += after - before
+                        if (
+                            before < facet_required[facet_index]
+                            and after >= facet_required[facet_index]
+                        ):
+                            completion_gain += 1
+                    key = (completion_gain, alias_gain, -index)
+                    if best_key is None or key > best_key:
+                        best_key = key
+                        best_index = index
+                if best_index < 0 or best_key is None or best_key[:2] == (0, 0):
+                    break
+                remaining.remove(best_index)
+                facet_first.append(scored[best_index])
+                for facet_index, matches in enumerate(
+                    matched_by_candidate[best_index]
+                ):
+                    covered[facet_index].update(matches)
+                if all(
+                    len(covered[index]) >= facet_required[index]
+                    for index in range(len(facet_required))
+                ):
+                    break
+            selected_ids = {
+                str(item[3].get("id") or "") for item in facet_first
+            }
+            if not person_unit_mapping_requested:
+                ordered_scored = [
+                    *facet_first,
+                    *[
+                        item
+                        for item in scored
+                        if str(item[3].get("id") or "") not in selected_ids
+                    ],
+                ]
         output: List[Dict[str, Any]] = []
-        for _dense_bucket, dense_rank, _negative_score, chunk in scored[:limit]:
+        for _dense_bucket, dense_rank, _negative_score, chunk in ordered_scored[:limit]:
             chunk_payload = self._chunk_payload_from_record(
                 chunk,
                 required_page=required_page,
@@ -5106,9 +5581,30 @@ class RoutedHybridRetriever:
             _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
             or _is_enumeration_query(query)
         )
+        required_facet_count = len(
+            [
+                facet
+                for facet in coverage_plan.get("required_facets") or []
+                if isinstance(facet, Mapping)
+                and str(facet.get("name") or "").strip()
+            ]
+        )
         fact_limit = 4 if aggregate_page_query else 1
         chunk_limit = 3 if aggregate_page_query else 2
         span_limit = 4 if aggregate_page_query else 2
+        if required_facet_count:
+            # Dense top-k is a relevance ranking, not a completeness proof.
+            # Retain a bounded wider page-local candidate pool so later facet
+            # packing can include a lower-ranked clause such as an interview,
+            # fee, exception, or deadline from the same authoritative page.
+            chunk_limit = max(
+                chunk_limit,
+                min(8, required_facet_count + 1),
+            )
+            span_limit = max(
+                span_limit,
+                min(8, required_facet_count + 1),
+            )
         for required_page in required_pages:
             normalized_required = self._normalize_source_url(required_page)
             injected_page_card = self._best_required_page_card(query, required_page)
@@ -5179,6 +5675,11 @@ class RoutedHybridRetriever:
                 required_page,
                 limit=chunk_limit,
                 preferred_chunk_ids=payload.get("dense_chunk_ids") or [],
+                required_facets=[
+                    facet
+                    for facet in coverage_plan.get("required_facets") or []
+                    if isinstance(facet, Mapping)
+                ],
             )
             if injected_chunks:
                 payload.setdefault("selected_chunk_ids", [])
