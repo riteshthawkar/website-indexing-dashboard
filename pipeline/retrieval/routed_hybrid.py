@@ -944,6 +944,54 @@ def _durable_page_candidate_allowed(query: str, page: Mapping[str, Any]) -> bool
     return True
 
 
+_INCIDENTAL_COLLECTION_ROUTE_RE = re.compile(
+    r"/(?:author|tag|category|search)(?:/|$)|/(?:page)/\d+(?:/|$)",
+    re.IGNORECASE,
+)
+
+
+def _incidental_collection_page_allowed(
+    query: str,
+    page: Mapping[str, Any],
+) -> bool:
+    """Keep archive/listing routes out of hard evidence requirements.
+
+    Author, tag, search, category, and pagination pages may repeat an entire
+    article or site footer and therefore look semantically complete. They are
+    useful recall surfaces, but they should become mandatory only when the user
+    explicitly asks for that collection surface.
+    """
+
+    source_url = str(page.get("normalized_url") or page.get("source_url") or "")
+    try:
+        path = unquote(urlparse(source_url).path or "").casefold()
+    except Exception:
+        path = source_url.casefold()
+    match = _INCIDENTAL_COLLECTION_ROUTE_RE.search(path)
+    if not match:
+        return True
+    normalized_query = _normalized_intent_text(query)
+    route = match.group(0).casefold()
+    if "/author" in route:
+        return bool(
+            re.search(r"\b(?:author page|posts? by|articles? by|author archive)\b", normalized_query)
+            or re.search(r"(?:صفحة الكاتب|مقالات الكاتب|منشورات الكاتب|أرشيف الكاتب)", normalized_query)
+        )
+    if "/tag" in route:
+        return bool(re.search(r"\b(?:tag page|tagged|tag archive)\b", normalized_query))
+    if "/category" in route:
+        return bool(
+            re.search(r"\b(?:category page|category archive)\b", normalized_query)
+            or re.search(r"(?:صفحة الفئة|أرشيف الفئة)", normalized_query)
+        )
+    if "/search" in route:
+        return bool(re.search(r"\b(?:search page|search results?)\b", normalized_query))
+    return bool(
+        re.search(r"\b(?:page\s+\d+|pagination|older posts?)\b", normalized_query)
+        or re.search(r"(?:الصفحة\s+\d+|ترقيم الصفحات|منشورات أقدم)", normalized_query)
+    )
+
+
 def _page_facet_coverage_score(
     facets: Sequence[Mapping[str, Any]],
     page: Mapping[str, Any],
@@ -4103,6 +4151,21 @@ class RoutedHybridRetriever:
             if normalized:
                 evidence_source_rank.setdefault(normalized, rank)
 
+        # A hard required-page contract must be supported by at least one
+        # bounded retrieval representation. Besides removing a full-corpus
+        # scan from every request, this prevents repeated archive text from
+        # creating a mandatory page that no retrieval lane actually selected.
+        candidate_source_urls = set(page_card_rank) | set(dense_source_rank) | set(
+            evidence_source_rank
+        )
+        candidate_pages = [
+            page
+            for page in self._coverage_page_records
+            if str(page.get("normalized_url") or "") in candidate_source_urls
+        ]
+        if not candidate_pages:
+            candidate_pages = list(self._coverage_page_records)
+
         compound_facet_request = _is_compound_facet_query(query)
         enforce_durable_topic_binding = not self._query_has_explicit_named_page_scope(
             query
@@ -4125,8 +4188,12 @@ class RoutedHybridRetriever:
             if host:
                 directly_corroborated_page_hosts.add(host)
 
+        collection_scope_request = bool(
+            _PAGE_COLLECTION_QUERY_RE.search(query)
+            and (_is_enumeration_query(query) or compound_facet_request)
+        )
         scored: List[tuple[float, float, bool, Dict[str, Any]]] = []
-        for page in self._coverage_page_records:
+        for page in candidate_pages:
             normalized = str(page.get("normalized_url") or "")
             page_is_arabic = bool(
                 page.get("page_is_arabic")
@@ -4134,6 +4201,8 @@ class RoutedHybridRetriever:
                 else "/ar/" in normalized or normalized.endswith("/ar")
             )
             if not query_is_arabic_script and page_is_arabic:
+                continue
+            if not _incidental_collection_page_allowed(query, page):
                 continue
             if enforce_durable_topic_binding and not _durable_page_candidate_allowed(
                 query,
@@ -4367,6 +4436,30 @@ class RoutedHybridRetriever:
                 # corpus, so unrelated domains cannot gain from a coincidental
                 # token match.
                 agreement_score += 0.40
+            if collection_scope_request and normalized in page_card_rank:
+                try:
+                    normalized_path = (urlparse(normalized).path or "/").rstrip("/")
+                except Exception:
+                    normalized_path = "/invalid"
+                direct_child_evidence = False
+                for other_url in candidate_source_urls:
+                    if other_url == normalized or not self._coverage_url_is_aggregate_parent(
+                        normalized,
+                        other_url,
+                    ):
+                        continue
+                    try:
+                        other_path = (urlparse(other_url).path or "/").rstrip("/")
+                    except Exception:
+                        continue
+                    if other_path.count("/") == normalized_path.count("/") + 1:
+                        direct_child_evidence = True
+                        break
+                if direct_child_evidence:
+                    # A retrieved Page Card that is the direct structural
+                    # parent of other retrieved pages is the natural source
+                    # for collection/category headings.
+                    agreement_score += 0.62
             weak_compound_aggregate = bool(
                 compound_facet_request
                 and semantic_score < 0.50
@@ -6821,11 +6914,20 @@ class RoutedHybridRetriever:
             3,
         )
         stage_started = time.perf_counter()
-        coverage_plan = self._coverage_plan_for_result(
-            query=coverage_query,
-            payload=payload,
-            mode=mode,
-        )
+        if payload["page_card_fusion_applied"]:
+            coverage_plan = self._coverage_plan_for_result(
+                query=coverage_query,
+                payload=payload,
+                mode=mode,
+            )
+        else:
+            # Adjudication changes selected evidence, not inferred page scope.
+            # Reuse the already-computed plan when Page Card ordering is
+            # unchanged and refresh only its evidence-dependent status.
+            coverage_plan = self._refresh_coverage_plan_status(
+                pre_adjudication_plan,
+                payload,
+            )
         if self._augment_payload_for_required_coverage(
             query=coverage_query,
             payload=payload,

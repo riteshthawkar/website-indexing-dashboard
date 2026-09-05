@@ -82,6 +82,29 @@ def test_short_enumerations_use_synthesis_but_exact_values_remain_facts():
     )
 
 
+def test_short_direct_fact_questions_use_the_bounded_rerank_path():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+
+    assert retriever._is_lightweight_fact_rerank_query(
+        "What age range is eligible to participate?",
+        mode=QueryMode.FACT,
+    )
+    assert retriever._is_lightweight_fact_rerank_query(
+        "ما البريد الإلكتروني للقبول؟",
+        mode=QueryMode.FACT,
+    )
+    assert not retriever._is_lightweight_fact_rerank_query(
+        "Compare all scholarship benefits across every program.",
+        mode=QueryMode.FACT,
+    )
+    assert not retriever._is_lightweight_fact_rerank_query(
+        "Which divisions are there?",
+        mode=QueryMode.SYNTHESIS,
+    )
+
+
 def test_enumeration_expands_across_sibling_page_sections():
     from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
 
@@ -899,6 +922,127 @@ def test_cross_script_page_name_mismatch_does_not_veto_dense_source_consensus():
 
     assert inferred["required_pages"] == [careers_url]
     assert inferred["required_pages_source"] == "semantic_page_evidence"
+
+
+def test_generalized_coverage_never_requires_incidental_author_archives():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    about_url = "https://ifm.example.edu/about/"
+    author_url = "https://ifm.example.edu/author/editor/"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    shared_text = (
+        "Institute of Foundation Models mission partner model headquarters "
+        "global hubs open collaboration"
+    )
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:about": {"id": "card:about", "source_url": about_url},
+            "card:author": {"id": "card:author", "source_url": author_url},
+        },
+        chunk_map={
+            "chunk:about": {"id": "chunk:about", "source_url": about_url},
+            "chunk:author": {"id": "chunk:author", "source_url": author_url},
+        },
+    )
+
+    def page(source_url: str, title: str) -> dict:
+        normalized_url = retriever._normalize_source_url(source_url)
+        sequence = retriever._generalized_page_token_sequence(title)
+        return {
+            "source_url": source_url,
+            "normalized_url": normalized_url,
+            "identity_text": title.casefold(),
+            "identity_tokens": set(_tokenize(title)),
+            "identity_sequence_text": f" {' '.join(sequence)} ",
+            "search_text": shared_text.casefold(),
+            "tokens": set(_tokenize(shared_text)),
+            "host_identity_tokens": {"ifm"},
+            "tail_tokens": set(_tokenize(source_url)),
+            "page_is_arabic": False,
+        }
+
+    retriever._coverage_page_records = [
+        page(about_url, "IFM About"),
+        page(author_url, "IFM author editor"),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "What are IFM's mission, partner model, headquarters, and global hubs?",
+        "multi_page_aggregation",
+        {
+            "dense_page_card_ids": ["card:about", "card:author"],
+            "dense_chunk_ids": ["chunk:about", "chunk:author"],
+        },
+    )
+
+    assert about_url in inferred["required_pages"]
+    assert author_url not in inferred["required_pages"]
+
+
+def test_collection_query_prefers_retrieved_structural_overview_page():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    root_url = "https://careers.example.edu/"
+    vacancies_url = "https://careers.example.edu/vacancies/"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:root": {"id": "card:root", "source_url": root_url},
+            "card:vacancies": {
+                "id": "card:vacancies",
+                "source_url": vacancies_url,
+            },
+        },
+        chunk_map={
+            "chunk:vacancies": {
+                "id": "chunk:vacancies",
+                "source_url": vacancies_url,
+            }
+        },
+    )
+
+    def page(source_url: str, title: str, text: str) -> dict:
+        normalized_url = retriever._normalize_source_url(source_url)
+        sequence = retriever._generalized_page_token_sequence(title)
+        return {
+            "source_url": source_url,
+            "normalized_url": normalized_url,
+            "identity_text": title.casefold(),
+            "identity_tokens": set(_tokenize(title)),
+            "identity_sequence_text": f" {' '.join(sequence)} ",
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+            "host_identity_tokens": {"careers"},
+            "tail_tokens": set(_tokenize(source_url)),
+            "page_is_arabic": False,
+        }
+
+    overview_text = (
+        "Careers sections categories faculty research engineering professional "
+        "vacancies and global centers locations Abu Dhabi Paris Silicon Valley"
+    )
+    retriever._coverage_page_records = [
+        page(root_url, "Careers", overview_text),
+        page(vacancies_url, "All Vacancies", overview_text),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "ما هي أقسام الوظائف المفتوحة في صفحة الوظائف، وما هي المراكز العالمية المذكورة فيها؟",
+        "multi_page_aggregation",
+        {
+            "dense_page_card_ids": ["card:root", "card:vacancies"],
+            "dense_chunk_ids": ["chunk:vacancies"],
+        },
+    )
+
+    assert inferred["required_pages"]
+    assert retriever._normalize_source_url(inferred["required_pages"][0]) == (
+        retriever._normalize_source_url(root_url)
+    )
 
 
 def test_generalized_comparison_retains_each_high_ranked_dense_page():

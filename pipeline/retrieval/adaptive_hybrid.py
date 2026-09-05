@@ -7812,6 +7812,35 @@ class AdaptiveHybridRetriever:
     def _is_lightweight_fact_rerank_query(self, query: str, *, mode: QueryMode) -> bool:
         if mode != QueryMode.FACT:
             return False
+        normalized = " ".join(str(query or "").casefold().split())
+        if not normalized or len(normalized.split()) > 20:
+            return False
+        if _is_enumeration_query(normalized) or re.search(
+            r"\b(?:compare|versus|across|all|every)\b|(?:قارن|مقارنة|جميع|كافة|كل)",
+            normalized,
+            flags=re.IGNORECASE,
+        ):
+            return False
+        if _query_starts_with(
+            normalized,
+            (
+                "what ",
+                "which ",
+                "who ",
+                "when ",
+                "where ",
+                "how many ",
+                "ما ",
+                "من ",
+                "متى ",
+                "أين ",
+                "اين ",
+                "كم ",
+                "أي ",
+                "اي ",
+            ),
+        ):
+            return True
         query_tokens = set(_tokenize(query))
         if not _query_starts_with(query, ("can ", "does ", "is ", "are ")):
             return False
