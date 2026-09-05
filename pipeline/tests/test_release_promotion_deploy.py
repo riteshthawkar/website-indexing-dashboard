@@ -21,6 +21,7 @@ def _run_promotion_attestation(
     *,
     backend_run_id: str = "candidate-1",
     backend_commit_sha: str = "e" * 40,
+    backend_reranker_enabled: bool = False,
     drift_backend_run_after_initial_attestation: bool = False,
     extra_env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
@@ -92,6 +93,11 @@ def _run_promotion_attestation(
                 "query_rewrite_model": "gpt-5.4-mini-2026-03-17",
                 "reranker_model": "gpt-5.4-mini-2026-03-17",
                 "grounded_finalizer_model": "gpt-5.4-mini-2026-03-17",
+            },
+            "reranker": {
+                "status": "healthy",
+                "enabled": backend_reranker_enabled,
+                "mode": "enabled" if backend_reranker_enabled else "disabled",
             },
             "retrieval_service": {
                 "status": "healthy",
@@ -224,6 +230,13 @@ def test_release_promotion_rejects_unexpected_backend_code_revision(tmp_path: Pa
 
     assert result.returncode != 0
     assert "backend-candidate code revision mismatch" in result.stderr
+
+
+def test_release_promotion_rejects_duplicate_backend_llm_reranker(tmp_path: Path) -> None:
+    result = _run_promotion_attestation(tmp_path, backend_reranker_enabled=True)
+
+    assert result.returncode != 0
+    assert "must disable the duplicate backend LLM reranker" in result.stderr
 
 
 def test_release_promotion_rechecks_candidate_after_evaluation(tmp_path: Path) -> None:

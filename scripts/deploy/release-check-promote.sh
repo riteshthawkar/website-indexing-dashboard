@@ -347,6 +347,15 @@ for key, expected_model in expected_answer_models.items():
             f"backend-candidate answer model mismatch for {key}: "
             f"expected={expected_model!r}, actual={backend_openai.get(key)!r}"
         )
+backend_reranker = (backend.get("checks") or {}).get("reranker") or {}
+if (
+    backend_reranker.get("status") != "healthy"
+    or backend_reranker.get("enabled") is not False
+    or backend_reranker.get("mode") != "disabled"
+):
+    raise SystemExit(
+        "backend-candidate must disable the duplicate backend LLM reranker"
+    )
 actual_backend_commit = str((backend.get("release") or {}).get("commit_sha") or "")
 if actual_backend_commit != expected_backend_commit:
     raise SystemExit(
