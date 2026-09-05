@@ -5292,7 +5292,165 @@ class AdaptiveHybridRetriever:
             if score > 0.0:
                 scored.append((page_card_id, score))
         scored.sort(key=lambda item: (-item[1], item[0]))
-        return [page_card_id for page_card_id, _score in scored[:top_k]]
+        ranked_ids = [page_card_id for page_card_id, _score in scored]
+        baseline_ids = ranked_ids[:top_k]
+        if len(baseline_ids) < 2 or not _is_enumeration_query(query):
+            return baseline_ids
+
+        # Dense embeddings may be unavailable, and a bounded lexical top-k can
+        # then contain only detail pages from one site area. Search the already
+        # bounded lexical candidate set for a structural overview on that same
+        # host. This is inexpensive, preserves source scope, and keeps the
+        # fallback path equivalent to the dense Page Card path.
+        host_counts: Dict[str, int] = {}
+        host_first_rank: Dict[str, int] = {}
+        for rank, page_card_id in enumerate(baseline_ids):
+            page = self.page_card_map.get(page_card_id) or {}
+            host = (urlparse(str(page.get("source_url") or "")).hostname or "").casefold()
+            if not host:
+                continue
+            host_counts[host] = host_counts.get(host, 0) + 1
+            host_first_rank.setdefault(host, rank)
+        if not host_counts:
+            return baseline_ids
+        dominant_host = min(
+            host_counts,
+            key=lambda host: (-host_counts[host], host_first_rank[host], host),
+        )
+        same_host_candidates = [
+            page_card_id
+            for page_card_id in ranked_ids
+            if (
+                urlparse(
+                    str((self.page_card_map.get(page_card_id) or {}).get("source_url") or "")
+                ).hostname
+                or ""
+            ).casefold()
+            == dominant_host
+        ]
+        promoted_same_host = self._promote_collection_overview_page_cards(
+            query,
+            same_host_candidates,
+        )
+        if not promoted_same_host:
+            return baseline_ids
+        return list(dict.fromkeys([promoted_same_host[0], *baseline_ids]))[:top_k]
+
+    def _promote_collection_overview_page_cards(
+        self,
+        query: str,
+        page_card_ids: Sequence[str],
+    ) -> List[str]:
+        """Prefer overview cards that enumerate several requested siblings.
+
+        A collection question can semantically match a long item listing more
+        strongly than the overview page that names the collection's actual
+        categories. Page Cards preserve section headings, so use that frozen
+        structure to distinguish a broad overview from a detail/listing page.
+        The rule is domain-neutral: it only counts headings that match at least
+        two informative query terms and never contains an expected answer.
+        """
+
+        ordered = list(
+            dict.fromkeys(
+                str(page_card_id)
+                for page_card_id in page_card_ids
+                if str(page_card_id) in self.page_card_map
+            )
+        )
+        if len(ordered) < 2 or not _is_enumeration_query(query):
+            return ordered
+
+        def _canonical_token(token: str) -> str:
+            value = str(token or "").casefold()
+            if value.endswith("ies") and len(value) > 4:
+                return value[:-3] + "y"
+            if value.endswith("s") and len(value) > 4 and not value.endswith("ss"):
+                return value[:-1]
+            return value
+
+        informative_tokens = {
+            _canonical_token(token)
+            for token in self._informative_query_tokens(query)
+            if _canonical_token(token)
+        }
+        collection_cues = {
+            "category",
+            "department",
+            "division",
+            "group",
+            "kind",
+            "section",
+            "type",
+            "أقسام",
+            "الأقسام",
+            "اقسام",
+            "الاقسام",
+        }
+        if len(informative_tokens) < 2 or not (informative_tokens & collection_cues):
+            return ordered
+
+        anchor_host = (
+            urlparse(
+                str((self.page_card_map.get(ordered[0]) or {}).get("source_url") or "")
+            ).hostname
+            or ""
+        ).casefold()
+        promoted: List[Tuple[int, int, int, str]] = []
+        for original_rank, page_card_id in enumerate(ordered):
+            page = self.page_card_map.get(page_card_id) or {}
+            page_host = (
+                urlparse(str(page.get("source_url") or "")).hostname or ""
+            ).casefold()
+            if anchor_host and page_host != anchor_host:
+                continue
+            lexical_text = str(
+                (getattr(self, "lexical_map", {}).get(page_card_id) or {}).get("text")
+                or ""
+            )
+            page_text = lexical_text or str(
+                page.get("text") or page.get("dense_text") or page.get("raw_text") or ""
+            )
+            in_sections = False
+            matching_headings = 0
+            short_matching_headings = 0
+            for raw_line in page_text.splitlines():
+                line = _clean_text(raw_line)
+                upper = line.upper()
+                if upper == "SECTIONS:":
+                    in_sections = True
+                    continue
+                if in_sections and upper.startswith("SOURCE_URL:"):
+                    break
+                if not in_sections or not line.startswith("-"):
+                    continue
+                heading_tokens = {
+                    _canonical_token(token)
+                    for token in _tokenize(line.lstrip("- "))
+                    if _canonical_token(token)
+                }
+                overlap = heading_tokens & informative_tokens
+                if overlap:
+                    if len(heading_tokens) <= 4:
+                        short_matching_headings += 1
+                if len(overlap) >= 2:
+                    matching_headings += 1
+            promoted.append(
+                (
+                    -short_matching_headings,
+                    -matching_headings,
+                    original_rank,
+                    page_card_id,
+                )
+            )
+
+        # One or two short matches are ordinary relevance. Promotion is only
+        # warranted when one card covers several concise sibling headings.
+        if not any(-short_count >= 3 for short_count, _count, _rank, _id in promoted):
+            return ordered
+        promoted.sort()
+        overview_id = promoted[0][3]
+        return [overview_id, *(page_card_id for page_card_id in ordered if page_card_id != overview_id)]
 
     def _local_action_query_ids(self, query: str, *, top_k: int) -> List[str]:
         """Rank verified page actions locally for resilient navigation."""
@@ -9037,6 +9195,10 @@ class AdaptiveHybridRetriever:
                 k=self.rrf_k,
             )
         ]
+        dense_page_card_ids = self._promote_collection_overview_page_cards(
+            query,
+            dense_page_card_ids,
+        )
         raw_dense_action_ids = lane_results["dense_action_ids"]
         local_action_ids = lane_results["local_action_ids"]
         dense_action_ids = [

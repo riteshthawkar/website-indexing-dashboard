@@ -8607,6 +8607,134 @@ def test_plural_inventory_query_expands_page_card_sibling_sections():
     ]
 
 
+def test_collection_query_promotes_overview_with_multiple_matching_sections():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.query_specific_retrieval_rules_enabled = False
+    retriever.lexical_map = {}
+    retriever.page_card_map = {
+        "page-card:list": {
+            "text": (
+                "TITLE: All openings\nSECTIONS:\n"
+                "- Browse all vacancies\n"
+                "- Research Engineer, Vision\n"
+                "- Faculty Position, Biology\n"
+                "SOURCE_URL: https://example.edu/vacancies"
+            )
+        },
+        "page-card:detail": {
+            "text": (
+                "TITLE: Engineering vacancies\nSECTIONS:\n"
+                "- Engineering Vacancies\n"
+                "- Research Engineer, Systems\n"
+                "SOURCE_URL: https://example.edu/engineering-vacancies"
+            )
+        },
+        "page-card:overview": {
+            "text": (
+                "TITLE: Careers\nSECTIONS:\n"
+                "- Faculty Vacancies\n"
+                "- Research Vacancies\n"
+                "- Engineering Vacancies\n"
+                "- Professional Vacancies\n"
+                "SOURCE_URL: https://example.edu/careers"
+            )
+        },
+    }
+
+    selected = retriever._promote_collection_overview_page_cards(
+        (
+            "ما هي أقسام الوظائف المفتوحة؟ "
+            "categories sections careers jobs vacancies open positions"
+        ),
+        ["page-card:list", "page-card:detail", "page-card:overview"],
+    )
+
+    assert selected == [
+        "page-card:overview",
+        "page-card:list",
+        "page-card:detail",
+    ]
+
+
+def test_local_collection_fallback_admits_same_host_overview_beyond_top_k():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    query = (
+        "ما هي أقسام الوظائف المفتوحة؟ "
+        "categories sections careers jobs vacancies open positions"
+    )
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.query_specific_retrieval_rules_enabled = False
+    retriever.local_page_card_candidate_pool = 96
+    retriever.namespace_page_cards = "page_cards"
+    retriever.lexical_map = {}
+    retriever.page_card_map = {
+        "page-card:list": {
+            "source_url": "https://careers.example.edu/vacancies",
+            "text": "TITLE: All vacancies\nSECTIONS:\n- Browse all vacancies",
+        },
+        "page-card:detail": {
+            "source_url": "https://careers.example.edu/engineering-vacancies",
+            "text": "TITLE: Engineering vacancies\nSECTIONS:\n- Engineering vacancies",
+        },
+        "page-card:overview": {
+            "source_url": "https://careers.example.edu/",
+            "text": (
+                "TITLE: Careers\nSECTIONS:\n"
+                "- Faculty Vacancies\n"
+                "- Research Vacancies\n"
+                "- Engineering Vacancies\n"
+                "- Professional Vacancies"
+            ),
+        },
+        "page-card:other-host": {
+            "source_url": "https://events.example.edu/",
+            "text": (
+                "TITLE: Events\nSECTIONS:\n"
+                "- Open sessions\n- Global sections\n- Work sections"
+            ),
+        },
+    }
+    retriever._lexical_query_ids = lambda *_args, **_kwargs: [
+        "page-card:list",
+        "page-card:detail",
+        "page-card:other-host",
+        "page-card:overview",
+    ]
+    scores = {
+        "All vacancies": 4.0,
+        "Engineering vacancies": 3.0,
+        "Events": 2.0,
+        "Careers": 1.0,
+    }
+    retriever._score_text_match = lambda _query, text: next(
+        score for marker, score in scores.items() if marker in text
+    )
+    retriever._source_query_bonus = lambda _query, **_kwargs: 0.0
+
+    assert retriever._local_page_card_query_ids(query, top_k=2) == [
+        "page-card:overview",
+        "page-card:list",
+    ]
+
+
+def test_non_collection_query_preserves_page_card_order():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.page_card_map = {
+        "page-card:first": {"text": "SECTIONS:\n- Faculty Vacancies"},
+        "page-card:second": {"text": "SECTIONS:\n- Research Vacancies"},
+    }
+
+    assert retriever._promote_collection_overview_page_cards(
+        "Tell me about the careers page",
+        ["page-card:first", "page-card:second"],
+    ) == ["page-card:first", "page-card:second"]
+
+
 def test_collection_query_uses_top_page_card_as_required_page():
     from types import SimpleNamespace
 
