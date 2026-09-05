@@ -50,6 +50,14 @@ def test_short_enumerations_use_synthesis_but_exact_values_remain_facts():
     assert classify_query_mode("What schools does the university have?") == QueryMode.SYNTHESIS
     assert classify_query_mode("ما هي الأقسام الأكاديمية؟") == QueryMode.SYNTHESIS
     assert (
+        classify_query_mode("ما البرامج الأكاديمية التي تقدمها الجامعة؟")
+        == QueryMode.SYNTHESIS
+    )
+    assert (
+        classify_query_mode("يرجى تقديم قائمة كاملة بالبرامج والدرجات التي تتيحها الجامعة.")
+        == QueryMode.SYNTHESIS
+    )
+    assert (
         classify_query_mode("ما الوحدات الأكاديمية الرئيسية في الجامعة؟")
         == QueryMode.SYNTHESIS
     )
@@ -654,6 +662,188 @@ def test_generalized_coverage_bridges_languages_from_dense_representation_agreem
 
     assert inferred["required_pages"] == [program_url]
     assert inferred["required_pages_source"] == "semantic_page_evidence"
+
+
+def test_generalized_durable_program_query_does_not_bind_to_incidental_news():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    program_url = "https://www.example.edu/faq/what-programs-does-the-university-offer"
+    single_program_url = "https://www.example.edu/ar/academics/access/ai-reach"
+    masters_programs_url = "https://www.example.edu/study/msc-programs"
+    division_programs_url = "https://www.example.edu/research/division-computing"
+    news_url = (
+        "https://www.example.edu/knowledge-center/the-node/"
+        "government-announces-university-partnership"
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_min_confidence = 0.55
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:news": {"id": "card:news", "source_url": news_url},
+            "card:single-program": {
+                "id": "card:single-program",
+                "source_url": single_program_url,
+            },
+            "card:masters-programs": {
+                "id": "card:masters-programs",
+                "source_url": masters_programs_url,
+            },
+            "card:division-programs": {
+                "id": "card:division-programs",
+                "source_url": division_programs_url,
+            },
+            "card:programs": {
+                "id": "card:programs",
+                "source_url": program_url,
+            },
+        },
+        chunk_map={
+            "chunk:news": {"id": "chunk:news", "source_url": news_url},
+            "chunk:programs": {
+                "id": "chunk:programs",
+                "source_url": program_url,
+            },
+        },
+    )
+
+    def page(source_url, identity, text, page_type, *, arabic):
+        return {
+            "source_url": source_url,
+            "normalized_url": retriever._normalize_source_url(source_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+            "page_type": page_type,
+            "page_is_arabic": arabic,
+        }
+
+    retriever._coverage_page_records = [
+        page(
+            news_url,
+            "جامعة المثال للذكاء الاصطناعي تعلن عن شراكة معرفية استراتيجية",
+            "تدعم الشراكة البرامج الأكاديمية والبحث والتعليم",
+            "news_or_event",
+            arabic=True,
+        ),
+        page(
+            single_program_url,
+            "برنامج ريتش للذكاء الاصطناعي",
+            "برنامج أكاديمي واحد يقدم فرص البحث والتدريب لطلاب الجامعة",
+            "admissions_or_program",
+            arabic=True,
+        ),
+        page(
+            masters_programs_url,
+            "Master's programs",
+            "Master's degree programs offered by the university",
+            "admissions_or_program",
+            arabic=False,
+        ),
+        page(
+            division_programs_url,
+            "Division of Computing and Mathematical Sciences",
+            "The division offers several academic programs and degrees.",
+            "admissions_or_program",
+            arabic=False,
+        ),
+        page(
+            program_url,
+            "Academic programs",
+            "Undergraduate, master's, and Ph.D. degree programs offered by the university",
+            "admissions_or_program",
+            arabic=False,
+        ),
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "ما البرامج الأكاديمية التي تقدمها جامعة المثال للذكاء الاصطناعي؟",
+        "multi_page_aggregation",
+        {
+            # The incidental article is deliberately ranked first in both
+            # semantic lanes. Durable source policy must still bind the answer
+            # to the maintained program surface.
+            "dense_page_card_ids": [
+                "card:news",
+                "card:single-program",
+                "card:masters-programs",
+                "card:division-programs",
+                "card:programs",
+            ],
+            "dense_chunk_ids": ["chunk:news", "chunk:programs"],
+        },
+    )
+
+    assert inferred["required_pages"] == [program_url]
+    assert inferred["required_pages_source"] == "semantic_page_evidence"
+
+    paraphrased = retriever._infer_generalized_coverage_requirements(
+        "يرجى تقديم قائمة كاملة بالبرامج الأكاديمية والدرجات التي تتيحها جامعة المثال للطلاب.",
+        "multi_page_aggregation",
+        {
+            "dense_page_card_ids": [
+                "card:single-program",
+                "card:division-programs",
+                "card:programs",
+            ],
+            "dense_chunk_ids": ["chunk:programs"],
+        },
+    )
+    assert paraphrased["required_pages"] == [program_url]
+
+
+def test_generalized_news_query_can_still_bind_to_news_surface():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    news_url = (
+        "https://www.example.edu/knowledge-center/the-node/"
+        "government-announces-university-partnership"
+    )
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "card:news": {"id": "card:news", "source_url": news_url},
+        },
+        chunk_map={
+            "chunk:news": {"id": "chunk:news", "source_url": news_url},
+        },
+    )
+    identity = "Latest academic program announcement"
+    text = "The university announced its latest academic program partnership in 2026."
+    retriever._coverage_page_records = [
+        {
+            "source_url": news_url,
+            "normalized_url": retriever._normalize_source_url(news_url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": text.casefold(),
+            "tokens": set(_tokenize(text)),
+            "page_type": "news_or_event",
+            "page_is_arabic": False,
+        }
+    ]
+
+    inferred = retriever._infer_generalized_coverage_requirements(
+        "What is the latest 2026 academic program announcement?",
+        "scoped",
+        {
+            "dense_page_card_ids": ["card:news"],
+            "dense_chunk_ids": ["chunk:news"],
+        },
+    )
+
+    assert inferred["required_pages"] == [news_url]
+
+    assert retriever._infer_generalized_coverage_requirements(
+        "ماذا أعلنت الجامعة عن أحدث برامجها الأكاديمية؟",
+        "scoped",
+        {
+            "dense_page_card_ids": ["card:news"],
+            "dense_chunk_ids": ["chunk:news"],
+        },
+    )["required_pages"] == [news_url]
 
 
 def test_cross_script_page_name_mismatch_does_not_veto_dense_source_consensus():
@@ -1662,6 +1852,87 @@ def test_evidence_pack_keeps_cross_lingual_dense_child_of_bound_page():
 
     assert exact_chunk_id in [item["id"] for item in pack["items"]]
     assert pack["coverage_status"] == "complete"
+
+
+def test_semantic_sufficiency_accepts_trusted_cross_script_dense_page_binding():
+    program_url = "https://www.mbzuai.ac.ae/faq/programs"
+    query = "أعطني قائمة البرامج الأكاديمية التي توفرها الجامعة."
+    pack = build_evidence_pack(
+        query=query,
+        result={
+            "query_rewritten": f"{query} programs disciplines",
+            "query_rewrite_labels": ["multilingual_semantic_bridge"],
+            "retrieval_confidence": 0.0,
+            "evidence_span_documents": [
+                {
+                    "id": "span:undergraduate",
+                    "text": "The university offers an undergraduate artificial intelligence degree.",
+                    "source_url": program_url,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 2,
+                },
+                {
+                    "id": "span:masters",
+                    "text": "Master of Science programs include machine learning and robotics.",
+                    "source_url": program_url,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 2,
+                },
+                {
+                    "id": "span:doctoral",
+                    "text": "Doctoral programs include computer vision and computer science.",
+                    "source_url": program_url,
+                    "coverage_dense_evidence": True,
+                    "dense_semantic_rank": 2,
+                },
+            ],
+        },
+        max_items=6,
+        max_chars=5000,
+        max_per_source=4,
+        coverage_plan={
+            "intent": "multi_page_aggregation",
+            "required_pages": [program_url],
+            "semantic_sufficiency_enabled": True,
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    assert pack["coverage_status"] == "complete"
+    assert pack["sufficiency"]["query_alignment_source"] == (
+        "multilingual_semantic_bridge"
+    )
+    assert pack["sufficiency"]["all_required_pages_have_dense_evidence"] is True
+    assert pack["sufficiency"]["reasons"] == []
+
+
+def test_semantic_sufficiency_rejects_unlabelled_cross_script_rewrite():
+    program_url = "https://www.example.edu/faq/programs"
+    query = "أعطني قائمة البرامج الأكاديمية التي توفرها الجامعة."
+    pack = build_evidence_pack(
+        query=query,
+        result={
+            "query_rewritten": f"{query} programs disciplines",
+            "query_rewrite_labels": [],
+            "retrieval_confidence": 0.0,
+            "retrieval_documents": [
+                {
+                    "id": "chunk:generic",
+                    "text": "Programs and disciplines.",
+                    "source_url": program_url,
+                }
+            ],
+        },
+        coverage_plan={
+            "intent": "multi_page_aggregation",
+            "semantic_sufficiency_enabled": True,
+            "query_specific_rules_enabled": False,
+        },
+    )
+
+    assert pack["coverage_status"] == "partial"
+    assert pack["sufficiency"]["query_alignment_source"] == "original"
+    assert "weak_query_evidence_alignment" in pack["sufficiency"]["reasons"]
 
 
 def test_production_mode_does_not_inject_prompt_specific_lexical_aliases():

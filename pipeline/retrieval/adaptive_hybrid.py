@@ -1055,12 +1055,16 @@ _ENUMERATION_QUERY_RE = re.compile(
     # (hours, email, date, phone) are classified before this check.
     r"|\b(?:what|which)\s+(?:[\w'-]+\s+){0,3}[\w'-]+s\s+"
     r"(?:do|does|did|are|were|can|could|should|must|will|would|have|has)\b"
-    r"|(?:اذكر|عدّد|عدد|جميع|كل|كافة|كم|ما\s+هي|ما\s+هما|أي\s+من)"
+    r"|(?:اذكر|عدّد|عدد|قائمة|القائمة|جميع|كل|كافة|كم|ما\s+هي|ما\s+هما|أي\s+من)"
     # Arabic often omits the copula: "ما الوحدات ... الرئيسية؟". Detect
     # plural morphology or a plural-list adjective without encoding any
     # domain noun or expected answer.
     r"|^(?:ما|ماذا|أي|اي)\s+(?:هي\s+)?(?:ال)?[\u0600-\u06ff]+(?:ات|ون|ين)\b"
-    r"|^(?:ما|ماذا|أي|اي)\s+.{1,100}\b(?:الرئيسية|المتاحة|الموجودة|المقدمة|المتوفرة|المعروضة)\b",
+    r"|^(?:ما|ماذا|أي|اي)\s+.{1,100}\b(?:الرئيسية|المتاحة|الموجودة|المقدمة|المتوفرة|المعروضة)\b"
+    # Relative-clause enumeration: Arabic broken plurals do not carry the
+    # regular plural suffix above (for example, "ما البرامج التي تقدمها ...").
+    # Match the generic request shape rather than any domain noun or answer.
+    r"|^(?:ما|ماذا|أي|اي)\s+.{1,100}\b(?:تقدمها|يقدمها|توفرها|يوفرها|تشملها|يشملها|تضمها|يضمها)\b",
     re.IGNORECASE,
 )
 

@@ -63,7 +63,12 @@ def infer_navigation_context(query: str) -> Dict[str, Any]:
         ),
         (
             "apply",
-            r"\b(?:apply|application portal|submit (?:my |an )?application)\b|(?:\bقد[ّ]?م\b|\bتقديم\b|\bالتقديم\b|\bطلب (?:التوظيف|الالتحاق)\b)",
+            r"\b(?:apply|application portal|submit (?:my |an )?application)\b|"
+            r"(?:\bقد[ّ]?م\s+(?:طلب|طلبك)\b|"
+            r"\b(?:تقديم|التقديم)\s+(?:على|إلى|الى|لبرنامج|للبرنامج|لوظيفة|للوظيفة)\b|"
+            r"\b(?:أقدم|اقدم)\s+(?:على|إلى|الى|للجامعة|للبرنامج|للوظيفة)\b|"
+            r"\b(?:أريد|اريد|أرغب|ارغب)\s+(?:أن\s+)?(?:أقدم|اقدم|التقديم)\b|"
+            r"\bطلب (?:التوظيف|الالتحاق)\b)",
             0.94,
         ),
         (

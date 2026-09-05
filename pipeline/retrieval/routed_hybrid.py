@@ -592,20 +592,36 @@ def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
     return facets
 
 
-def _durable_information_surface_preference(query: str, page: Mapping[str, Any]) -> float:
-    """Prefer durable institutional pages over incidental news mentions."""
-
-    normalized = _normalized_intent_text(query)
+def _is_news_surface(page: Mapping[str, Any]) -> bool:
     source_url = str(page.get("normalized_url") or page.get("source_url") or "").casefold()
     page_type = str(page.get("page_type") or "").casefold()
-    identity = str(page.get("identity_text") or "").casefold()
-    search_text = str(page.get("search_text") or "").casefold()
-    is_news = page_type == "news_or_event" or "/knowledge-center/the-node/" in source_url
-    asks_news = bool(
+    return page_type == "news_or_event" or "/knowledge-center/the-node/" in source_url
+
+
+def _query_requests_news(normalized: str) -> bool:
+    return bool(
         re.search(r"\b(?:news|announcement|announced|latest|current|today|20\d{2})\b", normalized)
-        or any(marker in normalized for marker in ("خبر", "أخبار", "احدث", "أحدث", "اعلان", "إعلان"))
+        or any(
+            marker in normalized
+            for marker in (
+                "خبر",
+                "أخبار",
+                "احدث",
+                "أحدث",
+                "اعلان",
+                "إعلان",
+                "اعلن",
+                "أعلن",
+                "اعلنت",
+                "أعلنت",
+                "تعلن",
+            )
+        )
     )
-    durable_topic = bool(
+
+
+def _query_requests_durable_information(normalized: str) -> bool:
+    return bool(
         re.search(
             r"\b(?:admissions?|requirements?|eligibility|documents?|scholarships?|funding|"
             r"tuition|programs?|curriculum|divisions?|departments?|leadership|governance)\b",
@@ -625,6 +641,19 @@ def _durable_information_surface_preference(query: str, page: Mapping[str, Any])
             )
         )
     )
+
+
+def _durable_information_surface_preference(query: str, page: Mapping[str, Any]) -> float:
+    """Prefer durable institutional pages over incidental news mentions."""
+
+    normalized = _normalized_intent_text(query)
+    source_url = str(page.get("normalized_url") or page.get("source_url") or "").casefold()
+    page_type = str(page.get("page_type") or "").casefold()
+    identity = str(page.get("identity_text") or "").casefold()
+    search_text = str(page.get("search_text") or "").casefold()
+    is_news = _is_news_surface(page)
+    asks_news = _query_requests_news(normalized)
+    durable_topic = _query_requests_durable_information(normalized)
     score = -1.05 if durable_topic and is_news and not asks_news else 0.0
     admissions_or_program = page_type == "admissions_or_program" or any(
         marker in source_url for marker in ("/admissions", "/study/", "/program")
@@ -670,6 +699,20 @@ def _durable_page_candidate_allowed(query: str, page: Mapping[str, Any]) -> bool
     token_text = " ".join(str(value) for value in (page.get("tokens") or []))
     blob = f"{source_url} {identity} {search_text} {token_text}"
 
+    # A dated article may mention an institutional fact in the user's exact
+    # language and therefore outrank the canonical page lexically.  It is
+    # still useful as supporting evidence, but must not become the hard page
+    # constraint for a durable policy/catalogue question.  Keeping this guard
+    # in coverage planning (rather than candidate retrieval) preserves recall
+    # when the user explicitly asks for news while preventing incidental
+    # announcements from displacing maintained admissions, program,
+    # governance, and funding surfaces.
+    is_news = _is_news_surface(page)
+    asks_news = _query_requests_news(normalized)
+    durable_topic = _query_requests_durable_information(normalized)
+    if durable_topic and is_news and not asks_news:
+        return False
+
     requested_levels = _academic_level_scope(normalized)
     candidate_levels = _academic_level_scope(f"{source_url} {identity}")
     if (
@@ -678,6 +721,63 @@ def _durable_page_candidate_allowed(query: str, page: Mapping[str, Any]) -> bool
         and requested_levels.isdisjoint(candidate_levels)
     ):
         return False
+
+    program_inventory_query = bool(
+        _is_enumeration_query(query)
+        and (
+            re.search(r"\b(?:programs?|programmes?|degrees?|offerings?)\b", normalized)
+            or any(
+                marker in normalized
+                for marker in ("البرامج", "برامج", "التخصصات", "تخصصات", "الدرجات")
+            )
+        )
+    )
+    if program_inventory_query:
+        # A biography or one named program can strongly match the institution
+        # name and the word "program" without being capable of answering an
+        # inventory question. Require plural/catalogue evidence on the page
+        # itself. When the user did not request a study level, also avoid
+        # turning one level-specific landing page into the sole hard source;
+        # those pages remain available as ordinary supporting evidence.
+        program_inventory_surface = bool(
+            re.search(
+                r"\b(?:programs|programmes|degrees|offerings)\b",
+                f"{source_url} {identity} {search_text}",
+            )
+            or any(
+                marker in f"{identity} {search_text}"
+                for marker in (
+                    "البرامج",
+                    "برامج",
+                    "التخصصات",
+                    "تخصصات",
+                    "الدرجات",
+                )
+            )
+        )
+        if not program_inventory_surface:
+            return False
+        if not requested_levels and len(candidate_levels) == 1:
+            return False
+        query_names_unit = bool(
+            re.search(r"\b(?:division|department|school|faculty)\b", normalized)
+            or any(
+                marker in normalized
+                for marker in ("القسم", "قسم", "الشعبة", "شعبة", "الكلية", "كلية")
+            )
+        )
+        candidate_is_unit_scoped = bool(
+            re.search(
+                r"\b(?:division|department|school|faculty)\b",
+                f"{source_url} {identity}",
+            )
+            or any(
+                marker in identity
+                for marker in ("القسم", "قسم", "الشعبة", "شعبة", "الكلية", "كلية")
+            )
+        )
+        if candidate_is_unit_scoped and not query_names_unit:
+            return False
 
     scholarship_query = bool(
         re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
@@ -4192,8 +4292,14 @@ class RoutedHybridRetriever:
                     )
                 )
 
+        prefer_independently_corroborated_page = bool(
+            query_is_arabic_script
+            and multilingual_aliases
+            and _is_enumeration_query(query)
+        )
         scored.sort(
             key=lambda item: (
+                -int(prefer_independently_corroborated_page and item[2]),
                 -item[0],
                 -item[1],
                 item[3].get("normalized_url") or "",

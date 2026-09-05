@@ -482,6 +482,11 @@ def test_navigation_intent_is_explicit_and_multilingual():
     assert infer_navigation_context("ما الذي يحمّل هذا الزر؟")["intent"] == "download"
     assert infer_navigation_context("ما عنوان البريد الذي ستراسل به الجامعة؟")["intent"] == "contact"
     assert infer_navigation_context("أين أذهب لتقديم طلب التوظيف؟")["intent"] == "apply"
+    assert infer_navigation_context("أريد التقديم على برنامج الماجستير")["intent"] == "apply"
+    assert infer_navigation_context("كيف أقدم إلى الجامعة؟")["intent"] == "apply"
+    assert infer_navigation_context(
+        "يرجى تقديم قائمة كاملة بالبرامج الأكاديمية التي تتيحها الجامعة."
+    )["intent"] == "none"
     assert infer_navigation_context(
         "ما الميزة المالية التي تقدمها جميع برامج الدكتوراه في الجامعة؟"
     )["intent"] == "none"

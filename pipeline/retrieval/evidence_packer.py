@@ -652,6 +652,35 @@ def _trusted_retrieval_expansion(result: Dict[str, Any]) -> str:
     return expansion if expansion and planner_confidence >= 0.55 else ""
 
 
+def _trusted_multilingual_bridge_terms(
+    query: str,
+    result: Dict[str, Any],
+) -> set[str]:
+    """Return only deterministic bridge terms appended by routed retrieval.
+
+    Cross-script evidence cannot overlap the original query lexically.  The
+    routed retriever records its bounded vocabulary bridge explicitly; accept
+    only the suffix it appended to the exact user query, never arbitrary model
+    rewrites or caller-provided expansion text.
+    """
+
+    labels = {
+        _clean_text(value)
+        for value in result.get("query_rewrite_labels") or []
+        if _clean_text(value)
+    }
+    if "multilingual_semantic_bridge" not in labels:
+        return set()
+    original = _clean_text(query)
+    rewritten = _clean_text(result.get("query_rewritten"))
+    if not original or not rewritten.startswith(f"{original} "):
+        return set()
+    bridge_terms = _query_terms(rewritten) - _query_terms(original)
+    if not 1 <= len(bridge_terms) <= 18:
+        return set()
+    return bridge_terms
+
+
 def _evidence_sufficiency(
     *,
     query: str,
@@ -679,6 +708,11 @@ def _evidence_sufficiency(
         for label, value in query_variants
         if (terms := _query_terms(value))
     ]
+    multilingual_bridge_terms = _trusted_multilingual_bridge_terms(query, result)
+    if multilingual_bridge_terms:
+        query_term_variants.append(
+            ("multilingual_semantic_bridge", multilingual_bridge_terms)
+        )
     evidence_terms: set[str] = set()
     content_keys: set[str] = set()
     official_sources: set[str] = set()
@@ -686,6 +720,7 @@ def _evidence_sufficiency(
     aggregate_items = 0
     trusted_aggregate_items = 0
     trusted_page_card_sources: set[str] = set()
+    dense_evidence_sources: set[str] = set()
     required_page_set = {
         normalized
         for value in required_pages
@@ -729,6 +764,8 @@ def _evidence_sufficiency(
             trusted_page_card_sources.add(
                 _normalize_url_for_match(source_url)
             )
+        if bool(item.get("coverage_dense_evidence")) and source_url:
+            dense_evidence_sources.add(_normalize_url_for_match(source_url))
 
     all_required_pages_have_page_cards = bool(
         required_page_set
@@ -737,6 +774,10 @@ def _evidence_sufficiency(
     all_required_pages_have_evidence = bool(
         required_page_set
         and required_page_set <= official_sources
+    )
+    all_required_pages_have_dense_evidence = bool(
+        required_page_set
+        and required_page_set <= dense_evidence_sources
     )
     complete_required_facet_count = sum(
         1 for facet in required_facets if _facet_evidence(facet, items)[0]
@@ -752,6 +793,7 @@ def _evidence_sufficiency(
     trusted_bound_representation = bool(
         trusted_aggregate_items
         or all_required_pages_have_page_cards
+        or all_required_pages_have_dense_evidence
         or trusted_faceted_evidence
     )
 
@@ -828,6 +870,7 @@ def _evidence_sufficiency(
         "trusted_page_card_source_count": len(trusted_page_card_sources),
         "all_required_pages_have_page_cards": all_required_pages_have_page_cards,
         "all_required_pages_have_evidence": all_required_pages_have_evidence,
+        "all_required_pages_have_dense_evidence": all_required_pages_have_dense_evidence,
         "complete_required_facet_count": complete_required_facet_count,
         "required_facet_count": len(required_facets),
         "trusted_faceted_evidence": trusted_faceted_evidence,
