@@ -3424,7 +3424,11 @@ def classify_query_mode(query: str) -> QueryMode:
     return QueryMode.SCOPED
 
 
-def _make_gemini_client(*, request_timeout_ms: int | None = None):
+def _make_gemini_client(
+    *,
+    request_timeout_ms: int | None = None,
+    retry_attempts: int | None = None,
+):
     api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError("GOOGLE_API_KEY or GEMINI_API_KEY is required")
@@ -3435,23 +3439,45 @@ def _make_gemini_client(*, request_timeout_ms: int | None = None):
     )
     if timeout_ms <= 0:
         raise ValueError("gemini_request_timeout_ms must be greater than zero")
+    normalized_retry_attempts = (
+        None if retry_attempts is None else int(retry_attempts)
+    )
+    if normalized_retry_attempts is not None and normalized_retry_attempts <= 0:
+        raise ValueError("Gemini provider retry attempts must be greater than zero")
     cached_key = getattr(_GEMINI_CLIENT_STATE, "api_key", None)
     cached_timeout_ms = getattr(_GEMINI_CLIENT_STATE, "request_timeout_ms", None)
+    cached_retry_attempts = getattr(
+        _GEMINI_CLIENT_STATE,
+        "retry_attempts",
+        None,
+    )
     cached_client = getattr(_GEMINI_CLIENT_STATE, "client", None)
     if (
         cached_client is not None
         and cached_key == api_key
         and cached_timeout_ms == timeout_ms
+        and cached_retry_attempts == normalized_retry_attempts
     ):
         return cached_client
     genai = import_genai()
     types = import_genai_types()
+    http_options_kwargs: Dict[str, Any] = {"timeout": timeout_ms}
+    if normalized_retry_attempts is not None:
+        retry_options_type = getattr(types, "HttpRetryOptions", None)
+        if retry_options_type is None:
+            raise ValueError(
+                "Installed Google Gen AI SDK does not support explicit retry options"
+            )
+        http_options_kwargs["retry_options"] = retry_options_type(
+            attempts=normalized_retry_attempts
+        )
     client = genai.Client(
         api_key=api_key,
-        http_options=types.HttpOptions(timeout=timeout_ms),
+        http_options=types.HttpOptions(**http_options_kwargs),
     )
     _GEMINI_CLIENT_STATE.api_key = api_key
     _GEMINI_CLIENT_STATE.request_timeout_ms = timeout_ms
+    _GEMINI_CLIENT_STATE.retry_attempts = normalized_retry_attempts
     _GEMINI_CLIENT_STATE.client = client
     return client
 
@@ -3564,6 +3590,7 @@ def _embed_query(
     output_dimensionality: int | None,
     task_type: str = "RETRIEVAL_QUERY",
     request_timeout_ms: int | None = None,
+    provider_retry_attempts: int | None = None,
 ) -> List[float]:
     use_prompt_instruction = str(model or "").strip().lower() == "gemini-embedding-2"
     embed_text = f"task: search result | query: {query}" if use_prompt_instruction else query
@@ -3598,11 +3625,12 @@ def _embed_query(
             config_kwargs["task_type"] = task_type
         config = SimpleNamespace(**config_kwargs)
 
-    client = (
-        _make_gemini_client(request_timeout_ms=request_timeout_ms)
-        if request_timeout_ms is not None
-        else _make_gemini_client()
-    )
+    client_kwargs: Dict[str, Any] = {}
+    if request_timeout_ms is not None:
+        client_kwargs["request_timeout_ms"] = request_timeout_ms
+    if provider_retry_attempts is not None:
+        client_kwargs["retry_attempts"] = provider_retry_attempts
+    client = _make_gemini_client(**client_kwargs)
     attempts = max(1, _QUERY_EMBEDDING_RETRIES + 1)
     last_exc: Exception | None = None
     for attempt in range(attempts):
@@ -3635,6 +3663,7 @@ def _embed_queries(
     output_dimensionality: int | None,
     task_type: str = "RETRIEVAL_QUERY",
     request_timeout_ms: int | None = None,
+    provider_retry_attempts: int | None = None,
 ) -> List[List[float]]:
     if not queries:
         return []
@@ -3648,11 +3677,12 @@ def _embed_queries(
     if not use_prompt_instruction:
         config_kwargs["task_type"] = task_type
     config = types.EmbedContentConfig(**config_kwargs)
-    client = (
-        _make_gemini_client(request_timeout_ms=request_timeout_ms)
-        if request_timeout_ms is not None
-        else _make_gemini_client()
-    )
+    client_kwargs: Dict[str, Any] = {}
+    if request_timeout_ms is not None:
+        client_kwargs["request_timeout_ms"] = request_timeout_ms
+    if provider_retry_attempts is not None:
+        client_kwargs["retry_attempts"] = provider_retry_attempts
+    client = _make_gemini_client(**client_kwargs)
     vectors: List[List[float]] = []
     batch_size = _GEMINI_QUERY_EMBEDDING_BATCH_SIZE
     for start in range(0, len(embed_queries), batch_size):
@@ -3756,6 +3786,39 @@ class AdaptiveHybridRetriever:
         )
         if self.gemini_request_timeout_ms <= 0:
             raise ValueError("embedder.gemini_request_timeout_ms must be greater than zero")
+        query_timeout_override = os.getenv("RETRIEVAL_QUERY_EMBEDDING_TIMEOUT_MS")
+        self.gemini_query_request_timeout_ms = int(
+            query_timeout_override
+            if query_timeout_override is not None
+            else (
+                embed_cfg.get("gemini_query_request_timeout_ms")
+                if embed_cfg.get("gemini_query_request_timeout_ms") is not None
+                else self.gemini_request_timeout_ms
+            )
+        )
+        if self.gemini_query_request_timeout_ms <= 0:
+            raise ValueError(
+                "embedder.gemini_query_request_timeout_ms must be greater than zero"
+            )
+        provider_retry_attempts = os.getenv(
+            "RETRIEVAL_QUERY_EMBEDDING_PROVIDER_ATTEMPTS"
+        )
+        if provider_retry_attempts is None:
+            provider_retry_attempts = embed_cfg.get(
+                "gemini_query_provider_retry_attempts"
+            )
+        self.gemini_query_provider_retry_attempts = (
+            int(provider_retry_attempts)
+            if provider_retry_attempts is not None
+            else None
+        )
+        if (
+            self.gemini_query_provider_retry_attempts is not None
+            and self.gemini_query_provider_retry_attempts <= 0
+        ):
+            raise ValueError(
+                "embedder.gemini_query_provider_retry_attempts must be greater than zero"
+            )
         self.namespace_chunks = str(embed_cfg.get("namespace_chunks") or "chunks")
         self.namespace_parents = str(embed_cfg.get("namespace_parents") or "parents")
         self.namespace_media = str(embed_cfg.get("namespace_media") or "media")
@@ -4503,7 +4566,8 @@ class AdaptiveHybridRetriever:
             model=self.model,
             output_dimensionality=self.output_dimensionality,
             task_type="RETRIEVAL_QUERY",
-            request_timeout_ms=self.gemini_request_timeout_ms,
+            request_timeout_ms=self.gemini_query_request_timeout_ms,
+            provider_retry_attempts=self.gemini_query_provider_retry_attempts,
         )
 
     def embed_queries(self, queries: Sequence[str]) -> List[List[float]]:
@@ -4512,7 +4576,8 @@ class AdaptiveHybridRetriever:
             model=self.model,
             output_dimensionality=self.output_dimensionality,
             task_type="RETRIEVAL_QUERY",
-            request_timeout_ms=self.gemini_request_timeout_ms,
+            request_timeout_ms=self.gemini_query_request_timeout_ms,
+            provider_retry_attempts=self.gemini_query_provider_retry_attempts,
         )
 
     def _dense_query_ids(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
@@ -957,6 +958,9 @@ class RoutedHybridRetriever:
         self.routed_fallback_to_vector = bool(retrieval_cfg.get("routed_fallback_to_vector", True))
         self.parallel_graph_enabled = bool(retrieval_cfg.get("parallel_graph_enabled", True))
         self.parallel_query_rewriting_enabled = bool(retrieval_cfg.get("parallel_query_rewriting_enabled", True))
+        self.parallel_query_embedding_enabled = bool(
+            retrieval_cfg.get("parallel_query_embedding_enabled", True)
+        )
         self.parallel_graph_augment_all_queries = bool(retrieval_cfg.get("parallel_graph_augment_all_queries", True))
         self.query_planner_enabled = bool(retrieval_cfg.get("query_planner_enabled", False))
         self.query_planner_model = str(retrieval_cfg.get("query_planner_model") or "gpt-5-nano")
@@ -964,6 +968,21 @@ class RoutedHybridRetriever:
             retrieval_cfg.get("query_planner_reasoning_effort") or "minimal"
         )
         self.query_planner_min_confidence = float(retrieval_cfg.get("query_planner_min_confidence") or 0.55)
+        self.query_planner_timeout_sec = float(
+            os.getenv("RETRIEVAL_QUERY_PLANNER_TIMEOUT_SECONDS")
+            or retrieval_cfg.get("query_planner_timeout_sec")
+            or 12.0
+        )
+        self.query_planner_retries = max(
+            1,
+            int(
+                os.getenv("RETRIEVAL_QUERY_PLANNER_ATTEMPTS")
+                or retrieval_cfg.get("query_planner_retries")
+                or 1
+            ),
+        )
+        if self.query_planner_timeout_sec <= 0:
+            raise ValueError("retrieval.query_planner_timeout_sec must be greater than zero")
         # Legacy releases contain query-to-page and query-to-fact rules added
         # for individual evaluation prompts. Keep the code as an emergency
         # rollback path, but production can run entirely on semantic retrieval,
@@ -1269,7 +1288,12 @@ class RoutedHybridRetriever:
             plan = plan_query(
                 query=query,
                 model=self.query_planner_model,
+                reasoning_effort=str(
+                    getattr(self, "query_planner_reasoning_effort", "minimal")
+                ),
+                retries=int(getattr(self, "query_planner_retries", 1)),
                 fallback_query_type=query_mode,
+                timeout_sec=float(getattr(self, "query_planner_timeout_sec", 12.0)),
             )
             planner_confidence = float(plan.get("confidence") or 0.0)
             navigation = normalize_navigation_context(
@@ -1387,6 +1411,78 @@ class RoutedHybridRetriever:
             planner_confidence=planner_confidence,
             retrieval_expansion=retrieval_expansion,
         )
+
+    def _embed_query_with_fallback(
+        self,
+        query: str,
+    ) -> tuple[List[float], str, str]:
+        try:
+            # Dense similarity stays anchored to the original user meaning.
+            # Planner/HyDE expansions enrich lexical and graph lanes, but do
+            # not replace the primary semantic vector.
+            return list(self.vector.embed_query(query)), "ok", ""
+        except Exception as exc:
+            logger.warning(
+                "Routed dense query embedding failed; continuing with sparse/local retrieval fallback: %s",
+                exc,
+            )
+            return (
+                [],
+                "failed_sparse_local_fallback",
+                _public_query_embedding_error_code(exc),
+            )
+
+    def _prepare_query_rewrites_and_embedding(
+        self,
+        query: str,
+        *,
+        relation_plan: RelationQueryPlan | None,
+        query_mode: str,
+        use_query_planner: bool,
+        query_vector: List[float] | None,
+    ) -> tuple[QueryRewriteBundle, List[float], str, str]:
+        if query_vector is not None:
+            rewrites = self._build_query_rewrite_bundle(
+                query,
+                relation_plan=relation_plan,
+                query_mode=query_mode,
+                use_query_planner=use_query_planner,
+            )
+            resolved_vector = list(query_vector)
+            return (
+                rewrites,
+                resolved_vector,
+                "ok" if resolved_vector else "skipped_dense_no_query_vector",
+                "",
+            )
+
+        if not getattr(self, "parallel_query_embedding_enabled", True):
+            rewrites = self._build_query_rewrite_bundle(
+                query,
+                relation_plan=relation_plan,
+                query_mode=query_mode,
+                use_query_planner=use_query_planner,
+            )
+            resolved_vector, status, error = self._embed_query_with_fallback(query)
+            return rewrites, resolved_vector, status, error
+
+        # The dense vector is based on the untouched user query, so it is
+        # independent of query planning. Starting it alongside the planner
+        # removes one external network hop from the critical path while the
+        # bounded embedding call can still fail over to local/lexical lanes.
+        with ThreadPoolExecutor(
+            max_workers=1,
+            thread_name_prefix="mbzuai-query-embedding",
+        ) as executor:
+            embedding_future = executor.submit(self._embed_query_with_fallback, query)
+            rewrites = self._build_query_rewrite_bundle(
+                query,
+                relation_plan=relation_plan,
+                query_mode=query_mode,
+                use_query_planner=use_query_planner,
+            )
+            resolved_vector, status, error = embedding_future.result()
+        return rewrites, resolved_vector, status, error
 
     def _empty_graph_context(self, query: str) -> GraphQueryContext:
         return GraphQueryContext(
@@ -6186,11 +6282,17 @@ class RoutedHybridRetriever:
 
         decision = self._route_query(query)
         relation_plan = decision.relation_plan if decision.graph_available else None
-        rewrites = self._build_query_rewrite_bundle(
+        (
+            rewrites,
+            query_vector,
+            query_embedding_status,
+            query_embedding_error,
+        ) = self._prepare_query_rewrites_and_embedding(
             query,
             relation_plan=relation_plan,
             query_mode=mode.value,
             use_query_planner=not skip_query_planner,
+            query_vector=query_vector,
         )
         if skip_query_planner:
             rewrites = QueryRewriteBundle(
@@ -6232,27 +6334,6 @@ class RoutedHybridRetriever:
                 "source": rewrites.navigation_source,
             },
         )
-        query_embedding_status = "ok"
-        query_embedding_error = ""
-        if query_vector is not None:
-            query_vector = list(query_vector)
-            if not query_vector:
-                query_embedding_status = "skipped_dense_no_query_vector"
-        else:
-            try:
-                # Dense similarity stays anchored to the original user meaning.
-                # Planner/HyDE expansions still enrich lexical and graph lanes,
-                # but must not replace the primary semantic vector or make an
-                # identical user query retrieve a different page on each plan.
-                query_vector = self.vector.embed_query(query)
-            except Exception as exc:
-                query_vector = []
-                query_embedding_status = "failed_sparse_local_fallback"
-                query_embedding_error = _public_query_embedding_error_code(exc)
-                logger.warning(
-                    "Routed dense query embedding failed; continuing with sparse/local retrieval fallback: %s",
-                    exc,
-                )
         routing_latency_ms = (time.perf_counter() - routing_started) * 1000.0
 
         backend_started = time.perf_counter()

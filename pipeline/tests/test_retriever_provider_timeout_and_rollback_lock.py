@@ -19,11 +19,17 @@ def test_retriever_gemini_client_applies_and_caches_provider_timeout(monkeypatch
     clients: list[dict[str, object]] = []
 
     class FakeHttpOptions:
-        def __init__(self, *, timeout: int):
+        def __init__(self, *, timeout: int, retry_options=None):
             self.timeout = timeout
+            self.retry_options = retry_options
+
+    class FakeHttpRetryOptions:
+        def __init__(self, *, attempts: int):
+            self.attempts = attempts
 
     class FakeTypes:
         HttpOptions = FakeHttpOptions
+        HttpRetryOptions = FakeHttpRetryOptions
 
     class FakeGenAI:
         class Client:
@@ -36,13 +42,23 @@ def test_retriever_gemini_client_applies_and_caches_provider_timeout(monkeypatch
     monkeypatch.setattr(module, "import_genai_types", lambda: FakeTypes)
     monkeypatch.setattr(module, "_GEMINI_CLIENT_STATE", threading.local())
 
-    first = module._make_gemini_client(request_timeout_ms=12_345)
-    repeated = module._make_gemini_client(request_timeout_ms=12_345)
-    changed = module._make_gemini_client(request_timeout_ms=54_321)
+    first = module._make_gemini_client(
+        request_timeout_ms=12_345,
+        retry_attempts=1,
+    )
+    repeated = module._make_gemini_client(
+        request_timeout_ms=12_345,
+        retry_attempts=1,
+    )
+    changed = module._make_gemini_client(
+        request_timeout_ms=54_321,
+        retry_attempts=2,
+    )
 
     assert first is repeated
     assert changed is not first
     assert [entry["http_options"].timeout for entry in clients] == [12_345, 54_321]
+    assert [entry["http_options"].retry_options.attempts for entry in clients] == [1, 2]
     assert all(entry["api_key"] == "unit-test-key" for entry in clients)
 
 
@@ -60,10 +76,12 @@ def test_adaptive_retriever_passes_configured_timeout_to_embedding(monkeypatch) 
     retriever = object.__new__(module.AdaptiveHybridRetriever)
     retriever.model = "gemini-embedding-2"
     retriever.output_dimensionality = 1_536
-    retriever.gemini_request_timeout_ms = 87_654
+    retriever.gemini_query_request_timeout_ms = 6_000
+    retriever.gemini_query_provider_retry_attempts = 1
 
     assert retriever.embed_query("admissions") == [0.1, 0.2]
-    assert captured["request_timeout_ms"] == 87_654
+    assert captured["request_timeout_ms"] == 6_000
+    assert captured["provider_retry_attempts"] == 1
 
 
 def test_stable_gemini_embedding_uses_documented_asymmetric_query_instruction(monkeypatch) -> None:

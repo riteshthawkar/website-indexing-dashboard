@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 
 def test_routed_rewrite_bundle_skips_llm_planner_for_upstream_rewrites(monkeypatch):
     import pipeline.retrieval.routed_hybrid as module
@@ -91,6 +93,81 @@ def test_routed_planner_expands_without_replacing_original_query(monkeypatch):
     assert bundle.retrieval_expansion == "MBZUAI academic organization divisions"
     assert "openai_vector_plan" in bundle.labels
     assert "semantic_alias_expansion" not in bundle.labels
+
+
+def test_routed_planner_and_query_embedding_run_in_parallel():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.parallel_query_embedding_enabled = True
+    embedding_started = threading.Event()
+    planner_started = threading.Event()
+    expected_bundle = object()
+
+    class FakeVector:
+        @staticmethod
+        def embed_query(_query):
+            embedding_started.set()
+            assert planner_started.wait(timeout=1.0)
+            return [0.1, 0.2]
+
+    def fake_build(_query, **_kwargs):
+        assert embedding_started.wait(timeout=1.0)
+        planner_started.set()
+        return expected_bundle
+
+    retriever.vector = FakeVector()
+    retriever._build_query_rewrite_bundle = fake_build
+
+    bundle, vector, status, error = retriever._prepare_query_rewrites_and_embedding(
+        "What are the admissions requirements?",
+        relation_plan=None,
+        query_mode="synthesis",
+        use_query_planner=True,
+        query_vector=None,
+    )
+
+    assert bundle is expected_bundle
+    assert vector == [0.1, 0.2]
+    assert status == "ok"
+    assert error == ""
+
+
+def test_routed_planner_passes_production_deadline_and_single_attempt(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    captured = {}
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.query_planner_enabled = True
+    retriever.query_planner_model = "gpt-test"
+    retriever.query_planner_reasoning_effort = "minimal"
+    retriever.query_planner_timeout_sec = 6.0
+    retriever.query_planner_retries = 1
+    retriever.query_planner_min_confidence = 0.55
+    retriever.parallel_query_rewriting_enabled = False
+    retriever.hyde_enabled = False
+
+    def fake_plan(**kwargs):
+        captured.update(kwargs)
+        return {
+            "query_type": "fact",
+            "vector_query": kwargs["query"],
+            "graph_query": kwargs["query"],
+            "answer_types": [],
+            "entity_hints": [],
+            "navigation_intent": "none",
+            "navigation_goal": "",
+            "navigation_confidence": 0.0,
+            "confidence": 0.8,
+        }
+
+    monkeypatch.setattr(module, "plan_query", fake_plan)
+    retriever._build_query_rewrite_bundle("Where is MBZUAI located?")
+
+    assert captured["timeout_sec"] == 6.0
+    assert captured["retries"] == 1
+    assert captured["reasoning_effort"] == "minimal"
 
 
 def test_query_planner_cannot_invent_navigation_for_factual_website_reference(monkeypatch):

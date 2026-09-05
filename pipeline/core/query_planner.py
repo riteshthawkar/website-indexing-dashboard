@@ -207,9 +207,14 @@ def plan_query(
     retry_delay_sec: float = 1.0,
     per_request_delay_sec: float = 0.0,
     fallback_query_type: str = "fact",
+    timeout_sec: float | None = None,
 ) -> Dict[str, Any]:
     try:
-        client = make_openai_client()
+        client = (
+            make_openai_client(timeout_sec=timeout_sec)
+            if timeout_sec is not None
+            else make_openai_client()
+        )
     except RuntimeError:
         return heuristic_plan(query, query_type=fallback_query_type)
 
