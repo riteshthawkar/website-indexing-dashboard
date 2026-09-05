@@ -2636,6 +2636,10 @@ def test_answer_readiness_term_matching_handles_cross_language_dates_and_safe_va
         "The action opens the applicant portal login page.",
         "login/start page",
     )
+    assert _required_term_supported(
+        "أُقيم الحدث في Dubai.",
+        "دبي",
+    )
 
 
 def test_routed_static_page_markers_choose_canonical_language_routes_and_avoid_program_noise():
@@ -5399,6 +5403,11 @@ def test_answer_readiness_judge_prompt_includes_full_generated_rubric():
             "answer_should_cover": ["requirements", "deadline"],
             "expected_source_hints": ["Admissions"],
             "expected_reference_urls": ["https://mbzuai.ac.ae/study/apply"],
+            "alternate_expected_reference_urls": {
+                "https://mbzuai.ac.ae/study/apply": [
+                    "https://preprod.mbzuai.ac.ae/study/apply"
+                ]
+            },
             "citation_requirements": ["Deadline and requirements must be cited."],
             "expected_followup_topics": ["application documents"],
             "expected_suggested_actions": ["Open application page"],
@@ -5417,6 +5426,8 @@ def test_answer_readiness_judge_prompt_includes_full_generated_rubric():
 
     assert "expected_response_structure" in prompt
     assert "https://mbzuai.ac.ae/study/apply" in prompt
+    assert "https://preprod.mbzuai.ac.ae/study/apply" in prompt
+    assert "allowed_reference_url_groups" in prompt
     assert "citation_requirements" in prompt
     assert "Deadline and requirements must be cited." in prompt
     assert "Do not penalize an answer for including a term or detail that appears in the reference answer" in prompt

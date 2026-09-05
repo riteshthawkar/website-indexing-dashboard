@@ -483,6 +483,7 @@ _CROSS_LANGUAGE_REQUIRED_PHRASE_EQUIVALENTS: dict[str, tuple[str, ...]] = {
         "الأداء المعرفي والاستدلال",
         "اداء المعرفة والاستدلال",
     ),
+    "دبي": ("Dubai",),
 }
 
 
@@ -1339,6 +1340,7 @@ def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
         "answer_should_cover": _metadata_list(example_metadata, "answer_should_cover"),
         "expected_source_hints": _metadata_list(example_metadata, "expected_source_hints"),
         "expected_reference_urls": _metadata_list(example_metadata, "expected_reference_urls"),
+        "allowed_reference_url_groups": _expected_reference_url_groups(example_metadata),
         "citation_requirements": _metadata_list(example_metadata, "citation_requirements"),
         "expected_followup_topics": _metadata_list(example_metadata, "expected_followup_topics"),
         "expected_suggested_actions": _metadata_list(example_metadata, "expected_suggested_actions"),
@@ -1370,7 +1372,7 @@ def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
         "4. Penalize UI components, injected content, suggested actions, or followups that are irrelevant, stale, unsafe, or inconsistent with the answer.\n"
         "5. When answer_should_cover is present, completeness must reflect whether every listed requirement is addressed.\n"
         "6. When expected_source_hints are present, citation_quality must reflect whether returned sources are specific, relevant, and substantively support those evidence needs, not just generic pages.\n"
-        "7. When expected_reference_urls are present, citation_quality must reflect whether the returned references include the expected official page(s) or an equally specific official supporting page.\n"
+        "7. When expected_reference_urls are present, citation_quality must reflect whether the returned references include the expected official page(s) or an equally specific official supporting page. Each entry in allowed_reference_url_groups is an explicit equivalence group: any one URL in that group fully satisfies its corresponding expected reference, and must not be penalized as unofficial or mismatched merely because it is an alternate route.\n"
         "8. When citation_requirements are present, citation_quality must reflect whether citations substantively support each required claim, not just whether any URL is present.\n"
         "9. When expected_response_structure is present, helpfulness and completeness must reflect whether the answer is structured in that usable format when appropriate.\n"
         "10. When expected_followup_topics or expected_suggested_actions are present, component_quality must reflect whether followups/actions are useful, relevant next steps and not random suggestions.\n"
