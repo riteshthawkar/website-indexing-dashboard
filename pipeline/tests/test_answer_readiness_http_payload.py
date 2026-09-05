@@ -155,6 +155,10 @@ def test_arabic_answer_matching_accepts_governed_lexical_equivalents():
     assert _required_term_supported("تُظهر الصورة تجمّع المياه بعد المطر.", "تراكم المياه")
     assert _required_term_supported("يعتمد العمل على نموذج تعاوني مع الشركاء.", "التعاون")
     assert _required_term_supported("تشرف لجان المجلس والإدارة على شؤون الجامعة.", "لجان إدارية")
+    assert _required_term_supported(
+        "يضع النموذج معايير جديدة في الأداء المعرفي والاستدلال.",
+        "knowledge and reasoning performance",
+    )
 
 
 def test_arabic_answer_matching_handles_feminine_plural_with_attached_pronoun():

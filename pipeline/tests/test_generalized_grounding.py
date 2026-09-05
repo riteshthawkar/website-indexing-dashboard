@@ -1168,6 +1168,63 @@ def test_named_site_token_prefers_that_official_host_over_a_mirror():
     ) > retriever._generalized_page_target_score(query, mirrored_host)
 
 
+def test_named_acronym_prefers_identity_page_over_incidental_content_mention():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    query = "Where are IFM headquarters and research hubs located?"
+
+    def page(identity, content):
+        return {
+            "source_url": "https://example.edu/research",
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+            "search_text": content.casefold(),
+            "tokens": set(_tokenize(content)),
+            "host_identity_tokens": set(),
+            "tail_tokens": set(),
+        }
+
+    exact = page("IFM headquarters and research hubs", "Global institute locations")
+    umbrella = page("Research", "Our institutes include IFM and other centers")
+
+    assert retriever._generalized_page_target_score(
+        query, exact
+    ) > retriever._generalized_page_target_score(query, umbrella)
+
+
+def test_multilingual_bridge_covers_arabic_careers_categories_and_locations():
+    from pipeline.retrieval.routed_hybrid import _multilingual_retrieval_bridge_tokens
+
+    aliases = set(
+        _multilingual_retrieval_bridge_tokens(
+            "ما هي أقسام الوظائف المفتوحة وما هي المراكز المذكورة كبيئة عمل عالمية؟"
+        )
+    )
+
+    assert {"categories", "careers", "vacancies", "centers", "global"} <= aliases
+
+
+def test_broad_synthesis_uses_aggregation_evidence_budget():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.evidence_budget_items = 8
+    retriever.evidence_budget_chars = 8000
+    retriever.aggregation_evidence_budget_items = 12
+    retriever.aggregation_evidence_budget_chars = 10000
+    retriever.large_page_evidence_budget_items = 10
+    retriever.large_page_evidence_budget_chars = 9000
+    retriever.evidence_budget_max_per_source = 4
+
+    assert retriever._evidence_budget_for_plan({"intent": "broad_synthesis"}) == (
+        12,
+        10000,
+        4,
+    )
+
+
 def test_explicit_page_scope_beats_content_heavy_mirror_consensus():
     from pipeline.retrieval.adaptive_hybrid import _tokenize
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever

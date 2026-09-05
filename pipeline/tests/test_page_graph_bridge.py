@@ -909,6 +909,97 @@ def test_navigation_planner_does_not_use_page_name_to_choose_sibling_email():
     assert plan["steps"][1]["target_url"] == "mailto:OSR@mbzuai.ac.ae"
 
 
+def test_navigation_planner_uses_complete_service_mailbox_phrase_for_siblings():
+    catalog = build_navigation_catalog(_ready_bridge())
+    page = next(
+        value for value in catalog["pages"] if value["page_card_id"] == "page:admissions"
+    )
+    page.update(
+        {
+            "title": "Cloud and On-Prem HPC",
+            "purpose_summary": "Contact the Cloud HPC or On-Prem HPC team.",
+            "source_url": "https://mbzuai.ac.ae/hpc",
+            "canonical_url": "https://mbzuai.ac.ae/hpc",
+            "canonical_family_url": "https://mbzuai.ac.ae/hpc",
+        }
+    )
+    base = deepcopy(
+        next(action for action in catalog["actions"] if action["action_id"] == "action:email")
+    )
+    on_prem = deepcopy(base)
+    on_prem.update(
+        {
+            "action_id": "action:on-prem-hpc",
+            "label": "hpc.admins@mbzuai.ac.ae",
+            "context_label": "Get in Touch",
+            "source_section_heading": "Get in Touch",
+            "target_url": "mailto:hpc.admins@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:hpc.admins@mbzuai.ac.ae",
+        }
+    )
+    cloud = deepcopy(base)
+    cloud.update(
+        {
+            "action_id": "action:cloud-hpc",
+            "label": "Cloud.hpc@mbzuai.ac.ae",
+            "context_label": "Get in Touch",
+            "source_section_heading": "Get in Touch",
+            "target_url": "mailto:Cloud.hpc@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:Cloud.hpc@mbzuai.ac.ae",
+        }
+    )
+    catalog["actions"] = [on_prem, cloud]
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="What contact email is listed for the Cloud HPC team?",
+        result={"evidence_pack": {"items": [{"source_url": "https://mbzuai.ac.ae/hpc"}]}},
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["steps"][1]["target_url"] == "mailto:Cloud.hpc@mbzuai.ac.ae"
+
+
+def test_navigation_plan_caps_page_evidence_to_backend_schema_limit():
+    catalog = build_navigation_catalog(_ready_bridge())
+    admissions = next(
+        value for value in catalog["pages"] if value["page_card_id"] == "page:admissions"
+    )
+    extra_pages = []
+    for index in range(25):
+        page = deepcopy(admissions)
+        page.update(
+            {
+                "page_card_id": f"page:reference-{index:02d}",
+                "document_revision_id": f"revision:reference-{index:02d}",
+                "source_url": f"https://mbzuai.ac.ae/reference/{index:02d}",
+                "canonical_url": f"https://mbzuai.ac.ae/reference/{index:02d}",
+                "canonical_family_url": f"https://mbzuai.ac.ae/reference/{index:02d}",
+                "title": f"Reference page {index:02d}",
+                "purpose_summary": "Background reference material.",
+                "action_ids": [],
+            }
+        )
+        extra_pages.append(page)
+    catalog["pages"].extend(extra_pages)
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="Where does the Apply Now action lead?",
+        result={
+            "dense_page_card_ids": [
+                "page:admissions",
+                *[page["page_card_id"] for page in extra_pages],
+            ],
+            "dense_action_ids": ["action:apply"],
+        },
+    )
+
+    assert plan["target_page"]["page_card_id"] == "page:admissions"
+    assert len(plan["evidence"]["page_card_ids"]) == 20
+    assert plan["evidence"]["page_card_ids"][0] == "page:admissions"
+
+
 def test_navigation_planner_does_not_substitute_email_for_requested_phone_number():
     catalog = build_navigation_catalog(_ready_bridge())
     planner = GroundedNavigationPlanner(catalog=catalog)

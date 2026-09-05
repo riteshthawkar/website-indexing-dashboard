@@ -25,6 +25,7 @@ from pipeline.core.page_graph_bridge import NAVIGATION_CATALOG_SCHEMA_VERSION
 
 
 NAVIGATION_PLAN_SCHEMA_VERSION = "mbzuai.navigation_plan.v1"
+NAVIGATION_EVIDENCE_MAX_PAGE_IDS = 20
 _ACTION_TYPES_BY_INTENT = {
     "apply": {"apply", "submit_form"},
     "register": {"register", "submit_form"},
@@ -1098,6 +1099,23 @@ class GroundedNavigationPlanner:
                     local_part = (
                         target_url.split(":", 1)[1].split("@", 1)[0].casefold()
                     )
+                    endpoint_tokens = _ordered_tokens(
+                        re.sub(r"[._+-]+", " ", local_part)
+                    )
+                    query_sequence = _ordered_tokens(query)
+                    if len(endpoint_tokens) >= 2 and any(
+                        query_sequence[index : index + len(endpoint_tokens)]
+                        == endpoint_tokens
+                        for index in range(
+                            max(0, len(query_sequence) - len(endpoint_tokens) + 1)
+                        )
+                    ):
+                        # A service-qualified mailbox such as ``cloud.hpc``
+                        # is stronger sibling-action evidence than a generic
+                        # mailbox on the same page. Requiring the complete,
+                        # ordered local-part phrase avoids rewarding an
+                        # incidental page-name token in another endpoint.
+                        score += 6.0
                     if local_part in _GENERAL_CONTACT_EMAIL_LOCAL_PARTS:
                         score += 1.0
             else:
@@ -1155,7 +1173,7 @@ class GroundedNavigationPlanner:
         grounding_page_ids = [
             page_id,
             *sorted(value for value in retrieved_page_ids if value != page_id),
-        ]
+        ][:NAVIGATION_EVIDENCE_MAX_PAGE_IDS]
         source_url = _clean_text(page.get("source_url"))
         if not _safe_action_target(source_url) or not _official_navigation_target(source_url):
             return self._empty_plan(

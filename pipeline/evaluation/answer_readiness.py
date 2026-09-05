@@ -475,6 +475,15 @@ _ARABIC_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
 _ENGLISH_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"ahead", "before"}),
 )
+_CROSS_LANGUAGE_REQUIRED_PHRASE_EQUIVALENTS: dict[str, tuple[str, ...]] = {
+    # Exact, source-governed translations used by the Arabic benchmark. Keep
+    # this narrow: factual entities, numbers, and qualifiers still require
+    # their ordinary deterministic matches.
+    "knowledge and reasoning performance": (
+        "الأداء المعرفي والاستدلال",
+        "اداء المعرفة والاستدلال",
+    ),
+}
 
 
 def _arabic_term_token_variants(token: str) -> set[str]:
@@ -608,6 +617,11 @@ def _required_term_supported(response: str, term: str) -> bool:
         return True
     if normalized_term in normalized_response:
         return True
+    for equivalent in _CROSS_LANGUAGE_REQUIRED_PHRASE_EQUIVALENTS.get(
+        normalized_term, ()
+    ):
+        if _normalize_for_term_match(equivalent) in normalized_response:
+            return True
 
     term_tokens = _term_tokens(term)
     if not term_tokens:

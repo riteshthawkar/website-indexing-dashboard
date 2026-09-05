@@ -161,7 +161,10 @@ def _multilingual_retrieval_bridge_tokens(query: str) -> List[str]:
         (("التامين الصحي", "التأمين الصحي", "الرعاية الصحية"), ("healthcare", "insurance")),
         (("التاشيرة", "التأشيرة"), ("visa",)),
         (("البرامج", "برامج", "التخصصات", "تخصصات"), ("programs", "disciplines")),
-        (("الشعب", "الاقسام", "الأقسام", "القطاعات"), ("divisions", "departments")),
+        (("الشعب", "الاقسام", "الأقسام", "اقسام", "أقسام", "القطاعات", "فئات"), ("divisions", "departments", "sections", "categories")),
+        (("الوظائف", "وظائف", "وظيفة", "الشواغر", "شواغر"), ("careers", "jobs", "vacancies", "open positions")),
+        (("المراكز", "مراكز", "المقرات", "مقرات"), ("centers", "locations", "hubs")),
+        (("بيئة عمل", "كبيئة عمل", "عالمية", "العالمية"), ("work environment", "global", "worldwide")),
         (
             (
                 "نماذج اللغة الكبيرة",
@@ -2279,7 +2282,7 @@ class RoutedHybridRetriever:
 
     def _evidence_budget_for_plan(self, coverage_plan: Dict[str, Any]) -> tuple[int, int, int]:
         intent = str((coverage_plan or {}).get("intent") or "")
-        if intent == "multi_page_aggregation":
+        if intent in {"multi_page_aggregation", "broad_synthesis"}:
             return (
                 self.aggregation_evidence_budget_items,
                 self.aggregation_evidence_budget_chars,
@@ -3526,9 +3529,9 @@ class RoutedHybridRetriever:
         )
         emphasized_content_overlap = emphasized_scope_tokens & content_tokens
         if emphasized_identity_overlap:
-            score += min(1.35, 0.90 + (0.20 * len(emphasized_identity_overlap)))
+            score += min(1.65, 1.20 + (0.22 * len(emphasized_identity_overlap)))
         elif emphasized_content_overlap:
-            score += min(1.45, 1.10 + (0.18 * len(emphasized_content_overlap)))
+            score += min(0.90, 0.58 + (0.14 * len(emphasized_content_overlap)))
         if query_tokens & host_identity_tokens:
             # A user who explicitly names a site/institute token should prefer
             # that official host over a mirrored institutional summary.  This
@@ -4321,7 +4324,14 @@ class RoutedHybridRetriever:
                 flags=re.IGNORECASE,
             )
         )
-        max_pages = 4 if comparison_request else 2 if compound_facet_request else 1
+        interrogative_clause_count = len(_INTERROGATIVE_CLAUSE_RE.findall(query))
+        max_pages = (
+            4
+            if comparison_request
+            else min(4, max(2, interrogative_clause_count))
+            if compound_facet_request
+            else 1
+        )
         multi_page_request = comparison_request or compound_facet_request
         pages = [
             str(page.get("source_url") or "")
@@ -4339,7 +4349,7 @@ class RoutedHybridRetriever:
             )
         ][:max_pages]
         pages = self._dedupe_explicit_pages_by_family(pages, query=query)
-        if pages and not comparison_request:
+        if pages and not comparison_request and interrogative_clause_count < 3:
             primary_page = self._coverage_page_record_for_url(pages[0])
             if primary_page and _page_satisfies_required_facets(
                 required_facets,
