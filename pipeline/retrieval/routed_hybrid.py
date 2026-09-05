@@ -393,6 +393,86 @@ def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
             min_alias_matches=2,
         )
 
+    careers_context = bool(
+        re.search(r"\b(?:careers?|jobs?|vacanc(?:y|ies)|open positions?)\b", normalized)
+        or any(
+            marker in normalized
+            for marker in (
+                "الوظائف",
+                "وظائف",
+                "وظيفة",
+                "الشواغر",
+                "شواغر",
+            )
+        )
+    )
+    vacancy_inventory_query = careers_context and bool(
+        re.search(
+            r"\b(?:categories|sections|types|kinds|groups)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "أقسام",
+                "اقسام",
+                "الأقسام",
+                "الاقسام",
+                "فئات",
+                "الفئات",
+                "أنواع",
+                "انواع",
+            )
+        )
+    )
+    if vacancy_inventory_query:
+        add(
+            "vacancy categories",
+            (
+                "vacancies",
+                "open positions",
+                "job categories",
+                "vacancy categories",
+                "career sections",
+            ),
+        )
+
+    global_work_locations_query = careers_context and bool(
+        re.search(
+            r"\b(?:centers?|centres?|locations?|offices?|hubs?|global|worldwide|work environment)\b",
+            normalized,
+        )
+        or any(
+            marker in normalized
+            for marker in (
+                "المراكز",
+                "مراكز",
+                "المقرات",
+                "مقرات",
+                "المواقع",
+                "مواقع",
+                "عالمية",
+                "العالمية",
+                "بيئة عمل",
+                "كبيئة عمل",
+            )
+        )
+    )
+    if global_work_locations_query:
+        add(
+            "global work locations",
+            (
+                "global community",
+                "global locations",
+                "work locations",
+                "centers",
+                "centres",
+                "locations",
+                "hubs",
+                "worldwide",
+            ),
+        )
+
     scholarship_context = bool(
         re.search(r"\b(?:scholarships?|financial aid|funding)\b", normalized)
         or any(marker in normalized for marker in ("المنح", "المنحة", "تمويل"))
@@ -4597,14 +4677,28 @@ class RoutedHybridRetriever:
         pages = self._dedupe_explicit_pages_by_family(pages, query=query)
         if pages and not comparison_request and interrogative_clause_count < 3:
             primary_page = self._coverage_page_record_for_url(pages[0])
-            if primary_page and _page_satisfies_required_facets(
+            primary_is_collection_parent = bool(
+                collection_scope_request
+                and len(pages) > 1
+                and all(
+                    self._coverage_url_is_aggregate_parent(pages[0], other_page)
+                    for other_page in pages[1:]
+                )
+            )
+            if (
+                primary_page
+                and (not collection_scope_request or primary_is_collection_parent)
+                and _page_satisfies_required_facets(
                 required_facets,
                 primary_page,
+                )
             ):
                 # Multiple interrogative clauses about one subject do not
                 # require multiple sources when the leading authoritative page
-                # already proves every facet. Keeping unrelated corroboration
-                # here only dilutes the generation context.
+                # already proves every facet. For a collection request, only
+                # collapse when that page is also the structural parent of the
+                # other candidates; a detail page can repeat global navigation
+                # labels without actually being the collection overview.
                 pages = pages[:1]
         pages = self._expand_mapping_page_scope(
             query,

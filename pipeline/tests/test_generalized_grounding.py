@@ -1039,10 +1039,11 @@ def test_collection_query_prefers_retrieved_structural_overview_page():
         },
     )
 
-    assert inferred["required_pages"]
-    assert retriever._normalize_source_url(inferred["required_pages"][0]) == (
-        retriever._normalize_source_url(root_url)
-    )
+    assert inferred["required_pages"] == [root_url]
+    assert [facet["name"] for facet in inferred["required_facets"]] == [
+        "vacancy categories",
+        "global work locations",
+    ]
 
 
 def test_generalized_comparison_retains_each_high_ranked_dense_page():
