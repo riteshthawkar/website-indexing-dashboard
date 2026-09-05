@@ -2193,7 +2193,12 @@ def _person_name_tokens(query: str) -> List[str]:
         phrase_tokens = [
             token
             for token in _tokenize(phrase)
-            if token not in _PERSON_NAME_EXCLUDE_TOKENS and len(token) >= 3
+            # Initials and abbreviated given names such as "Md" are common
+            # in profile titles.  The phrase detector has already required a
+            # multi-token, name-like span, so retaining two-character tokens
+            # here improves exact-person recall without broadening ordinary
+            # lexical queries.
+            if token not in _PERSON_NAME_EXCLUDE_TOKENS and len(token) >= 2
         ]
         if len(phrase_tokens) >= 2:
             return list(dict.fromkeys(phrase_tokens[:4]))
@@ -3969,6 +3974,14 @@ class AdaptiveHybridRetriever:
             8,
             int(retrieval_cfg.get("local_media_candidate_pool", 64) or 64),
         )
+        self.local_page_card_candidate_pool = max(
+            8,
+            int(retrieval_cfg.get("local_page_card_candidate_pool", 96) or 96),
+        )
+        self.local_action_candidate_pool = max(
+            8,
+            int(retrieval_cfg.get("local_action_candidate_pool", 96) or 96),
+        )
         self.local_evidence_span_candidate_pool = max(
             12,
             int(retrieval_cfg.get("local_evidence_span_candidate_pool", 128) or 128),
@@ -4085,7 +4098,17 @@ class AdaptiveHybridRetriever:
                 self.fact_texts_by_chunk.setdefault(str(chunk_id), []).append(fact_text)
         self.media_texts_by_chunk: Dict[str, List[str]] = {}
         self.media_texts_by_id: Dict[str, str] = {}
+        self.media_ids_by_page_number: Dict[str, List[str]] = defaultdict(list)
         for media in self.media_map.values():
+            media_id = str(media.get("id") or "")
+            page_numbers = list(media.get("page_numbers") or [])
+            for key in ("page_number", "pdf_page_number"):
+                if media.get(key) not in (None, ""):
+                    page_numbers.append(media.get(key))
+            for page_number in page_numbers:
+                normalized_page_number = str(page_number or "").strip()
+                if media_id and normalized_page_number.isdigit():
+                    self.media_ids_by_page_number[normalized_page_number].append(media_id)
             text = _clean_text(
                 " ".join(
                     str(media.get(key) or "")
@@ -4580,6 +4603,28 @@ class AdaptiveHybridRetriever:
                     for token in raw_tokens
                     if token not in _LOOKUP_ENTITY_ROLE_TOKENS
                 ]
+            person_tokens = _person_name_tokens(query)
+            if lookup_profile.is_contact_lookup and person_tokens:
+                # For a named contact lookup, generic wording such as
+                # "linked action on his page" should not consume the bounded
+                # lexical candidate pool ahead of the actual person.  Keep
+                # source-surface qualifiers because they disambiguate a
+                # directory listing from a profile page.
+                surface_qualifiers = {
+                    "directory",
+                    "faculty",
+                    "library",
+                    "listing",
+                    "profile",
+                    "researcher",
+                    "staff",
+                    "team",
+                }
+                scoped_surface_tokens = [
+                    token for token in raw_tokens if token in surface_qualifiers
+                ]
+                focus_tokens = list(person_tokens)
+                raw_tokens = scoped_surface_tokens
             base_tokens = [*focus_tokens, *attribute_tokens, *raw_tokens]
             alias_tokens = (
                 _semantic_query_alias_tokens(query)
@@ -5097,11 +5142,26 @@ class AdaptiveHybridRetriever:
     def _local_media_query_ids(self, query: str, *, top_k: int) -> List[str]:
         if top_k <= 0 or not self.media_map:
             return []
-        candidate_ids = self._lexical_query_ids(
+        requested_pages = list(
+            dict.fromkeys(
+                re.findall(
+                    r"(?:\bpage|الصفحة)\s*[:#-]?\s*(\d{1,4})\b",
+                    _clean_text(query).lower(),
+                    flags=re.IGNORECASE,
+                )
+            )
+        )
+        exact_page_ids = [
+            media_id
+            for page_number in requested_pages
+            for media_id in self.media_ids_by_page_number.get(page_number, [])
+        ]
+        lexical_ids = self._lexical_query_ids(
             query,
             max(top_k, self.local_media_candidate_pool),
             namespace=self.namespace_media,
         )
+        candidate_ids = list(dict.fromkeys([*exact_page_ids, *lexical_ids]))
         if not candidate_ids:
             # A local lexical miss is not permission to rescore the complete
             # media corpus; the independent dense media lane preserves recall.
@@ -5117,6 +5177,101 @@ class AdaptiveHybridRetriever:
             scored.append((media_id, score))
         scored.sort(key=lambda item: item[1], reverse=True)
         return [media_id for media_id, _score in scored[:top_k]]
+
+    def _local_page_card_query_ids(self, query: str, *, top_k: int) -> List[str]:
+        """Rank frozen Page Cards without requiring an embedding provider."""
+        if top_k <= 0 or not self.page_card_map:
+            return []
+        candidate_ids = self._lexical_query_ids(
+            query,
+            max(top_k, self.local_page_card_candidate_pool),
+            namespace=self.namespace_page_cards,
+        )
+        scored: List[Tuple[str, float]] = []
+        for page_card_id in candidate_ids:
+            page = self.page_card_map.get(page_card_id)
+            if not page:
+                continue
+            lexical_text = str((self.lexical_map.get(page_card_id) or {}).get("text") or "")
+            page_text = lexical_text or _clean_text(
+                " ".join(
+                    str(page.get(key) or "")
+                    for key in (
+                        "title",
+                        "purpose_summary",
+                        "page_type",
+                        "source_url",
+                        "text",
+                    )
+                )
+            )
+            score = self._score_text_match(query, page_text)
+            score += _lookup_signal_bonus(query, page_text)
+            score += _source_identity_bonus(
+                query,
+                source_url=str(page.get("source_url") or ""),
+                document_title=str(page.get("title") or ""),
+                heading=str(page.get("purpose_summary") or ""),
+            )
+            score += self._source_query_bonus(
+                query,
+                source_url=str(page.get("source_url") or ""),
+                document_title=str(page.get("title") or ""),
+                heading=str(page.get("purpose_summary") or ""),
+                text=page_text,
+            )
+            if score > 0.0:
+                scored.append((page_card_id, score))
+        scored.sort(key=lambda item: (-item[1], item[0]))
+        return [page_card_id for page_card_id, _score in scored[:top_k]]
+
+    def _local_action_query_ids(self, query: str, *, top_k: int) -> List[str]:
+        """Rank verified page actions locally for resilient navigation."""
+        if top_k <= 0 or not self.action_map:
+            return []
+        candidate_ids = self._lexical_query_ids(
+            query,
+            max(top_k, self.local_action_candidate_pool),
+            namespace=self.namespace_actions,
+        )
+        navigation_intent = str(infer_navigation_context(query).get("intent") or "none")
+        intent_action_types = {
+            "apply": {"apply", "submit_form"},
+            "register": {"register", "submit_form"},
+            "contact": {"contact", "email", "telephone", "submit_form"},
+            "download": {"download"},
+            "login": {"login"},
+            "search": {"search"},
+        }
+        scored: List[Tuple[str, float]] = []
+        for action_id in candidate_ids:
+            action = self.action_map.get(action_id)
+            if not action:
+                continue
+            lexical_text = str((self.lexical_map.get(action_id) or {}).get("text") or "")
+            action_text = lexical_text or _clean_text(
+                " ".join(
+                    str(action.get(key) or "")
+                    for key in (
+                        "label",
+                        "context_label",
+                        "source_section_heading",
+                        "target_url",
+                        "source_url",
+                        "text",
+                    )
+                )
+            )
+            score = self._score_text_match(query, action_text)
+            score += _lookup_signal_bonus(query, action_text)
+            if str(action.get("action_type") or "") in intent_action_types.get(
+                navigation_intent, set()
+            ):
+                score += 0.75
+            if score > 0.0:
+                scored.append((action_id, score))
+        scored.sort(key=lambda item: (-item[1], item[0]))
+        return [action_id for action_id, _score in scored[:top_k]]
 
     def _source_query_bonus(
         self,
@@ -8147,6 +8302,37 @@ class AdaptiveHybridRetriever:
         wanted_chunk_ids = set(chunk_ids)
         wanted_parent_ids = set()
         media_query = _is_media_query(query)
+        page_specific_floor_ids: List[str] = []
+        requested_pages = set(
+            re.findall(
+                r"(?:\bpage|الصفحة)\s*[:#-]?\s*(\d{1,4})\b",
+                _clean_text(query).lower(),
+                flags=re.IGNORECASE,
+            )
+        )
+        if media_query and requested_pages:
+            page_candidates: List[Tuple[float, int, str]] = []
+            for rank, media_id in enumerate(media_hits):
+                media = self.media_map.get(str(media_id))
+                if not media or self._is_low_signal_media(media):
+                    continue
+                media_pages = {
+                    str(value or "").strip()
+                    for value in [
+                        *(media.get("page_numbers") or []),
+                        media.get("page_number"),
+                        media.get("pdf_page_number"),
+                    ]
+                    if str(value or "").strip().isdigit()
+                }
+                if not (requested_pages & media_pages):
+                    continue
+                relevance = self._score_media_relevance(query, media)
+                if relevance > 0.0:
+                    page_candidates.append((relevance, -rank, str(media_id)))
+            if page_candidates:
+                page_candidates.sort(reverse=True)
+                page_specific_floor_ids.append(page_candidates[0][2])
         dense_floor_ids: List[str] = []
         if media_query:
             eligible_dense: List[Tuple[str, Dict[str, Any]]] = []
@@ -8306,7 +8492,11 @@ class AdaptiveHybridRetriever:
             )
         ranked_media.sort(key=lambda item: (-item[1], item[2], item[0]))
         ranked_ids = [media_id for media_id, _score, _rank_hint in ranked_media]
-        selected_ids = list(dict.fromkeys([*dense_floor_ids, *ranked_ids]))[
+        selected_ids = list(
+            dict.fromkeys(
+                [*page_specific_floor_ids, *dense_floor_ids, *ranked_ids]
+            )
+        )[
             : self.max_media_results
         ]
         return [
@@ -8769,8 +8959,24 @@ class AdaptiveHybridRetriever:
         media_dense_ids = lane_results["media_dense_ids"]
         sparse_media_ids = lane_results["sparse_media_ids"]
         local_media_ids = lane_results["local_media_ids"]
-        dense_page_card_ids = lane_results["dense_page_card_ids"]
-        dense_action_ids = lane_results["dense_action_ids"]
+        raw_dense_page_card_ids = lane_results["dense_page_card_ids"]
+        local_page_card_ids = lane_results["local_page_card_ids"]
+        dense_page_card_ids = [
+            record_id
+            for record_id, _score in _rrf_merge(
+                [local_page_card_ids, raw_dense_page_card_ids],
+                k=self.rrf_k,
+            )
+        ]
+        raw_dense_action_ids = lane_results["dense_action_ids"]
+        local_action_ids = lane_results["local_action_ids"]
+        dense_action_ids = [
+            record_id
+            for record_id, _score in _rrf_merge(
+                [local_action_ids, raw_dense_action_ids],
+                k=self.rrf_k,
+            )
+        ]
         fact_dense_ids = lane_results["fact_dense_ids"]
         sparse_fact_ids = lane_results["sparse_fact_ids"]
         local_fact_ids = lane_results["local_fact_ids"]
@@ -9054,7 +9260,9 @@ class AdaptiveHybridRetriever:
                 "sparse_media_ids": [],
                 "local_media_ids": [],
                 "dense_page_card_ids": [],
+                "local_page_card_ids": [],
                 "dense_action_ids": [],
+                "local_action_ids": [],
                 "dense_fact_ids": [],
                 "sparse_fact_ids": [],
                 "local_fact_ids": [],
@@ -9102,7 +9310,11 @@ class AdaptiveHybridRetriever:
                     "sparse_media_ids": sparse_media_ids,
                     "local_media_ids": local_media_ids,
                     "dense_page_card_ids": dense_page_card_ids,
+                    "raw_dense_page_card_ids": raw_dense_page_card_ids,
+                    "local_page_card_ids": local_page_card_ids,
                     "dense_action_ids": dense_action_ids,
+                    "raw_dense_action_ids": raw_dense_action_ids,
+                    "local_action_ids": local_action_ids,
                     "dense_fact_ids": fact_dense_ids,
                     "sparse_fact_ids": sparse_fact_ids,
                     "local_fact_ids": local_fact_ids,
@@ -9442,7 +9654,9 @@ class AdaptiveHybridRetriever:
             "sparse_media_ids": sparse_media_ids,
             "local_media_ids": local_media_ids,
             "dense_page_card_ids": dense_page_card_ids,
+            "local_page_card_ids": local_page_card_ids,
             "dense_action_ids": dense_action_ids,
+            "local_action_ids": local_action_ids,
             "dense_fact_ids": fact_dense_ids,
             "sparse_fact_ids": sparse_fact_ids,
             "local_fact_ids": local_fact_ids,
@@ -9569,8 +9783,14 @@ class AdaptiveHybridRetriever:
                 "page_cards",
                 self.dense_page_card_top_k if page_card_lane_enabled else 0,
             ),
+            "page_card_local": self.dense_page_card_top_k if page_card_lane_enabled else 0,
             "action_dense": (
                 self._remote_dense_lane_top_k("actions", self.dense_action_top_k)
+                if action_lane_enabled and navigation_intent != "none"
+                else 0
+            ),
+            "action_local": (
+                self.dense_action_top_k
                 if action_lane_enabled and navigation_intent != "none"
                 else 0
             ),
@@ -9723,6 +9943,10 @@ class AdaptiveHybridRetriever:
                     score_key="dense_page_card_ids",
                 ),
             )
+            tasks["local_page_card_ids"] = (
+                self._local_page_card_query_ids,
+                {"query": query, "top_k": lane_top_ks.get("page_card_local", 0)},
+            )
         if getattr(self, "action_map", None):
             tasks["dense_action_ids"] = (
                 self._dense_query_ids,
@@ -9731,6 +9955,10 @@ class AdaptiveHybridRetriever:
                     top_k=lane_top_ks.get("action_dense", 0),
                     score_key="dense_action_ids",
                 ),
+            )
+            tasks["local_action_ids"] = (
+                self._local_action_query_ids,
+                {"query": query, "top_k": lane_top_ks.get("action_local", 0)},
             )
         if self.fact_map:
             tasks["fact_dense_ids"] = (
@@ -9783,7 +10011,9 @@ class AdaptiveHybridRetriever:
             "sparse_media_ids": [],
             "local_media_ids": [],
             "dense_page_card_ids": [],
+            "local_page_card_ids": [],
             "dense_action_ids": [],
+            "local_action_ids": [],
             "fact_dense_ids": [],
             "sparse_fact_ids": [],
             "local_fact_ids": [],

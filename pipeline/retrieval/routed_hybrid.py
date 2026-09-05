@@ -161,6 +161,24 @@ def _multilingual_retrieval_bridge_tokens(query: str) -> List[str]:
         (("التاشيرة", "التأشيرة"), ("visa",)),
         (("البرامج", "برامج", "التخصصات", "تخصصات"), ("programs", "disciplines")),
         (("الشعب", "الاقسام", "الأقسام", "القطاعات"), ("divisions", "departments")),
+        (
+            (
+                "نماذج اللغة الكبيرة",
+                "النماذج اللغوية الكبيرة",
+                "نماذج لغوية كبيرة",
+                "الذكاء الاصطناعي التوليدي",
+            ),
+            ("large language models", "llm", "generative ai"),
+        ),
+        (
+            ("الحوسبة", "القدرة الحاسوبية", "القوة الحاسوبية", "قوة الحوسبة"),
+            ("computing", "compute", "computational power"),
+        ),
+        (("التدريب", "تدريب النماذج", "تدريب نموذج"), ("training", "model training")),
+        (
+            ("العتاد", "الأجهزة", "المعالجات", "الرقاقات", "الشرائح"),
+            ("hardware", "processor", "gpu", "chip"),
+        ),
     )
     for markers, terms in contracts:
         if any(marker in normalized for marker in markers):

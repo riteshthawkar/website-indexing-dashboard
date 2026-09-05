@@ -289,6 +289,116 @@ def test_page_card_dense_hit_bridges_to_chunks_by_document_revision(tmp_path):
     ]
 
 
+def test_named_contact_local_page_and_action_lanes_keep_short_name_token(tmp_path):
+    from pipeline.retrieval.adaptive_hybrid import (
+        AdaptiveHybridRetriever,
+        _person_name_tokens,
+    )
+
+    stage_dir = tmp_path / "stage_outputs" / "format_retrieval"
+    stage_dir.mkdir(parents=True)
+    page_id = "page-card:md-sohail"
+    action_id = "page-action:md-sohail-email"
+    atomic_write_json(
+        stage_dir / "retrieval_bundle.json",
+        {
+            "version": 6,
+            "chunk_records": [],
+            "parent_records": [],
+            "media_records": [],
+            "page_card_records": [
+                {
+                    "id": page_id,
+                    "title": "Md Sohail | University Library",
+                    "source_url": "https://library.mbzuai.ac.ae/md-sohail",
+                },
+                {
+                    "id": "page-card:library-home",
+                    "title": "University Library",
+                    "source_url": "https://library.mbzuai.ac.ae/",
+                },
+            ],
+            "action_records": [
+                {
+                    "id": action_id,
+                    "action_type": "email",
+                    "target_url": "mailto:md.sohail@mbzuai.ac.ae",
+                },
+                {
+                    "id": "page-action:library-general",
+                    "action_type": "email",
+                    "target_url": "mailto:library@mbzuai.ac.ae",
+                },
+            ],
+            "fact_records": [],
+            "evidence_span_records": [],
+            "summary_records": [],
+            "assertion_records": [],
+            "entity_records": [],
+            "answer_records": [],
+        },
+    )
+    atomic_write_json(
+        stage_dir / "lexical_corpus.json",
+        [
+            {
+                "id": page_id,
+                "record_type": "page_card",
+                "text": "TITLE: Md Sohail | University Library SOURCE_URL: https://library.mbzuai.ac.ae/md-sohail",
+            },
+            {
+                "id": "page-card:library-home",
+                "record_type": "page_card",
+                "text": "TITLE: University Library homepage",
+            },
+            {
+                "id": action_id,
+                "record_type": "action",
+                "text": "ACTION: md.sohail@mbzuai.ac.ae SOURCE_PAGE: Md Sohail University Library",
+            },
+            {
+                "id": "page-action:library-general",
+                "record_type": "action",
+                "text": "ACTION: library@mbzuai.ac.ae SOURCE_PAGE: University Library",
+            },
+        ],
+    )
+    retriever = AdaptiveHybridRetriever(
+        config={
+            "embedder": {"pinecone_index": "test-index"},
+            "retrieval": {"enable_sparse": False, "enable_rerank": False},
+        },
+        work_dir=tmp_path,
+    )
+    query = "What email is linked to Md Sohail on his library profile page?"
+
+    assert _person_name_tokens(query)[:2] == ["md", "sohail"]
+    assert retriever._local_page_card_query_ids(query, top_k=2)[0] == page_id
+    assert retriever._local_action_query_ids(query, top_k=2)[0] == action_id
+
+
+def test_local_media_lane_seeds_exact_pdf_page_before_lexical_candidates():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.media_map = {
+        "page-19": {"id": "page-19", "page_numbers": [19], "text": "computing hardware"},
+        "generic": {"id": "generic", "page_numbers": [2], "text": "generic report image"},
+    }
+    retriever.media_ids_by_page_number = {"19": ["page-19"]}
+    retriever.local_media_candidate_pool = 8
+    retriever.namespace_media = "media"
+    retriever._lexical_query_ids = lambda *_args, **_kwargs: ["generic"]
+    retriever._score_media_relevance = lambda _query, media: (
+        5.0 if media["id"] == "page-19" else 1.0
+    )
+
+    assert retriever._local_media_query_ids(
+        "What does the image on page 19 show?",
+        top_k=1,
+    ) == ["page-19"]
+
+
 def test_source_query_bonus_prefers_named_subdomain_identity():
     from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
 
@@ -9144,6 +9254,49 @@ def test_explicit_dense_media_hit_is_not_discarded_by_chunk_attachment():
     )
 
     assert [item["id"] for item in selected][:2] == ["dense-gold", "linked"]
+
+
+def test_explicit_pdf_page_uses_best_matching_document_visual_as_media_floor():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_media_results = 1
+    retriever.chunk_map = {
+        "supplier-a": {"id": "supplier-a", "media_ids": ["supplier-page-19"]},
+        "supplier-b": {"id": "supplier-b", "media_ids": ["supplier-page-19"]},
+    }
+    retriever.parent_map = {}
+    retriever.parent_ids_by_chunk = {"supplier-a": [], "supplier-b": []}
+    retriever.section_parent_ids_by_chunk = {"supplier-a": [], "supplier-b": []}
+    retriever.page_parent_ids_by_chunk = {"supplier-a": [], "supplier-b": []}
+    retriever.media_map = {
+        "llm-page-19": {
+            "id": "llm-page-19",
+            "media_type": "image",
+            "title": "LLM Report",
+            "page_numbers": [19],
+            "linked_chunk_ids": [],
+        },
+        "supplier-page-19": {
+            "id": "supplier-page-19",
+            "media_type": "image",
+            "title": "Supplier Guide",
+            "page_numbers": [19],
+            "linked_chunk_ids": ["supplier-a", "supplier-b"],
+        },
+    }
+    retriever._is_low_signal_media = lambda _media: False
+    retriever._score_media_relevance = lambda _query, media: (
+        5.0 if media["id"] == "llm-page-19" else 3.0
+    )
+
+    selected = retriever._attach_media(
+        ["supplier-a", "supplier-b"],
+        ["llm-page-19", "supplier-page-19"],
+        "What does page 19 of the LLM Report show?",
+    )
+
+    assert [item["id"] for item in selected] == ["llm-page-19"]
 
 
 def test_cross_lingual_dense_media_floor_survives_zero_lexical_overlap():

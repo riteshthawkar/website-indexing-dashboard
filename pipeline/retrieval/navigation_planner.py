@@ -1012,6 +1012,13 @@ class GroundedNavigationPlanner:
                 required_contact_mechanism = "telephone"
             elif query_tokens & _EMAIL_CONTACT_QUERY_TERMS:
                 required_contact_mechanism = "email"
+        page = self.pages_by_id.get(page_id) or {}
+        page_identity_tokens = _tokens(
+            " ".join(
+                _clean_text(page.get(key))
+                for key in ("title", "purpose_summary", "page_type", "source_url")
+            )
+        )
         relevance_tokens = (
             query_tokens - _CONTACT_INTENT_TERMS
             if intent == "contact"
@@ -1022,7 +1029,7 @@ class GroundedNavigationPlanner:
             for rank, action_id in enumerate(retrieved_action_ids, start=1)
             if _clean_text(action_id)
         }
-        scored: List[tuple[float, str, Dict[str, Any]]] = []
+        prepared_actions: List[tuple[Dict[str, Any], str, set[str]]] = []
         for action in self.actions_by_page.get(page_id, []):
             action_type = _clean_text(action.get("action_type"))
             if not _action_satisfies_intent(action, intent):
@@ -1042,17 +1049,41 @@ class GroundedNavigationPlanner:
                 and action_mechanism != required_contact_mechanism
             ):
                 continue
-            action_tokens = _tokens(
+            context_tokens = _tokens(
                 " ".join(
                     _clean_text(action.get(key))
                     for key in (
-                        "label",
                         "context_label",
                         "source_section_heading",
-                        "target_url",
                     )
                 )
             )
+            label = _clean_text(action.get("label"))
+            target_tokens = _tokens(
+                " ".join(
+                    (
+                        label if "@" in label or "://" in label else "",
+                        _clean_text(action.get("target_url")),
+                    )
+                )
+            )
+            if label and "@" not in label and "://" not in label:
+                context_tokens.update(_tokens(label))
+            # Page-identity words remain meaningful when an action's visible
+            # context names the service (for example, "Admissions contact").
+            # They are removed only from raw endpoint text, where an address
+            # can mechanically repeat the page name without identifying the
+            # requested sibling action.
+            action_tokens = context_tokens | (target_tokens - page_identity_tokens)
+            prepared_actions.append((action, action_type, action_tokens))
+
+        overlap_counts = [
+            len(relevance_tokens & action_tokens)
+            for _action, _action_type, action_tokens in prepared_actions
+        ]
+        minimum_overlap = min(overlap_counts) if overlap_counts else 0
+        scored: List[tuple[float, str, Dict[str, Any]]] = []
+        for action, action_type, action_tokens in prepared_actions:
             if intent == "contact":
                 score = {
                     "email": 7.0,
@@ -1076,10 +1107,16 @@ class GroundedNavigationPlanner:
                     len(relevance_tokens)
                 )
             retrieved_rank = retrieved_ranks.get(_clean_text(action.get("action_id")))
-            if retrieved_rank is not None:
+            action_overlap = len(relevance_tokens & action_tokens)
+            if retrieved_rank is not None and (
+                len(prepared_actions) == 1 or action_overlap > minimum_overlap
+            ):
                 # Preserve the vector lane's direct action evidence.  The
-                # semantic checks above still prevent an unrelated endpoint
-                # from being selected solely because it was retrieved.
+                # rank may differentiate siblings only when action-specific
+                # evidence—not the already-selected page identity—supports
+                # one of them. This prevents an address such as
+                # postaward.administration@... from winning merely because
+                # the page itself is named Research Administration.
                 score += max(2.0, 8.0 - float(retrieved_rank - 1))
             if action.get("source_section_id"):
                 score += 0.2

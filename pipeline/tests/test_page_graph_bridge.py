@@ -846,6 +846,64 @@ def test_navigation_planner_prefers_specific_contact_endpoint_over_general_email
     assert general_plan["steps"][1]["target_url"] == "mailto:info@mbzuai.ac.ae"
 
 
+def test_navigation_planner_does_not_use_page_name_to_choose_sibling_email():
+    catalog = build_navigation_catalog(_ready_bridge())
+    page = next(
+        value for value in catalog["pages"] if value["page_card_id"] == "page:admissions"
+    )
+    page.update(
+        {
+            "title": "Research Administration",
+            "purpose_summary": "Research Administration full lifecycle support.",
+            "source_url": "https://research.mbzuai.ac.ae/research-administration",
+            "canonical_url": "https://research.mbzuai.ac.ae/research-administration",
+            "canonical_family_url": "https://research.mbzuai.ac.ae/research-administration",
+        }
+    )
+    base = deepcopy(next(action for action in catalog["actions"] if action["action_id"] == "action:email"))
+    general = deepcopy(base)
+    general.update(
+        {
+            "action_id": "action:00-general",
+            "label": "OSR@mbzuai.ac.ae",
+            "context_label": "Full Lifecycle Support",
+            "source_section_heading": "Full Lifecycle Support",
+            "target_url": "mailto:OSR@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:OSR@mbzuai.ac.ae",
+        }
+    )
+    specialized = deepcopy(base)
+    specialized.update(
+        {
+            "action_id": "action:10-postaward",
+            "label": "postaward.administration@mbzuai.ac.ae",
+            "context_label": "Full Lifecycle Support",
+            "source_section_heading": "Full Lifecycle Support",
+            "target_url": "mailto:postaward.administration@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:postaward.administration@mbzuai.ac.ae",
+        }
+    )
+    catalog["actions"] = [general, specialized]
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query="What email does Research Administration give for full lifecycle support?",
+        result={
+            "evidence_pack": {
+                "items": [
+                    {"source_url": "https://research.mbzuai.ac.ae/research-administration"}
+                ]
+            },
+            # The semantic action lane can rank a target containing the page
+            # name first; that must not outweigh equal section evidence.
+            "dense_action_ids": ["action:10-postaward", "action:00-general"],
+        },
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["steps"][1]["target_url"] == "mailto:OSR@mbzuai.ac.ae"
+
+
 def test_navigation_planner_does_not_substitute_email_for_requested_phone_number():
     catalog = build_navigation_catalog(_ready_bridge())
     planner = GroundedNavigationPlanner(catalog=catalog)
