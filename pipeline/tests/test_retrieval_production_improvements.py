@@ -2640,6 +2640,13 @@ def test_answer_readiness_term_matching_handles_cross_language_dates_and_safe_va
         "أُقيم الحدث في Dubai.",
         "دبي",
     )
+    assert _required_term_supported(
+        (
+            "يمكن أن يجعل التقنيات أكثر **كفاءة** و**موثوقية** "
+            "و**تمحورًا حول الإنسان**."
+        ),
+        "efficient, trustworthy, and human-centered",
+    )
 
 
 def test_routed_static_page_markers_choose_canonical_language_routes_and_avoid_program_noise():

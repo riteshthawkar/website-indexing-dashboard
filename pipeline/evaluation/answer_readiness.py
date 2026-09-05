@@ -483,6 +483,10 @@ _CROSS_LANGUAGE_REQUIRED_PHRASE_EQUIVALENTS: dict[str, tuple[str, ...]] = {
         "الأداء المعرفي والاستدلال",
         "اداء المعرفة والاستدلال",
     ),
+    "efficient trustworthy and human centered": (
+        "كفاءة وموثوقية وتمحور حول الإنسان",
+        "كفؤ وموثوق ومتمحور حول الإنسان",
+    ),
     "دبي": ("Dubai",),
 }
 
@@ -621,7 +625,11 @@ def _required_term_supported(response: str, term: str) -> bool:
     for equivalent in _CROSS_LANGUAGE_REQUIRED_PHRASE_EQUIVALENTS.get(
         normalized_term, ()
     ):
-        if _normalize_for_term_match(equivalent) in normalized_response:
+        normalized_equivalent = _normalize_for_term_match(equivalent)
+        if normalized_equivalent in normalized_response or (
+            normalized_equivalent != normalized_term
+            and _required_term_supported(response, equivalent)
+        ):
             return True
 
     term_tokens = _term_tokens(term)
