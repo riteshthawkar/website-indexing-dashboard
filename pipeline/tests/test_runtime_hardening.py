@@ -1158,6 +1158,41 @@ def test_verified_media_evidence_skips_text_only_adjudication(monkeypatch):
     assert result["adjudication_reason"] == "grounded_media_evidence"
 
 
+def test_cross_lingual_top_media_is_verified_by_page_card_and_chunk_consensus(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    def fail_if_called(**_kwargs):
+        raise AssertionError("cross-lane media consensus must not use text adjudication")
+
+    source_url = "https://research.mbzuai.ac.ae/projects"
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", fail_if_called)
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.vector = SimpleNamespace(
+        media_map={"media-1": {"id": "media-1", "source_url": source_url}},
+        page_card_map={"card-1": {"id": "card-1", "source_url": source_url}},
+        chunk_map={"chunk-1": {"id": "chunk-1", "source_url": source_url}},
+        _has_grounded_media_candidates=lambda **_kwargs: False,
+    )
+
+    result = retriever._apply_evidence_adjudication(
+        "أي نموذج يظهر في لوحة مشاريع البحث؟",
+        {
+            "mode": "fact",
+            "abstained": False,
+            "dense_media_ids": ["media-1"],
+            "dense_page_card_ids": ["card-1"],
+            "dense_chunk_ids": ["chunk-1"],
+            "selected_media_ids": ["media-1"],
+            "media": [{"id": "media-1", "source_url": source_url}],
+            "retrieval_documents": [{"id": "weak", "text": "Untranslated context"}],
+        },
+    )
+
+    assert result["media_evidence_verified"] is True
+    assert result["verification_status"] == "verified_media_evidence"
+
+
 def test_verified_media_does_not_bypass_premise_grounding(monkeypatch):
     import pipeline.retrieval.routed_hybrid as module
 

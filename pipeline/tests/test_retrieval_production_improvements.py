@@ -9726,13 +9726,14 @@ def test_policy_media_excerpt_preserves_minimum_service_timing_rule():
     assert "minimum service of two years" in compacted
 
 
-def test_arabic_research_board_query_gets_cross_lingual_nanda_aliases():
+def test_arabic_research_board_query_uses_semantic_aliases_without_answer_value():
     from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
     query = "أي نموذج مذكور في لوحة مشاريع البحث بوصفه نموذجاً هندياً للّغات الكبيرة؟"
-    aliases = _semantic_query_alias_tokens(query)
-    assert aliases[:6] == ["NANDA", "Hindi", "LLM", "knowledge", "reasoning", "performance"]
+    aliases = set(_semantic_query_alias_tokens(query))
+    assert {"research", "projects", "Hindi", "Indian", "language", "model", "LLM"} <= aliases
+    assert "NANDA" not in aliases
 
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
     assert retriever._explicit_required_page_markers(query) == [

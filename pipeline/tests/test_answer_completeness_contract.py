@@ -367,6 +367,43 @@ def test_person_to_division_question_creates_a_mapping_coverage_facet():
         assert {"dean", "led by", "division of"} <= set(mapping["aliases"])
 
 
+def test_gpu_range_visual_feedback_and_industry_process_get_semantic_facets():
+    gpu_names = {
+        facet["name"]
+        for facet in _required_evidence_facets(
+            "What range of GPU options does the center offer?"
+        )
+    }
+    visual_names = {
+        facet["name"]
+        for facet in _required_evidence_facets(
+            "What feedback and progress tracking does this screenshot show?"
+        )
+    }
+    industry_names = {
+        facet["name"]
+        for facet in _required_evidence_facets(
+            "How does the university engage with industry and capture value?"
+        )
+    }
+
+    assert "GPU option range and intended audience" in gpu_names
+    assert "visible feedback and progress indicators" in visual_names
+    assert "industry engagement and value-capture process" in industry_names
+
+
+def test_arabic_research_dashboard_bridge_adds_categories_not_answer_values():
+    aliases = set(
+        _multilingual_retrieval_bridge_tokens(
+            "أي نموذج في لوحة مشاريع البحث هو نموذج هندي للغات الكبيرة "
+            "وحقق أداء معرفياً في الاستدلال؟"
+        )
+    )
+
+    assert {"research projects", "hindi", "indian", "knowledge", "reasoning"} <= aliases
+    assert "NANDA" not in aliases
+
+
 def test_person_to_division_pack_reserves_every_relation_bearing_section():
     page_url = "https://example.edu/research/divisions"
     query = "Who are the three deans, and which division does each lead?"

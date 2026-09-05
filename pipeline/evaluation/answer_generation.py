@@ -595,7 +595,11 @@ def generate_answer_predictions(
     resume_predictions: bool = False,
     examples: Sequence[EvalExample] | None = None,
 ) -> Dict[str, Any]:
-    retriever = AdaptiveHybridRetriever.from_config(config_name=config_name, work_dir=work_dir)
+    retriever = AdaptiveHybridRetriever.from_config(
+        config_name=config_name,
+        work_dir=work_dir,
+        validate_existing_release_manifest=False,
+    )
     examples = list(examples) if examples is not None else load_eval_examples(dataset_path)
     maps = _bundle_maps(work_dir)
 

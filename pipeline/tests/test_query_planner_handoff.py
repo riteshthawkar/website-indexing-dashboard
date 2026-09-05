@@ -133,6 +133,47 @@ def test_routed_planner_and_query_embedding_run_in_parallel():
     assert error == ""
 
 
+def test_embedding_failure_runs_bounded_planner_when_upstream_skipped_it():
+    from pipeline.retrieval.routed_hybrid import QueryRewriteBundle, RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.parallel_query_embedding_enabled = True
+    retriever.query_planner_enabled = True
+    calls = []
+
+    class FakeVector:
+        @staticmethod
+        def embed_query(_query):
+            raise RuntimeError("429 RESOURCE_EXHAUSTED")
+
+    def fake_build(query, **kwargs):
+        calls.append(bool(kwargs["use_query_planner"]))
+        expanded = f"{query} translated semantic expansion" if kwargs["use_query_planner"] else query
+        return QueryRewriteBundle(
+            vector_query=expanded,
+            graph_query=expanded,
+            labels=("openai_vector_plan",) if kwargs["use_query_planner"] else (),
+        )
+
+    retriever.vector = FakeVector()
+    retriever._build_query_rewrite_bundle = fake_build
+
+    bundle, vector, status, error = retriever._prepare_query_rewrites_and_embedding(
+        "سؤال عربي عن صفحة إنجليزية",
+        relation_plan=None,
+        query_mode="fact",
+        use_query_planner=False,
+        query_vector=None,
+    )
+
+    assert calls == [False, True]
+    assert vector == []
+    assert status == "failed_sparse_local_fallback"
+    assert error == "query_embedding_rate_limited"
+    assert bundle.vector_query.endswith("translated semantic expansion")
+    assert "embedding_failure_planner_fallback" in bundle.labels
+
+
 def test_routed_planner_passes_production_deadline_and_single_attempt(monkeypatch):
     import pipeline.retrieval.routed_hybrid as module
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever

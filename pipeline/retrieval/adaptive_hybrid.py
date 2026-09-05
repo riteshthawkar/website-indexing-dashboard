@@ -2991,6 +2991,11 @@ def _hours_query_alias_tokens(query: str) -> List[str]:
 
 def _semantic_query_alias_tokens(query: str) -> List[str]:
     normalized = _clean_text(query).lower()
+    arabic_folded = re.sub(
+        r"[\u064b-\u065f\u0670\u06d6-\u06ed\u0640]",
+        "",
+        normalized,
+    )
     query_tokens = set(_tokenize(query))
     synthesis_like_topics = {
         "location",
@@ -3010,11 +3015,17 @@ def _semantic_query_alias_tokens(query: str) -> List[str]:
     ):
         return []
     aliases: List[str] = []
+    if any(term in arabic_folded for term in ("مشاريع البحث", "المشاريع البحثية", "لوحة مشاريع")):
+        aliases.extend(["research", "projects", "dashboard"])
+    if any(term in arabic_folded for term in ("هندي", "هندية", "الهندية")):
+        aliases.extend(["Hindi", "Indian"])
     if (
-        re.search(r"(?:لوحة|اللوحة).{0,80}(?:مشاريع|المشاريع).{0,120}(?:هندي|هندية)", normalized)
-        or re.search(r"(?:هندي|هندية).{0,120}(?:لوحة|اللوحة).{0,80}(?:مشاريع|المشاريع)", normalized)
+        any(term in arabic_folded for term in ("نموذج لغوي", "نماذج اللغة", "اللغات الكبيرة"))
+        or ("نموذج" in arabic_folded and "لغ" in arabic_folded)
     ):
-        aliases.extend(["NANDA", "Hindi", "LLM", "knowledge", "reasoning", "performance"])
+        aliases.extend(["language", "model", "LLM"])
+    if any(term in arabic_folded for term in ("الأداء المعرفي", "الاداء المعرفي", "المعرفة", "الاستدلال")):
+        aliases.extend(["cognitive", "knowledge", "reasoning", "performance", "benchmark"])
     if any(term in normalized for term in ("بعد المطر", "بعد هطول المطر", "ما بعد المطر")):
         aliases.extend(["after", "rain", "rainfall", "post", "water", "accumulation", "flood"])
     if "صورة" in normalized or "الصورة" in normalized:
@@ -4387,7 +4398,13 @@ class AdaptiveHybridRetriever:
         )
 
     @classmethod
-    def from_config(cls, *, config_name: str, work_dir: str | Path) -> "AdaptiveHybridRetriever":
+    def from_config(
+        cls,
+        *,
+        config_name: str,
+        work_dir: str | Path,
+        validate_existing_release_manifest: bool = True,
+    ) -> "AdaptiveHybridRetriever":
         from ..core.config import load_effective_config
         from ..core.runtime_contract import validate_runtime_artifact_contract
 
@@ -4395,7 +4412,11 @@ class AdaptiveHybridRetriever:
             config = load_effective_config(config_name, work_dir=work_dir)
         except FileNotFoundError:
             config = load_config(config_name)
-        runtime_contract = validate_runtime_artifact_contract(config, work_dir)
+        runtime_contract = validate_runtime_artifact_contract(
+            config,
+            work_dir,
+            validate_existing_release_manifest=validate_existing_release_manifest,
+        )
         config = apply_vector_upload_manifest_config(config, work_dir)
         config["_runtime_artifact_contract"] = runtime_contract
         backend = str((config.get("retrieval") or {}).get("retriever_backend") or "vector").strip().lower()

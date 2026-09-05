@@ -2148,7 +2148,11 @@ def evaluate_retrieval_dataset(
             uncached_query_count=len(uncached_examples),
         )
         retriever_load_started_at = time.perf_counter()
-        retriever = AdaptiveHybridRetriever.from_config(config_name=config_name, work_dir=work_dir)
+        retriever = AdaptiveHybridRetriever.from_config(
+            config_name=config_name,
+            work_dir=work_dir,
+            validate_existing_release_manifest=False,
+        )
         _emit_progress(
             progress_callback,
             "retrieval_eval_retriever_load_done",
@@ -2302,7 +2306,11 @@ def evaluate_retrieval_dataset(
                 return retriever
             worker = getattr(thread_state, "retriever", None)
             if worker is None:
-                worker = AdaptiveHybridRetriever.from_config(config_name=config_name, work_dir=work_dir)
+                worker = AdaptiveHybridRetriever.from_config(
+                    config_name=config_name,
+                    work_dir=work_dir,
+                    validate_existing_release_manifest=False,
+                )
                 thread_state.retriever = worker
             return worker
 

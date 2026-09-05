@@ -183,6 +183,15 @@ def _multilingual_retrieval_bridge_tokens(query: str) -> List[str]:
             ("العتاد", "الأجهزة", "المعالجات", "الرقاقات", "الشرائح"),
             ("hardware", "processor", "gpu", "chip"),
         ),
+        (
+            ("مشاريع البحث", "المشاريع البحثية", "لوحة مشاريع", "لوحة المشروعات"),
+            ("research projects", "project dashboard", "research dashboard"),
+        ),
+        (("هندي", "هندية", "الهندية"), ("hindi", "indian")),
+        (
+            ("الأداء المعرفي", "الاداء المعرفي", "المعرفة", "الاستدلال"),
+            ("cognitive performance", "knowledge", "reasoning", "benchmark"),
+        ),
     )
     for markers, terms in contracts:
         if any(marker in normalized for marker in markers):
@@ -591,6 +600,58 @@ def _required_evidence_facets(query: str) -> List[Dict[str, Any]]:
             "complete person-to-division mappings",
             ("dean", "led by", "leads", "division of", "meet our deans"),
             min_alias_matches=3,
+        )
+
+    gpu_options_query = bool(
+        re.search(r"\b(?:gpu|graphics processing unit)\b", normalized)
+        and re.search(
+            r"\b(?:options?|range|configurations?|available|offer(?:s|ed)?)\b",
+            normalized,
+        )
+    )
+    if gpu_options_query:
+        add(
+            "GPU option range and intended audience",
+            (
+                "gpu options",
+                "single-gpu",
+                "single gpu",
+                "multi-gpu",
+                "multi gpu",
+                "configurations",
+                "students",
+                "researchers",
+            ),
+            min_alias_matches=3,
+        )
+
+    visual_feedback_query = bool(
+        re.search(r"\b(?:screenshot|interface|dashboard|image|visual)\b", normalized)
+        and re.search(r"\b(?:feedback|progress|tracking|status)\b", normalized)
+    )
+    if visual_feedback_query:
+        add(
+            "visible feedback and progress indicators",
+            ("feedback", "progress", "tracking", "visualization", "status", "score"),
+            min_alias_matches=2,
+        )
+
+    industry_process_query = bool(
+        re.search(r"\bindustry\b", normalized)
+        and re.search(r"\bengag\w*\b", normalized)
+        and re.search(r"\bcaptur\w*\s+value\b", normalized)
+    )
+    if industry_process_query:
+        add(
+            "industry engagement and value-capture process",
+            (
+                "industry engagement",
+                "engage with industry",
+                "engage industry",
+                "capture value",
+                "engagement process",
+            ),
+            min_alias_matches=2,
         )
     return facets
 
@@ -1585,6 +1646,45 @@ class RoutedHybridRetriever:
                 use_query_planner=use_query_planner,
             )
             resolved_vector, status, error = embedding_future.result()
+        if (
+            status != "ok"
+            and not use_query_planner
+            and bool(getattr(self, "query_planner_enabled", False))
+        ):
+            # The backend normally performs the planner call once and asks the
+            # retriever to skip it. If dense embedding fails, however, the
+            # upstream semantic vector is unavailable and lexical/graph lanes
+            # need a richer query to remain useful. Run the bounded planner
+            # only on this degraded path; successful requests keep the same
+            # single-call latency profile.
+            fallback_rewrites = self._build_query_rewrite_bundle(
+                query,
+                relation_plan=relation_plan,
+                query_mode=query_mode,
+                use_query_planner=True,
+            )
+            if fallback_rewrites.vector_query != query or fallback_rewrites.labels:
+                rewrites = QueryRewriteBundle(
+                    vector_query=fallback_rewrites.vector_query,
+                    graph_query=fallback_rewrites.graph_query,
+                    labels=tuple(
+                        dict.fromkeys(
+                            [
+                                *fallback_rewrites.labels,
+                                "embedding_failure_planner_fallback",
+                            ]
+                        )
+                    ),
+                    navigation_intent=fallback_rewrites.navigation_intent,
+                    navigation_goal=fallback_rewrites.navigation_goal,
+                    navigation_confidence=fallback_rewrites.navigation_confidence,
+                    navigation_source=fallback_rewrites.navigation_source,
+                    planned_query_type=fallback_rewrites.planned_query_type,
+                    answer_types=fallback_rewrites.answer_types,
+                    entity_hints=fallback_rewrites.entity_hints,
+                    planner_confidence=fallback_rewrites.planner_confidence,
+                    retrieval_expansion=fallback_rewrites.retrieval_expansion,
+                )
         return rewrites, resolved_vector, status, error
 
     def _empty_graph_context(self, query: str) -> GraphQueryContext:
@@ -1803,6 +1903,53 @@ class RoutedHybridRetriever:
         media_evidence_verified = bool(
             media_documents and payload.get("media_evidence_rescued")
         )
+        if media_documents and not media_evidence_verified:
+            # A top dense visual is strongly grounded when two independent
+            # dense text representations (Page Card and chunk) agree on the
+            # same source page. This is especially important cross-lingually,
+            # where literal OCR overlap can be weak. It remains corpus-agnostic
+            # and cannot manufacture an answer: all three records must already
+            # have been retrieved from one official source.
+            media_map = getattr(self.vector, "media_map", {})
+            page_card_map = getattr(self.vector, "page_card_map", {})
+            chunk_map = getattr(self.vector, "chunk_map", {})
+
+            def ranked_sources(
+                ids: Sequence[Any],
+                record_map: Mapping[str, Any],
+                *,
+                limit: int,
+            ) -> set[str]:
+                sources: set[str] = set()
+                for record_id in list(ids or [])[:limit]:
+                    record = record_map.get(str(record_id))
+                    if not isinstance(record, Mapping):
+                        continue
+                    source = self._normalize_source_url(
+                        self._source_url_from_record(dict(record))
+                    )
+                    if source and self._is_coverage_source_url(source):
+                        sources.add(source)
+                return sources
+
+            dense_media_sources = ranked_sources(
+                payload.get("dense_media_ids") or [],
+                media_map if isinstance(media_map, Mapping) else {},
+                limit=1,
+            )
+            dense_page_sources = ranked_sources(
+                payload.get("dense_page_card_ids") or [],
+                page_card_map if isinstance(page_card_map, Mapping) else {},
+                limit=3,
+            )
+            dense_chunk_sources = ranked_sources(
+                payload.get("dense_chunk_ids") or [],
+                chunk_map if isinstance(chunk_map, Mapping) else {},
+                limit=3,
+            )
+            media_evidence_verified = bool(
+                dense_media_sources & dense_page_sources & dense_chunk_sources
+            )
         media_verifier = getattr(
             getattr(self, "vector", None),
             "_has_grounded_media_candidates",
@@ -3531,7 +3678,7 @@ class RoutedHybridRetriever:
         if emphasized_identity_overlap:
             score += min(1.65, 1.20 + (0.22 * len(emphasized_identity_overlap)))
         elif emphasized_content_overlap:
-            score += min(0.90, 0.58 + (0.14 * len(emphasized_content_overlap)))
+            score += min(1.30, 0.96 + (0.14 * len(emphasized_content_overlap)))
         if query_tokens & host_identity_tokens:
             # A user who explicitly names a site/institute token should prefer
             # that official host over a mirrored institutional summary.  This
@@ -4214,6 +4361,12 @@ class RoutedHybridRetriever:
                     0.06,
                     0.30 - (0.035 * dense_source_rank[normalized]),
                 )
+            if preferred_host_match and preferred_host_candidate_exists:
+                # An explicitly named/acronym-expanded host is a source-scope
+                # signal. Reward it only when such a host exists in the current
+                # corpus, so unrelated domains cannot gain from a coincidental
+                # token match.
+                agreement_score += 0.40
             weak_compound_aggregate = bool(
                 compound_facet_request
                 and semantic_score < 0.50
@@ -6822,6 +6975,8 @@ class RoutedHybridRetriever:
             "media_evidence_verified": bool(
                 payload.get("media_evidence_verified")
             ),
+            "query_embedding_status": payload.get("query_embedding_status") or "",
+            "query_embedding_error": payload.get("query_embedding_error") or "",
             "vector_backend_latency_ms": payload.get("vector_backend_latency_ms") or 0.0,
             "graph_context_latency_ms": payload.get("graph_context_latency_ms") or 0.0,
             "graph_augment_latency_ms": payload.get("graph_augment_latency_ms") or 0.0,

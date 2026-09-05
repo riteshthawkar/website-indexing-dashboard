@@ -176,12 +176,17 @@ def _validate_release_manifest(
 def validate_runtime_artifact_contract(
     config: Dict[str, Any],
     work_dir: str | Path,
+    *,
+    validate_existing_release_manifest: bool = True,
 ) -> Dict[str, Any]:
     """Validate the upload, bundle, graph, namespaces, and release manifest.
 
     Current production profiles require schema-v4, release-scoped namespaces,
     and exact bundle/graph hashes.  Static namespaces remain supported for
-    explicit non-production and legacy configurations.
+    explicit non-production and legacy configurations. Candidate evaluation
+    may disable validation of a previous derived release result while retaining
+    every immutable upload, bundle, graph, and namespace check. Serving callers
+    keep the strict default.
     """
 
     root = Path(work_dir).expanduser().resolve()
@@ -802,7 +807,7 @@ def validate_runtime_artifact_contract(
 
     release_manifest_path = root / "release" / "retrieval_release_manifest.json"
     release_manifest = load_json_safe(release_manifest_path, None)
-    if release_manifest is not None:
+    if validate_existing_release_manifest and release_manifest is not None:
         if not isinstance(release_manifest, dict):
             errors.append(f"release manifest is invalid: {release_manifest_path}")
         elif production or int(release_manifest.get("schema_version") or 0) >= 2:
@@ -837,5 +842,12 @@ def validate_runtime_artifact_contract(
         "selected_release_assembly_sha256": selected_release_assembly_sha256,
         "selected_release_binding_sha256": selected_release_binding_sha256,
         "page_graph_navigation_catalog_sha256": page_graph_navigation_catalog_sha256,
-        "release_manifest": str(release_manifest_path) if release_manifest_path.is_file() else "",
+        "release_manifest": (
+            str(release_manifest_path)
+            if validate_existing_release_manifest and release_manifest_path.is_file()
+            else ""
+        ),
+        "existing_release_manifest_validated": bool(
+            validate_existing_release_manifest and release_manifest_path.is_file()
+        ),
     }

@@ -552,6 +552,23 @@ def test_current_production_runtime_validates_release_namespaces_bundle_and_grap
     assert report["namespace_strategy"] == "release"
     assert report["knowledge_graph_kind"] == "community_local_graph"
 
+    # A failed release report is derived evaluation output, not an immutable
+    # index input. Serving still rejects it, while a fresh candidate evaluation
+    # can re-check the same artifacts without becoming permanently wedged.
+    atomic_write_json(
+        work_dir / "release" / "retrieval_release_manifest.json",
+        {"schema_version": 2, "status": "failed", "run_id": work_dir.name},
+    )
+    with pytest.raises(RuntimeArtifactContractError, match="status is not promotable"):
+        validate_runtime_artifact_contract(config, work_dir)
+    candidate_report = validate_runtime_artifact_contract(
+        config,
+        work_dir,
+        validate_existing_release_manifest=False,
+    )
+    assert candidate_report["validated"] is True
+    assert candidate_report["existing_release_manifest_validated"] is False
+
 
 def test_selected_runtime_validates_full_assembly_and_rejects_lane_tampering(
     tmp_path: Path,
