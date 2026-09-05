@@ -7379,6 +7379,11 @@ def test_modern_vector_upload_manifest_takes_precedence_over_legacy_manifest(tmp
                 "summaries": "summaries",
                 "assertions": "assertions",
             },
+            "uploaded": {
+                "chunks": 120,
+                "facts": 0,
+                "evidence_spans": 0,
+            },
         },
     )
     atomic_write_json(
@@ -7423,9 +7428,31 @@ def test_modern_vector_upload_manifest_takes_precedence_over_legacy_manifest(tmp
     assert resolved["retrieval"]["enable_sparse"] is True
     assert resolved["retrieval"]["pinecone_index"] == "dense-v3"
     assert resolved["retrieval"]["namespace_evidence_spans"] == "evidence_spans"
+    assert resolved["retrieval"]["uploaded_record_counts"] == {
+        "chunks": 120,
+        "facts": 0,
+        "evidence_spans": 0,
+    }
     assert "legacy_vectorstore_contract" not in resolved["retrieval"]
     assert resolved["retrieval"]["legacy_hybrid_sparse_enabled"] is False
     assert resolved["stages"][-1] == {"id": "upload_retrieval", "type": "embedder", "plugin": "gemini_pinecone"}
+
+
+def test_empty_uploaded_namespace_disables_only_its_remote_dense_lane():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.uploaded_record_counts = {
+        "chunks": 120,
+        "facts": 0,
+        "evidence_spans": 0,
+    }
+
+    assert retriever._remote_dense_lane_top_k("chunks", 12) == 12
+    assert retriever._remote_dense_lane_top_k("facts", 12) == 0
+    assert retriever._remote_dense_lane_top_k("evidence_spans", 12) == 0
+    # Older manifests without a count retain the configured lane.
+    assert retriever._remote_dense_lane_top_k("page_cards", 6) == 6
 
 
 def test_mbzuai_institution_token_is_not_required_for_own_site_abstention():
@@ -8363,6 +8390,304 @@ def test_selective_adjudication_skips_high_confidence_single_answer():
             "fact_documents": [{"id": "fact-1", "text": "A weak fact."}],
         }
     )
+
+
+def test_page_card_bridge_selects_answer_bearing_source_chunk():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.page_card_map = {
+        "page-card:division": {"id": "page-card:division"},
+    }
+    retriever.chunk_ids_by_page_card = {
+        "page-card:division": ["chunk:media", "chunk:overview"],
+    }
+    retriever.chunk_map = {
+        "chunk:media": {
+            "id": "chunk:media",
+            "heading": "Embedded Media",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/division",
+            "text": "Images for the division page.",
+        },
+        "chunk:overview": {
+            "id": "chunk:overview",
+            "heading": "Overview",
+            "document_title": "Division of Computing and Mathematical Sciences",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/division",
+            "text": (
+                "This division includes machine learning, computer vision, "
+                "natural language processing, statistics, and robotics."
+            ),
+        },
+    }
+    retriever._score_text_match = lambda query, text: (
+        1.0 if "machine learning" in text.casefold() and "computer vision" in text.casefold() else 0.0
+    )
+    retriever._source_query_bonus = lambda _query, **_kwargs: 0.0
+
+    assert retriever._page_card_anchor_chunk_ids(
+        "Which division includes machine learning and computer vision?",
+        ["page-card:division"],
+        per_page=1,
+    ) == ["chunk:overview"]
+
+
+def test_plural_inventory_query_expands_page_card_sibling_sections():
+    from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode, classify_query_mode
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    retriever.max_context_chunks = 12
+    retriever.page_card_map = {"page-card:divisions": {"id": "page-card:divisions"}}
+    retriever.chunk_ids_by_page_card = {
+        "page-card:divisions": [
+            "chunk:overview",
+            "chunk:biological",
+            "chunk:computing",
+            "chunk:undergraduate",
+            "chunk:media",
+        ]
+    }
+    retriever.chunk_map = {
+        "chunk:overview": {
+            "heading": "Overview",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/our-divisions",
+            "text": "MBZUAI organizes its work through several divisions.",
+        },
+        "chunk:biological": {
+            "heading": "Division of Biological and Life Sciences",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/our-divisions",
+            "text": "The biological and life sciences division advances health research.",
+        },
+        "chunk:computing": {
+            "heading": "Division of Computing and Mathematical Sciences",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/our-divisions",
+            "text": "The computing and mathematical sciences division advances AI research.",
+        },
+        "chunk:undergraduate": {
+            "heading": "Division of Undergraduate Studies",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/our-divisions",
+            "text": "The undergraduate studies division delivers degree programs.",
+        },
+        "chunk:media": {
+            "heading": "Embedded Media",
+            "source_url": "https://preprod.mbzuai.ac.ae/research/our-divisions",
+            "text": "Images from the divisions page.",
+        },
+    }
+    retriever._score_text_match = lambda _query, _text: 1.0
+    retriever._source_query_bonus = lambda _query, **_kwargs: 0.0
+
+    query = "What are MBZUAI's current research divisions?"
+    selected = retriever._page_card_anchor_chunk_ids(
+        query,
+        ["page-card:divisions"],
+        per_page=1,
+        limit=1,
+    )
+
+    # Inventory questions retain the generalized synthesis route introduced by
+    # the current production branch, while Page Card hydration supplies sibling
+    # sections without an additional provider adjudication call.
+    assert classify_query_mode(query) == QueryMode.SYNTHESIS
+    assert selected == [
+        "chunk:overview",
+        "chunk:biological",
+        "chunk:computing",
+        "chunk:undergraduate",
+    ]
+
+
+def test_collection_query_uses_top_page_card_as_required_page():
+    from types import SimpleNamespace
+
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    page_url = "https://preprod.mbzuai.ac.ae/research/our-divisions/"
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "page-card:divisions": {
+                "id": "page-card:divisions",
+                "source_url": page_url,
+            }
+        }
+    )
+    retriever._unsupported_intent_reason = lambda _query: ""
+    retriever._explicit_required_page_markers = lambda _query: []
+    retriever._infer_coverage_requirements = lambda _query, _intent, _payload: {
+        "required_entities": [],
+        "required_pages": [],
+        "required_sections": [],
+        "required_pages_source": "none",
+    }
+    retriever._coverage_page_record_for_url = lambda source_url: (
+        {"source_url": source_url} if source_url == page_url else None
+    )
+    retriever._page_target_score = lambda _query, _page: 1.0
+    retriever._selected_source_urls = lambda _payload: {
+        retriever._normalize_source_url(page_url)
+    }
+
+    plan = retriever._coverage_plan_for_result(
+        query="What are MBZUAI's current research divisions?",
+        payload={
+            "dense_page_card_ids": ["page-card:divisions"],
+            "selected_chunk_ids": ["chunk:divisions"],
+        },
+        mode=QueryMode.FACT,
+    )
+
+    assert plan["intent"] == "large_page"
+    assert plan["required_pages"] == [page_url]
+    assert plan["required_pages_source"] == "page_card_collection"
+    assert plan["coverage_status"] == "complete"
+
+
+def test_qualified_collection_query_uses_sections_instead_of_whole_page_parent():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert (
+        retriever._best_required_page_parent(
+            "What are MBZUAI's current research divisions?",
+            "https://preprod.mbzuai.ac.ae/research/our-divisions",
+        )
+        is None
+    )
+
+
+def test_division_mapping_evidence_pack_prefers_exact_source_chunk():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    exact_chunk = {
+        "id": "chunk:division-overview",
+        "text": (
+            "The Division of Computing and Mathematical Sciences includes "
+            "machine learning and computer vision."
+        ),
+        "source_url": "https://preprod.mbzuai.ac.ae/research/our-divisions",
+        "document_title": "Our divisions",
+        "section_heading": "Division of Computing and Mathematical Sciences",
+        "retrieval_rank": 0,
+    }
+    unrelated_fact = {
+        "id": "fact:news",
+        "text": "A news article discusses machine learning and computer vision.",
+        "source_url": "https://preprod.mbzuai.ac.ae/knowledge-center/news-item",
+        "document_title": "Research news",
+    }
+
+    pack = build_evidence_pack(
+        query="Which division includes machine learning and computer vision?",
+        result={
+            "fact_documents": [unrelated_fact],
+            "retrieval_documents": [unrelated_fact, exact_chunk],
+        },
+        max_items=4,
+        max_chars=3000,
+    )
+
+    assert pack["items"][0]["id"] == "chunk:division-overview"
+    assert pack["items"][0]["kind"] == "chunk"
+
+
+def test_research_division_inventory_rejects_undergraduate_faq_breadcrumbs():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    source_url = "https://preprod.mbzuai.ac.ae/research/our-divisions"
+    division_chunks = [
+        {
+            "id": f"chunk:division:{index:05d}:value",
+            "text": f"TITLE: Our divisions\nSECTION: {name}\n\n{name} supports MBZUAI research.",
+            "source_url": source_url,
+            "document_title": "Our divisions",
+            "section_heading": name,
+            "retrieval_rank": index,
+        }
+        for index, name in enumerate(
+            (
+                "Division of Biological and Life Sciences",
+                "Division of Computing and Mathematical Sciences",
+                "Division of Undergraduate Studies",
+            )
+        )
+    ]
+    # Some generated chunk records carry the section only in their serialized
+    # text header; inventory coverage must still reserve that member.
+    division_chunks[1]["section_heading"] = ""
+    unrelated_span = {
+        "id": "span:undergraduate-faq",
+        "text": "General student services and internationally recognized programs.",
+        "source_url": "https://preprod.mbzuai.ac.ae/faq/student-services",
+        "document_title": "Student services",
+        "breadcrumb": "Divisions of Undergraduate Studies > Program details",
+    }
+
+    pack = build_evidence_pack(
+        query="What are MBZUAI's current research divisions?",
+        result={
+            "evidence_span_documents": [unrelated_span],
+            "retrieval_documents": division_chunks,
+        },
+        max_items=3,
+    )
+
+    assert [item["id"] for item in pack["items"]] == [
+        chunk["id"] for chunk in division_chunks[:2]
+    ]
+    assert all("undergraduate" not in item["id"] for item in pack["items"])
+
+
+def test_provider_disabled_adjudication_uses_deterministic_guard(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    monkeypatch.setattr(
+        module,
+        "adjudicate_factual_evidence",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("provider adjudicator must not run")
+        ),
+    )
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.evidence_adjudicator_provider_enabled = False
+    retriever.selective_adjudication_enabled = False
+    retriever.evidence_adjudicator_model = "gpt-5-nano"
+    retriever.evidence_adjudicator_reasoning_effort = "minimal"
+    retriever.evidence_adjudicator_min_confidence = 0.58
+    retriever.evidence_adjudicator_max_completion_tokens = 100
+    retriever.evidence_adjudicator_retries = 1
+    retriever.evidence_adjudicator_retry_delay_sec = 0.0
+    retriever.evidence_adjudicator_per_request_delay_sec = 0.0
+    retriever.evidence_adjudicator_timeout_sec = 1.0
+    retriever.evidence_adjudicator_provider_timeout_sec = 0.8
+    retriever.evidence_adjudicator_answer_limit = 2
+    retriever.evidence_adjudicator_fact_limit = 2
+    retriever.evidence_adjudicator_chunk_limit = 2
+
+    result = retriever._apply_evidence_adjudication(
+        "Where is MBZUAI located?",
+        {
+            "mode": "fact",
+            "abstained": False,
+            "retrieval_confidence": 0.4,
+            "selected_chunk_ids": ["chunk:location"],
+            "answer_documents": [],
+            "fact_documents": [],
+            "retrieval_documents": [
+                {
+                    "id": "chunk:location",
+                    "text": "MBZUAI is located in Masdar City, Abu Dhabi.",
+                }
+            ],
+        },
+    )
+
+    assert result["adjudication_method"] == "heuristic"
+    assert result["adjudication_provider_used"] is False
+    assert result["verification_status"] == "verified"
 
 
 def test_verified_media_evidence_skips_heuristic_required_page_inference():

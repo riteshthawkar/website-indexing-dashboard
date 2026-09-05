@@ -27,7 +27,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--max-concurrency",
         type=int,
-        default=4,
+        default=3,
         help="Maximum concurrent retrieval requests",
     )
     parser.add_argument(
@@ -39,7 +39,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--queue-timeout-seconds",
         type=float,
-        default=1.0,
+        default=3.0,
         help="Maximum wait for retrieval worker capacity",
     )
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")

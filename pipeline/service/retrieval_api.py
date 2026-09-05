@@ -7,7 +7,9 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -414,6 +416,8 @@ def _health_payload(app: FastAPI) -> Dict[str, Any]:
         "detached_inflight": detached_inflight,
         "cancelled_request_count": int(getattr(app.state, "cancelled_request_count", 0)),
         "queue_rejection_count": int(getattr(app.state, "queue_rejection_count", 0)),
+        "coalesced_request_count": int(getattr(app.state, "coalesced_request_count", 0)),
+        "coalesced_inflight": len(getattr(app.state, "result_inflight", {}) or {}),
         "result_cache_size": len(getattr(app.state, "result_cache", {}) or {}),
         "result_cache_max_size": int(getattr(app.state, "result_cache_max_size", 0)),
         "uptime_seconds": round(max(0.0, time.monotonic() - started_at), 3),
@@ -428,18 +432,71 @@ def _normalize_cache_query(
     navigation_context: Mapping[str, Any] | None = None,
     context_page_url: str | None = None,
 ) -> str:
-    normalized_query = " ".join(str(query or "").strip().split()).casefold()
+    def normalize_text(value: Any) -> str:
+        normalized = unicodedata.normalize("NFKC", str(value or "")).casefold()
+        # Retrieval is invariant to casing, surrounding punctuation, repeated
+        # separators, and typographic quote variants. Preserve letters and
+        # numbers from every language while normalizing those presentation-only
+        # differences into one reusable cache key.
+        return " ".join(re.findall(r"[^\W_]+", normalized, flags=re.UNICODE))
+
+    normalized_query = normalize_text(query)
     if not normalized_query:
         return ""
+    navigation = dict(navigation_context or {})
     navigation_key = json.dumps(
-        dict(navigation_context or {}), ensure_ascii=True, sort_keys=True, separators=(",", ":")
+        {
+            "intent": normalize_text(navigation.get("intent")),
+            "goal": normalize_text(navigation.get("goal")),
+            "confidence": round(float(navigation.get("confidence") or 0.0), 2),
+            "source": normalize_text(navigation.get("source")),
+        }
+        if navigation
+        else {},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
     )
-    original_key = " ".join(str(original_query or "").strip().split()).casefold()
+    original_key = normalize_text(original_query)
     return (
         f"planner-skip={int(bool(skip_query_planner))}:"
         f"navigation={navigation_key}:context-page={str(context_page_url or '').casefold()}:"
         f"original={original_key}:{normalized_query}"
     )
+
+
+async def _claim_inflight_result(app: FastAPI, cache_key: str) -> tuple[asyncio.Future, bool]:
+    """Coalesce equivalent cold requests before they consume retriever slots."""
+    async with app.state.result_cache_lock:
+        existing = app.state.result_inflight.get(cache_key)
+        if existing is not None:
+            app.state.coalesced_request_count += 1
+            return existing, False
+        future = asyncio.get_running_loop().create_future()
+        app.state.result_inflight[cache_key] = future
+        return future, True
+
+
+async def _finish_inflight_result(
+    app: FastAPI,
+    cache_key: str,
+    future: asyncio.Future,
+    *,
+    payload: Dict[str, Any] | None = None,
+    status_code: int | None = None,
+    detail: str | None = None,
+) -> None:
+    result = {
+        "ok": status_code is None,
+        "payload": copy.deepcopy(payload or {}),
+        "status_code": int(status_code or 200),
+        "detail": str(detail or "retrieval_failed"),
+    }
+    async with app.state.result_cache_lock:
+        if app.state.result_inflight.get(cache_key) is future:
+            app.state.result_inflight.pop(cache_key, None)
+        if not future.done():
+            future.set_result(result)
 
 
 async def _get_cached_result(
@@ -510,9 +567,9 @@ def create_retrieval_service_app(
     *,
     config_name: str,
     work_dir: str | Path,
-    max_concurrency: int = 4,
+    max_concurrency: int = 3,
     request_timeout_seconds: float = 90.0,
-    queue_timeout_seconds: float = 1.0,
+    queue_timeout_seconds: float = 3.0,
 ) -> FastAPI:
     # Load the optional local environment before reading service-local auth,
     # cache, probe, and shutdown settings. Injected production variables win.
@@ -625,6 +682,7 @@ def create_retrieval_service_app(
         app.state.detached_inflight = 0
         app.state.cancelled_request_count = 0
         app.state.queue_rejection_count = 0
+        app.state.coalesced_request_count = 0
         app.state.config_name = config_name
         # These values are populated only after the deployment wrapper has
         # validated the active release. They are intentionally non-secret and
@@ -663,6 +721,7 @@ def create_retrieval_service_app(
         app.state.result_cache_lock = asyncio.Lock()
         app.state.result_cache_max_size = result_cache_size
         app.state.result_cache_ttl_seconds = result_cache_ttl_seconds
+        app.state.result_inflight = {}
         app.state.inflight_futures = set()
         logger.info(
             "Loading retrieval service: config=%s work_dir=%s max_concurrency=%s timeout=%ss",
@@ -818,6 +877,13 @@ def create_retrieval_service_app(
         context_page_url = _validated_context_page_url(payload.context_page_url)
         if payload.context_page_url and not context_page_url:
             raise HTTPException(status_code=400, detail="context_page_url_not_official")
+        cache_key = _normalize_cache_query(
+            query,
+            original_query=original_query,
+            skip_query_planner=payload.skip_query_planner,
+            navigation_context=navigation_context,
+            context_page_url=context_page_url,
+        )
         cached_result = await _get_cached_result(
             app,
             query,
@@ -833,6 +899,49 @@ def create_retrieval_service_app(
             output["service_backend"] = "retrieval_service"
             output["service_config_name"] = app.state.config_name
             output["service_cache_hit"] = True
+            output["service_coalesced"] = False
+            output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
+            output["service_original_query_forwarded"] = bool(original_query)
+            output["service_navigation_context_forwarded"] = bool(
+                navigation_context
+            )
+            return output
+        inflight_result, owns_inflight_result = await _claim_inflight_result(
+            app,
+            cache_key,
+        )
+        if not owns_inflight_result:
+            try:
+                shared = await asyncio.wait_for(
+                    asyncio.shield(inflight_result),
+                    timeout=(
+                        app.state.queue_timeout_seconds
+                        + app.state.request_timeout_seconds
+                        + 1.0
+                    ),
+                )
+            except asyncio.TimeoutError as exc:
+                app.state.error_count += 1
+                raise HTTPException(
+                    status_code=504,
+                    detail="retrieval_coalesced_timeout",
+                ) from exc
+            if not bool(shared.get("ok")):
+                app.state.error_count += 1
+                raise HTTPException(
+                    status_code=int(shared.get("status_code") or 500),
+                    detail=str(shared.get("detail") or "retrieval_failed"),
+                )
+            output = dict(copy.deepcopy(shared.get("payload") or {}))
+            output["service_request_id"] = request_id
+            output["service_latency_ms"] = round(
+                (time.perf_counter() - started_at) * 1000.0,
+                3,
+            )
+            output["service_backend"] = "retrieval_service"
+            output["service_config_name"] = app.state.config_name
+            output["service_cache_hit"] = False
+            output["service_coalesced"] = True
             output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
             output["service_original_query_forwarded"] = bool(original_query)
             output["service_navigation_context_forwarded"] = bool(
@@ -845,6 +954,13 @@ def create_retrieval_service_app(
         except asyncio.TimeoutError as exc:
             app.state.error_count += 1
             app.state.queue_rejection_count += 1
+            await _finish_inflight_result(
+                app,
+                cache_key,
+                inflight_result,
+                status_code=503,
+                detail="retrieval_busy",
+            )
             raise HTTPException(status_code=503, detail="retrieval_busy") from exc
 
         release_capacity_on_exit = True
@@ -901,6 +1017,13 @@ def create_retrieval_service_app(
             app.state.error_count += 1
             release_capacity_on_exit = False
             _retain_capacity_until_done(retrieval_future, timed_out=True)
+            await _finish_inflight_result(
+                app,
+                cache_key,
+                inflight_result,
+                status_code=504,
+                detail="retrieval_timeout",
+            )
             raise HTTPException(status_code=504, detail="retrieval_timeout") from exc
         except asyncio.CancelledError:
             # Client disconnects cancel the ASGI task, but Python cannot stop the
@@ -909,13 +1032,34 @@ def create_retrieval_service_app(
             app.state.cancelled_request_count += 1
             release_capacity_on_exit = False
             _retain_capacity_until_done(retrieval_future, timed_out=False)
+            await _finish_inflight_result(
+                app,
+                cache_key,
+                inflight_result,
+                status_code=503,
+                detail="retrieval_leader_cancelled",
+            )
             raise
-        except HTTPException:
+        except HTTPException as exc:
             app.state.error_count += 1
+            await _finish_inflight_result(
+                app,
+                cache_key,
+                inflight_result,
+                status_code=exc.status_code,
+                detail=str(exc.detail or "retrieval_failed"),
+            )
             raise
         except Exception as exc:  # pragma: no cover - exercised in live validation
             app.state.error_count += 1
             logger.exception("Retrieval request failed: request_id=%s path=%s", request_id, request.url.path)
+            await _finish_inflight_result(
+                app,
+                cache_key,
+                inflight_result,
+                status_code=500,
+                detail="retrieval_failed",
+            )
             raise HTTPException(status_code=500, detail="retrieval_failed") from exc
         finally:
             if release_capacity_on_exit:
@@ -931,11 +1075,18 @@ def create_retrieval_service_app(
             navigation_context=navigation_context,
             context_page_url=context_page_url,
         )
+        await _finish_inflight_result(
+            app,
+            cache_key,
+            inflight_result,
+            payload=output,
+        )
         output["service_request_id"] = request_id
         output["service_latency_ms"] = round((time.perf_counter() - started_at) * 1000.0, 3)
         output["service_backend"] = "retrieval_service"
         output["service_config_name"] = app.state.config_name
         output["service_cache_hit"] = False
+        output["service_coalesced"] = False
         output["service_query_planner_skipped"] = bool(payload.skip_query_planner)
         output["service_original_query_forwarded"] = bool(original_query_forwarded)
         output["service_navigation_context_forwarded"] = bool(navigation_context)

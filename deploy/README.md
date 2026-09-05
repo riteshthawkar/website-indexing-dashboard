@@ -87,7 +87,7 @@ separation, backup policy, and release lifecycle remain documented in
 
 The routed retriever uses thread-local provider clients, request-local
 diagnostics, immutable local indexes, and an atomic lazy graph loader. Each
-process therefore starts with two concurrent retrieval slots. The 10-second
+process therefore starts with three concurrent retrieval slots. The 3-second
 bounded queue provides backpressure beyond that limit. Raise
 `RETRIEVER_MAX_CONCURRENCY` only after the release load gate passes at the new
 value and peak RSS, provider errors, p95/p99 latency, and queue rejections stay

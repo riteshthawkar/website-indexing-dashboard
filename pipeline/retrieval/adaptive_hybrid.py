@@ -172,6 +172,34 @@ def _apply_modern_vector_manifest_config(payload: Dict[str, Any], manifest: Dict
             embed_cfg[f"namespace_{key}"] = namespace
             retrieval_cfg[f"namespace_{key}"] = namespace
 
+    uploaded = manifest.get("uploaded") if isinstance(manifest.get("uploaded"), dict) else {}
+    uploaded_record_counts: Dict[str, int] = {}
+    for key in (
+        "chunks",
+        "parents",
+        "media",
+        "page_cards",
+        "actions",
+        "facts",
+        "evidence_spans",
+        "summaries",
+        "assertions",
+        "entities",
+        "communities",
+    ):
+        if key not in uploaded:
+            continue
+        try:
+            uploaded_record_counts[key] = max(0, int(uploaded[key]))
+        except (TypeError, ValueError):
+            continue
+    if uploaded_record_counts:
+        # The immutable upload manifest is the authoritative statement of
+        # which physical namespaces contain vectors. Runtime retrieval can
+        # avoid network calls to namespaces known to be empty while retaining
+        # local lexical access to the same record kinds.
+        retrieval_cfg["uploaded_record_counts"] = uploaded_record_counts
+
     if manifest.get("model"):
         embed_cfg["model"] = manifest.get("model")
     dimension = manifest.get("output_dimensionality") or manifest.get("dimension")
@@ -699,6 +727,32 @@ class QueryIntent:
             for slot in self.slots
             if slot.answer_type == "role_holder" and slot.qualifier
         )
+
+_COLLECTION_SCOPE_TOKENS = {
+    "benefits",
+    "centers",
+    "centres",
+    "courses",
+    "degrees",
+    "departments",
+    "divisions",
+    "institutes",
+    "laboratories",
+    "labs",
+    "requirements",
+    "scholarships",
+    "schools",
+    "أقسام",
+    "اقسام",
+    "الأقسام",
+    "الاقسام",
+    "الإدارات",
+    "الادارات",
+    "المعاهد",
+    "المراكز",
+    "المدارس",
+}
+
 
 _SCOPED_QUERY_TOKENS = {
     "amenity",
@@ -3711,6 +3765,16 @@ class AdaptiveHybridRetriever:
         self.namespace_summaries = str(embed_cfg.get("namespace_summaries") or retrieval_cfg.get("namespace_summaries") or "summaries")
         self.namespace_assertions = str(embed_cfg.get("namespace_assertions") or "assertions")
         self.sparse_index_name = str(embed_cfg.get("pinecone_sparse_index") or "").strip()
+        raw_uploaded_record_counts = retrieval_cfg.get("uploaded_record_counts")
+        self.uploaded_record_counts = {
+            str(key): max(0, int(value))
+            for key, value in (
+                raw_uploaded_record_counts.items()
+                if isinstance(raw_uploaded_record_counts, Mapping)
+                else []
+            )
+            if str(key).strip()
+        }
 
         self.dense_chunk_top_k = int(retrieval_cfg.get("dense_chunk_top_k", 12))
         self.dense_parent_top_k = int(retrieval_cfg.get("dense_parent_top_k", 6))
@@ -6570,6 +6634,95 @@ class AdaptiveHybridRetriever:
                 chunk_ids.extend(self.fact_map[record_id].get("linked_chunk_ids") or [])
         return list(dict.fromkeys(chunk_ids))
 
+    def _page_card_anchor_chunk_ids(
+        self,
+        query: str,
+        page_card_ids: Sequence[str],
+        *,
+        top_pages: int = 3,
+        per_page: int = 2,
+        limit: int = 6,
+    ) -> List[str]:
+        """Bridge semantic Page Card hits back to their best source chunks.
+
+        Page Cards are discovery records rather than answer evidence.  Their
+        dense lane can nevertheless identify the correct page when a generic
+        fact/span lane is distracted by repeated topic words in news or event
+        pages.  Select a bounded number of query-relevant chunks from the
+        leading cards so the normal chunk reranker can judge the underlying
+        source text.  This never treats Page Card metadata as factual proof.
+        """
+
+        if not page_card_ids or limit <= 0:
+            return []
+        # Plural inventory questions need sibling sections from the matched
+        # page, not only its most similar introductory paragraph. The Page
+        # Card identifies the page while linked chunks remain the evidence.
+        if set(_tokenize(query)) & _COLLECTION_SCOPE_TOKENS:
+            top_pages = min(max(1, int(top_pages)), 2)
+            per_page = max(4, int(per_page))
+            limit = max(
+                int(limit),
+                min(
+                    int(getattr(self, "max_context_chunks", 12)),
+                    top_pages * per_page,
+                ),
+            )
+        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", str(query or "")))
+        ranked: List[Tuple[float, int, int, str]] = []
+        for page_rank, raw_page_card_id in enumerate(
+            list(page_card_ids)[: max(1, int(top_pages))],
+            start=1,
+        ):
+            page_card_id = str(raw_page_card_id or "")
+            if not page_card_id or page_card_id not in self.page_card_map:
+                continue
+            linked_chunk_ids = list(
+                dict.fromkeys(
+                    str(value)
+                    for value in (
+                        getattr(self, "chunk_ids_by_page_card", {}).get(page_card_id, [])
+                        or self.page_card_map[page_card_id].get("linked_chunk_ids")
+                        or []
+                    )
+                    if str(value) in self.chunk_map
+                )
+            )
+            page_candidates: List[Tuple[float, int, int, str]] = []
+            for chunk_rank, chunk_id in enumerate(linked_chunk_ids):
+                chunk = self.chunk_map.get(chunk_id) or {}
+                chunk_text = _clean_text(chunk.get("dense_text") or chunk.get("text") or "")
+                if not chunk_text:
+                    continue
+                source_url = str(chunk.get("source_url") or "")
+                heading = str(chunk.get("heading") or "")
+                score = 4.0 * self._score_text_match(query, chunk_text)
+                score += 1.5 * self._source_query_bonus(
+                    query,
+                    source_url=source_url,
+                    document_title=str(chunk.get("document_title") or ""),
+                    heading=heading,
+                    text=chunk_text,
+                )
+                # Preserve the semantic Page Card ordering while preferring a
+                # source-language match and answer-bearing prose over media-only
+                # sections from the same page.
+                score += 2.0 / float(page_rank)
+                source_is_arabic = "/ar/" in source_url.casefold()
+                if query_is_arabic == source_is_arabic:
+                    score += 0.35
+                if "embedded media" in heading.casefold():
+                    score -= 1.5
+                page_candidates.append((-score, page_rank, chunk_rank, chunk_id))
+            page_candidates.sort()
+            ranked.extend(page_candidates[: max(1, int(per_page))])
+
+        ranked.sort()
+        return [
+            chunk_id
+            for _negative_score, _page_rank, _chunk_rank, chunk_id in ranked[:limit]
+        ]
+
     def _span_anchor_chunk_ids(self, span_ids: Iterable[str]) -> List[str]:
         chunk_ids: List[str] = []
         for span_id in span_ids:
@@ -8807,6 +8960,14 @@ class AdaptiveHybridRetriever:
                     ]
                 )
             )
+        page_card_anchor_chunk_ids = self._page_card_anchor_chunk_ids(
+            query,
+            dense_page_card_ids,
+        )
+        if page_card_anchor_chunk_ids:
+            candidate_chunk_ids = list(
+                dict.fromkeys([*page_card_anchor_chunk_ids, *candidate_chunk_ids])
+            )
         ranked_chunks = self._rerank_chunk_candidates(
             query,
             candidate_chunk_ids,
@@ -9031,9 +9192,21 @@ class AdaptiveHybridRetriever:
             if promoted_chunk_ids:
                 selected_chunk_ids = list(dict.fromkeys([*promoted_chunk_ids, *selected_chunk_ids]))
         if selected_evidence_span_ids:
-            selected_chunk_ids = list(
-                dict.fromkeys([*self._span_anchor_chunk_ids(selected_evidence_span_ids), *selected_chunk_ids])
+            span_anchor_chunk_ids = self._span_anchor_chunk_ids(
+                selected_evidence_span_ids
             )
+            if mode == QueryMode.FACT:
+                selected_chunk_ids = list(
+                    dict.fromkeys([*span_anchor_chunk_ids, *selected_chunk_ids])
+                )
+            else:
+                # Extracted spans are precision anchors for factual lookups,
+                # but they can come from repeated boilerplate on unrelated
+                # pages. Preserve page/parent coherence for collection and
+                # synthesis queries, then append spans as supporting context.
+                selected_chunk_ids = list(
+                    dict.fromkeys([*selected_chunk_ids, *span_anchor_chunk_ids])
+                )
         selected_chunk_ids = self._preserve_dense_chunk_recall(
             selected_chunk_ids,
             chunk_dense_ids,
@@ -9298,6 +9471,16 @@ class AdaptiveHybridRetriever:
             "response_agent_instructions": response_agent_media_instructions(),
         }
 
+    def _remote_dense_lane_top_k(self, record_type: str, top_k: int) -> int:
+        counts = getattr(self, "uploaded_record_counts", {})
+        if isinstance(counts, Mapping) and record_type in counts:
+            try:
+                if int(counts[record_type]) <= 0:
+                    return 0
+            except (TypeError, ValueError):
+                pass
+        return max(0, int(top_k))
+
     def _lane_top_ks(self, *, query: str, mode: QueryMode, media_query: bool) -> Dict[str, int]:
         lookup_profile = _lookup_query_profile(query)
         exact_lookup = mode == QueryMode.FACT and lookup_profile.is_exact_lookup
@@ -9356,30 +9539,47 @@ class AdaptiveHybridRetriever:
             evidence_span_sparse_top_k = max(4, self.sparse_evidence_span_top_k // 2)
             evidence_span_local_top_k = max(4, self.sparse_evidence_span_top_k // 2)
         return {
-            "chunk_dense": chunk_dense_top_k,
+            "chunk_dense": self._remote_dense_lane_top_k("chunks", chunk_dense_top_k),
             "chunk_sparse": chunk_sparse_top_k,
             "chunk_local": local_chunk_top_k,
-            "assertion_dense": assertion_dense_top_k if answer_lane_enabled and not legacy_text_only else 0,
+            "assertion_dense": self._remote_dense_lane_top_k(
+                "assertions",
+                assertion_dense_top_k if answer_lane_enabled and not legacy_text_only else 0,
+            ),
             "assertion_sparse": assertion_sparse_top_k if answer_lane_enabled and not legacy_text_only else 0,
             "answer_local": answer_local_top_k,
-            "parent_dense": self.dense_parent_top_k if parent_lane_enabled else 0,
+            "parent_dense": self._remote_dense_lane_top_k(
+                "parents",
+                self.dense_parent_top_k if parent_lane_enabled else 0,
+            ),
             "parent_sparse": self.sparse_parent_top_k if parent_lane_enabled else 0,
             "parent_local": self.sparse_parent_top_k if local_parent_lane_enabled else 0,
-            "summary_dense": self.dense_summary_top_k if summary_lane_enabled else 0,
+            "summary_dense": self._remote_dense_lane_top_k(
+                "summaries",
+                self.dense_summary_top_k if summary_lane_enabled else 0,
+            ),
             "summary_sparse": self.sparse_summary_top_k if summary_lane_enabled else 0,
-            "media_dense": self.dense_media_top_k if media_lane_enabled else 0,
+            "media_dense": self._remote_dense_lane_top_k(
+                "media",
+                self.dense_media_top_k if media_lane_enabled else 0,
+            ),
             "media_sparse": self.sparse_media_top_k if media_lane_enabled else 0,
             "media_local": self.sparse_media_top_k if media_lane_enabled else 0,
-            "page_card_dense": self.dense_page_card_top_k if page_card_lane_enabled else 0,
+            "page_card_dense": self._remote_dense_lane_top_k(
+                "page_cards",
+                self.dense_page_card_top_k if page_card_lane_enabled else 0,
+            ),
             "action_dense": (
-                self.dense_action_top_k
+                self._remote_dense_lane_top_k("actions", self.dense_action_top_k)
                 if action_lane_enabled and navigation_intent != "none"
-                else max(1, self.dense_action_top_k // 3) if action_lane_enabled else 0
+                else 0
             ),
             "fact_dense": (
-                fact_dense_top_k
+                self._remote_dense_lane_top_k("facts", fact_dense_top_k)
                 if fact_lane_enabled and mode == QueryMode.FACT
-                else scoped_fact_top_k if fact_lane_enabled else 0
+                else self._remote_dense_lane_top_k("facts", scoped_fact_top_k)
+                if fact_lane_enabled
+                else 0
             ),
             "fact_sparse": (
                 fact_sparse_top_k
@@ -9391,7 +9591,10 @@ class AdaptiveHybridRetriever:
                 if fact_lane_enabled and mode == QueryMode.FACT
                 else scoped_sparse_fact_top_k if fact_lane_enabled else 0
             ),
-            "evidence_span_dense": evidence_span_dense_top_k if evidence_span_lane_enabled else 0,
+            "evidence_span_dense": self._remote_dense_lane_top_k(
+                "evidence_spans",
+                evidence_span_dense_top_k if evidence_span_lane_enabled else 0,
+            ),
             "evidence_span_sparse": evidence_span_sparse_top_k if evidence_span_lane_enabled else 0,
             "evidence_span_local": evidence_span_local_top_k if evidence_span_lane_enabled else 0,
         }

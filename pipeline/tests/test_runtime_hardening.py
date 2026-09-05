@@ -356,6 +356,82 @@ def test_retrieval_service_runs_two_safe_requests_concurrently(tmp_path, monkeyp
     assert retriever.max_active == 2
 
 
+def test_retrieval_cache_key_normalizes_case_spacing_and_punctuation():
+    from pipeline.service.retrieval_api import _normalize_cache_query
+
+    variants = [
+        "What are MBZUAI's divisions?",
+        "  what ARE mbzuai’s divisions  ",
+        "what are mbzuai s divisions!!!",
+    ]
+
+    keys = {_normalize_cache_query(query) for query in variants}
+
+    assert len(keys) == 1
+
+
+def test_retrieval_service_coalesces_equivalent_cold_requests(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    class BlockingRetriever:
+        supports_shared_parallel_retrieval = True
+
+        def __init__(self):
+            self.started = threading.Event()
+            self.release = threading.Event()
+            self.calls = 0
+            self.lock = threading.Lock()
+
+        def retrieve(self, query):
+            with self.lock:
+                self.calls += 1
+            self.started.set()
+            self.release.wait(timeout=3.0)
+            return {
+                "query": query,
+                "abstained": False,
+                "retrieval_documents": [{"id": "divisions", "text": "Two divisions"}],
+            }
+
+    retriever = BlockingRetriever()
+    monkeypatch.setattr(
+        "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+        lambda **_kwargs: retriever,
+    )
+    app = create_retrieval_service_app(
+        config_name="cfg",
+        work_dir=tmp_path,
+        max_concurrency=3,
+    )
+    queries = [
+        "What are MBZUAI's divisions?",
+        "what are mbzuai’s divisions",
+        " WHAT ARE MBZUAI S DIVISIONS!!! ",
+    ]
+    start_barrier = threading.Barrier(len(queries))
+
+    with TestClient(app) as client:
+        def request(query):
+            start_barrier.wait(timeout=2.0)
+            return client.post("/retrieve", json={"query": query})
+
+        with ThreadPoolExecutor(max_workers=len(queries)) as executor:
+            futures = [executor.submit(request, query) for query in queries]
+            assert retriever.started.wait(timeout=1.0)
+            time.sleep(0.1)
+            retriever.release.set()
+            responses = [future.result(timeout=3.0) for future in futures]
+        health = client.get("/attestationz").json()
+
+    assert retriever.calls == 1
+    assert all(response.status_code == 200 for response in responses)
+    assert sum(bool(response.json()["service_coalesced"]) for response in responses) == 2
+    assert health["coalesced_request_count"] == 2
+    assert health["coalesced_inflight"] == 0
+
+
 def test_retrieval_service_cache_separates_planner_handoff_mode(tmp_path, monkeypatch):
     from fastapi.testclient import TestClient
 

@@ -53,12 +53,24 @@ _AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
     r"differences|criteria|items|articles|entries|listed|shown|displayed|sections|"
     r"categories|stages|process|fees?|tuition|costs?|waivers?|conditions|scholarships?|"
     r"financial aid|funding|coverage|per[- ]credit|seat[- ]holding|support|services|uses|options|focus areas|"
+    r"divisions?|departments?|schools?|institutes?|cent(?:er|re)s?|units?|labs?|"
     r"research interests|hands-on access|offerings|committees|industry engagement)\b"
     r"|(?:المتطلبات|المؤهلات|الأدوار|المسؤوليات|المزايا|الفروقات|المعايير|العناصر|"
     r"المقالات|أقسام|اقسام|فئات|مراحل|عملية|الرسوم|رسوم|تكلفة|تكاليف|إعفاء|اعفاء|المنح|منح|تغطية|تمويل|الشروط|شروط|الدعم|دعم|الخدمات|خدمات|استخدامات|"
     r"خيارات|المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
     r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
+    re.IGNORECASE,
+)
+_PAGE_COLLECTION_QUERY_RE = re.compile(
+    r"\b(?:divisions?|departments?|schools?|institutes?|cent(?:er|re)s?|units?|labs?)\b"
+    r"|(?:أقسام|اقسام|الأقسام|الاقسام|إدارات|ادارات|الإدارات|الادارات|"
+    r"معاهد|المعاهد|مراكز|المراكز|مدارس|المدارس)",
+    re.IGNORECASE,
+)
+_PAGE_COLLECTION_SCOPE_MODIFIER_RE = re.compile(
+    r"\b(?:research|undergraduate|graduate|academic|admissions?)\b"
+    r"|(?:بحث|البحث|بحثية|بكالوريوس|البكالوريوس|دراسات عليا|أكاديمي|اكاديمي|قبول|القبول)",
     re.IGNORECASE,
 )
 
@@ -975,6 +987,9 @@ class RoutedHybridRetriever:
                 f"{self.navigation_planner.load_error or 'not found'}"
             )
         self.evidence_adjudicator_enabled = bool(retrieval_cfg.get("evidence_adjudicator_enabled", False))
+        self.evidence_adjudicator_provider_enabled = bool(
+            retrieval_cfg.get("evidence_adjudicator_provider_enabled", True)
+        )
         self.selective_adjudication_enabled = bool(retrieval_cfg.get("selective_adjudication_enabled", True))
         self.selective_adjudication_fact_min_confidence = max(
             0.0,
@@ -1678,57 +1693,67 @@ class RoutedHybridRetriever:
                 max_chunk_ids=self.evidence_adjudicator_chunk_limit,
             )
 
-        self._initialize_evidence_adjudicator_runtime()
-        capacity = self._evidence_adjudicator_capacity
-        if not capacity.acquire(blocking=False):
-            if premise_grounding_required:
-                adjudication = heuristic_fallback()
-            else:
-                payload.setdefault("adjudication_used", False)
-                payload["verification_status"] = "skipped_busy"
-                payload["adjudication_reason"] = "evidence_adjudicator_capacity_exhausted"
-                return payload
+        if not bool(getattr(self, "evidence_adjudicator_provider_enabled", True)):
+            # Keep deterministic premise/subject checks in the hot path while
+            # avoiding a second model round trip before answer generation.
+            adjudication = heuristic_fallback()
+            payload["adjudication_provider_used"] = False
         else:
-            try:
-                future = self._evidence_adjudicator_executor.submit(
-                    adjudicate_factual_evidence,
-                    **adjudication_kwargs,
-                )
-            except RuntimeError:
-                capacity.release()
+            self._initialize_evidence_adjudicator_runtime()
+            capacity = self._evidence_adjudicator_capacity
+            if not capacity.acquire(blocking=False):
                 if premise_grounding_required:
                     adjudication = heuristic_fallback()
                 else:
                     payload.setdefault("adjudication_used", False)
-                    payload["verification_status"] = "skipped_unavailable"
-                    payload["adjudication_reason"] = "evidence_adjudicator_unavailable"
+                    payload["verification_status"] = "skipped_busy"
+                    payload["adjudication_reason"] = "evidence_adjudicator_capacity_exhausted"
                     return payload
             else:
-                # Release only when provider work actually exits. ``Future.cancel``
-                # does not stop a running network call and must not free capacity early.
-                future.add_done_callback(lambda _future: capacity.release())
                 try:
-                    adjudication = future.result(
-                        timeout=max(
-                            0.1,
-                            float(
-                                getattr(
-                                    self,
-                                    "evidence_adjudicator_timeout_sec",
-                                    12.0,
-                                )
-                            ),
-                        )
+                    future = self._evidence_adjudicator_executor.submit(
+                        adjudicate_factual_evidence,
+                        **adjudication_kwargs,
                     )
-                except FutureTimeoutError:
-                    future.cancel()
+                except RuntimeError:
+                    capacity.release()
                     if premise_grounding_required:
                         adjudication = heuristic_fallback()
                     else:
                         payload.setdefault("adjudication_used", False)
-                        payload["verification_status"] = "skipped_timeout"
-                        payload["adjudication_reason"] = "evidence_adjudicator_timeout"
+                        payload["verification_status"] = "skipped_unavailable"
+                        payload["adjudication_reason"] = "evidence_adjudicator_unavailable"
                         return payload
+                else:
+                    # Release only when provider work actually exits.
+                    # ``Future.cancel`` does not stop a running network call
+                    # and must not free capacity early.
+                    future.add_done_callback(lambda _future: capacity.release())
+                    try:
+                        adjudication = future.result(
+                            timeout=max(
+                                0.1,
+                                float(
+                                    getattr(
+                                        self,
+                                        "evidence_adjudicator_timeout_sec",
+                                        12.0,
+                                    )
+                                ),
+                            )
+                        )
+                    except FutureTimeoutError:
+                        future.cancel()
+                        if premise_grounding_required:
+                            adjudication = heuristic_fallback()
+                        else:
+                            payload.setdefault("adjudication_used", False)
+                            payload["verification_status"] = "skipped_timeout"
+                            payload["adjudication_reason"] = "evidence_adjudicator_timeout"
+                            return payload
+            payload["adjudication_provider_used"] = bool(
+                str(adjudication.get("method") or "").casefold() == "openai"
+            )
 
         payload["adjudication_used"] = bool(
             adjudication.get("used")
@@ -1833,6 +1858,12 @@ class RoutedHybridRetriever:
         query_lower = query.lower()
         if self._unsupported_intent_reason(query):
             return "unsupported"
+        if _PAGE_COLLECTION_QUERY_RE.search(query) and not re.search(
+            r"\b(?:compare|across|multiple)\b|(?:قارن|عبر عدة|متعددة)",
+            query,
+            flags=re.IGNORECASE,
+        ):
+            return "large_page"
         if _is_enumeration_query(query):
             return "multi_page_aggregation"
         if re.search(r"\b(compare|all|list|across|multiple|programs|departments|schools|faculty members|aggregate)\b", query_lower):
@@ -1959,14 +1990,38 @@ class RoutedHybridRetriever:
             )
             if str(value).strip()
         ]
-        required_pages_source = str(
-            payload.get("required_pages_source")
-            or (
-                "retrieval_payload"
-                if payload_required_pages
-                else inferred.get("required_pages_source") or "none"
+        page_card_required_page = False
+        if (
+            not required_pages
+            and intent == "large_page"
+            and _PAGE_COLLECTION_QUERY_RE.search(query)
+        ):
+            for page_card_id in payload.get("dense_page_card_ids") or []:
+                page_card = (
+                    getattr(self.vector, "page_card_map", {}).get(
+                        str(page_card_id)
+                    )
+                    or {}
+                )
+                source_url = self._source_url_from_record(page_card)
+                page_record = self._coverage_page_record_for_url(source_url)
+                if not source_url or not page_record:
+                    continue
+                if self._page_target_score(query, page_record) < 0.58:
+                    continue
+                required_pages = [source_url]
+                page_card_required_page = True
+                break
+        if payload.get("required_pages_source"):
+            required_pages_source = str(payload["required_pages_source"])
+        elif payload_required_pages:
+            required_pages_source = "retrieval_payload"
+        elif page_card_required_page:
+            required_pages_source = "page_card_collection"
+        else:
+            required_pages_source = str(
+                inferred.get("required_pages_source") or "none"
             )
-        )
         required_sections = [
             str(value)
             for value in (payload.get("required_sections") or inferred.get("required_sections") or [])
@@ -5380,6 +5435,15 @@ class RoutedHybridRetriever:
             _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
             or _is_enumeration_query(query)
         ):
+            return None
+        if _PAGE_COLLECTION_QUERY_RE.search(
+            str(query or "")
+        ) and _PAGE_COLLECTION_SCOPE_MODIFIER_RE.search(str(query or "")):
+            # A whole-page synopsis deliberately lists every sibling section.
+            # For a qualified collection (for example, research divisions),
+            # that erases the qualifier and can make an adjacent undergraduate
+            # or administrative section look like a member of the requested
+            # subset. Hydrate the page's scored section chunks/spans instead.
             return None
         scored: List[tuple[float, Dict[str, Any]]] = []
         parent_map = getattr(self.vector, "parent_map", {})

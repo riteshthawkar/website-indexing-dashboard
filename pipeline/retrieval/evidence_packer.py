@@ -1248,11 +1248,231 @@ def _usable_fact_or_assertion_text(value: Any) -> bool:
     )
 
 
+_SCOPE_IDENTITY_FAMILIES: tuple[frozenset[str], ...] = (
+    frozenset({"division", "divisions", "شعبة", "شعب", "قسم", "اقسام"}),
+    frozenset({"department", "departments", "قسم", "اقسام"}),
+    frozenset({"school", "schools", "كلية", "كليات"}),
+    frozenset({"institute", "institutes", "معهد", "معاهد"}),
+    frozenset({"center", "centers", "centre", "centres", "مركز", "مراكز"}),
+    frozenset({"unit", "units", "وحدة", "وحدات"}),
+    frozenset({"lab", "labs", "laboratory", "laboratories", "مختبر", "مختبرات"}),
+    frozenset(
+        {
+            "program",
+            "programs",
+            "programme",
+            "programmes",
+            "degree",
+            "degrees",
+            "bachelor",
+            "bachelors",
+            "undergraduate",
+            "graduate",
+            "master",
+            "masters",
+            "msc",
+            "phd",
+            "doctoral",
+            "برنامج",
+            "برامج",
+            "بكالوريوس",
+            "ماجستير",
+            "دكتوراه",
+        }
+    ),
+    frozenset({"course", "courses", "module", "modules", "مقرر", "مقررات"}),
+)
+
+_SCOPE_IDENTITY_MODIFIER_FAMILIES: tuple[frozenset[str], ...] = (
+    frozenset({"research", "researcher", "researchers", "بحث", "البحث", "بحثية"}),
+    frozenset({"undergraduate", "bachelor", "bachelors", "بكالوريوس", "البكالوريوس"}),
+    frozenset({"graduate", "master", "masters", "msc", "phd", "doctoral", "دراسات", "ماجستير", "دكتوراه"}),
+    frozenset({"admission", "admissions", "application", "apply", "قبول", "القبول", "تقديم"}),
+)
+_SCOPE_IDENTITY_CONTAINER_TERMS = {
+    "division",
+    "divisions",
+    "department",
+    "departments",
+    "school",
+    "schools",
+    "institute",
+    "institutes",
+    "center",
+    "centers",
+    "centre",
+    "centres",
+    "unit",
+    "units",
+    "lab",
+    "labs",
+    "laboratory",
+    "laboratories",
+    "program",
+    "programs",
+    "programme",
+    "programmes",
+    "degree",
+    "degrees",
+    "course",
+    "courses",
+    "قسم",
+    "اقسام",
+    "شعبة",
+    "شعب",
+    "كلية",
+    "كليات",
+    "معهد",
+    "معاهد",
+    "مركز",
+    "مراكز",
+    "وحدة",
+    "وحدات",
+    "مختبر",
+    "مختبرات",
+    "برنامج",
+    "برامج",
+    "مقرر",
+    "مقررات",
+}
+_ORGANIZATIONAL_COLLECTION_QUERY_RE = re.compile(
+    r"\b(?:divisions?|departments?|schools?|institutes?|cent(?:er|re)s?|units?|labs?|laborator(?:y|ies))\b"
+    r"|(?:أقسام|اقسام|الأقسام|الاقسام|إدارات|ادارات|الإدارات|الادارات|"
+    r"معاهد|المعاهد|مراكز|المراكز|مدارس|المدارس|مختبرات|المختبرات)",
+    re.IGNORECASE,
+)
+
+
+def _scope_identity_has_conflicting_modifier(
+    query: str,
+    *,
+    document_title: str,
+    heading: str,
+    breadcrumb: str,
+) -> bool:
+    query_terms = _query_terms(query)
+    if not (_SCOPE_IDENTITY_CONTAINER_TERMS & query_terms):
+        return False
+    requested_modifiers = [
+        family
+        for family in _SCOPE_IDENTITY_MODIFIER_FAMILIES
+        if family & query_terms
+    ]
+    if not requested_modifiers:
+        return False
+    local_identity_terms = {
+        normalized
+        for raw_token in re.findall(
+            r"[^\W_]+",
+            " ".join(
+                (
+                    str(document_title or ""),
+                    str(heading or ""),
+                    str(breadcrumb or ""),
+                )
+            ).casefold(),
+            flags=re.UNICODE,
+        )
+        if (normalized := _normalize_match_token(raw_token))
+    }
+    research_family, undergraduate_family, graduate_family, _admissions_family = (
+        _SCOPE_IDENTITY_MODIFIER_FAMILIES
+    )
+    return bool(
+        (research_family in requested_modifiers and undergraduate_family & local_identity_terms)
+        or (
+            undergraduate_family in requested_modifiers
+            and (research_family | graduate_family) & local_identity_terms
+        )
+        or (
+            graduate_family in requested_modifiers
+            and undergraduate_family & local_identity_terms
+        )
+    )
+
+
+def _scope_identity_alignment_bonus(
+    query: str,
+    *,
+    source_url: str,
+    document_title: str,
+    heading: str,
+    breadcrumb: str,
+) -> float:
+    """Prefer evidence whose page/section identity matches the requested scope.
+
+    Topic words alone are not enough for container questions: a news article
+    may mention both machine learning and computer vision without identifying
+    the division that contains them.  Match requested organizational/program
+    nouns only against source identity metadata, while factual support still
+    comes from the evidence text itself.
+    """
+
+    query_terms = _query_terms(query)
+    requested_families = [
+        family for family in _SCOPE_IDENTITY_FAMILIES if family & query_terms
+    ]
+    if not requested_families:
+        return 0.0
+    try:
+        parsed = urlparse(str(source_url or ""))
+        source_identity = f"{parsed.hostname or ''} {unquote(parsed.path or '')}"
+    except Exception:
+        source_identity = str(source_url or "")
+    identity_terms = {
+        normalized
+        for raw_token in re.findall(
+            r"[^\W_]+",
+            " ".join(
+                (
+                    source_identity.replace("-", " ").replace("_", " "),
+                    str(document_title or ""),
+                    str(heading or ""),
+                    str(breadcrumb or ""),
+                )
+            ).casefold(),
+            flags=re.UNICODE,
+        )
+        if (normalized := _normalize_match_token(raw_token))
+    }
+    matched = sum(1 for family in requested_families if family & identity_terms)
+    if not matched:
+        return -18.0
+    requested_modifiers = [
+        family
+        for family in _SCOPE_IDENTITY_MODIFIER_FAMILIES
+        if family & query_terms
+    ]
+    if _scope_identity_has_conflicting_modifier(
+        query,
+        document_title=document_title,
+        heading=heading,
+        breadcrumb=breadcrumb,
+    ):
+        return -64.0
+    modifier_matched = bool(
+        requested_modifiers
+        and any(family & identity_terms for family in requested_modifiers)
+    )
+    if requested_modifiers and not modifier_matched:
+        # Matching the container noun is insufficient when the user supplied
+        # a scope modifier: e.g. an undergraduate FAQ breadcrumb containing
+        # "Divisions" must not satisfy a query about research divisions.
+        return -42.0
+    return min(
+        84.0,
+        42.0
+        + (12.0 * float(matched - 1))
+        + (12.0 if modifier_matched else 0.0),
+    )
+
+
 _MULTI_DETAIL_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|qualification|academic qualification|roles|positions|responsibilities|steps|"
     r"features|benefits|differences|criteria|items|articles|entries|sections|categories|stages|process|programs?|"
     r"experience|professional experience|fees?|tuition|costs?|charges?|prices?|amounts?|waivers?|conditions|"
     r"scholarships?|financial aid|funding|coverage|per[- ]credit|seat[- ]holding|"
+    r"divisions?|departments?|schools?|institutes?|cent(?:er|re)s?|units?|labs?|"
     r"support|services|use|uses|using|options|focus areas|research interests|hands-on access|offerings|committees|industry engagement)\b"
     r"|(?:المتطلبات|المؤهلات|المؤهل الأكاديمي|المؤهل|المناصب|الأدوار|المسؤوليات|الخطوات|المزايا|الفروقات|"
     r"المعايير|العناصر|المقالات|أقسام|اقسام|فئات|مراحل|عملية|البرنامج|برنامج|البرامج|برامج|المدة|مدة|"
@@ -1646,6 +1866,13 @@ def _candidate_score(
         document_title=_document_title(doc),
         heading=_clean_text(doc.get("section_heading") or doc.get("heading")),
     )
+    score += _scope_identity_alignment_bonus(
+        query,
+        source_url=source,
+        document_title=_document_title(doc),
+        heading=_clean_text(doc.get("section_heading") or doc.get("heading")),
+        breadcrumb=_clean_text(doc.get("breadcrumb")),
+    )
     score += _multi_detail_chunk_coverage_bonus(
         query,
         item_blob,
@@ -1770,6 +1997,13 @@ def build_evidence_pack(
             }
         )
         if query_specific_rules_enabled and _should_exclude_context_item(query, item_blob):
+            continue
+        if _scope_identity_has_conflicting_modifier(
+            query,
+            document_title=_document_title(doc),
+            heading=_clean_text(doc.get("section_heading") or doc.get("heading")),
+            breadcrumb=_clean_text(doc.get("breadcrumb")),
+        ):
             continue
         key = _dedupe_key(doc, kind)
         if key in seen_keys:
@@ -1927,6 +2161,35 @@ def build_evidence_pack(
             }
         )
         return True
+
+    if _ORGANIZATIONAL_COLLECTION_QUERY_RE.search(str(query or "")):
+        # Preserve one best evidence block per named section for inventory
+        # questions. A generic overview or dean biography may have a higher
+        # lexical score, but it cannot replace one of the requested members.
+        # Conflicting scoped sections were already removed above.
+        selected_labels: set[str] = set()
+        collection_limit = min(max_items, 6)
+        for _score, kind, doc in candidates:
+            heading = _clean_text(doc.get("section_heading") or doc.get("heading"))
+            if not heading:
+                section_match = re.search(
+                    r"(?:^|\s)(?:SECTION:\s*|#{1,6}\s+)(.{3,180}?)"
+                    r"(?=\s+(?:SOURCE_URL:|TYPE:|TITLE:|#{1,6}\s)|$)",
+                    _doc_text(doc),
+                    flags=re.IGNORECASE,
+                )
+                heading = _clean_text(section_match.group(1)) if section_match else ""
+            if not heading or not _ORGANIZATIONAL_COLLECTION_QUERY_RE.search(heading):
+                continue
+            label = heading.casefold()
+            if label in selected_labels:
+                continue
+            if required_page_set and not _candidate_matches_any_required_page(doc):
+                continue
+            if _append_candidate(kind, doc):
+                selected_labels.add(label)
+            if len(selected_labels) >= collection_limit:
+                break
 
     if explicit_media_query:
         # Media relevance is resolved upstream by the adaptive hybrid

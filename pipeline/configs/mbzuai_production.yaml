@@ -273,6 +273,9 @@ retrieval:
   page_card_evidence_fusion_rrf_k: 60
   query_planner_model: "gpt-5-nano-2025-08-07"
   evidence_adjudicator_enabled: true
+  # The answer model already performs grounded synthesis. Keep deterministic
+  # fail-closed adjudication but remove a redundant 2-5 second model hop.
+  evidence_adjudicator_provider_enabled: false
   selective_adjudication_fact_min_confidence: 0.65
   evidence_adjudicator_model: "gpt-5-nano-2025-08-07"
   evidence_adjudicator_timeout_sec: 12
