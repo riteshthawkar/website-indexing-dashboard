@@ -16,6 +16,7 @@ The production path scrapes the MBZUAI website, normalizes website and document 
 ## Repository Layout
 
 - [`pipeline/`](pipeline/): pipeline stages, retrieval, evaluation, CLI
+- [`lawa_rag/`](lawa_rag/): stable, reusable Python package API
 - [`pipeline/configs/mbzuai_production.yaml`](pipeline/configs/mbzuai_production.yaml): canonical production contract
 - [`pipeline/configs/default.yaml`](pipeline/configs/default.yaml): shared defaults inherited by environment-specific configs
 - [`docs/`](docs/): operator and system docs
@@ -197,3 +198,4 @@ PIPELINE_EMBEDDER__VERIFY_INDEX_MIN_COUNT_ONLY=true bash scripts/pipeline.sh run
 
 - setup guide: [`docs/setup.md`](docs/setup.md)
 - retriever handoff: [`docs/retriever_system.md`](docs/retriever_system.md)
+- reusable Python package: [`docs/internal_package.md`](docs/internal_package.md)
