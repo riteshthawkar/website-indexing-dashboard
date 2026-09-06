@@ -18,7 +18,7 @@ def _load_json_object(path: Path, *, label: str) -> dict[str, Any]:
         raise FileNotFoundError(f"{label} not found: {path}")
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         raise ReleaseContractError(f"{label} is not valid JSON: {path}") from exc
     if not isinstance(value, dict):
         raise ReleaseContractError(f"{label} must be a JSON object: {path}")

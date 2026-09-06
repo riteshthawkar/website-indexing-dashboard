@@ -69,6 +69,9 @@ def validate_wheel(path: Path) -> dict[str, object]:
         raise ValueError(f"Wheel contains forbidden development files: {forbidden[:20]}")
     if metadata.get("Name") != "lawa-rag":
         raise ValueError(f"Unexpected distribution name: {metadata.get('Name')!r}")
+    classifiers = set(metadata.get_all("Classifier") or [])
+    if "Private :: Do Not Upload" not in classifiers:
+        raise ValueError("Wheel is missing the private-distribution classifier")
     expected_version = _expected_version()
     if metadata.get("Version") != expected_version:
         raise ValueError(f"Unexpected distribution version: {metadata.get('Version')!r}")

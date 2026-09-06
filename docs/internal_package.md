@@ -29,6 +29,18 @@ For package development:
 python -m pip install -e ".[indexing,test]"
 ```
 
+Run the package-management suite across configuration, execution, checkpoint,
+failure, release, lazy-import, service-factory, representation, and wheel
+contracts:
+
+```bash
+python -m pytest -q pipeline/tests/test_lawa_rag_*.py
+```
+
+CI runs this suite on Python 3.10, 3.11, and 3.12, builds the wheel, rejects
+internal tests, bytecode, and environment files in the archive, and performs a
+clean installed-wheel import check.
+
 The package supports Python 3.10 through 3.12. Provider credentials continue
 to come from environment variables and are never accepted as package defaults.
 

@@ -34,9 +34,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install package contract dependencies
-        run: python -m pip install --upgrade pip ".[test]"
+        run: python -m pip install --upgrade pip ".[retrieval,test]"
       - name: Test public package contracts
-        run: python -m pytest -q pipeline/tests/test_lawa_rag_package.py
+        run: python -m pytest -q pipeline/tests/test_lawa_rag_*.py
       - name: Build wheel
         run: python -m pip wheel --no-deps --wheel-dir dist .
       - name: Validate wheel contents
