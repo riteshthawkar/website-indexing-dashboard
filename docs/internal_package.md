@@ -152,6 +152,30 @@ attestation, evaluation gates, and locking rather than a casual library call.
 - The package wraps the existing orchestrator and retriever; it does not create
   a second execution path.
 
+## Package structure
+
+The public boundary is intentionally split by one responsibility per module:
+
+```text
+lawa_rag/
+├── config.py          configuration loading
+├── contracts.py       custom-stage and artifact interfaces
+├── runner.py          validated and resumable execution
+├── results.py         immutable plan, stage, and run results
+├── release.py         read-only release inspection
+├── representation.py Representation V2 contracts
+├── retrieval.py       lazy retrieval exports
+├── evaluation.py      lazy evaluation exports
+├── service.py         retrieval-service factory
+└── indexing.py        compatibility import facade
+```
+
+CI enforces a 240-line package-module budget, a 50-line function budget, a
+bounded decision count, 100-column source lines, explicit public `__all__`
+contracts, no wildcard imports, no local import cycles, and 250-line test-file
+budgets. These are guardrails rather than targets: new functionality should
+normally be substantially smaller.
+
 ## Planned increments
 
 1. Move backend-neutral answer orchestration and streaming event schemas behind

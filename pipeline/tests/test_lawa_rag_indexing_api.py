@@ -2,83 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any
 
 import pytest
 
-from lawa_rag import (
-    IndexingPipeline,
-    PipelineRun,
-    PipelineStage,
-    StageContext,
-    StageResult,
-    register_stage,
-)
-
-
-@register_stage
-class PackageBehaviorStage(PipelineStage):
-    name = "package_behavior_test"
-    stage_type = "package_behavior"
-    description = "Exercise package execution behavior and failure handling."
-
-    async def validate_config(self, config: Dict[str, Any]) -> List[str]:
-        value = config.get("package_behavior") or {}
-        return [] if value.get("enabled") else ["package_behavior.enabled must be true"]
-
-    async def execute(self, ctx: StageContext) -> StageResult:
-        mode = str(ctx.stage_config.get("mode") or "success")
-        if mode == "raise":
-            raise RuntimeError("intentional provider exception")
-        if mode == "failure":
-            return StageResult.failure(
-                "intentional stage failure",
-                outputs={"failed_stage_id": ctx.stage_id},
-                metrics={"attempted": 1},
-            )
-        if mode == "skip":
-            return StageResult.skipped("intentionally skipped")
-
-        prior = ctx.get_stage_outputs(str(ctx.stage_config.get("read_stage") or ""))
-        output_file = ctx.output_dir("behavior") / "output.txt"
-        output_file.write_text(ctx.stage_id, encoding="utf-8")
-        return StageResult.success(
-            outputs={
-                "stage_id": ctx.stage_id,
-                "output_file": str(output_file),
-                "prior_stage_id": str(prior.get("stage_id") or ""),
-            },
-            metrics={"records": 1},
-        )
-
-    async def cleanup(self, ctx: StageContext) -> None:
-        cleanup_file = ctx.work_dir / f"{ctx.stage_id}.cleanup"
-        cleanup_file.write_text("clean", encoding="utf-8")
-
-
-def _behavior_config(
-    tmp_path: Path,
-    *,
-    stage_definitions: list[dict[str, Any]] | None = None,
-    enabled: bool = True,
-) -> dict[str, Any]:
-    return {
-        "project_name": "package_behavior",
-        "work_dir": str(tmp_path / "runs"),
-        "pipeline": {
-            "audit_on_stage_complete": False,
-            "audit_on_run_complete": False,
-        },
-        "package_behavior": {"enabled": enabled, "mode": "success"},
-        "stages": stage_definitions
-        or [
-            {
-                "id": "behavior",
-                "type": "package_behavior",
-                "plugin": "package_behavior_test",
-            }
-        ],
-    }
+from lawa_rag import IndexingPipeline, PipelineRun
+from pipeline.tests.lawa_rag_test_support import behavior_config
 
 
 def test_runner_properties_plan_callbacks_and_success_result(tmp_path: Path) -> None:
@@ -86,7 +15,7 @@ def test_runner_properties_plan_callbacks_and_success_result(tmp_path: Path) -> 
     completions: list[tuple[str, str, object]] = []
     logs: list[tuple[str, str]] = []
     pipeline = IndexingPipeline.from_config(
-        _behavior_config(tmp_path),
+        behavior_config(tmp_path),
         run_id="behavior-success",
         on_stage_start=lambda stage_type, name, info: starts.append((stage_type, name, info)),
         on_stage_complete=lambda stage_type, name, info: completions.append(
@@ -126,7 +55,7 @@ def test_runner_properties_plan_callbacks_and_success_result(tmp_path: Path) -> 
 
 
 def test_stage_outputs_flow_through_the_public_runner(tmp_path: Path) -> None:
-    config = _behavior_config(
+    config = behavior_config(
         tmp_path,
         stage_definitions=[
             {
@@ -161,7 +90,7 @@ def test_stage_failures_are_returned_as_inspectable_run_results(
     mode: str,
     expected_message: str,
 ) -> None:
-    config = _behavior_config(
+    config = behavior_config(
         tmp_path,
         stage_definitions=[
             {
@@ -190,7 +119,7 @@ def test_stage_failures_are_returned_as_inspectable_run_results(
 
 
 def test_skipped_stage_is_successful_and_pipeline_continues(tmp_path: Path) -> None:
-    config = _behavior_config(
+    config = behavior_config(
         tmp_path,
         stage_definitions=[
             {
@@ -219,7 +148,7 @@ def test_skipped_stage_is_successful_and_pipeline_continues(tmp_path: Path) -> N
 def test_async_plan_validation_and_execution(tmp_path: Path) -> None:
     async def exercise() -> PipelineRun:
         pipeline = IndexingPipeline.from_config(
-            _behavior_config(tmp_path),
+            behavior_config(tmp_path),
             run_id="async",
         )
         assert (await pipeline.validate()).ok
@@ -232,7 +161,7 @@ def test_async_plan_validation_and_execution(tmp_path: Path) -> None:
 def test_sync_methods_fail_clearly_inside_an_event_loop(tmp_path: Path) -> None:
     async def exercise() -> None:
         pipeline = IndexingPipeline.from_config(
-            _behavior_config(tmp_path),
+            behavior_config(tmp_path),
             run_id="loop-guard",
         )
         with pytest.raises(RuntimeError, match="already running"):
@@ -247,7 +176,7 @@ def test_sync_methods_fail_clearly_inside_an_event_loop(tmp_path: Path) -> None:
 
 def test_validation_can_be_inspected_without_creating_a_run_directory(tmp_path: Path) -> None:
     pipeline = IndexingPipeline.from_config(
-        _behavior_config(tmp_path, enabled=False),
+        behavior_config(tmp_path, enabled=False),
         run_id="validation-only",
     )
 
@@ -280,7 +209,7 @@ def test_loading_missing_or_incomplete_checkpoints_fails_clearly(tmp_path: Path)
 
 def test_run_and_stage_serialization_return_detached_data(tmp_path: Path) -> None:
     result = IndexingPipeline.from_config(
-        _behavior_config(tmp_path),
+        behavior_config(tmp_path),
         run_id="serialization",
     ).run_sync()
 
