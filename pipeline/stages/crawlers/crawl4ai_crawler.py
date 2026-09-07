@@ -5119,6 +5119,24 @@ class Crawl4AICrawler(CrawlerStage):
         return [url for url in urls if url not in verified]
 
     def _playwright_browser_kwargs(self) -> Dict[str, Any]:
+        browser_urls: List[Any] = [
+            self.start_url,
+            getattr(self, "browser_fetch_context_url", ""),
+            *(spec.url for spec in getattr(self, "dynamic_collection_specs", []) or []),
+        ]
+        for endpoint in self.config.get("seed_inventory_endpoints") or []:
+            if isinstance(endpoint, dict):
+                browser_urls.extend(
+                    [endpoint.get("url"), endpoint.get("browser_context_url")]
+                )
+        allowed_origins = set()
+        for value in browser_urls:
+            normalized = _normalize_http_url(value)
+            if not normalized:
+                continue
+            parsed = urlparse(normalized)
+            if self._host_allowed((parsed.hostname or "").lower()):
+                allowed_origins.add(f"{parsed.scheme}://{parsed.netloc}")
         return {
             "headless": self.headless,
             "timeout_sec": self.timeout,
@@ -5136,6 +5154,7 @@ class Crawl4AICrawler(CrawlerStage):
             "viewport": self.config.get("viewport"),
             "proxy": self.proxy,
             "storage_state": self.config.get("storage_state"),
+            "allowed_origins": sorted(allowed_origins),
         }
 
     async def _discover_seed_inventory_urls(self) -> List[str]:
@@ -6298,7 +6317,13 @@ class Crawl4AICrawler(CrawlerStage):
                 processed = await self._process_result(result, mark_failure=False)
                 if processed and result_url:
                     pages_crawled += 1
-                    processed_page_urls.append(result_url)
+                    processed_page_urls.append(
+                        _normalize_http_url(
+                            getattr(result, "final_url", None),
+                            result_url,
+                        )
+                        or result_url
+                    )
                 if not processed and result_url:
                     failed_batch_urls[result_url] = {
                         "status_code": getattr(result, "status_code", None),
@@ -6566,9 +6591,27 @@ class Crawl4AICrawler(CrawlerStage):
         return str(soup), True
 
     async def _process_result(self, result: Any, *, mark_failure: bool = True) -> bool:
-        page_url = _normalize_http_url(getattr(result, "url", None))
-        if not page_url:
+        requested_page_url = _normalize_http_url(getattr(result, "url", None))
+        if not requested_page_url:
             return False
+        page_url = requested_page_url
+        reported_final_url = _normalize_http_url(
+            getattr(result, "final_url", None),
+            requested_page_url,
+        )
+        if reported_final_url and reported_final_url != requested_page_url:
+            if not self._url_allowed_for_fetch(
+                reported_final_url
+            ) or not self._allow_frontier_url(reported_final_url):
+                if mark_failure:
+                    self._mark_url_skipped(
+                        requested_page_url,
+                        error_message="redirect_outside_crawl_policy",
+                        reason="SKIPPED_EGRESS_POLICY",
+                    )
+                    self._flush_runtime_state()
+                return False
+            page_url = reported_final_url
         self._last_result_seen_at = time.time()
 
         status_code = getattr(result, "status_code", None)
@@ -6582,7 +6625,7 @@ class Crawl4AICrawler(CrawlerStage):
         if numeric_status is not None and numeric_status >= 400:
             if mark_failure:
                 self._mark_url_skipped(
-                    page_url,
+                    requested_page_url,
                     status_code=numeric_status,
                     error_message=getattr(result, "error_message", ""),
                 )
@@ -6600,12 +6643,34 @@ class Crawl4AICrawler(CrawlerStage):
             else:
                 if mark_failure:
                     self._mark_url_skipped(
-                        page_url,
+                        requested_page_url,
                         status_code=status_code,
                         error_message=getattr(result, "error_message", ""),
                     )
                     self._flush_runtime_state()
                 return False
+
+        existing_output = str(self.url_mapping.get(page_url) or "")
+        if existing_output and not existing_output.startswith("SKIPPED"):
+            try:
+                existing_path = Path(existing_output)
+            except (OSError, ValueError):
+                existing_path = Path()
+            if existing_path.is_file():
+                if requested_page_url != page_url:
+                    self.url_mapping[requested_page_url] = existing_output
+                    metadata = self.page_metadata.get(page_url)
+                    if isinstance(metadata, dict):
+                        redirected_from = {
+                            str(value)
+                            for value in metadata.get("redirected_from", [])
+                            if str(value)
+                        }
+                        redirected_from.add(requested_page_url)
+                        metadata["redirected_from"] = sorted(redirected_from)
+                        metadata["final_url"] = page_url
+                self._flush_runtime_state()
+                return True
 
         raw_source_html = ""
         raw_source_status: Optional[int] = None
@@ -6627,7 +6692,7 @@ class Crawl4AICrawler(CrawlerStage):
                 getattr(self, "transient_page_statuses", set()),
             ):
                 self._mark_url_skipped(
-                    page_url,
+                    requested_page_url,
                     status_code=raw_source_status,
                     error_message="raw_source_terminal_http_status",
                 )
@@ -6666,7 +6731,7 @@ class Crawl4AICrawler(CrawlerStage):
             except (TypeError, ValueError):
                 skip_status = None
             self._mark_url_skipped(
-                page_url,
+                requested_page_url,
                 status_code=skip_status,
                 error_message=f"content_quality:{','.join(selected_quality_report.get('reasons') or [])}",
                 reason="SKIPPED_LOW_QUALITY",
@@ -6685,6 +6750,8 @@ class Crawl4AICrawler(CrawlerStage):
         html_path = self.html_dir / f"{_url_digest(page_url)}.html"
         html_path.write_text(html, encoding="utf-8")
         self.url_mapping[page_url] = str(html_path)
+        if requested_page_url != page_url:
+            self.url_mapping[requested_page_url] = str(html_path)
         self.stats["pages_scraped"] += 1
         self.stats["bytes_downloaded"] += len(html.encode("utf-8"))
         pages_scraped = self.stats["pages_scraped"]
@@ -6799,6 +6866,11 @@ class Crawl4AICrawler(CrawlerStage):
                 markdown_source=markdown_source,
                 markdown_quality_reason=markdown_quality_reason,
             )
+            if requested_page_url != page_url:
+                self.page_metadata[page_url]["redirected_from"] = [
+                    requested_page_url
+                ]
+                self.page_metadata[page_url]["final_url"] = page_url
         except Exception as exc:
             logger.warning("Skipping page graph/metadata extraction for %s: %s", page_url, exc)
 

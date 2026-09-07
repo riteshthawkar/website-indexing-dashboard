@@ -511,7 +511,7 @@ def test_browser_fetch_adapter_returns_processable_html_results():
             assert kwargs["max_bytes"] == 2048
             if url.endswith("/retry"):
                 return 503, "temporary", url, {"content-type": "text/html"}
-            return 200, "<html><body>Ready</body></html>", url, {
+            return 200, "<html><body>Ready</body></html>", f"{url}/canonical", {
                 "content-type": "text/html"
             }
 
@@ -533,4 +533,75 @@ def test_browser_fetch_adapter_returns_processable_html_results():
         (503, False),
     ]
     assert results[0].html == "<html><body>Ready</body></html>"
+    assert results[0].final_url == "https://example.com/ready/canonical"
     assert results[1].error_message == "browser_fetch_http_503"
+
+
+def test_successful_internal_redirect_maps_alias_to_one_canonical_artifact(
+    tmp_path,
+    monkeypatch,
+):
+    requested_url = "https://example.com/old-admissions"
+    final_url = "https://example.com/current-admissions"
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.html_dir = tmp_path / "html"
+    crawler.html_dir.mkdir()
+    crawler.md_dir = tmp_path / "markdown"
+    crawler.url_mapping = {}
+    crawler.url_to_md_mapping = {}
+    crawler.page_images = {}
+    crawler.page_videos = {}
+    crawler.page_media = {}
+    crawler.page_links = {}
+    crawler.page_metadata = {}
+    crawler.dynamic_collection_inventory = {"collections": [], "urls": []}
+    crawler.seed_inventory = {"endpoints": [], "urls": []}
+    crawler.crawl_state = {"depths": {requested_url: 1, final_url: 1}}
+    crawler.allowed_domains = {"example.com"}
+    crawler.allowed_hosts = {"example.com"}
+    crawler.excluded_subdomains = set()
+    crawler.validate_source_html = False
+    crawler.validate_source_html_mode = "never"
+    crawler.write_markdown = False
+    crawler.extract_images = False
+    crawler.extract_videos = False
+    crawler.stats = {
+        "pages_scraped": 0,
+        "bytes_downloaded": 0,
+        "documents_downloaded": 0,
+        "images_extracted": 0,
+        "videos_extracted": 0,
+        "content_quality_warnings": 0,
+        "source_html_replacements": 0,
+    }
+    monkeypatch.setattr(crawler, "_url_allowed_for_fetch", lambda _url: True)
+    monkeypatch.setattr(crawler, "_allow_frontier_url", lambda _url: True)
+    monkeypatch.setattr(crawler, "_flush_runtime_state", lambda *args, **kwargs: None)
+
+    html = (
+        "<html><head><title>Current Admissions</title></head><body><main>"
+        + "Current admissions requirements, deadlines, programs, and application "
+        * 12
+        + "</main></body></html>"
+    )
+    processed = asyncio.run(
+        crawler._process_result(
+            SimpleNamespace(
+                url=requested_url,
+                final_url=final_url,
+                status_code=200,
+                success=True,
+                html=html,
+                error_message="",
+                response_headers={"content-type": "text/html"},
+                links={"internal": [], "external": []},
+                markdown=None,
+            )
+        )
+    )
+
+    assert processed is True
+    assert crawler.stats["pages_scraped"] == 1
+    assert crawler.url_mapping[requested_url] == crawler.url_mapping[final_url]
+    assert crawler.page_metadata[final_url]["redirected_from"] == [requested_url]
+    assert crawler.page_metadata[final_url]["final_url"] == final_url

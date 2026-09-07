@@ -387,6 +387,7 @@ def test_browser_json_fetch_primes_same_origin_and_enforces_size_limit():
     }
     assert 'cache: "no-store"' in page.evaluate_calls[0][0]
     assert "AbortController" in page.evaluate_calls[0][0]
+    assert 'redirect: "follow"' in page.evaluate_calls[0][0]
 
     page.body = "payload-is-too-large"
     try:
@@ -429,6 +430,7 @@ def test_browser_binary_fetch_is_bounded_and_bypasses_cache():
         async def evaluate(self, script, argument):
             assert 'cache: "no-store"' in script
             assert "AbortController" in script
+            assert 'redirect: "follow"' in script
             assert argument["maxBytes"] == 1024
             assert argument["timeoutMs"] == 5000
             return {
@@ -459,3 +461,41 @@ def test_browser_binary_fetch_is_bounded_and_bypasses_cache():
     assert actual == payload
     assert final_url == "https://example.com/files/guide.pdf"
     assert headers["content-type"] == "application/pdf"
+
+
+def test_browser_origin_guard_blocks_cross_origin_before_network_egress():
+    class Request:
+        def __init__(self, url):
+            self.url = url
+
+    class Route:
+        def __init__(self, url):
+            self.request = Request(url)
+            self.continued = False
+            self.aborted = False
+
+        async def continue_(self):
+            self.continued = True
+
+        async def abort(self):
+            self.aborted = True
+
+    browser = PlaywrightDynamicCollectionBrowser(
+        headless=False,
+        timeout_sec=5,
+        allowed_origins=["https://example.com:443/path"],
+    )
+    allowed = Route("https://example.com/redirect-target")
+    blocked = Route("https://outside.example/redirect-target")
+    local = Route("data:text/plain,hello")
+
+    asyncio.run(browser._route_allowed_origin_request(allowed))
+    asyncio.run(browser._route_allowed_origin_request(blocked))
+    asyncio.run(browser._route_allowed_origin_request(local))
+
+    assert allowed.continued is True
+    assert allowed.aborted is False
+    assert blocked.continued is False
+    assert blocked.aborted is True
+    assert local.continued is True
+    assert local.aborted is False

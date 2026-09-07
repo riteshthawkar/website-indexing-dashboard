@@ -25,6 +25,28 @@ DEFAULT_EXPECTED_COUNT_PATTERN = (
 )
 
 
+def _http_origin(value: Any) -> str:
+    """Return a normalized HTTP origin without credentials or default ports."""
+
+    try:
+        parsed = urlparse(str(value or "").strip())
+        scheme = parsed.scheme.lower()
+        hostname = (parsed.hostname or "").lower().strip(".")
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    if scheme not in {"http", "https"} or not hostname:
+        return ""
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    if port and not (
+        (scheme == "http" and port == 80)
+        or (scheme == "https" and port == 443)
+    ):
+        return f"{scheme}://{hostname}:{port}"
+    return f"{scheme}://{hostname}"
+
+
 def _compact_text(value: Any, *, limit: int) -> str:
     text = " ".join(str(value or "").split())
     return text[:limit].rstrip()
@@ -548,6 +570,7 @@ class PlaywrightDynamicCollectionBrowser:
         viewport: Optional[Mapping[str, Any]] = None,
         proxy: Any = None,
         storage_state: Any = None,
+        allowed_origins: Optional[Sequence[str]] = None,
     ):
         self.headless = headless
         self.timeout_ms = max(1000, int(timeout_sec * 1000))
@@ -562,6 +585,13 @@ class PlaywrightDynamicCollectionBrowser:
         self.viewport = dict(viewport or {}) or None
         self.proxy = proxy
         self.storage_state = storage_state
+        if allowed_origins is None:
+            self.allowed_origins: Optional[frozenset[str]] = None
+        else:
+            normalized_origins = {_http_origin(value) for value in allowed_origins}
+            if "" in normalized_origins:
+                raise ValueError("allowed_origins must contain valid HTTP(S) origins")
+            self.allowed_origins = frozenset(normalized_origins)
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
@@ -599,10 +629,24 @@ class PlaywrightDynamicCollectionBrowser:
         if self.storage_state:
             context_kwargs["storage_state"] = self.storage_state
         self._context = await self._browser.new_context(**context_kwargs)
+        if self.allowed_origins is not None:
+            await self._context.route("**/*", self._route_allowed_origin_request)
         if self.cookies:
             await self._context.add_cookies(self.cookies)
         self._context.set_default_timeout(self.timeout_ms)
         return self
+
+    async def _route_allowed_origin_request(self, route: Any) -> None:
+        """Abort disallowed HTTP requests before they can leave the browser."""
+
+        request_url = str(getattr(getattr(route, "request", None), "url", "") or "")
+        origin = _http_origin(request_url)
+        if origin and (
+            self.allowed_origins is not None and origin not in self.allowed_origins
+        ):
+            await route.abort()
+            return
+        await route.continue_()
 
     async def fetch_json(
         self,
@@ -675,7 +719,7 @@ class PlaywrightDynamicCollectionBrowser:
                     const response = await fetch(url, {
                         cache: "no-store",
                         credentials: "include",
-                        redirect: "manual",
+                        redirect: "follow",
                         signal: controller.signal
                     });
                     const headers = Object.fromEntries(response.headers.entries());
@@ -818,7 +862,7 @@ class PlaywrightDynamicCollectionBrowser:
                         cache: "no-store",
                         credentials: "include",
                         headers: {Accept: accept},
-                        redirect: "manual",
+                        redirect: "follow",
                         signal: controller.signal
                     });
                     return {
