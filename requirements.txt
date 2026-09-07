@@ -35,7 +35,10 @@ tiktoken==0.9.0
 trafilatura==2.0.0
 uvicorn[standard]==0.47.0
 websockets==16.0
-networkx==3.6.1
+# NetworkX 3.5+ requires Python 3.11. Keep the supported Python 3.10 worker
+# line installable without changing the graph behavior used by this project.
+networkx==3.4.2; python_version < "3.11"
+networkx==3.6.1; python_version >= "3.11"
 igraph==1.0.0
 jsonschema==4.26.0
 leidenalg==0.11.0
