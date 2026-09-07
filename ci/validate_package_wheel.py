@@ -13,6 +13,7 @@ from zipfile import BadZipFile, ZipFile
 
 REQUIRED_FILES = {
     "lawa_rag/__init__.py",
+    "lawa_rag/_website_validation.py",
     "lawa_rag/config.py",
     "lawa_rag/contracts.py",
     "lawa_rag/evaluation.py",
@@ -24,9 +25,14 @@ REQUIRED_FILES = {
     "lawa_rag/retrieval.py",
     "lawa_rag/runner.py",
     "lawa_rag/service.py",
+    "lawa_rag/website_collections.py",
+    "lawa_rag/website_config.py",
+    "lawa_rag/websites.py",
     "pipeline/__init__.py",
     "pipeline/configs/default.yaml",
     "pipeline/configs/mbzuai_production.yaml",
+    "pipeline/configs/website_generic.yaml",
+    "pipeline/core/document_schemas.py",
 }
 
 

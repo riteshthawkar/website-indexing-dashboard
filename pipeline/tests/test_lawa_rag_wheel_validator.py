@@ -50,7 +50,7 @@ def test_wheel_validator_accepts_complete_private_distribution(tmp_path: Path) -
 
     assert report["valid"] is True
     assert report["version"] == "0.1.0"
-    assert report["bundled_config_count"] == 2
+    assert report["bundled_config_count"] == 3
     assert report["file_count"] == len(REQUIRED_FILES) + 1
 
 

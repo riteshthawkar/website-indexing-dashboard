@@ -75,6 +75,71 @@ substituted at their client boundary.
 The package supports Python 3.10 through 3.12. Provider credentials continue
 to come from environment variables and are never accepted as package defaults.
 
+## Generic website ingestion
+
+Website ingestion has a separate entry point and configuration preset. It does
+not inherit the MBZUAI configuration, release policy, retrieval aliases, or
+index namespaces. Existing MBZUAI jobs continue using their explicit
+`mbzuai_*` profiles, while new sites compile from `website_generic` through a
+validated `WebsiteProfile`.
+
+```python
+from lawa_rag import DynamicCollection, IndexingPipeline, WebsiteProfile
+
+profile = WebsiteProfile(
+    site_id="university-docs",
+    start_urls=("https://www.example.edu/",),
+    allowed_hosts=("www.example.edu", "careers.example.edu"),
+    languages=("en", "ar"),
+    sitemap_urls=("https://www.example.edu/sitemap.xml",),
+    dynamic_collections=(
+        DynamicCollection(
+            id="faculty",
+            url="/faculty",
+            item_selector="main article",
+            next_selector='button[aria-label="Next Page"]',
+            minimum_items=1,
+        ),
+    ),
+)
+
+pipeline = IndexingPipeline.for_website(
+    profile,
+    overrides={"chunker": {"target_tokens": 500}},
+    run_id="candidate-001",
+)
+```
+
+The profile owns website identity, exact allowed hosts, seeds, sitemap origins,
+robots behavior, and SPA traversal definitions. General overrides may tune
+conversion, quality, chunking, and runtime settings, but cannot replace those
+boundaries or inject tenant-specific stages. Bypassing robots directives
+requires `RobotsPolicy.AUTHORIZED_OVERRIDE` plus a non-empty authorization note
+that is retained in the resolved run configuration.
+
+Generic profiles also disable the historical MBZUAI capture heuristics. The
+compatibility pipeline keeps their previous default behavior, but generic
+sites do not inherit MBZUAI title stripping, shell-text detection, or
+faculty-page boilerplate rules.
+
+The initial generic preset ends at lossless chunks:
+
+```text
+WebsiteProfile
+  -> crawl and preserve raw artifacts
+  -> raw-content quality gate
+  -> clean HTML
+  -> convert downloaded documents and HTML
+  -> provenance-aware deduplication
+  -> multilingual, heading-aware chunking
+```
+
+This is intentionally the shared ingestion boundary for future source types.
+Document-folder/object-storage and database connectors will emit the same
+normalized document, media, provenance, and deletion records before entering
+deduplication and chunking. They therefore will not duplicate the downstream
+representation, embedding, graph, vector-store, evaluation, or release logic.
+
 ## Run an indexing pipeline
 
 ```python
@@ -191,6 +256,9 @@ The public boundary is intentionally split by one responsibility per module:
 lawa_rag/
 ├── config.py          configuration loading
 ├── contracts.py       custom-stage and artifact interfaces
+├── websites.py        validated website source profiles
+├── website_config.py  protected generic pipeline compilation
+├── website_collections.py typed SPA/pagination contracts
 ├── runner.py          validated and resumable execution
 ├── results.py         immutable plan, stage, and run results
 ├── release.py         read-only release inspection
@@ -209,11 +277,15 @@ normally be substantially smaller.
 
 ## Planned increments
 
-1. Move backend-neutral answer orchestration and streaming event schemas behind
+1. Add document, object-storage, and incremental database source profiles that
+   converge on the normalized corpus boundary.
+2. Extend the generic website preset from chunks through Representation V2,
+   graph construction, provider-selected embedding, evaluation, and promotion.
+3. Move backend-neutral answer orchestration and streaming event schemas behind
    `lawa_rag.agent` adapters.
-2. Add explicit embedding and vector-store provider protocols plus conformance
+4. Add explicit embedding and vector-store provider protocols plus conformance
    tests for Gemini, Pinecone, and pgvector.
-3. Split optional conversion providers into smaller extras if external teams
+5. Split optional conversion providers into smaller extras if external teams
    need a lighter crawler-only installation.
-4. Publish immutable wheels to the internal registry only after API and supply-
+6. Publish immutable wheels to the internal registry only after API and supply-
    chain CI checks are enabled.

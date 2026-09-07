@@ -17,6 +17,8 @@ from .results import (
     PipelineRun,
     PipelineValidationReport,
 )
+from .website_config import build_website_config
+from .websites import WebsiteProfile
 
 
 _T = TypeVar("_T")
@@ -68,6 +70,19 @@ class IndexingPipeline:
             on_stage_complete=on_stage_complete,
             on_log=on_log,
         )
+
+    @classmethod
+    def for_website(
+        cls,
+        profile: WebsiteProfile,
+        *,
+        overrides: Mapping[str, Any] | None = None,
+        **runner_options: Any,
+    ) -> "IndexingPipeline":
+        """Create the canonical generic website pipeline for ``profile``."""
+
+        config = build_website_config(profile, overrides=overrides)
+        return cls(config, **runner_options)
 
     @classmethod
     def from_config(

@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 import lawa_rag
 import pipeline
-from lawa_rag import IndexingPipeline, load_pipeline_config
+from lawa_rag import IndexingPipeline, WebsiteProfile, load_pipeline_config
 from lawa_rag.retrieval import (
     AdaptiveHybridRetriever,
     PgVectorStore,
@@ -70,6 +70,27 @@ def _smoke_production_plan(root: Path) -> int:
     if work_dir.exists():
         raise RuntimeError("planning or validation unexpectedly wrote a run directory")
     return len(plan)
+
+
+def _smoke_generic_website_profile() -> int:
+    profile = WebsiteProfile(
+        site_id="installed-wheel-docs",
+        start_urls=("https://docs.example.com/",),
+        allowed_hosts=("docs.example.com", "www.example.com"),
+        languages=("en", "ar"),
+    )
+    config = IndexingPipeline.for_website(profile).config
+    plugins = [stage["plugin"] for stage in config["stages"]]
+    if config["source_profile"]["kind"] != "website":
+        raise RuntimeError("generic website source identity was not preserved")
+    if config["crawler"]["allowed_hosts"] != [
+        "docs.example.com",
+        "www.example.com",
+    ]:
+        raise RuntimeError("generic website exact-host boundary drifted")
+    if any("mbzuai" in plugin.lower() for plugin in plugins):
+        raise RuntimeError("generic website plan contains a tenant-specific plugin")
+    return len(plugins)
 
 
 def _smoke_retrieval(root: Path) -> dict:
@@ -136,13 +157,15 @@ def main() -> int:
 
     with tempfile.TemporaryDirectory(prefix="lawa-rag-wheel-smoke-") as value:
         root = Path(value)
+        website_stage_count = _smoke_generic_website_profile()
         stage_count = _smoke_production_plan(root)
         result = _smoke_retrieval(root)
         asyncio.run(_smoke_service(root))
 
     print(
         "installed wheel production smoke passed: "
-        f"{stage_count} stages, evidence={result['selected_chunk_ids']}"
+        f"website={website_stage_count} stages, production={stage_count} stages, "
+        f"evidence={result['selected_chunk_ids']}"
     )
     return 0
 

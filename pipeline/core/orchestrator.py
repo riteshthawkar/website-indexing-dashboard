@@ -341,6 +341,13 @@ class PipelineOrchestrator:
         cfg = self.config.get("pipeline", {})
         return cfg if isinstance(cfg, dict) else {}
 
+    def _immutable_run_requested(self) -> bool:
+        pipeline = self._pipeline_config()
+        return bool(
+            pipeline.get("production_profile", False)
+            or pipeline.get("immutable_run", False)
+        )
+
     def _write_config_snapshot(self) -> None:
         atomic_write_json(
             self.work_dir / "resolved_config.json",
@@ -365,11 +372,12 @@ class PipelineOrchestrator:
 
         snapshot_path = self.work_dir / "resolved_config.json"
         snapshot = load_json_safe(snapshot_path, None)
-        production = bool(self._pipeline_config().get("production_profile", False))
+        immutable = self._immutable_run_requested()
         if not isinstance(snapshot, dict):
-            if production:
+            if immutable:
                 raise RunConfigMismatchError(
-                    f"Cannot resume production run without a valid immutable config snapshot: {snapshot_path}"
+                    "Cannot resume an immutable run without a valid config snapshot: "
+                    f"{snapshot_path}"
                 )
             return
 
@@ -389,9 +397,10 @@ class PipelineOrchestrator:
         recorded_fingerprint = str(
             snapshot.get("production_indexing_contract_fingerprint") or ""
         ).strip()
-        if production and not recorded_fingerprint:
+        if immutable and not recorded_fingerprint:
             raise RunConfigMismatchError(
-                "Cannot resume production run because its recorded indexing fingerprint is missing"
+                "Cannot resume an immutable run because its recorded indexing "
+                "fingerprint is missing"
             )
         if recorded_fingerprint and recorded_fingerprint != actual_fingerprint:
             raise RunConfigMismatchError(
@@ -432,11 +441,17 @@ class PipelineOrchestrator:
             saved_pipeline_value if isinstance(saved_pipeline_value, dict) else {}
         )
         current_pipeline = self._pipeline_config()
-        if bool(saved_pipeline.get("production_profile", False)) or bool(
+        saved_immutable = bool(
+            saved_pipeline.get("production_profile", False)
+            or saved_pipeline.get("immutable_run", False)
+        )
+        current_immutable = bool(
             current_pipeline.get("production_profile", False)
-        ):
+            or current_pipeline.get("immutable_run", False)
+        )
+        if saved_immutable or current_immutable:
             raise RunConfigMismatchError(
-                "Cannot migrate an incomplete production run; create a new run ID"
+                "Cannot migrate an incomplete immutable run; create a new run ID"
             )
         if str(snapshot.get("run_id") or self.run_id) != self.run_id:
             raise RunConfigMismatchError(
@@ -515,7 +530,7 @@ class PipelineOrchestrator:
         )
 
     def _validate_fresh_production_run_directory(self) -> None:
-        if not bool(self._pipeline_config().get("production_profile", False)):
+        if not self._immutable_run_requested():
             return
         sentinels = (
             self.work_dir / "resolved_config.json",
@@ -526,7 +541,7 @@ class PipelineOrchestrator:
         existing = [path for path in sentinels if path.exists()]
         if existing:
             raise RunConfigMismatchError(
-                "Production run directory is already initialized; use --resume with the matching config "
+                "Immutable run directory is already initialized; use --resume with the matching config "
                 "or create a new run ID. Existing paths: "
                 + ", ".join(str(path) for path in existing)
             )

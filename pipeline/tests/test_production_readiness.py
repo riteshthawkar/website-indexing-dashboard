@@ -6245,7 +6245,7 @@ class TestDoclingConverter:
         assert "Docling pages 1-2" in merged
         assert "## Pages 3-3" in merged
         structured = json.loads(Path(result["structured_document_path"]).read_text(encoding="utf-8"))
-        assert structured["schema"] == "mbzuai_docling_page_windows.v1"
+        assert structured["schema"] == "docling_page_windows.v1"
         assert len(structured["parts"]) == 2
 
     def test_rewrite_structured_doc_image_refs_removes_sidecar_artifacts(self, tmp_dir):

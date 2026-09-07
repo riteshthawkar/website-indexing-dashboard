@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import unquote
 
 from pipeline.core.base import ConverterStage, StageContext, StageResult
+from pipeline.core.document_schemas import DOCLING_PAGE_WINDOWS_SCHEMA
 from pipeline.core.document_quality import (
     assess_markdown_document,
     prefer_fallback_candidate,
@@ -1367,7 +1368,7 @@ def _convert_large_pdf_with_docling_windows(
     atomic_write_json(
         structured_doc_path,
         {
-            "schema": "mbzuai_docling_page_windows.v1",
+            "schema": DOCLING_PAGE_WINDOWS_SCHEMA,
             "source_file": str(file_path),
             "page_count": page_count,
             "window_pages": window_pages,
