@@ -687,6 +687,7 @@ class PlaywrightDynamicCollectionBrowser:
         result = await page.evaluate(
             """async ({url, accept}) => {
                 const response = await fetch(url, {
+                    cache: "no-store",
                     credentials: "include",
                     headers: {Accept: accept},
                     redirect: "manual"

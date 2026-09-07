@@ -383,6 +383,7 @@ def test_browser_json_fetch_primes_same_origin_and_enforces_size_limit():
         "url": "https://example.com/api/items?page=1",
         "accept": "application/json",
     }
+    assert 'cache: "no-store"' in page.evaluate_calls[0][0]
 
     page.body = "payload-is-too-large"
     try:
