@@ -383,8 +383,10 @@ def test_browser_json_fetch_primes_same_origin_and_enforces_size_limit():
     assert page.evaluate_calls[0][1] == {
         "url": "https://example.com/api/items?page=1",
         "accept": "application/json",
+        "timeoutMs": 5000,
     }
     assert 'cache: "no-store"' in page.evaluate_calls[0][0]
+    assert "AbortController" in page.evaluate_calls[0][0]
 
     page.body = "payload-is-too-large"
     try:
@@ -426,7 +428,9 @@ def test_browser_binary_fetch_is_bounded_and_bypasses_cache():
 
         async def evaluate(self, script, argument):
             assert 'cache: "no-store"' in script
+            assert "AbortController" in script
             assert argument["maxBytes"] == 1024
+            assert argument["timeoutMs"] == 5000
             return {
                 "status": 200,
                 "finalUrl": argument["url"],

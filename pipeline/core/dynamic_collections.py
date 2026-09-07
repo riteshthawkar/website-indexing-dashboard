@@ -668,51 +668,62 @@ class PlaywrightDynamicCollectionBrowser:
             return status, b"", final_url, {}
 
         result = await page.evaluate(
-            """async ({url, maxBytes}) => {
-                const response = await fetch(url, {
-                    cache: "no-store",
-                    credentials: "include",
-                    redirect: "manual"
-                });
-                const headers = Object.fromEntries(response.headers.entries());
-                const declaredLength = Number(headers["content-length"] || 0);
-                if (declaredLength > maxBytes) {
+            """async ({url, maxBytes, timeoutMs}) => {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                    const response = await fetch(url, {
+                        cache: "no-store",
+                        credentials: "include",
+                        redirect: "manual",
+                        signal: controller.signal
+                    });
+                    const headers = Object.fromEntries(response.headers.entries());
+                    const declaredLength = Number(headers["content-length"] || 0);
+                    if (declaredLength > maxBytes) {
+                        return {
+                            status: response.status,
+                            finalUrl: response.url,
+                            headers,
+                            tooLarge: true,
+                            byteLength: declaredLength,
+                            bodyChunks: []
+                        };
+                    }
+                    const bytes = new Uint8Array(await response.arrayBuffer());
+                    if (bytes.byteLength > maxBytes) {
+                        return {
+                            status: response.status,
+                            finalUrl: response.url,
+                            headers,
+                            tooLarge: true,
+                            byteLength: bytes.byteLength,
+                            bodyChunks: []
+                        };
+                    }
+                    const bodyChunks = [];
+                    const chunkSize = 32766;
+                    for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                        const chunk = bytes.subarray(offset, offset + chunkSize);
+                        bodyChunks.push(btoa(String.fromCharCode(...chunk)));
+                    }
                     return {
                         status: response.status,
                         finalUrl: response.url,
                         headers,
-                        tooLarge: true,
-                        byteLength: declaredLength,
-                        bodyChunks: []
-                    };
-                }
-                const bytes = new Uint8Array(await response.arrayBuffer());
-                if (bytes.byteLength > maxBytes) {
-                    return {
-                        status: response.status,
-                        finalUrl: response.url,
-                        headers,
-                        tooLarge: true,
+                        tooLarge: false,
                         byteLength: bytes.byteLength,
-                        bodyChunks: []
+                        bodyChunks
                     };
+                } finally {
+                    clearTimeout(timeout);
                 }
-                const bodyChunks = [];
-                const chunkSize = 32766;
-                for (let offset = 0; offset < bytes.length; offset += chunkSize) {
-                    const chunk = bytes.subarray(offset, offset + chunkSize);
-                    bodyChunks.push(btoa(String.fromCharCode(...chunk)));
-                }
-                return {
-                    status: response.status,
-                    finalUrl: response.url,
-                    headers,
-                    tooLarge: false,
-                    byteLength: bytes.byteLength,
-                    bodyChunks
-                };
             }""",
-            {"url": url, "maxBytes": max(1, int(max_bytes))},
+            {
+                "url": url,
+                "maxBytes": max(1, int(max_bytes)),
+                "timeoutMs": self.timeout_ms,
+            },
         )
         if bool(result.get("tooLarge")):
             raise ValueError(
@@ -799,21 +810,28 @@ class PlaywrightDynamicCollectionBrowser:
             return status, b"", final_url, {}
 
         result = await page.evaluate(
-            """async ({url, accept}) => {
-                const response = await fetch(url, {
-                    cache: "no-store",
-                    credentials: "include",
-                    headers: {Accept: accept},
-                    redirect: "manual"
-                });
-                return {
-                    status: response.status,
-                    finalUrl: response.url,
-                    headers: Object.fromEntries(response.headers.entries()),
-                    body: await response.text()
-                };
+            """async ({url, accept, timeoutMs}) => {
+                const controller = new AbortController();
+                const timeout = setTimeout(() => controller.abort(), timeoutMs);
+                try {
+                    const response = await fetch(url, {
+                        cache: "no-store",
+                        credentials: "include",
+                        headers: {Accept: accept},
+                        redirect: "manual",
+                        signal: controller.signal
+                    });
+                    return {
+                        status: response.status,
+                        finalUrl: response.url,
+                        headers: Object.fromEntries(response.headers.entries()),
+                        body: await response.text()
+                    };
+                } finally {
+                    clearTimeout(timeout);
+                }
             }""",
-            {"url": url, "accept": accept},
+            {"url": url, "accept": accept, "timeoutMs": self.timeout_ms},
         )
         status = int(result.get("status") or 0)
         payload = str(result.get("body") or "").encode("utf-8")
