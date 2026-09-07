@@ -387,6 +387,37 @@ def test_completion_gate_requires_successful_priority_seeds():
     assert crawler.stats["priority_seed_urls_failed"] == 1
 
 
+def test_completion_gate_requires_successful_seed_inventory_with_explicit_404_policy():
+    allowed_404 = "https://preprod.mbzuai.ac.ae/annette-black-1"
+    unexpected_500 = "https://preprod.mbzuai.ac.ae/programs/current"
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.config = {
+        "require_complete_seed_inventory": True,
+        "require_successful_seed_inventory": True,
+        "seed_inventory_allowed_terminal_url_patterns": [
+            r"^https://preprod\.mbzuai\.ac\.ae/annette-black(?:-[0-9]+)?/?$"
+        ],
+    }
+    crawler.max_pages = 100
+    crawler.crawl_state = {"pending": []}
+    crawler.seed_inventory = {"urls": [allowed_404, unexpected_500]}
+    crawler.url_mapping = {
+        allowed_404: "SKIPPED_HTTP_404:browser_fetch_http_404",
+        unexpected_500: "SKIPPED_HTTP_500:browser_fetch_http_500",
+    }
+    crawler.stats = {}
+
+    errors = crawler._crawl_completion_errors()
+
+    assert len(errors) == 1
+    assert "not successfully captured" in errors[0]
+    assert unexpected_500 in errors[0]
+    assert allowed_404 not in errors[0]
+    assert crawler.stats["seed_inventory_urls_failed"] == 2
+    assert crawler.stats["seed_inventory_allowed_terminal_urls"] == 1
+    assert crawler.stats["seed_inventory_unexpected_failed_urls"] == 1
+
+
 def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     crawler = crawler_module.Crawl4AICrawler()
     crawler.stats = {"pages_failed": 0, "skipped_urls": 0}

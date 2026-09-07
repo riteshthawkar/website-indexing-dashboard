@@ -36,6 +36,12 @@ crawler:
   fail_on_empty_result: true
   fail_on_incomplete_frontier: true
   require_complete_seed_inventory: true
+  require_successful_seed_inventory: true
+  # These leaked Drupal fixture routes are present in the live search API but
+  # remained genuine 404s across six cache-bypassing browser requests. They are
+  # explicit terminal inventory evidence, not silently dropped content.
+  seed_inventory_allowed_terminal_url_patterns:
+    - "^https://preprod\\.mbzuai\\.ac\\.ae/annette-black(?:-[0-9]+)?/?$"
   require_complete_priority_seeds: true
   require_https: true
   ignore_https_errors: false

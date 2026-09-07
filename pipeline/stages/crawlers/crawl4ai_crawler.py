@@ -2788,6 +2788,31 @@ class Crawl4AICrawler(CrawlerStage):
             )
         )
         unmapped_inventory_urls = sorted(inventory_urls - mapped_urls)
+        failed_inventory_urls = sorted(
+            url
+            for url in inventory_urls & mapped_urls
+            if str((getattr(self, "url_mapping", {}) or {}).get(url) or "").startswith(
+                "SKIPPED"
+            )
+        )
+        allowed_terminal_patterns = [
+            str(value)
+            for value in (
+                self.config.get("seed_inventory_allowed_terminal_url_patterns") or []
+            )
+        ]
+        allowed_terminal_inventory_urls = sorted(
+            url
+            for url in failed_inventory_urls
+            if _crawl_skip_status(
+                (getattr(self, "url_mapping", {}) or {}).get(url)
+            )
+            in {404, 410}
+            and any(re.search(pattern, url) for pattern in allowed_terminal_patterns)
+        )
+        unexpected_failed_inventory_urls = sorted(
+            set(failed_inventory_urls) - set(allowed_terminal_inventory_urls)
+        )
         dynamic_inventory_urls = {
             normalized
             for value in (
@@ -2815,6 +2840,13 @@ class Crawl4AICrawler(CrawlerStage):
         self.stats["priority_seed_urls_unmapped"] = len(unmapped_priority_urls)
         self.stats["priority_seed_urls_failed"] = len(failed_priority_urls)
         self.stats["seed_inventory_urls_unmapped"] = len(unmapped_inventory_urls)
+        self.stats["seed_inventory_urls_failed"] = len(failed_inventory_urls)
+        self.stats["seed_inventory_allowed_terminal_urls"] = len(
+            allowed_terminal_inventory_urls
+        )
+        self.stats["seed_inventory_unexpected_failed_urls"] = len(
+            unexpected_failed_inventory_urls
+        )
         self.stats["dynamic_collection_urls_unmapped"] = len(unmapped_dynamic_urls)
         self.stats["dynamic_collection_urls_failed"] = len(failed_dynamic_urls)
 
@@ -2844,6 +2876,14 @@ class Crawl4AICrawler(CrawlerStage):
                 "Seed inventory contains URLs with no durable crawl outcome: "
                 f"unmapped={len(unmapped_inventory_urls)} "
                 f"sample={unmapped_inventory_urls[:10]}"
+            )
+        if unexpected_failed_inventory_urls and bool(
+            self.config.get("require_successful_seed_inventory", False)
+        ):
+            errors.append(
+                "Seed inventory URLs were not successfully captured: "
+                f"failed={len(unexpected_failed_inventory_urls)} "
+                f"sample={unexpected_failed_inventory_urls[:10]}"
             )
         require_dynamic = bool(
             getattr(
@@ -3160,6 +3200,30 @@ class Crawl4AICrawler(CrawlerStage):
                 except (TypeError, ValueError):
                     errors.append(
                         "crawler.transient_page_statuses values must be HTTP statuses between 400 and 599"
+                    )
+                    break
+
+        if not isinstance(
+            crawler.get("require_successful_seed_inventory", False), bool
+        ):
+            errors.append(
+                "crawler.require_successful_seed_inventory must be a boolean"
+            )
+        allowed_terminal_patterns = crawler.get(
+            "seed_inventory_allowed_terminal_url_patterns"
+        ) or []
+        if not isinstance(allowed_terminal_patterns, list):
+            errors.append(
+                "crawler.seed_inventory_allowed_terminal_url_patterns must be a list"
+            )
+        else:
+            for pattern in allowed_terminal_patterns:
+                try:
+                    re.compile(str(pattern))
+                except re.error as exc:
+                    errors.append(
+                        "crawler.seed_inventory_allowed_terminal_url_patterns "
+                        f"contains an invalid regex: {exc}"
                     )
                     break
 
