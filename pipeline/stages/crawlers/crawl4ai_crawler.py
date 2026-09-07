@@ -3280,6 +3280,14 @@ class Crawl4AICrawler(CrawlerStage):
             errors.append(
                 "crawler.attempt_http_fallback_for_browser_failures must be a boolean"
             )
+        retry_queue_position = str(
+            crawler.get("recoverable_skip_retry_queue_position", "front")
+            or "front"
+        ).strip().lower()
+        if retry_queue_position not in {"front", "tail"}:
+            errors.append(
+                "crawler.recoverable_skip_retry_queue_position must be front or tail"
+            )
         if not isinstance(crawler.get("write_markdown", True), bool):
             errors.append("crawler.write_markdown must be a boolean")
 
@@ -3474,6 +3482,10 @@ class Crawl4AICrawler(CrawlerStage):
         self.recoverable_skip_max_retries = max(
             0, int(self.config.get("recoverable_skip_max_retries", 2))
         )
+        self.recoverable_skip_retry_queue_position = str(
+            self.config.get("recoverable_skip_retry_queue_position", "front")
+            or "front"
+        ).strip().lower()
         self.max_pages = max(1, int(self.config.get("max_pages", 1000)))
         self.max_depth = max(0, int(self.config.get("max_depth", 10)))
         self.max_file_size_bytes = int(float(self.config.get("max_file_size_mb", 100)) * 1024 * 1024)
@@ -4753,9 +4765,18 @@ class Crawl4AICrawler(CrawlerStage):
             self.url_mapping.pop(url, None)
             self.url_mapping.pop(normalized, None)
             if normalized not in pending_urls:
-                # Keep the mapping's stable insertion order while prioritizing
-                # all retries ahead of work that has not yet been attempted.
-                pending.insert(len(requeued), {"url": normalized, "parent_url": None})
+                item = {"url": normalized, "parent_url": None}
+                if (
+                    getattr(self, "recoverable_skip_retry_queue_position", "front")
+                    == "tail"
+                ):
+                    # Distribute retries across the crawl so a warming route has
+                    # meaningful time to recover while untouched URLs continue.
+                    pending.append(item)
+                else:
+                    # Keep the mapping's stable insertion order while prioritizing
+                    # retries ahead of work that has not yet been attempted.
+                    pending.insert(len(requeued), item)
                 pending_urls.add(normalized)
             requeued.append(normalized)
             requeued_set.add(normalized)
@@ -6308,6 +6329,23 @@ class Crawl4AICrawler(CrawlerStage):
                 for item in (self.crawl_state.get("pending") or [])
                 if isinstance(item, dict) and item.get("url")
             ]
+            if (
+                getattr(self, "recoverable_skip_retry_queue_position", "front")
+                == "tail"
+            ):
+                retry_urls = set(self.recoverable_skip_retries)
+                pending = [
+                    *[
+                        item
+                        for item in pending
+                        if _normalize_http_url(item.get("url")) not in retry_urls
+                    ],
+                    *[
+                        item
+                        for item in pending
+                        if _normalize_http_url(item.get("url")) in retry_urls
+                    ],
+                ]
             visited = [
                 str(url)
                 for url in (self.crawl_state.get("visited") or [])
