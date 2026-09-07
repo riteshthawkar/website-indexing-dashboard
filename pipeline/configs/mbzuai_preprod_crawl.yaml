@@ -286,6 +286,8 @@ crawler:
   validate_source_html: false
   validate_source_html_mode: "never"
   parse_source_html_for_media: false
+  # Cleaning consumes html_dir directly and produces canonical Markdown later.
+  write_markdown: false
   extract_images: true
   download_page_images: false
   max_images_per_page: 30

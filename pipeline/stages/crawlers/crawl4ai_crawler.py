@@ -3170,6 +3170,8 @@ class Crawl4AICrawler(CrawlerStage):
             errors.append(
                 "crawler.attempt_http_fallback_for_browser_failures must be a boolean"
             )
+        if not isinstance(crawler.get("write_markdown", True), bool):
+            errors.append("crawler.write_markdown must be a boolean")
 
         for key in (
             "max_pages",
@@ -3355,6 +3357,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.attempt_http_fallback_for_browser_failures = bool(
             self.config.get("attempt_http_fallback_for_browser_failures", True)
         )
+        self.write_markdown = bool(self.config.get("write_markdown", True))
         self.retry_recoverable_skipped_on_resume = bool(
             self.config.get("retry_recoverable_skipped_on_resume", True)
         )
@@ -6549,21 +6552,26 @@ class Crawl4AICrawler(CrawlerStage):
             )
 
         md_path: Optional[Path] = None
-        md_text, markdown_source, markdown_quality_reason = self._extract_markdown(
-            result,
-            html=html,
-            page_url=page_url,
-            rendered_markdown=rendered_markdown,
-            capture_source=capture_source,
-            prefer_html=(dynamic_collection_augmented or seed_inventory_augmented),
-        )
-        if md_text:
-            md_path = self.md_dir / f"{html_path.stem}.md"
-            md_path.write_text(md_text, encoding="utf-8")
-            self.url_to_md_mapping[page_url] = str(md_path)
-            self.stats["markdown_written"] += 1
-        elif markdown_quality_reason:
-            self.stats["low_quality_markdown_suppressed"] += 1
+        markdown_source = ""
+        markdown_quality_reason = ""
+        if getattr(self, "write_markdown", True):
+            md_text, markdown_source, markdown_quality_reason = self._extract_markdown(
+                result,
+                html=html,
+                page_url=page_url,
+                rendered_markdown=rendered_markdown,
+                capture_source=capture_source,
+                prefer_html=(
+                    dynamic_collection_augmented or seed_inventory_augmented
+                ),
+            )
+            if md_text:
+                md_path = self.md_dir / f"{html_path.stem}.md"
+                md_path.write_text(md_text, encoding="utf-8")
+                self.url_to_md_mapping[page_url] = str(md_path)
+                self.stats["markdown_written"] += 1
+            elif markdown_quality_reason:
+                self.stats["low_quality_markdown_suppressed"] += 1
 
         if self.extract_images or self.extract_videos:
             try:
