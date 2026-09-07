@@ -529,6 +529,7 @@ def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
         "net::err_connection_aborted",
         "net::err_connection_closed",
         "net::err_connection_timed_out",
+        "browser_fetch_http_unknown",
         "skipped_no_result",
         "skipped_http_403:content_quality",
         "skipped_low_quality:content_quality:blocked_or_error_page",

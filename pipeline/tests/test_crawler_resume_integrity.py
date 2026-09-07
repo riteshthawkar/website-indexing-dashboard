@@ -171,6 +171,12 @@ def test_missing_mapped_output_is_requeued_and_stale_mapping_removed(tmp_path, m
     assert crawler.url_mapping[skipped_url] == "SKIPPED_HTTP_404"
 
 
+def test_browser_fetch_unknown_status_is_recoverable_after_resume():
+    assert crawler_module._is_recoverable_crawl_skip_reason(
+        "SKIPPED_ERROR:browser_fetch_http_unknown"
+    )
+
+
 def test_saved_http_200_error_shell_is_quarantined_and_requeued(tmp_path, monkeypatch):
     page_url = "https://example.com/intermittent"
     html_dir = tmp_path / "html"
