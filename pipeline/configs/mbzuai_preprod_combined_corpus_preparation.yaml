@@ -46,6 +46,19 @@ formatter:
         include_url_prefixes:
           - "https://mbzuai.ac.ae/wp-content/"
         include_url_less_documents: true
+        # Exact legacy document families audited in the immutable 2026-08-21
+        # source. Current documents must come from the refreshed preprod run.
+        # The provenance filter also removes their figures and media sidecars.
+        exclude_source_path_patterns:
+          - '20-21-MBZUAI-Catalogue'
+          - 'MBZUAI_University_Catalogue_2021-22'
+          - 'MBZUAI_University_Catalog_2022'
+          - 'University-Catalogue-2023-24'
+          - 'University-Catalogue-2024-2025'
+          - 'University_Catalogue(?:_[0-9a-f]{12})?\.pdf'
+          - 'MBZUAI_Executive_Prospectus_2022'
+          - 'MBZUAI_Executive_Prospectus_FInal2022'
+          - 'mep-prospectus-v3-70'
         preserve_media_ids_by_content_hash: true
         evidence:
           pipeline_state_sha256: "f13c64a15c2a0ef5ea3a31a530f089a385c969ba686179d4d9ec25ae0ca4a2b5"

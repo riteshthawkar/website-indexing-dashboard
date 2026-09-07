@@ -12,6 +12,7 @@ from PIL import Image
 from pipeline.core.artifacts import (
     ArtifactCatalog,
     build_artifact_record,
+    load_artifact_catalog,
     save_artifact_catalog,
 )
 from pipeline.core.base import StageContext, StageStatus
@@ -399,7 +400,11 @@ def test_corpus_merge_can_include_url_less_documents_without_web_leakage(tmp_pat
         producer_stage="convert_documents",
         uri=(tmp_path / "document.md").resolve().as_uri(),
         local_path=tmp_path / "document.md",
-        metadata={"source_type": "pdf", "source_url": ""},
+        metadata={
+            "source_type": "pdf",
+            "source_url": "",
+            "source_file": "/downloads/current-program-guide.pdf",
+        },
     )
     webpage = build_artifact_record(
         artifact_type="markdown",
@@ -417,6 +422,214 @@ def test_corpus_merge_can_include_url_less_documents_without_web_leakage(tmp_pat
 
     assert _source_allows_record(source, document) is True
     assert _source_allows_record(source, webpage) is False
+
+    source["exclude_source_path_patterns"] = [r"legacy-catalogue-2021"]
+    legacy_document = build_artifact_record(
+        artifact_type="markdown",
+        role="content",
+        producer_stage="convert_documents",
+        uri=(tmp_path / "document.md").resolve().as_uri(),
+        local_path=tmp_path / "document.md",
+        metadata={
+            "source_type": "pdf",
+            "source_url": "",
+            "source_file": "/downloads/Legacy-Catalogue-2021.pdf",
+        },
+    )
+    assert _source_allows_record(source, legacy_document) is False
+
+
+def test_corpus_merge_excludes_document_and_all_derived_media_by_provenance(
+    tmp_path: Path,
+):
+    source_run = _write_source_run(
+        tmp_path / "source-documents",
+        run_id="source-documents",
+        project="supplemental",
+        url="https://careers.mbzuai.ac.ae/jobs",
+        color="navy",
+    )
+    catalog = load_artifact_catalog(source_run)
+    document_media: list[dict] = []
+
+    for label, source_name, color in (
+        ("legacy", "MBZUAI_University_Catalogue_2021-22.pdf", "red"),
+        ("current", "MBZUAI_Student_Handbook_2026-27.pdf", "green"),
+    ):
+        markdown = source_run / f"{label}.md"
+        markdown.write_text(f"# {label}\n\n{label} document", encoding="utf-8")
+        structured = source_run / f"{label}.docling.json"
+        atomic_write_json(structured, {"document": label})
+        quality = source_run / f"{label}.validation.json"
+        atomic_write_json(
+            quality,
+            {"accepted": True, "selected_markdown_path": str(markdown)},
+        )
+        image_path = source_run / f"{label}-figure.png"
+        content_hash = _png(image_path, color)
+        source_file = str(source_run / "downloads" / source_name)
+        source_url = f"https://staticcdn.mbzuai.ac.ae/documents/{source_name}"
+        base_metadata = {
+            "source_type": "pdf",
+            "source_url": "",
+            "source_file": source_file,
+        }
+        catalog.extend(
+            [
+                build_artifact_record(
+                    artifact_type="markdown",
+                    role="content",
+                    producer_stage="convert_documents",
+                    uri=markdown.resolve().as_uri(),
+                    local_path=markdown,
+                    metadata=base_metadata,
+                ),
+                build_artifact_record(
+                    artifact_type="structured_document",
+                    role="docling_document",
+                    producer_stage="convert_documents",
+                    uri=structured.resolve().as_uri(),
+                    local_path=structured,
+                    metadata={
+                        **base_metadata,
+                        "source_markdown_path": str(markdown),
+                    },
+                ),
+                build_artifact_record(
+                    artifact_type="document_quality_report",
+                    role="quality_report",
+                    producer_stage="convert_documents",
+                    uri=quality.resolve().as_uri(),
+                    local_path=quality,
+                    metadata={
+                        **base_metadata,
+                        "selected_markdown_path": str(markdown),
+                    },
+                ),
+            ]
+        )
+        media_item = normalize_media_item(
+            {
+                "type": "image",
+                "id": f"document-image-{label}",
+                "url": image_path.resolve().as_uri(),
+                "source_url": source_url,
+                "source_type": "pdf",
+                "source_file": source_file,
+                "source_document_path": str(markdown),
+                "document_id": source_name.removesuffix(".pdf"),
+                "local_path": str(image_path),
+                "mime_type": "image/png",
+                "content_hash": content_hash,
+            }
+        )
+        catalog.add(
+            build_artifact_record(
+                artifact_type="extracted_image",
+                role="document_figure",
+                producer_stage="enrich_media",
+                uri=image_path.resolve().as_uri(),
+                local_path=image_path,
+                metadata=media_item,
+            )
+        )
+        document_media.append(media_item)
+
+    save_artifact_catalog(catalog, source_run)
+    atomic_write_json(
+        source_run / "document_media.json",
+        build_media_manifest(document_media, kind="document_media"),
+    )
+    existing_media = load_json_safe(source_run / "media_manifest.json")["items"]
+    atomic_write_json(
+        source_run / "media_manifest.json",
+        build_media_manifest([*existing_media, *document_media]),
+    )
+
+    work_dir = tmp_path / "combined-documents"
+    config = {
+        "formatter": {
+            "corpus_merge": {
+                "use_current_artifacts": False,
+                "source_runs": [
+                    {
+                        "run_dir": str(source_run),
+                        "project_name": "supplemental",
+                        "required_stage_ids": ["enrich_media"],
+                        "include_hosts": [
+                            "careers.mbzuai.ac.ae",
+                            "staticcdn.mbzuai.ac.ae",
+                        ],
+                        "include_url_less_documents": True,
+                        "preserve_media_ids_by_content_hash": True,
+                        "exclude_source_path_patterns": [
+                            r"MBZUAI_University_Catalogue_2021-22"
+                        ],
+                    }
+                ],
+                "require_source_audit_ok": True,
+                "minimum_source_count": 1,
+            }
+        }
+    }
+    formatter = CorpusMergeFormatter()
+    assert asyncio.run(formatter.validate_config(config)) == []
+    context = StageContext(
+        run_id="combined-documents",
+        project_name="combined-documents",
+        config=config,
+        work_dir=work_dir,
+        previous_outputs={},
+        stage_definition={
+            "id": "merge_corpora",
+            "type": "formatter",
+            "plugin": "corpus_merge",
+        },
+        stage_id="merge_corpora",
+        artifact_catalog=ArtifactCatalog(records=[]),
+    )
+
+    result = asyncio.run(formatter.execute(context))
+
+    assert result.status == StageStatus.COMPLETED
+    assert result.metrics["markdown_artifacts"] == 2  # webpage + current document
+    assert result.metrics["structured_document_artifacts"] == 1
+    assert result.metrics["extracted_image_artifacts"] == 1
+    assert result.metrics["unique_visual_content_hashes"] == 2
+    output_media = load_json_safe(result.outputs["media_manifest_file"])["items"]
+    assert {item["id"] for item in output_media} == {
+        "image-source-documents",
+        "document-image-current",
+    }
+    assert "Catalogue_2021-22" not in json.dumps(
+        [record.to_dict() for record in result.artifacts]
+    )
+    report = load_json_safe(result.outputs["corpus_merge_report_file"])
+    assert report["sources"][0]["filters"]["exclude_source_path_patterns"] == [
+        "MBZUAI_University_Catalogue_2021-22"
+    ]
+
+
+def test_corpus_merge_rejects_invalid_source_path_regex():
+    config = {
+        "formatter": {
+            "corpus_merge": {
+                "use_current_artifacts": False,
+                "source_runs": [
+                    {
+                        "run_dir": "/tmp/source",
+                        "required_stage_ids": ["enrich_media"],
+                        "exclude_source_path_patterns": ["[unclosed"],
+                    }
+                ],
+            }
+        }
+    }
+
+    errors = asyncio.run(CorpusMergeFormatter().validate_config(config))
+
+    assert len(errors) == 1
+    assert "invalid regular expression" in errors[0]
 
 
 def test_media_semantics_plan_deduplicates_by_content_hash_and_propagates(tmp_path: Path):

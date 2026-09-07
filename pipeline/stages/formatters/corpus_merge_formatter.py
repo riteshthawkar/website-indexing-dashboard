@@ -49,6 +49,51 @@ _SOURCE_FILTER_KEYS = (
     "exclude_hosts",
     "exclude_url_prefixes",
 )
+_SOURCE_PATH_PATTERN_KEYS = (
+    "include_source_path_patterns",
+    "exclude_source_path_patterns",
+)
+_DOCUMENT_SOURCE_TYPES = {
+    "doc",
+    "docx",
+    "document",
+    "epub",
+    "odt",
+    "pdf",
+    "ppt",
+    "pptx",
+    "rtf",
+    "xls",
+    "xlsx",
+}
+_DOCUMENT_SOURCE_SUFFIXES = {
+    ".doc",
+    ".docx",
+    ".epub",
+    ".odt",
+    ".pdf",
+    ".ppt",
+    ".pptx",
+    ".rtf",
+    ".xls",
+    ".xlsx",
+}
+_DOCUMENT_PROVENANCE_KEYS = (
+    "asset_uri",
+    "context_source_path",
+    "document_id",
+    "file_name",
+    "filename",
+    "final_url",
+    "md_path",
+    "original_filename",
+    "source_document_path",
+    "source_file",
+    "source_markdown_path",
+    "source_path",
+    "source_url",
+    "url",
+)
 
 
 def _now_iso() -> str:
@@ -98,7 +143,69 @@ def _normalized_source_filters(raw_spec: Mapping[str, Any]) -> Dict[str, List[st
             if item:
                 normalized.add(item)
         filters[key] = sorted(normalized)
+    for key in _SOURCE_PATH_PATTERN_KEYS:
+        filters[key] = sorted(
+            {
+                str(value).strip()
+                for value in raw_spec.get(key) or []
+                if str(value).strip()
+            }
+        )
     return filters
+
+
+def _document_provenance_values(value: Mapping[str, Any]) -> List[str]:
+    values: List[str] = []
+    for key in _DOCUMENT_PROVENANCE_KEYS:
+        raw = value.get(key)
+        if raw in (None, "") or isinstance(raw, (dict, list, tuple, set)):
+            continue
+        item = str(raw).strip()
+        if item and item not in values:
+            values.append(item)
+    return values
+
+
+def _is_document_provenance(value: Mapping[str, Any]) -> bool:
+    source_type = str(value.get("source_type") or "").strip().lower()
+    if source_type in _DOCUMENT_SOURCE_TYPES:
+        return True
+    for raw in _document_provenance_values(value):
+        candidate = raw.split("?", 1)[0].split("#", 1)[0].lower()
+        if any(candidate.endswith(suffix) for suffix in _DOCUMENT_SOURCE_SUFFIXES):
+            return True
+    return False
+
+
+def _source_allows_document_provenance(
+    source: Mapping[str, Any], value: Mapping[str, Any]
+) -> bool:
+    """Apply source-path policy only to document-derived records.
+
+    URL filters remain responsible for webpages.  This independent provenance
+    gate lets a supplemental source retain its allowlisted websites while
+    excluding superseded documents and every derivative that still carries
+    the original file/URL/document identity.
+    """
+
+    if not _is_document_provenance(value):
+        return True
+    candidates = _document_provenance_values(value)
+    include_patterns = source.get("include_source_path_patterns") or []
+    exclude_patterns = source.get("exclude_source_path_patterns") or []
+    if any(
+        re.search(pattern, candidate, flags=re.IGNORECASE)
+        for pattern in exclude_patterns
+        for candidate in candidates
+    ):
+        return False
+    if include_patterns:
+        return any(
+            re.search(pattern, candidate, flags=re.IGNORECASE)
+            for pattern in include_patterns
+            for candidate in candidates
+        )
+    return True
 
 
 def _source_allows_url(source: Mapping[str, Any], value: Any) -> bool:
@@ -136,8 +243,11 @@ def _record_source_urls(record: ArtifactRecord) -> List[str]:
 
 
 def _source_allows_record(source: Mapping[str, Any], record: ArtifactRecord) -> bool:
+    metadata = dict(record.metadata or {})
+    if not _source_allows_document_provenance(source, metadata):
+        return False
     if record.artifact_type in _IMAGE_ARTIFACT_TYPES:
-        content_hash = str((record.metadata or {}).get("content_hash") or "").lower()
+        content_hash = str(metadata.get("content_hash") or "").lower()
         if content_hash and content_hash in set(
             source.get("allowed_page_media_hashes") or []
         ):
@@ -147,7 +257,7 @@ def _source_allows_record(source: Mapping[str, Any], record: ArtifactRecord) -> 
     )
     urls = _record_source_urls(record)
     if not urls:
-        source_type = str((record.metadata or {}).get("source_type") or "").strip().lower()
+        source_type = str(metadata.get("source_type") or "").strip().lower()
         if bool(source.get("include_url_less_documents", False)) and source_type not in {
             "",
             "html",
@@ -219,6 +329,25 @@ def _allowed_page_media_associations(
         content_hash: sorted(urls)
         for content_hash, urls in sorted(associations.items())
     }
+
+
+def _source_allows_media_item(
+    source: Mapping[str, Any], raw_item: Mapping[str, Any]
+) -> bool:
+    if not _source_allows_document_provenance(source, raw_item):
+        return False
+    source_url = _normalized_url(raw_item.get("source_url"))
+    content_hash = str(raw_item.get("content_hash") or "").lower()
+    if content_hash in set(source.get("allowed_page_media_hashes") or []):
+        return True
+    source_type = str(raw_item.get("source_type") or "").strip().lower()
+    url_less_document = bool(source.get("include_url_less_documents", False)) and (
+        not source_url and source_type not in {"", "html", "web", "webpage"}
+    )
+    return bool(
+        (source_url and _source_allows_url(source, source_url))
+        or url_less_document
+    )
 
 
 def _preferred_media_ids_by_content_hash(
@@ -593,21 +722,7 @@ def _merge_media_manifest_items(
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
         for raw_item in load_media_manifest_items(payload):
-            source_url = _normalized_url(raw_item.get("source_url"))
-            content_hash = str(raw_item.get("content_hash") or "").lower()
-            page_associated = content_hash in set(
-                source.get("allowed_page_media_hashes") or []
-            )
-            source_type = str(raw_item.get("source_type") or "").strip().lower()
-            url_less_document = bool(source.get("include_url_less_documents", False)) and (
-                not source_url
-                and source_type not in {"", "html", "web", "webpage"}
-            )
-            if not (
-                page_associated
-                or (source_url and _source_allows_url(source, source_url))
-                or url_less_document
-            ):
+            if not _source_allows_media_item(source, raw_item):
                 continue
             item = normalize_media_item(
                 _remap_paths(_filtered_record_metadata(source, raw_item), path_map)
@@ -912,6 +1027,25 @@ class CorpusMergeFormatter(FormatterStage):
                         f"formatter.corpus_merge.source_runs[{index}].{filter_key} "
                         "must be a list of non-empty strings"
                     )
+            for pattern_key in _SOURCE_PATH_PATTERN_KEYS:
+                values = raw.get(pattern_key)
+                if values is not None and (
+                    not isinstance(values, list)
+                    or not all(isinstance(value, str) and value.strip() for value in values)
+                ):
+                    errors.append(
+                        f"formatter.corpus_merge.source_runs[{index}].{pattern_key} "
+                        "must be a list of non-empty regular expressions"
+                    )
+                    continue
+                for value in values or []:
+                    try:
+                        re.compile(value, flags=re.IGNORECASE)
+                    except re.error as exc:
+                        errors.append(
+                            f"formatter.corpus_merge.source_runs[{index}].{pattern_key} "
+                            f"contains an invalid regular expression {value!r}: {exc}"
+                        )
             if raw.get("include_url_less_documents") is not None and not isinstance(
                 raw.get("include_url_less_documents"), bool
             ):
@@ -1242,7 +1376,7 @@ class CorpusMergeFormatter(FormatterStage):
                         "filters": {
                             **{
                                 key: list(source.get(key) or [])
-                                for key in _SOURCE_FILTER_KEYS
+                                for key in (*_SOURCE_FILTER_KEYS, *_SOURCE_PATH_PATTERN_KEYS)
                             },
                             "include_url_less_documents": bool(
                                 source.get("include_url_less_documents", False)
