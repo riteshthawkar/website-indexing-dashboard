@@ -196,6 +196,16 @@ crawler:
     Accept-Language: "en-US,en;q=0.9,ar;q=0.8"
     X-Crawler-Name: "MBZUAIKnowledgeIndexer"
     X-Crawler-Purpose: "authorized-preproduction-search-index"
+  # Cloudflare Access now protects the refreshed preproduction application.
+  # Only environment-variable names are persisted in the immutable run; the
+  # service-token values are resolved in memory and never logged or snapshotted.
+  request_header_env:
+    - name: "CF-Access-Client-Id"
+      env: "CLOUDFLARE_ACCESS_CLIENT_ID"
+      required: true
+    - name: "CF-Access-Client-Secret"
+      env: "CLOUDFLARE_ACCESS_CLIENT_SECRET"
+      required: true
 
   # These routes anchor every major information architecture branch even if a
   # client-rendered menu or listing fails to expose one during a crawl.

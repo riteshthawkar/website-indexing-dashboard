@@ -42,6 +42,10 @@ from pipeline.core.dynamic_collections import (
 )
 from pipeline.core.media import dedupe_media_items
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe, safe_filename
+from pipeline.core.request_headers import (
+    request_header_config_errors,
+    resolve_request_headers,
+)
 from pipeline.core.registry import register_stage
 from pipeline.core.sitemap_cohorts import (
     finalize_evidence,
@@ -2801,6 +2805,13 @@ class Crawl4AICrawler(CrawlerStage):
                 "crawler.validate_source_html_mode must be always, on_quality_warning, or never"
             )
 
+        errors.extend(
+            request_header_config_errors(
+                crawler.get("headers"),
+                crawler.get("request_header_env"),
+            )
+        )
+
         for key in (
             "max_pages",
             "fetch_concurrency",
@@ -2905,6 +2916,13 @@ class Crawl4AICrawler(CrawlerStage):
     async def execute(self, ctx: StageContext) -> StageResult:
         self.ctx = ctx
         self.config = dict(ctx.crawler_config)
+        try:
+            self.request_headers = resolve_request_headers(
+                self.config.get("headers"),
+                self.config.get("request_header_env"),
+            )
+        except ValueError as exc:
+            return StageResult.failure(str(exc))
         self.start_url = _normalize_http_url(self.config.get("start_url"))
         if not self.start_url:
             return StageResult.failure("crawler.start_url is missing or invalid")
@@ -4129,10 +4147,9 @@ class Crawl4AICrawler(CrawlerStage):
         return requeued
 
     async def _open_http_session(self) -> None:
-        headers = {}
-        config_headers = self.config.get("headers")
-        if isinstance(config_headers, dict):
-            headers.update({str(k): str(v) for k, v in config_headers.items()})
+        headers = dict(
+            getattr(self, "request_headers", self.config.get("headers") or {})
+        )
 
         user_agent = self.config.get("user_agent")
         if user_agent and "User-Agent" not in headers:
@@ -4355,7 +4372,11 @@ class Crawl4AICrawler(CrawlerStage):
             return list(urls)
 
         headers: Dict[str, str] = {}
-        config_headers = self.config.get("headers")
+        config_headers = getattr(
+            self,
+            "request_headers",
+            self.config.get("headers") or {},
+        )
         if isinstance(config_headers, dict):
             headers.update(
                 {
@@ -4754,7 +4775,11 @@ class Crawl4AICrawler(CrawlerStage):
             "headless": self.headless,
             "timeout_sec": self.timeout,
             "user_agent": str(self.config.get("user_agent") or ""),
-            "headers": self.config.get("headers") or {},
+            "headers": getattr(
+                self,
+                "request_headers",
+                self.config.get("headers") or {},
+            ),
             "ignore_https_errors": self.ignore_https_errors,
             "viewport": self.config.get("viewport"),
             "proxy": self.proxy,
@@ -5238,7 +5263,11 @@ class Crawl4AICrawler(CrawlerStage):
             "headless": self.headless,
             "ignore_https_errors": self.ignore_https_errors,
             "user_agent": self.config.get("user_agent"),
-            "headers": self.config.get("headers"),
+            "headers": getattr(
+                self,
+                "request_headers",
+                self.config.get("headers"),
+            ),
             "cookies": self.config.get("cookies") or None,
             "proxy": self.proxy,
             "proxy_config": self.config.get("proxy_config"),
@@ -6318,7 +6347,11 @@ class Crawl4AICrawler(CrawlerStage):
         """
 
         headers: Dict[str, str] = {}
-        config_headers = self.config.get("headers")
+        config_headers = getattr(
+            self,
+            "request_headers",
+            self.config.get("headers") or {},
+        )
         if isinstance(config_headers, dict):
             headers.update(
                 {

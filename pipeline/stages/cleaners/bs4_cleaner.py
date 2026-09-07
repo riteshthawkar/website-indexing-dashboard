@@ -69,6 +69,15 @@ ERROR_PAGE_HEADING = re.compile(
     r"(?:404(?:\s+(?:error|not\s+found))?|page\s+not\s+found)\s*[.!]?\s*$"
 )
 
+DISCLOSURE_CONTAINER_NAMES = {
+    "accordioncontent",
+    "accordion-content",
+    "accordioncollapse",
+    "accordion-collapse",
+    "disclosurecontent",
+    "disclosure-content",
+}
+
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -89,6 +98,144 @@ def _safe_tag_attr(tag, name: str, default=None):
         return default
     value = attrs.get(name, default)
     return default if value is None else value
+
+
+def _attribute_tokens(tag, name: str) -> set[str]:
+    value = _safe_tag_attr(tag, name, [])
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, (list, tuple, set)):
+        return set()
+    return {
+        str(token).strip().casefold()
+        for token in value
+        if str(token).strip()
+    }
+
+
+def _strip_hidden_style(style: Any) -> str:
+    """Remove only CSS declarations that collapse disclosure text."""
+
+    retained: List[str] = []
+    for declaration in str(style or "").split(";"):
+        declaration = declaration.strip()
+        if not declaration:
+            continue
+        property_name, separator, value = declaration.partition(":")
+        normalized_property = property_name.strip().casefold()
+        normalized_value = re.sub(r"\s+", "", value.casefold())
+        if separator and (
+            (normalized_property == "display" and normalized_value == "none")
+            or (
+                normalized_property == "visibility"
+                and normalized_value in {"hidden", "collapse"}
+            )
+        ):
+            continue
+        retained.append(declaration)
+    return "; ".join(retained)
+
+
+def _disclosure_region_is_semantic(tag, controlled_ids: set[str]) -> bool:
+    attrs = getattr(tag, "attrs", None)
+    if not isinstance(attrs, dict):
+        return False
+    if tag.find_parent(["nav", "header", "footer", "aside"]):
+        return False
+    text = tag.get_text(" ", strip=True)
+    if len(text) < 8 or len(text.split()) < 2:
+        return False
+
+    element_id = str(attrs.get("id") or "").strip()
+    pc_name = str(attrs.get("data-pc-name") or "").strip().casefold()
+    class_tokens = _attribute_tokens(tag, "class")
+    inside_accordion_panel = tag.find_parent(
+        attrs={"data-pc-name": "accordionpanel"}
+    ) is not None
+    has_label_contract = bool(
+        str(attrs.get("aria-labelledby") or "").strip()
+        and str(attrs.get("role") or "").strip().casefold() == "region"
+    )
+    return bool(
+        (element_id and element_id in controlled_ids)
+        or pc_name in DISCLOSURE_CONTAINER_NAMES
+        or class_tokens.intersection(DISCLOSURE_CONTAINER_NAMES)
+        or (inside_accordion_panel and has_label_contract)
+    )
+
+
+def _find_disclosure_trigger(soup, region):
+    panel = region.find_parent(attrs={"data-pc-name": "accordionpanel"})
+    if panel is None:
+        panel = region.find_parent(
+            class_=lambda value: value
+            and "accordion" in " ".join(
+                value if isinstance(value, list) else [value]
+            ).casefold()
+        )
+    if panel is not None:
+        trigger = panel.find(attrs={"data-pc-name": "accordionheader"})
+        if trigger is None:
+            trigger = panel.find(["button", "summary"])
+        if trigger is not None:
+            return trigger
+
+    region_id = str(_safe_tag_attr(region, "id", "")).strip()
+    if region_id:
+        for candidate in soup.find_all(attrs={"aria-controls": True}):
+            controls = str(_safe_tag_attr(candidate, "aria-controls", "")).split()
+            if region_id in controls:
+                return candidate
+    labelled_by = str(_safe_tag_attr(region, "aria-labelledby", "")).strip()
+    if labelled_by:
+        return soup.find(id=labelled_by)
+    return None
+
+
+def preserve_accessible_disclosures(soup) -> int:
+    """Expose public collapsed panels while leaving arbitrary hidden DOM out."""
+
+    controlled_ids = {
+        control_id
+        for trigger in soup.find_all(attrs={"aria-controls": True})
+        for control_id in str(_safe_tag_attr(trigger, "aria-controls", "")).split()
+        if control_id
+    }
+    preserved = 0
+    converted_triggers: set[int] = set()
+    for region in list(soup.find_all(True)):
+        if not _disclosure_region_is_semantic(region, controlled_ids):
+            continue
+        attrs = getattr(region, "attrs", None)
+        if not isinstance(attrs, dict):
+            continue
+        attrs.pop("hidden", None)
+        if str(attrs.get("aria-hidden", "")).strip().casefold() == "true":
+            attrs.pop("aria-hidden", None)
+        cleaned_style = _strip_hidden_style(attrs.get("style", ""))
+        if cleaned_style:
+            attrs["style"] = cleaned_style
+        else:
+            attrs.pop("style", None)
+        attrs["data-indexer-visible-disclosure"] = "true"
+
+        trigger = _find_disclosure_trigger(soup, region)
+        if trigger is not None and id(trigger) not in converted_triggers:
+            trigger_text = trigger.get_text(" ", strip=True)
+            if trigger_text and trigger.name in {"button", "summary"}:
+                trigger.name = "h2"
+                trigger.attrs.pop("type", None)
+                converted_triggers.add(id(trigger))
+        preserved += 1
+    return preserved
+
+
+def prepare_html_for_content_extraction(raw: str) -> Tuple[str, int]:
+    """Return HTML with semantically public disclosure bodies index-visible."""
+
+    soup = BeautifulSoup(raw, "html.parser")
+    preserved = preserve_accessible_disclosures(soup)
+    return str(soup), preserved
 
 
 def _process_head(soup) -> Tuple[Optional[str], Dict[str, str]]:
@@ -131,6 +278,16 @@ def _remove_hidden(soup):
     for el in soup.find_all(True):
         attrs = getattr(el, "attrs", None)
         if not isinstance(attrs, dict):
+            continue
+
+        if str(attrs.get("data-indexer-visible-disclosure", "")).lower() == "true":
+            attrs.pop("hidden", None)
+            attrs.pop("aria-hidden", None)
+            cleaned_style = _strip_hidden_style(attrs.get("style", ""))
+            if cleaned_style:
+                attrs["style"] = cleaned_style
+            else:
+                attrs.pop("style", None)
             continue
 
         if "hidden" in attrs or str(attrs.get("aria-hidden", "")).lower() == "true":
@@ -226,6 +383,7 @@ def _is_structural_error_page(soup: BeautifulSoup) -> bool:
 def clean_html_content(raw: str, preserve_media: bool = False) -> Tuple[str, Optional[str]]:
     """Clean HTML content and return (status, cleaned_html)."""
     soup = BeautifulSoup(raw, "html.parser")
+    preserve_accessible_disclosures(soup)
     if _is_structural_error_page(soup):
         return "removed", None
 

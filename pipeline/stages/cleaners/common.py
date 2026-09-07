@@ -106,6 +106,7 @@ def validate_cleaner_policy_config(config: Mapping[str, Any]) -> List[str]:
         ("include_tables", True),
         ("include_links", True),
         ("preserve_embedded_media", True),
+        ("preserve_disclosure_content", True),
         ("recursive", True),
     ):
         if not isinstance(config.get(key, default), bool):

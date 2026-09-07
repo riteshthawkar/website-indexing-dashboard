@@ -19,7 +19,10 @@ from pipeline.core.io import (
     reset_stage_output_directory,
 )
 from pipeline.core.registry import register_stage
-from pipeline.stages.cleaners.bs4_cleaner import clean_html_content
+from pipeline.stages.cleaners.bs4_cleaner import (
+    clean_html_content,
+    prepare_html_for_content_extraction,
+)
 from pipeline.stages.cleaners.common import (
     CleaningPolicy,
     content_meets_policy,
@@ -125,6 +128,7 @@ class TrafilaturaCleaner(CleanerStage):
         logger.info("Trafilatura cleaner found %d HTML files", len(files))
 
         fallback_cleaned = 0
+        preserved_disclosures = 0
         content_artifacts = []
         dispositions: List[Dict[str, Any]] = []
 
@@ -178,10 +182,18 @@ class TrafilaturaCleaner(CleanerStage):
                 dispositions.append(disposition)
                 continue
 
+            prepared_raw = raw
+            disclosure_count = 0
+            if config.get("preserve_disclosure_content", True):
+                prepared_raw, disclosure_count = prepare_html_for_content_extraction(raw)
+                preserved_disclosures += disclosure_count
+                if disclosure_count:
+                    disposition["preserved_disclosure_count"] = disclosure_count
+
             extraction_error = None
             try:
                 text = trafilatura.extract(
-                    raw,
+                    prepared_raw,
                     include_tables=include_tables,
                     include_images=include_images,
                     include_links=include_links,
@@ -202,7 +214,7 @@ class TrafilaturaCleaner(CleanerStage):
             if not text or not content_meets_policy(selected_metrics, policy):
                 try:
                     fallback_status, fallback_html = clean_html_content(
-                        raw,
+                        prepared_raw,
                         preserve_media=config.get(
                             "preserve_embedded_media",
                             ctx.crawler_config.get("extract_images", True)
@@ -346,11 +358,12 @@ class TrafilaturaCleaner(CleanerStage):
         )
 
         logger.info(
-            "Trafilatura cleaner done: accepted=%d filtered=%d failed=%d retention=%.3f",
+            "Trafilatura cleaner done: accepted=%d filtered=%d failed=%d retention=%.3f disclosures=%d",
             gate["accepted_count"],
             gate["filtered_count"],
             gate["failed_count"],
             gate["retention_ratio"],
+            preserved_disclosures,
         )
 
         outputs = {
@@ -365,6 +378,7 @@ class TrafilaturaCleaner(CleanerStage):
             "removed": gate["filtered_count"],
             "errors": gate["failed_count"],
             "fallback_cleaned": fallback_cleaned,
+            "preserved_disclosures": preserved_disclosures,
             "retention_ratio": gate["retention_ratio"],
         }
         if not gate["ok"]:

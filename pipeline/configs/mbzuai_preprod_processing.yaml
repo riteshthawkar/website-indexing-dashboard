@@ -23,6 +23,7 @@ quality:
   maximum_error_ratio: 0.0
 
 cleaner:
+  preserve_disclosure_content: true
   fail_on_empty_input: true
   fail_on_zero_output: true
   minimum_retention_ratio: 0.75
