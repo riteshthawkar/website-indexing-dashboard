@@ -379,3 +379,8 @@ def test_terminal_http_statuses_are_not_retried_as_browser_failures():
     assert crawler_module._should_retry_page_failure(301)
     assert crawler_module._should_retry_page_failure(403)
     assert crawler_module._should_retry_page_failure(503)
+
+
+def test_site_specific_transient_statuses_can_include_preprod_404():
+    assert crawler_module._should_retry_page_failure(404, {404, 500})
+    assert not crawler_module._should_retry_page_failure(410, {404, 500})

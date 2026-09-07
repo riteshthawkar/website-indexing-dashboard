@@ -25,6 +25,7 @@ import ssl
 import time
 import xml.etree.ElementTree as ET
 from functools import lru_cache
+from http.cookies import SimpleCookie
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -33,6 +34,7 @@ from urllib.robotparser import RobotFileParser
 
 import aiohttp
 from bs4 import BeautifulSoup
+from yarl import URL
 
 from pipeline.core.base import CrawlerStage, StageContext, StageResult
 from pipeline.core.dynamic_collections import (
@@ -353,18 +355,64 @@ def _compact_failure_reason(value: Any, *, max_chars: int = 220) -> str:
     return text[:max_chars]
 
 
-def _should_retry_page_failure(status_code: Any) -> bool:
+def _should_retry_page_failure(
+    status_code: Any,
+    additional_statuses: Optional[Iterable[int]] = None,
+) -> bool:
     """Retry transient, anti-bot, redirect, and missing-status browser failures."""
     try:
         status = int(status_code) if status_code is not None else None
     except (TypeError, ValueError):
         status = None
+    configured_statuses = {
+        int(value)
+        for value in (additional_statuses or [])
+        if str(value).strip().isdigit()
+    }
     return (
         status is None
         or status in RETRYABLE_STATUSES
+        or status in configured_statuses
         or status in SAFE_REDIRECT_STATUSES
         or status == 403
     )
+
+
+def _parse_environment_cookie_header(value: Any) -> Dict[str, str]:
+    """Parse an environment-backed Cookie header without persisting its value."""
+
+    text = str(value or "").strip()
+    if not text:
+        return {}
+    parsed = SimpleCookie()
+    try:
+        parsed.load(text)
+    except Exception as exc:
+        raise ValueError("Crawler credential cookie is malformed") from exc
+    cookies = {
+        str(name): str(morsel.value)
+        for name, morsel in parsed.items()
+        if str(name).strip() and str(morsel.value)
+    }
+    if not cookies:
+        raise ValueError("Crawler credential cookie is malformed")
+    return cookies
+
+
+def _browser_cookie_records(
+    cookies: Mapping[str, str],
+    start_url: str,
+) -> List[Dict[str, Any]]:
+    parsed = urlparse(start_url)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        raise ValueError("Crawler start URL is invalid for scoped credentials")
+    origin = f"{parsed.scheme}://{parsed.hostname}"
+    if parsed.port:
+        origin = f"{origin}:{parsed.port}"
+    return [
+        {"name": name, "value": value, "url": f"{origin}/"}
+        for name, value in cookies.items()
+    ]
 
 
 def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
@@ -394,6 +442,11 @@ def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
         "skipped_low_quality:content_quality:blocked_or_error_page",
     )
     return any(token in text for token in recoverable_tokens)
+
+
+def _crawl_skip_status(value: Any) -> Optional[int]:
+    match = re.match(r"^skipped_http_(\d{3})(?::|$)", str(value or "").lower())
+    return int(match.group(1)) if match else None
 
 
 def _is_benign_browser_close_error(exc: BaseException) -> bool:
@@ -2812,6 +2865,21 @@ class Crawl4AICrawler(CrawlerStage):
             )
         )
 
+        transient_page_statuses = crawler.get("transient_page_statuses") or []
+        if not isinstance(transient_page_statuses, list):
+            errors.append("crawler.transient_page_statuses must be a list")
+        else:
+            for value in transient_page_statuses:
+                try:
+                    status = int(value)
+                    if status < 400 or status > 599:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    errors.append(
+                        "crawler.transient_page_statuses values must be HTTP statuses between 400 and 599"
+                    )
+                    break
+
         for key in (
             "max_pages",
             "fetch_concurrency",
@@ -2926,6 +2994,21 @@ class Crawl4AICrawler(CrawlerStage):
         self.start_url = _normalize_http_url(self.config.get("start_url"))
         if not self.start_url:
             return StageResult.failure("crawler.start_url is missing or invalid")
+        environment_cookie_header = ""
+        for header_name in list(self.request_headers):
+            if str(header_name).casefold() == "cookie":
+                environment_cookie_header = self.request_headers.pop(header_name)
+                break
+        try:
+            self.environment_cookies = _parse_environment_cookie_header(
+                environment_cookie_header
+            )
+            self.environment_browser_cookies = _browser_cookie_records(
+                self.environment_cookies,
+                self.start_url,
+            )
+        except ValueError as exc:
+            return StageResult.failure(str(exc))
 
         if AsyncWebCrawler is None or BrowserConfig is None or CrawlerRunConfig is None:
             return StageResult.failure("crawl4ai is not installed")
@@ -2950,6 +3033,10 @@ class Crawl4AICrawler(CrawlerStage):
         self.sitemap_failed_retry_backoff = max(
             0.0, float(self.config.get("sitemap_failed_retry_backoff_sec", 2.0))
         )
+        self.transient_page_statuses = {
+            int(value)
+            for value in (self.config.get("transient_page_statuses") or [])
+        }
         self.retry_recoverable_skipped_on_resume = bool(
             self.config.get("retry_recoverable_skipped_on_resume", True)
         )
@@ -4083,7 +4170,11 @@ class Crawl4AICrawler(CrawlerStage):
         exhausted = 0
         for url, reason in list(self.url_mapping.items()):
             normalized = _normalize_http_url(url)
-            if not normalized or not _is_recoverable_crawl_skip_reason(reason):
+            skip_status = _crawl_skip_status(reason)
+            if not normalized or not (
+                _is_recoverable_crawl_skip_reason(reason)
+                or skip_status in getattr(self, "transient_page_statuses", set())
+            ):
                 continue
             recoverable_mapping_urls.add(normalized)
             if normalized in requeued_set:
@@ -4156,6 +4247,12 @@ class Crawl4AICrawler(CrawlerStage):
             headers["User-Agent"] = str(user_agent)
 
         cookie_jar = aiohttp.CookieJar(unsafe=True)
+        environment_cookies = getattr(self, "environment_cookies", {})
+        if environment_cookies:
+            cookie_jar.update_cookies(
+                environment_cookies,
+                response_url=URL(self.start_url),
+            )
         for cookie in self.config.get("cookies") or []:
             if not isinstance(cookie, dict):
                 continue
@@ -4780,6 +4877,10 @@ class Crawl4AICrawler(CrawlerStage):
                 "request_headers",
                 self.config.get("headers") or {},
             ),
+            "cookies": [
+                *(self.config.get("cookies") or []),
+                *getattr(self, "environment_browser_cookies", []),
+            ],
             "ignore_https_errors": self.ignore_https_errors,
             "viewport": self.config.get("viewport"),
             "proxy": self.proxy,
@@ -5259,6 +5360,10 @@ class Crawl4AICrawler(CrawlerStage):
         return True
 
     def _build_browser_config(self) -> BrowserConfig:
+        browser_cookies = [
+            *(self.config.get("cookies") or []),
+            *getattr(self, "environment_browser_cookies", []),
+        ]
         browser_kwargs = {
             "headless": self.headless,
             "ignore_https_errors": self.ignore_https_errors,
@@ -5268,7 +5373,7 @@ class Crawl4AICrawler(CrawlerStage):
                 "request_headers",
                 self.config.get("headers"),
             ),
-            "cookies": self.config.get("cookies") or None,
+            "cookies": browser_cookies or None,
             "proxy": self.proxy,
             "proxy_config": self.config.get("proxy_config"),
             "enable_stealth": self.enable_stealth,
@@ -5571,7 +5676,8 @@ class Crawl4AICrawler(CrawlerStage):
                 recovered = 0
                 for url, failure in failed_batch_urls.items():
                     if _should_retry_page_failure(
-                        failure.get("status_code")
+                        failure.get("status_code"),
+                        getattr(self, "transient_page_statuses", set()),
                     ) and await self._recover_url_with_http_retry(url):
                         recovered += 1
                         processed_page_urls.append(url)
@@ -6237,7 +6343,10 @@ class Crawl4AICrawler(CrawlerStage):
                                 attempt,
                                 self.raw_source_retry_attempts,
                             )
-                            if not _should_retry_page_failure(response.status):
+                            if not _should_retry_page_failure(
+                                response.status,
+                                getattr(self, "transient_page_statuses", set()),
+                            ):
                                 return "", response.status
                             continue
                         return await response.text(), response.status
@@ -6338,12 +6447,13 @@ class Crawl4AICrawler(CrawlerStage):
 
     @contextlib.asynccontextmanager
     async def _fresh_cookie_isolated_download_session(self):
-        """Yield a short-lived session without long-lived affinity cookies.
+        """Yield a short-lived session without mutable affinity cookies.
 
         This is deliberately a normal request using the configured user agent,
         proxy, timeout, and TLS policy.  It is not an access-control bypass; it
         only prevents a transient cookie/connection affinity block in the main
         crawl session from making an otherwise public same-site PDF unavailable.
+        Environment-backed Access cookies remain scoped to the configured origin.
         """
 
         headers: Dict[str, str] = {}
@@ -6369,11 +6479,20 @@ class Crawl4AICrawler(CrawlerStage):
             ssl=False if self.ignore_https_errors else _build_verified_ssl_context(),
         )
         timeout = aiohttp.ClientTimeout(total=self.timeout)
+        environment_cookies = getattr(self, "environment_cookies", {})
+        if environment_cookies:
+            cookie_jar = aiohttp.CookieJar(unsafe=True)
+            cookie_jar.update_cookies(
+                environment_cookies,
+                response_url=URL(self.start_url),
+            )
+        else:
+            cookie_jar = aiohttp.DummyCookieJar()
         async with aiohttp.ClientSession(
             headers=headers or None,
             timeout=timeout,
             connector=connector,
-            cookie_jar=aiohttp.DummyCookieJar(),
+            cookie_jar=cookie_jar,
         ) as session:
             yield session
 

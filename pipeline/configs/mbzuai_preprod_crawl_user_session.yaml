@@ -1,0 +1,12 @@
+# Temporary one-time crawl profile for an interactive Cloudflare Access login.
+# The credential value is supplied only through the process environment and is
+# never copied into this configuration, a run snapshot, or an artifact.
+_inherit: mbzuai_preprod_crawl.yaml
+
+project_name: "mbzuai_preprod_crawl_user_session"
+
+crawler:
+  request_header_env:
+    - name: "Cookie"
+      env: "CLOUDFLARE_ACCESS_COOKIE"
+      required: true

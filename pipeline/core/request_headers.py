@@ -17,7 +17,6 @@ _ENV_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]*")
 _FORBIDDEN_HEADERS = {
     "connection",
     "content-length",
-    "cookie",
     "host",
     "proxy-connection",
     "set-cookie",
@@ -27,6 +26,7 @@ _ENVIRONMENT_ONLY_HEADERS = {
     "authorization",
     "cf-access-client-id",
     "cf-access-client-secret",
+    "cookie",
     "proxy-authorization",
     "x-api-key",
 }

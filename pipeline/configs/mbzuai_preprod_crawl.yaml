@@ -71,6 +71,22 @@ crawler:
   seed_inventory_fetch_attempts: 3
   seed_inventory_retry_backoff_sec: 0.75
 
+  # The preproduction frontend intermittently responds with a transient 404
+  # or 5xx while a deployment route is warming. Recheck these statuses with
+  # bounded backoff before accepting a page as terminally unavailable.
+  transient_page_statuses:
+    - 404
+    - 500
+    - 502
+    - 503
+    - 504
+  sitemap_failed_url_retry_attempts: 4
+  sitemap_failed_retry_backoff_sec: 1.5
+  raw_source_retry_attempts: 4
+  raw_source_retry_backoff_sec: 1.25
+  retry_recoverable_skipped_on_resume: true
+  recoverable_skip_max_retries: 2
+
   # Client-rendered directories expose only their first state to ordinary link
   # extraction.  These contracts walk the actual pagination controls first,
   # compare unique cards with the count displayed by the page, and seed every

@@ -542,6 +542,7 @@ class PlaywrightDynamicCollectionBrowser:
         timeout_sec: float,
         user_agent: str = "",
         headers: Optional[Mapping[str, Any]] = None,
+        cookies: Optional[Sequence[Mapping[str, Any]]] = None,
         ignore_https_errors: bool = False,
         viewport: Optional[Mapping[str, Any]] = None,
         proxy: Any = None,
@@ -555,6 +556,7 @@ class PlaywrightDynamicCollectionBrowser:
             for key, value in (headers or {}).items()
             if str(key).strip() and value is not None
         }
+        self.cookies = [dict(cookie) for cookie in (cookies or [])]
         self.ignore_https_errors = ignore_https_errors
         self.viewport = dict(viewport or {}) or None
         self.proxy = proxy
@@ -592,6 +594,8 @@ class PlaywrightDynamicCollectionBrowser:
         if self.storage_state:
             context_kwargs["storage_state"] = self.storage_state
         self._context = await self._browser.new_context(**context_kwargs)
+        if self.cookies:
+            await self._context.add_cookies(self.cookies)
         self._context.set_default_timeout(self.timeout_ms)
         return self
 

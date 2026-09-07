@@ -7,6 +7,10 @@ from pipeline.core.request_headers import (
     request_header_config_errors,
     resolve_request_headers,
 )
+from pipeline.stages.crawlers.crawl4ai_crawler import (
+    _browser_cookie_records,
+    _parse_environment_cookie_header,
+)
 
 
 _BINDINGS = [
@@ -82,3 +86,64 @@ def test_credential_header_value_cannot_be_persisted_in_static_config() -> None:
         "crawler.headers credential header must use request_header_env: "
         "'CF-Access-Client-Secret'"
     ]
+
+
+def test_cookie_credential_is_allowed_only_through_environment_binding() -> None:
+    binding = [
+        {
+            "name": "Cookie",
+            "env": "CLOUDFLARE_ACCESS_COOKIE",
+            "required": True,
+        }
+    ]
+    environment = {
+        "CLOUDFLARE_ACCESS_COOKIE": "CF_Authorization=short-lived-jwt"
+    }
+
+    assert request_header_config_errors(
+        {},
+        binding,
+        environ=environment,
+    ) == []
+    assert resolve_request_headers(
+        {},
+        binding,
+        environ=environment,
+    ) == {"Cookie": "CF_Authorization=short-lived-jwt"}
+    assert request_header_config_errors(
+        {"Cookie": "CF_Authorization=must-not-be-persisted"},
+        [],
+    ) == [
+        "crawler.headers credential header must use request_header_env: 'Cookie'"
+    ]
+
+
+def test_environment_cookie_is_parsed_and_scoped_to_crawl_origin() -> None:
+    parsed = _parse_environment_cookie_header(
+        "CF_Authorization=short-lived-jwt; session_hint=opaque"
+    )
+
+    assert parsed == {
+        "CF_Authorization": "short-lived-jwt",
+        "session_hint": "opaque",
+    }
+    assert _browser_cookie_records(
+        parsed,
+        "https://preprod.mbzuai.ac.ae/start",
+    ) == [
+        {
+            "name": "CF_Authorization",
+            "value": "short-lived-jwt",
+            "url": "https://preprod.mbzuai.ac.ae/",
+        },
+        {
+            "name": "session_hint",
+            "value": "opaque",
+            "url": "https://preprod.mbzuai.ac.ae/",
+        },
+    ]
+
+
+def test_malformed_environment_cookie_fails_closed() -> None:
+    with pytest.raises(ValueError, match="credential cookie is malformed"):
+        _parse_environment_cookie_header("not-a-cookie")
