@@ -471,3 +471,35 @@ def test_transient_source_404_cannot_invalidate_a_rendered_success():
     assert not crawler_module._is_authoritative_terminal_source_status(404, {404})
     assert crawler_module._is_authoritative_terminal_source_status(404, set())
     assert crawler_module._is_authoritative_terminal_source_status(410, {404})
+
+
+def test_browser_fetch_adapter_returns_processable_html_results():
+    class Browser:
+        async def fetch_html(self, url, **kwargs):
+            assert kwargs["context_url"] == "https://example.com"
+            assert kwargs["max_bytes"] == 2048
+            if url.endswith("/retry"):
+                return 503, "temporary", url, {"content-type": "text/html"}
+            return 200, "<html><body>Ready</body></html>", url, {
+                "content-type": "text/html"
+            }
+
+    adapter = crawler_module._BrowserFetchCrawlerAdapter(
+        Browser(),
+        context_url="https://example.com",
+        max_response_bytes=2048,
+        request_delay=0,
+    )
+    results = asyncio.run(
+        adapter.arun_many(
+            urls=["https://example.com/ready", "https://example.com/retry"],
+            config=SimpleNamespace(),
+        )
+    )
+
+    assert [(result.status_code, result.success) for result in results] == [
+        (200, True),
+        (503, False),
+    ]
+    assert results[0].html == "<html><body>Ready</body></html>"
+    assert results[1].error_message == "browser_fetch_http_503"

@@ -619,6 +619,43 @@ class PlaywrightDynamicCollectionBrowser:
         and the site's ordinary request contract.
         """
 
+        status, payload, _final_url, _headers = await self._fetch_text_response(
+            url,
+            context_url=context_url,
+            max_bytes=max_bytes,
+            accept="application/json",
+            reprime=reprime,
+        )
+        return status, payload
+
+    async def fetch_html(
+        self,
+        url: str,
+        *,
+        context_url: str,
+        max_bytes: int,
+        reprime: bool = False,
+    ) -> Tuple[int, str, str, Dict[str, str]]:
+        """Fetch HTML through a primed browser page without top-level navigation."""
+
+        status, payload, final_url, headers = await self._fetch_text_response(
+            url,
+            context_url=context_url,
+            max_bytes=max_bytes,
+            accept="text/html,application/xhtml+xml",
+            reprime=reprime,
+        )
+        return status, payload.decode("utf-8", errors="replace"), final_url, headers
+
+    async def _fetch_text_response(
+        self,
+        url: str,
+        *,
+        context_url: str,
+        max_bytes: int,
+        accept: str,
+        reprime: bool,
+    ) -> Tuple[int, bytes, str, Dict[str, str]]:
         if self._context is None:
             raise RuntimeError("dynamic collection browser is not open")
         parsed_url = urlparse(url)
@@ -628,7 +665,7 @@ class PlaywrightDynamicCollectionBrowser:
             or parsed_context.scheme not in {"http", "https"}
             or parsed_url.netloc.lower() != parsed_context.netloc.lower()
         ):
-            raise ValueError("browser JSON requests must be same-origin")
+            raise ValueError("browser requests must be same-origin")
 
         page = self._json_pages.get(context_url)
         if page is None or reprime:
@@ -644,26 +681,37 @@ class PlaywrightDynamicCollectionBrowser:
             )
             if response is None or int(response.status) >= 400:
                 status = int(response.status) if response is not None else 0
-                return status, b""
+                final_url = str(response.url) if response is not None else context_url
+                return status, b"", final_url, {}
 
         result = await page.evaluate(
-            """async ({url}) => {
+            """async ({url, accept}) => {
                 const response = await fetch(url, {
                     credentials: "include",
-                    headers: {Accept: "application/json"}
+                    headers: {Accept: accept},
+                    redirect: "manual"
                 });
-                return {status: response.status, body: await response.text()};
+                return {
+                    status: response.status,
+                    finalUrl: response.url,
+                    headers: Object.fromEntries(response.headers.entries()),
+                    body: await response.text()
+                };
             }""",
-            {"url": url},
+            {"url": url, "accept": accept},
         )
         status = int(result.get("status") or 0)
         payload = str(result.get("body") or "").encode("utf-8")
         if len(payload) > max(1, int(max_bytes)):
             raise ValueError(
-                "browser JSON response exceeds configured size limit "
+                "browser response exceeds configured size limit "
                 f"({int(max_bytes)} bytes)"
             )
-        return status, payload
+        headers = {
+            str(key): str(value)
+            for key, value in (result.get("headers") or {}).items()
+        }
+        return status, payload, str(result.get("finalUrl") or url), headers
 
     async def discover(
         self,

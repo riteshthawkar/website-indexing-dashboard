@@ -348,6 +348,70 @@ class _RobotsPolicyError(RuntimeError):
         self.status = status
 
 
+class _BrowserFetchCrawlerAdapter:
+    """Crawl adapter for origins that permit browser fetches, not repeated navigations."""
+
+    def __init__(
+        self,
+        browser: PlaywrightDynamicCollectionBrowser,
+        *,
+        context_url: str,
+        max_response_bytes: int,
+        request_delay: float,
+    ):
+        self.browser = browser
+        self.context_url = context_url
+        self.max_response_bytes = max(1, int(max_response_bytes))
+        self.request_delay = max(0.0, float(request_delay))
+
+    async def arun_many(self, *, urls: Sequence[str], config: Any) -> List[Any]:
+        del config
+        results: List[Any] = []
+        for url in urls:
+            normalized = _normalize_http_url(url)
+            if not normalized:
+                continue
+            try:
+                status, html, final_url, headers = await self.browser.fetch_html(
+                    normalized,
+                    context_url=self.context_url,
+                    max_bytes=self.max_response_bytes,
+                )
+                success = status == 200 and bool(html.strip())
+                results.append(
+                    SimpleNamespace(
+                        url=normalized,
+                        final_url=final_url,
+                        html=html,
+                        success=success,
+                        status_code=status or None,
+                        response_headers=headers,
+                        links={"internal": [], "external": []},
+                        markdown=None,
+                        error_message=(
+                            "" if success else f"browser_fetch_http_{status or 'unknown'}"
+                        ),
+                    )
+                )
+            except Exception as exc:
+                results.append(
+                    SimpleNamespace(
+                        url=normalized,
+                        final_url="",
+                        html="",
+                        success=False,
+                        status_code=None,
+                        response_headers={},
+                        links={"internal": [], "external": []},
+                        markdown=None,
+                        error_message=f"browser_fetch_{type(exc).__name__}",
+                    )
+                )
+            if self.request_delay:
+                await asyncio.sleep(self.request_delay)
+        return results
+
+
 def _compact_failure_reason(value: Any, *, max_chars: int = 220) -> str:
     text = " ".join(str(value or "").split())
     if not text:
@@ -2985,6 +3049,35 @@ class Crawl4AICrawler(CrawlerStage):
                     "playwright is required when crawler.seed_inventory_transport is browser"
                 )
 
+        frontier_fetch_transport = str(
+            crawler.get("frontier_fetch_transport", "crawl4ai") or "crawl4ai"
+        ).strip().lower()
+        if frontier_fetch_transport not in {"crawl4ai", "browser_fetch"}:
+            errors.append(
+                "crawler.frontier_fetch_transport must be crawl4ai or browser_fetch"
+            )
+        elif frontier_fetch_transport == "browser_fetch":
+            try:
+                import playwright.async_api  # noqa: F401
+            except ImportError:
+                errors.append(
+                    "playwright is required when crawler.frontier_fetch_transport is browser_fetch"
+                )
+            browser_fetch_context_url = _normalize_http_url(
+                crawler.get("browser_fetch_context_url") or start_url,
+                str(start_url or ""),
+            )
+            context_host = (
+                urlparse(browser_fetch_context_url).hostname or ""
+            ).lower() if browser_fetch_context_url else ""
+            if (
+                not browser_fetch_context_url
+                or (allowed_hosts and context_host not in allowed_hosts)
+            ):
+                errors.append(
+                    "crawler.browser_fetch_context_url must use crawler.allowed_hosts"
+                )
+
         dynamic_specs, dynamic_errors = normalize_dynamic_collection_specs(
             crawler.get("dynamic_collections"),
             start_url=str(start_url or ""),
@@ -3092,6 +3185,7 @@ class Crawl4AICrawler(CrawlerStage):
             "seed_inventory_fetch_concurrency",
             "seed_inventory_max_response_bytes",
             "seed_inventory_fetch_attempts",
+            "browser_fetch_max_response_bytes",
         ):
             value = crawler.get(key)
             if value is None:
@@ -3116,6 +3210,17 @@ class Crawl4AICrawler(CrawlerStage):
             except (TypeError, ValueError):
                 errors.append(
                     "crawler.seed_inventory_request_delay_sec must be numeric and >= 0"
+                )
+        browser_fetch_request_delay = crawler.get(
+            "browser_fetch_request_delay_sec"
+        )
+        if browser_fetch_request_delay is not None:
+            try:
+                if float(browser_fetch_request_delay) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(
+                    "crawler.browser_fetch_request_delay_sec must be numeric and >= 0"
                 )
 
         for depth_key in ("max_depth", "sitemap_max_depth"):
@@ -3392,6 +3497,24 @@ class Crawl4AICrawler(CrawlerStage):
         self.seed_inventory_transport = str(
             self.config.get("seed_inventory_transport", "http") or "http"
         ).strip().lower()
+        self.frontier_fetch_transport = str(
+            self.config.get("frontier_fetch_transport", "crawl4ai") or "crawl4ai"
+        ).strip().lower()
+        self.browser_fetch_context_url = (
+            _normalize_http_url(
+                self.config.get("browser_fetch_context_url") or self.start_url,
+                self.start_url,
+            )
+            or self.start_url
+        )
+        self.browser_fetch_max_response_bytes = max(
+            1,
+            int(self.config.get("browser_fetch_max_response_bytes", 16 * 1024 * 1024)),
+        )
+        self.browser_fetch_request_delay = max(
+            0.0,
+            float(self.config.get("browser_fetch_request_delay_sec", 0.5)),
+        )
         self.dynamic_collection_specs, dynamic_collection_errors = (
             normalize_dynamic_collection_specs(
                 self.config.get("dynamic_collections"),
@@ -3629,36 +3752,70 @@ class Crawl4AICrawler(CrawlerStage):
 
             browser_config = self._build_browser_config()
             run_config = self._build_run_config()
+            use_browser_fetch_frontier = (
+                self._should_use_seed_batch_crawl()
+                and self.frontier_fetch_transport == "browser_fetch"
+            )
 
-            crawler_holder = {"crawler": AsyncWebCrawler(config=browser_config)}
-            await crawler_holder["crawler"].__aenter__()
-            try:
-                if self._should_use_seed_batch_crawl():
-                    await self._crawl_seed_frontier(crawler_holder, run_config, browser_config)
-                else:
-                    results = crawler_holder["crawler"].arun(url=self.start_url, config=run_config)
-                    if asyncio.iscoroutine(results):
-                        crawl_task = asyncio.create_task(results)
-                        watchdog = asyncio.create_task(self._watch_crawl_health(crawl_task))
-                        try:
-                            results = await crawl_task
-                        except asyncio.CancelledError:
-                            if self._crawl_watchdog_error:
-                                raise RuntimeError(self._crawl_watchdog_error) from None
-                            raise
-                        finally:
-                            watchdog.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await watchdog
-                    await self._consume_crawl_results(results)
-            finally:
+            if use_browser_fetch_frontier:
+                async with PlaywrightDynamicCollectionBrowser(
+                    **self._playwright_browser_kwargs()
+                ) as browser:
+                    adapter = _BrowserFetchCrawlerAdapter(
+                        browser,
+                        context_url=self.browser_fetch_context_url,
+                        max_response_bytes=self.browser_fetch_max_response_bytes,
+                        request_delay=self.browser_fetch_request_delay,
+                    )
+                    await self._crawl_seed_frontier(
+                        {"crawler": adapter},
+                        run_config,
+                        None,
+                    )
+            else:
+                crawler_holder = {"crawler": AsyncWebCrawler(config=browser_config)}
+                await crawler_holder["crawler"].__aenter__()
                 try:
-                    await crawler_holder["crawler"].__aexit__(None, None, None)
-                except Exception as close_exc:
-                    if _is_benign_browser_close_error(close_exc):
-                        logger.warning("Ignoring benign browser shutdown error after crawler checkpoint flush: %s", close_exc)
+                    if self._should_use_seed_batch_crawl():
+                        await self._crawl_seed_frontier(
+                            crawler_holder,
+                            run_config,
+                            browser_config,
+                        )
                     else:
-                        raise
+                        results = crawler_holder["crawler"].arun(
+                            url=self.start_url,
+                            config=run_config,
+                        )
+                        if asyncio.iscoroutine(results):
+                            crawl_task = asyncio.create_task(results)
+                            watchdog = asyncio.create_task(
+                                self._watch_crawl_health(crawl_task)
+                            )
+                            try:
+                                results = await crawl_task
+                            except asyncio.CancelledError:
+                                if self._crawl_watchdog_error:
+                                    raise RuntimeError(
+                                        self._crawl_watchdog_error
+                                    ) from None
+                                raise
+                            finally:
+                                watchdog.cancel()
+                                with contextlib.suppress(asyncio.CancelledError):
+                                    await watchdog
+                        await self._consume_crawl_results(results)
+                finally:
+                    try:
+                        await crawler_holder["crawler"].__aexit__(None, None, None)
+                    except Exception as close_exc:
+                        if _is_benign_browser_close_error(close_exc):
+                            logger.warning(
+                                "Ignoring benign browser shutdown error after crawler checkpoint flush: %s",
+                                close_exc,
+                            )
+                        else:
+                            raise
 
             self._flush_runtime_state(force=True)
 
@@ -4811,13 +4968,8 @@ class Crawl4AICrawler(CrawlerStage):
         )
         return [url for url in urls if url not in verified]
 
-    async def _discover_seed_inventory_urls(self) -> List[str]:
-        """Expand bounded JSON inventories into crawl seeds with audit evidence."""
-
-        if getattr(self, "seed_inventory_transport", "http") != "browser":
-            return await self._discover_seed_inventory_urls_with_transport()
-
-        browser_kwargs = {
+    def _playwright_browser_kwargs(self) -> Dict[str, Any]:
+        return {
             "headless": self.headless,
             "timeout_sec": self.timeout,
             "user_agent": str(self.config.get("user_agent") or ""),
@@ -4835,7 +4987,16 @@ class Crawl4AICrawler(CrawlerStage):
             "proxy": self.proxy,
             "storage_state": self.config.get("storage_state"),
         }
-        async with PlaywrightDynamicCollectionBrowser(**browser_kwargs) as browser:
+
+    async def _discover_seed_inventory_urls(self) -> List[str]:
+        """Expand bounded JSON inventories into crawl seeds with audit evidence."""
+
+        if getattr(self, "seed_inventory_transport", "http") != "browser":
+            return await self._discover_seed_inventory_urls_with_transport()
+
+        async with PlaywrightDynamicCollectionBrowser(
+            **self._playwright_browser_kwargs()
+        ) as browser:
             return await self._discover_seed_inventory_urls_with_transport(browser)
 
     async def _discover_seed_inventory_urls_with_transport(
@@ -5214,25 +5375,9 @@ class Crawl4AICrawler(CrawlerStage):
                 )
 
         results: List[Dict[str, Any]] = []
-        browser_kwargs = {
-            "headless": self.headless,
-            "timeout_sec": self.timeout,
-            "user_agent": str(self.config.get("user_agent") or ""),
-            "headers": getattr(
-                self,
-                "request_headers",
-                self.config.get("headers") or {},
-            ),
-            "cookies": [
-                *(self.config.get("cookies") or []),
-                *getattr(self, "environment_browser_cookies", []),
-            ],
-            "ignore_https_errors": self.ignore_https_errors,
-            "viewport": self.config.get("viewport"),
-            "proxy": self.proxy,
-            "storage_state": self.config.get("storage_state"),
-        }
-        async with PlaywrightDynamicCollectionBrowser(**browser_kwargs) as browser:
+        async with PlaywrightDynamicCollectionBrowser(
+            **self._playwright_browser_kwargs()
+        ) as browser:
             for spec in specs:
                 if not self._url_allowed_for_fetch(spec.url):
                     raise RuntimeError(
@@ -5917,7 +6062,12 @@ class Crawl4AICrawler(CrawlerStage):
                     return discovered
         return discovered
 
-    async def _crawl_seed_frontier(self, crawler_holder: Dict[str, Any], run_config: CrawlerRunConfig, browser_config: Any) -> None:
+    async def _crawl_seed_frontier(
+        self,
+        crawler_holder: Dict[str, Any],
+        run_config: CrawlerRunConfig,
+        browser_config: Optional[Any],
+    ) -> None:
         pending: List[Dict[str, Optional[str]]] = [
             {"url": item.get("url"), "parent_url": item.get("parent_url")}
             for item in (self.crawl_state.get("pending") or [])
@@ -6073,9 +6223,10 @@ class Crawl4AICrawler(CrawlerStage):
             )
             self._flush_runtime_state(force=True)
 
-            # Playwright headless browser recycling to prevent slow RAM memory leaks
+            # Crawl4AI page contexts need periodic recycling. The browser-fetch
+            # adapter retains one lightweight priming page and does not.
             pages_since_last_recycle = pages_crawled - last_recycle_page_count
-            if pages_since_last_recycle >= 80:
+            if browser_config is not None and pages_since_last_recycle >= 80:
                 logger.info(
                     "Recycling Playwright browser context after crawling %d pages (total: %d pages)...",
                     pages_since_last_recycle,

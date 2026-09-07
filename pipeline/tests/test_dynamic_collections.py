@@ -380,7 +380,8 @@ def test_browser_json_fetch_primes_same_origin_and_enforces_size_limit():
     assert payload == b'{"rows": []}'
     assert page.goto_calls[0][0] == "https://example.com/items"
     assert page.evaluate_calls[0][1] == {
-        "url": "https://example.com/api/items?page=1"
+        "url": "https://example.com/api/items?page=1",
+        "accept": "application/json",
     }
 
     page.body = "payload-is-too-large"

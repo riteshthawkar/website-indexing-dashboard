@@ -25,7 +25,7 @@ crawler:
   start_url: "https://preprod.mbzuai.ac.ae/"
   max_pages: 5000
   max_depth: 8
-  fetch_concurrency: 2
+  fetch_concurrency: 1
   download_concurrency: 4
   sitemap_crawl_batch_size: 20
   timeout: 45
@@ -179,6 +179,14 @@ crawler:
   seed_inventory_fetch_attempts: 6
   seed_inventory_retry_backoff_sec: 2.0
 
+  # Cloudflare permits a primed browser session to fetch same-origin content,
+  # while challenging repeated top-level browser navigations. This transport
+  # keeps one authenticated page open and captures each SSR HTML response.
+  frontier_fetch_transport: "browser_fetch"
+  browser_fetch_context_url: "https://preprod.mbzuai.ac.ae/"
+  browser_fetch_max_response_bytes: 16777216
+  browser_fetch_request_delay_sec: 0.6
+
   # The preproduction frontend intermittently responds with a transient 404
   # or 5xx while a deployment route is warming. Recheck these statuses with
   # bounded backoff before accepting a page as terminally unavailable.
@@ -193,7 +201,7 @@ crawler:
   raw_source_retry_attempts: 4
   raw_source_retry_backoff_sec: 1.25
   retry_recoverable_skipped_on_resume: true
-  recoverable_skip_max_retries: 2
+  recoverable_skip_max_retries: 6
   # Direct HTTP is deliberately challenged on this host, so browser failures
   # are retried in the browser frontier instead of wasting time on raw fallback.
   attempt_http_fallback_for_browser_failures: false
@@ -251,7 +259,7 @@ crawler:
     - "https://preprod.mbzuai.ac.ae/"
     - "https://preprod.mbzuai.ac.ae/ar"
     - "https://preprod.mbzuai.ac.ae/about-us"
-    - "https://preprod.mbzuai.ac.ae/office-the-president"
+    - "https://preprod.mbzuai.ac.ae/about-us/leadership/office-the-president"
     - "https://preprod.mbzuai.ac.ae/about-us/leadership"
     - "https://preprod.mbzuai.ac.ae/about-us/contact-us"
     - "https://preprod.mbzuai.ac.ae/research"
@@ -260,27 +268,24 @@ crawler:
     - "https://preprod.mbzuai.ac.ae/study/undergraduate-program"
     - "https://preprod.mbzuai.ac.ae/study/msc-programs"
     - "https://preprod.mbzuai.ac.ae/study/phd-programs"
-    - "https://preprod.mbzuai.ac.ae/study/faculty-directory"
     - "https://preprod.mbzuai.ac.ae/academics/faculty-directory"
     - "https://preprod.mbzuai.ac.ae/ar/academics/faculty-directory"
     - "https://preprod.mbzuai.ac.ae/admissions"
-    - "https://preprod.mbzuai.ac.ae/admissions/undergraduate-admissions"
+    - "https://preprod.mbzuai.ac.ae/admissions-aid/undergraduate-admissions"
     - "https://preprod.mbzuai.ac.ae/graduate-masters-admissions"
-    - "https://preprod.mbzuai.ac.ae/admissions/graduate-phd-admissions"
+    - "https://preprod.mbzuai.ac.ae/admissions-aid/graduate-phd-admissions"
     - "https://preprod.mbzuai.ac.ae/innovation-partnerships"
     - "https://preprod.mbzuai.ac.ae/campus-community"
     - "https://preprod.mbzuai.ac.ae/news-events"
-    - "https://preprod.mbzuai.ac.ae/the-node"
     - "https://preprod.mbzuai.ac.ae/news-events/news"
     - "https://preprod.mbzuai.ac.ae/news-events/events"
-    - "https://preprod.mbzuai.ac.ae/events"
     - "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
 
   # The headed browser capture is authoritative for this protected SPA. Raw
   # validation requests are blocked by the WAF and add no independent signal.
   validate_source_html: false
   validate_source_html_mode: "never"
-  parse_source_html_for_media: true
+  parse_source_html_for_media: false
   extract_images: true
   download_page_images: false
   max_images_per_page: 30
