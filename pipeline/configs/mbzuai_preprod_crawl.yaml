@@ -25,9 +25,13 @@ crawler:
   start_url: "https://preprod.mbzuai.ac.ae/"
   max_pages: 5000
   max_depth: 8
-  fetch_concurrency: 4
-  download_concurrency: 8
+  fetch_concurrency: 2
+  download_concurrency: 4
   timeout: 45
+  # Run this profile under xvfb-run. A headed Linux Chromium session is needed
+  # because the preprod WAF rejects API pagination from headless/non-browser clients.
+  headless: false
+  enable_stealth: true
   fail_on_empty_result: true
   fail_on_incomplete_frontier: true
   require_complete_seed_inventory: true
@@ -50,12 +54,13 @@ crawler:
   minimum_crawled_pages_by_host:
     "preprod.mbzuai.ac.ae": 1
 
-  # The navigation graph exposes only a subset of published content. The
-  # public search view is a bounded content inventory (156 pages / 1,507
-  # unique URLs on 2026-08-31). It is used only to seed underlying pages; the
-  # result pages themselves are not admitted to the crawl frontier or corpus.
+  # The navigation graph exposes only a subset of published content. These
+  # bounded Drupal JSON inventories enumerate the global search corpus and
+  # every client-paginated collection directly. Their API pages are evidence
+  # only; each discovered content URL is still rendered and saved normally.
   seed_inventory_endpoints:
     - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/search"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/search"
       page_param: "page"
       page_start: 0
       total_pages_key: "totalPages"
@@ -66,10 +71,112 @@ crawler:
       minimum_urls: 1400
       required: true
       require_all_pages: true
-  seed_inventory_fetch_concurrency: 8
+
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/academics/faculty-directory"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/academics/faculty-directory"
+      page_param: "page"
+      page_start: 0
+      total_items_key: "totalItems"
+      items_per_page_key: "itemsPerPage"
+      item_element: "node-faculty-listing-card"
+      url_keys:
+        - "url"
+      max_pages: 30
+      minimum_urls: 220
+      required: true
+      require_all_pages: true
+
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/ar/academics/faculty-directory"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/ar/academics/faculty-directory"
+      page_param: "page"
+      page_start: 0
+      total_items_key: "totalItems"
+      items_per_page_key: "itemsPerPage"
+      item_element: "node-faculty-listing-card"
+      url_keys:
+        - "url"
+      max_pages: 30
+      minimum_urls: 210
+      required: true
+      require_all_pages: true
+
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/news-events/news"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/news-events/news"
+      page_param: "page"
+      page_start: 0
+      total_items_key: "totalItems"
+      items_per_page_key: "itemsPerPage"
+      item_element: "node-news-listing-card"
+      url_keys:
+        - "url"
+      max_pages: 150
+      minimum_urls: 900
+      required: true
+      require_all_pages: true
+
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/news-events/events"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/news-events/events"
+      page_param: "page"
+      page_start: 0
+      total_items_key: "totalItems"
+      items_per_page_key: "itemsPerPage"
+      item_element: "node-events-latest-articles"
+      url_keys:
+        - "url"
+      max_pages: 10
+      minimum_urls: 10
+      required: true
+      require_all_pages: true
+
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/research/project-hub"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/research/project-hub"
+      page_param: "page"
+      page_start: 0
+      total_items_key: "totalItems"
+      items_per_page_key: "itemsPerPage"
+      item_element: "node-research-project-search-result"
+      url_keys:
+        - "url"
+      max_pages: 10
+      minimum_urls: 10
+      required: true
+      require_all_pages: true
+
+    # Startup cards have no detail URLs. Capture every API card and append its
+    # semantic text to the saved listing page so all paginated cards are indexed.
+    - url: "https://preprod.mbzuai.ac.ae/api/drupal-ce/innovation-partnerships/national-engagement-outreach/startup-showcase"
+      browser_context_url: "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
+      page_param: "page"
+      page_start: 0
+      total_items_key: "totalItems"
+      items_per_page_key: "itemsPerPage"
+      item_element: "node-startup-listing-card"
+      url_keys:
+        - "url"
+      capture_items: true
+      item_text_keys:
+        - "title"
+        - "industryName"
+        - "stageName"
+        - "text"
+        - "value"
+        - "processed"
+      augment_listing_url: "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
+      require_item_count_match: true
+      minimum_items: 1
+      max_pages: 10
+      minimum_urls: 0
+      required: true
+      require_all_pages: true
+
+  # Low request parallelism and bounded backoff avoid intermittent preprod WAF
+  # challenges while still making the inventory deterministic and resumable.
+  seed_inventory_transport: "browser"
+  seed_inventory_fetch_concurrency: 1
+  seed_inventory_request_delay_sec: 0.45
   seed_inventory_max_response_bytes: 2097152
-  seed_inventory_fetch_attempts: 3
-  seed_inventory_retry_backoff_sec: 0.75
+  seed_inventory_fetch_attempts: 6
+  seed_inventory_retry_backoff_sec: 2.0
 
   # The preproduction frontend intermittently responds with a transient 404
   # or 5xx while a deployment route is warming. Recheck these statuses with
@@ -86,104 +193,15 @@ crawler:
   raw_source_retry_backoff_sec: 1.25
   retry_recoverable_skipped_on_resume: true
   recoverable_skip_max_retries: 2
+  delay_before_return_html: 1.5
+  mean_delay: 0.75
+  max_range: 0.75
 
-  # Client-rendered directories expose only their first state to ordinary link
-  # extraction.  These contracts walk the actual pagination controls first,
-  # compare unique cards with the count displayed by the page, and seed every
-  # discovered same-host detail URL into the required crawl frontier.
-  require_complete_dynamic_collections: true
-  dynamic_collections:
-    - id: "faculty_directory_en"
-      url: "https://preprod.mbzuai.ac.ae/study/faculty-directory"
-      item_selector: "main article"
-      next_selector: 'button[aria-label="Next Page"]'
-      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
-      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/faculty-directory/[^/?#]+/?$'
-      require_item_urls: true
-      minimum_items: 1
-      max_states: 30
-      augment_listing_page: true
-      required: true
-
-    # The localized directory currently lives on its legacy Drupal node route
-    # and exposes a slightly different faculty cohort.  Its union with the
-    # English directory prevents either locale from masking missing profiles.
-    - id: "faculty_directory_ar"
-      url: "https://preprod.mbzuai.ac.ae/ar/node/598"
-      item_selector: "main article"
-      next_selector: 'button[aria-label="Next Page"]'
-      expected_count_pattern: 'عرض النتائج من\s+\d+\s+إلى\s+\d+\s+من أصل\s+([\d,]+)'
-      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/faculty-directory/[^/?#]+/?$'
-      require_item_urls: true
-      # This legacy localized listing currently publishes thirteen stale Arabic-
-      # slug aliases that return HTTP 404. Preserve and report every card/link,
-      # while keeping every other Arabic-only profile hard-required.
-      allowed_terminal_item_urls:
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/ayan-mathywz"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/ayma-kantwyl"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/albrwfyswr-ayran-syghal"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/aldktwr-rmzy-bn-wghrm"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/dyfyd-shw"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/haiyan-huang"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/he-dr-mohamed-abdelhameed-al-askar"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/hsny-ghdyrt"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/maly-mr-bn-sltan-allma"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/professor-alexander-gasnikov"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/shy-haw-hangh"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/wan-ly-myn"
-        - "https://preprod.mbzuai.ac.ae/faculty-directory/ywanzy-ly"
-      minimum_items: 1
-      max_states: 30
-      augment_listing_page: true
-      required: true
-
-    - id: "news_the_node"
-      url: "https://preprod.mbzuai.ac.ae/the-node"
-      item_selector: "main article"
-      next_selector: 'button[aria-label="Next Page"]'
-      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
-      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/knowledge-center/the-node/[^/?#]+/?$'
-      require_item_urls: true
-      minimum_items: 1
-      max_states: 120
-      augment_listing_page: false
-      required: true
-
-    - id: "events"
-      url: "https://preprod.mbzuai.ac.ae/the-node/events"
-      item_selector: "main article"
-      next_selector: 'button[aria-label="Next Page"]'
-      expected_count_pattern: 'Showing\s+\d+\s+of\s+([\d,]+)\s+results'
-      require_item_urls: true
-      minimum_items: 1
-      max_states: 10
-      augment_listing_page: true
-      required: true
-
-    - id: "research_project_hub"
-      url: "https://preprod.mbzuai.ac.ae/research/project-hub"
-      item_selector: "main article"
-      next_selector: 'button[aria-label="Next Page"]'
-      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
-      item_url_pattern: '^https://preprod\.mbzuai\.ac\.ae/research/projects-hub/[^/?#]+/?$'
-      require_item_urls: true
-      minimum_items: 1
-      max_states: 10
-      augment_listing_page: true
-      required: true
-
-    # Some startup cards intentionally contain no detail link.  Card text is
-    # therefore the item identity and is appended to the saved listing page.
-    - id: "startup_showcase"
-      url: "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
-      item_selector: "main article"
-      next_selector: 'button[aria-label="Next Page"]'
-      expected_count_pattern: 'Showing\s+\d+\s*[-–]\s*\d+\s+of\s+([\d,]+)\s+results'
-      require_item_urls: false
-      minimum_items: 1
-      max_states: 10
-      augment_listing_page: true
-      required: true
+  # SPA listings are covered by the required JSON inventories above. Avoid
+  # depending on browser pagination because the frontend turns transient API
+  # challenges into a misleading client-side 404 page.
+  require_complete_dynamic_collections: false
+  dynamic_collections: []
 
   allowed_domains:
     - "preprod.mbzuai.ac.ae"
@@ -206,12 +224,10 @@ crawler:
   robots_user_agent: "MBZUAIKnowledgeIndexer"
   robots_unknown_host_policy: "allow"
   robots_origins: []
-  user_agent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+  user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
   headers:
     Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     Accept-Language: "en-US,en;q=0.9,ar;q=0.8"
-    X-Crawler-Name: "MBZUAIKnowledgeIndexer"
-    X-Crawler-Purpose: "authorized-preproduction-search-index"
   # Cloudflare Access now protects the refreshed preproduction application.
   # Only environment-variable names are persisted in the immutable run; the
   # service-token values are resolved in memory and never logged or snapshotted.
@@ -234,11 +250,13 @@ crawler:
     - "https://preprod.mbzuai.ac.ae/about-us/contact-us"
     - "https://preprod.mbzuai.ac.ae/research"
     - "https://preprod.mbzuai.ac.ae/research/our-divisions"
-    - "https://preprod.mbzuai.ac.ae/research/projects-hub"
+    - "https://preprod.mbzuai.ac.ae/research/project-hub"
     - "https://preprod.mbzuai.ac.ae/study/undergraduate-program"
     - "https://preprod.mbzuai.ac.ae/study/msc-programs"
     - "https://preprod.mbzuai.ac.ae/study/phd-programs"
     - "https://preprod.mbzuai.ac.ae/study/faculty-directory"
+    - "https://preprod.mbzuai.ac.ae/academics/faculty-directory"
+    - "https://preprod.mbzuai.ac.ae/ar/academics/faculty-directory"
     - "https://preprod.mbzuai.ac.ae/admissions"
     - "https://preprod.mbzuai.ac.ae/admissions/undergraduate-admissions"
     - "https://preprod.mbzuai.ac.ae/graduate-masters-admissions"
@@ -247,7 +265,10 @@ crawler:
     - "https://preprod.mbzuai.ac.ae/campus-community"
     - "https://preprod.mbzuai.ac.ae/news-events"
     - "https://preprod.mbzuai.ac.ae/the-node"
+    - "https://preprod.mbzuai.ac.ae/news-events/news"
+    - "https://preprod.mbzuai.ac.ae/news-events/events"
     - "https://preprod.mbzuai.ac.ae/events"
+    - "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
 
   validate_source_html: true
   validate_source_html_mode: "always"

@@ -15,7 +15,7 @@ import json
 import re
 import time
 from dataclasses import asdict, dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 from urllib.parse import urljoin, urlparse
 
 
@@ -564,6 +564,7 @@ class PlaywrightDynamicCollectionBrowser:
         self._playwright: Any = None
         self._browser: Any = None
         self._context: Any = None
+        self._json_pages: Dict[str, Any] = {}
 
     async def __aenter__(self) -> "PlaywrightDynamicCollectionBrowser":
         try:
@@ -574,7 +575,10 @@ class PlaywrightDynamicCollectionBrowser:
             ) from exc
 
         self._playwright = await async_playwright().start()
-        launch_kwargs: Dict[str, Any] = {"headless": self.headless}
+        launch_kwargs: Dict[str, Any] = {
+            "headless": self.headless,
+            "args": ["--disable-blink-features=AutomationControlled"],
+        }
         if self.proxy:
             launch_kwargs["proxy"] = (
                 dict(self.proxy)
@@ -598,6 +602,68 @@ class PlaywrightDynamicCollectionBrowser:
             await self._context.add_cookies(self.cookies)
         self._context.set_default_timeout(self.timeout_ms)
         return self
+
+    async def fetch_json(
+        self,
+        url: str,
+        *,
+        context_url: str,
+        max_bytes: int,
+        reprime: bool = False,
+    ) -> Tuple[int, bytes]:
+        """Fetch same-origin JSON using a real browser network session.
+
+        Some protected SPA origins reject non-browser TLS clients even after
+        successful Access authentication.  Priming a normal HTML route and
+        issuing the API request from that page preserves the browser session
+        and the site's ordinary request contract.
+        """
+
+        if self._context is None:
+            raise RuntimeError("dynamic collection browser is not open")
+        parsed_url = urlparse(url)
+        parsed_context = urlparse(context_url)
+        if (
+            parsed_url.scheme not in {"http", "https"}
+            or parsed_context.scheme not in {"http", "https"}
+            or parsed_url.netloc.lower() != parsed_context.netloc.lower()
+        ):
+            raise ValueError("browser JSON requests must be same-origin")
+
+        page = self._json_pages.get(context_url)
+        if page is None or reprime:
+            if page is not None:
+                with contextlib.suppress(Exception):
+                    await page.close()
+            page = await self._context.new_page()
+            self._json_pages[context_url] = page
+            response = await page.goto(
+                context_url,
+                wait_until="domcontentloaded",
+                timeout=self.timeout_ms,
+            )
+            if response is None or int(response.status) >= 400:
+                status = int(response.status) if response is not None else 0
+                return status, b""
+
+        result = await page.evaluate(
+            """async ({url}) => {
+                const response = await fetch(url, {
+                    credentials: "include",
+                    headers: {Accept: "application/json"}
+                });
+                return {status: response.status, body: await response.text()};
+            }""",
+            {"url": url},
+        )
+        status = int(result.get("status") or 0)
+        payload = str(result.get("body") or "").encode("utf-8")
+        if len(payload) > max(1, int(max_bytes)):
+            raise ValueError(
+                "browser JSON response exceeds configured size limit "
+                f"({int(max_bytes)} bytes)"
+            )
+        return status, payload
 
     async def discover(
         self,

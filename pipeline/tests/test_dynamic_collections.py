@@ -2,6 +2,7 @@ import asyncio
 
 from pipeline.core.dynamic_collections import (
     DynamicCollectionSpec,
+    PlaywrightDynamicCollectionBrowser,
     PlaywrightDynamicCollectionPage,
     normalize_dynamic_collection_specs,
     walk_dynamic_collection,
@@ -336,3 +337,75 @@ def test_completion_gate_reports_but_does_not_require_stale_collection_aliases()
     assert errors == []
     assert crawler.stats["dynamic_collection_urls_unmapped"] == 0
     assert crawler.stats["dynamic_collection_urls_failed"] == 0
+
+
+def test_browser_json_fetch_primes_same_origin_and_enforces_size_limit():
+    class Response:
+        status = 200
+
+    class Page:
+        def __init__(self):
+            self.goto_calls = []
+            self.evaluate_calls = []
+            self.body = '{"rows": []}'
+
+        async def goto(self, url, **kwargs):
+            self.goto_calls.append((url, kwargs))
+            return Response()
+
+        async def evaluate(self, script, argument):
+            self.evaluate_calls.append((script, argument))
+            return {"status": 200, "body": self.body}
+
+    class Context:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_page(self):
+            return self.page
+
+    page = Page()
+    browser = PlaywrightDynamicCollectionBrowser(headless=False, timeout_sec=5)
+    browser._context = Context(page)
+
+    status, payload = asyncio.run(
+        browser.fetch_json(
+            "https://example.com/api/items?page=1",
+            context_url="https://example.com/items",
+            max_bytes=1024,
+        )
+    )
+
+    assert status == 200
+    assert payload == b'{"rows": []}'
+    assert page.goto_calls[0][0] == "https://example.com/items"
+    assert page.evaluate_calls[0][1] == {
+        "url": "https://example.com/api/items?page=1"
+    }
+
+    page.body = "payload-is-too-large"
+    try:
+        asyncio.run(
+            browser.fetch_json(
+                "https://example.com/api/items?page=2",
+                context_url="https://example.com/items",
+                max_bytes=5,
+            )
+        )
+    except ValueError as exc:
+        assert "exceeds configured size limit" in str(exc)
+    else:
+        raise AssertionError("oversized browser JSON response must be rejected")
+
+    try:
+        asyncio.run(
+            browser.fetch_json(
+                "https://outside.example/api/items",
+                context_url="https://example.com/items",
+                max_bytes=1024,
+            )
+        )
+    except ValueError as exc:
+        assert "same-origin" in str(exc)
+    else:
+        raise AssertionError("cross-origin browser JSON fetch must be rejected")

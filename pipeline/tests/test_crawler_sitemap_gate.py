@@ -233,6 +233,12 @@ def test_json_seed_inventory_extracts_only_configured_result_items():
     }
 
     assert crawler_module._seed_inventory_total_pages(payload, "totalPages") == 3
+    assert crawler_module._seed_inventory_total_pages(
+        {"pager_info": {"totalItems": 228, "itemsPerPage": 12}},
+        "totalPages",
+        total_items_key="totalItems",
+        items_per_page_key="itemsPerPage",
+    ) == 19
     assert crawler_module._extract_seed_inventory_urls(
         payload,
         base_url="https://preprod.mbzuai.ac.ae/",
@@ -247,6 +253,81 @@ def test_json_seed_inventory_extracts_only_configured_result_items():
         "page",
         2,
     ) == "https://preprod.mbzuai.ac.ae/api/drupal-ce/search?lang=en&page=2"
+
+
+def test_json_seed_inventory_captures_card_only_semantic_items():
+    payload = {
+        "pager_info": {"totalItems": 2, "itemsPerPage": 1},
+        "rows": [
+            {
+                "element": "node-startup-listing-card",
+                "props": {
+                    "title": "Ortho AI",
+                    "industryName": "Healthcare and pharma",
+                    "stageName": "Building in beta",
+                },
+                "slots": {
+                    "description": {
+                        "processed": "<p>Clinical workflow platform.</p>"
+                    }
+                },
+            }
+        ],
+    }
+
+    assert crawler_module._extract_seed_inventory_items(
+        payload,
+        base_url="https://preprod.mbzuai.ac.ae/",
+        item_element="node-startup-listing-card",
+        url_keys=["url"],
+        text_keys=["title", "industryName", "stageName", "processed"],
+    ) == [
+        {
+            "item_id": crawler_module.hashlib.sha256(
+                (
+                    "Ortho AI | Healthcare and pharma | Building in beta | "
+                    "Clinical workflow platform."
+                ).encode("utf-8")
+            ).hexdigest(),
+            "text": (
+                "Ortho AI | Healthcare and pharma | Building in beta | "
+                "Clinical workflow platform."
+            ),
+            "urls": [],
+        }
+    ]
+
+
+def test_seed_inventory_card_items_are_appended_to_saved_listing_html():
+    crawler = crawler_module.Crawl4AICrawler()
+    listing_url = "https://preprod.mbzuai.ac.ae/startups"
+    crawler.seed_inventory = {
+        "endpoints": [
+            {
+                "url": "https://preprod.mbzuai.ac.ae/api/startups",
+                "augment_listing_url": listing_url,
+                "expected_item_count": 2,
+                "captured_item_count": 2,
+                "fetched_pages": 2,
+                "items": [
+                    {"item_id": "one", "text": "Startup One", "urls": []},
+                    {"item_id": "two", "text": "Startup Two", "urls": []},
+                ],
+            }
+        ]
+    }
+    crawler.stats = {}
+
+    augmented, changed = crawler._augment_seed_inventory_html(
+        listing_url,
+        "<html><body><main><h1>Startups</h1></main></body></html>",
+    )
+
+    assert changed is True
+    assert "Collected 2 of 2 listed items across 2 API pages." in augmented
+    assert "Startup One" in augmented
+    assert "Startup Two" in augmented
+    assert crawler.stats["seed_inventory_pages_augmented"] == 1
 
 
 def test_completion_gate_rejects_pending_or_unmapped_inventory_urls():
@@ -384,3 +465,9 @@ def test_terminal_http_statuses_are_not_retried_as_browser_failures():
 def test_site_specific_transient_statuses_can_include_preprod_404():
     assert crawler_module._should_retry_page_failure(404, {404, 500})
     assert not crawler_module._should_retry_page_failure(410, {404, 500})
+
+
+def test_transient_source_404_cannot_invalidate_a_rendered_success():
+    assert not crawler_module._is_authoritative_terminal_source_status(404, {404})
+    assert crawler_module._is_authoritative_terminal_source_status(404, set())
+    assert crawler_module._is_authoritative_terminal_source_status(410, {404})

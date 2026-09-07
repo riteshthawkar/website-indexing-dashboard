@@ -378,6 +378,27 @@ def _should_retry_page_failure(
     )
 
 
+def _is_authoritative_terminal_source_status(
+    status_code: Any,
+    transient_statuses: Optional[Iterable[int]] = None,
+) -> bool:
+    """Return whether source validation may invalidate a rendered success."""
+
+    try:
+        status = int(status_code) if status_code is not None else None
+    except (TypeError, ValueError):
+        return False
+    configured_transient_statuses = {
+        int(value)
+        for value in (transient_statuses or [])
+        if str(value).strip().isdigit()
+    }
+    return (
+        status in AUTHORITATIVE_TERMINAL_PAGE_STATUSES
+        and status not in configured_transient_statuses
+    )
+
+
 def _parse_environment_cookie_header(value: Any) -> Dict[str, str]:
     """Parse an environment-backed Cookie header without persisting its value."""
 
@@ -1284,8 +1305,10 @@ def _iter_json_objects(value: Any) -> Iterable[Dict[str, Any]]:
             yield from _iter_json_objects(child)
 
 
-def _seed_inventory_total_pages(payload: Any, key: str) -> Optional[int]:
+def _seed_inventory_positive_int(payload: Any, key: str) -> Optional[int]:
     values: List[int] = []
+    if not key:
+        return None
     for item in _iter_json_objects(payload):
         value = item.get(key)
         if isinstance(value, bool):
@@ -1297,6 +1320,25 @@ def _seed_inventory_total_pages(payload: Any, key: str) -> Optional[int]:
         if parsed > 0:
             values.append(parsed)
     return max(values) if values else None
+
+
+def _seed_inventory_total_pages(
+    payload: Any,
+    key: str,
+    *,
+    total_items_key: str = "",
+    items_per_page_key: str = "",
+) -> Optional[int]:
+    explicit_pages = _seed_inventory_positive_int(payload, key)
+    if explicit_pages:
+        return explicit_pages
+
+    if total_items_key and items_per_page_key:
+        total_items = _seed_inventory_positive_int(payload, total_items_key)
+        items_per_page = _seed_inventory_positive_int(payload, items_per_page_key)
+        if total_items and items_per_page:
+            return max(1, math.ceil(total_items / items_per_page))
+    return None
 
 
 def _extract_seed_inventory_urls(
@@ -1326,6 +1368,61 @@ def _extract_seed_inventory_urls(
                     urls.append(normalized)
 
     return urls
+
+
+def _extract_seed_inventory_items(
+    payload: Any,
+    *,
+    base_url: str,
+    item_element: str,
+    url_keys: Sequence[str],
+    text_keys: Sequence[str],
+) -> List[Dict[str, Any]]:
+    """Extract compact semantic records from one paginated JSON response."""
+
+    normalized_element = str(item_element or "").strip()
+    normalized_url_keys = list(
+        dict.fromkeys(str(value).strip() for value in url_keys if str(value).strip())
+    )
+    normalized_text_keys = list(
+        dict.fromkeys(str(value).strip() for value in text_keys if str(value).strip())
+    )
+    records: List[Dict[str, Any]] = []
+    for item in _iter_json_objects(payload):
+        if str(item.get("element") or "") != normalized_element:
+            continue
+        urls: List[str] = []
+        text_parts: List[str] = []
+        for candidate in _iter_json_objects(item):
+            for key in normalized_url_keys:
+                value = candidate.get(key)
+                if not isinstance(value, str):
+                    continue
+                normalized = _normalize_http_url(value, base_url)
+                if normalized and normalized not in urls:
+                    urls.append(normalized)
+            for key in normalized_text_keys:
+                value = candidate.get(key)
+                if not isinstance(value, str):
+                    continue
+                text = " ".join(
+                    BeautifulSoup(value, "html.parser").get_text(" ", strip=True).split()
+                )
+                if text and text not in text_parts:
+                    text_parts.append(text)
+        combined_text = " | ".join(text_parts)
+        if not combined_text and not urls:
+            continue
+        records.append(
+            {
+                "item_id": urls[0]
+                if urls
+                else hashlib.sha256(combined_text.encode("utf-8")).hexdigest(),
+                "text": combined_text,
+                "urls": urls,
+            }
+        )
+    return records
 
 
 def _url_with_query_param(url: str, key: str, value: int) -> str:
@@ -2779,6 +2876,30 @@ class Crawl4AICrawler(CrawlerStage):
                 errors.append(f"{label}.url must be a valid HTTPS URL")
             elif allowed_hosts and (parsed.hostname or "").lower() not in allowed_hosts:
                 errors.append(f"{label}.url must use crawler.allowed_hosts")
+            browser_context_url = str(
+                endpoint.get("browser_context_url") or ""
+            ).strip()
+            if browser_context_url:
+                normalized_context = _normalize_http_url(
+                    browser_context_url,
+                    str(start_url or ""),
+                )
+                context_parsed = urlparse(normalized_context or "")
+                if (
+                    not normalized_context
+                    or (
+                        bool(crawler.get("require_https", True))
+                        and context_parsed.scheme != "https"
+                    )
+                    or (
+                        allowed_hosts
+                        and (context_parsed.hostname or "").lower()
+                        not in allowed_hosts
+                    )
+                ):
+                    errors.append(
+                        f"{label}.browser_context_url must use crawler.allowed_hosts"
+                    )
             page_param = str(endpoint.get("page_param") or "page").strip()
             if not re.fullmatch(r"[A-Za-z0-9_.\[\]-]+", page_param):
                 errors.append(f"{label}.page_param contains unsupported characters")
@@ -2787,13 +2908,82 @@ class Crawl4AICrawler(CrawlerStage):
                 isinstance(value, str) and value.strip() for value in url_keys
             ):
                 errors.append(f"{label}.url_keys must be a non-empty list of strings")
-            for key, minimum in (("max_pages", 1), ("minimum_urls", 0)):
+            capture_items = endpoint.get("capture_items", False)
+            if not isinstance(capture_items, bool):
+                errors.append(f"{label}.capture_items must be a boolean")
+            text_keys = endpoint.get("item_text_keys") or []
+            if capture_items and (
+                not isinstance(text_keys, list)
+                or not text_keys
+                or not all(isinstance(value, str) and value.strip() for value in text_keys)
+            ):
+                errors.append(
+                    f"{label}.item_text_keys must be a non-empty list of strings when capture_items is true"
+                )
+            if capture_items and not str(endpoint.get("item_element") or "").strip():
+                errors.append(
+                    f"{label}.item_element is required when capture_items is true"
+                )
+            augment_listing_url = str(
+                endpoint.get("augment_listing_url") or ""
+            ).strip()
+            if augment_listing_url:
+                normalized_augment = _normalize_http_url(
+                    augment_listing_url,
+                    str(start_url or ""),
+                )
+                augment_parsed = urlparse(normalized_augment or "")
+                if (
+                    not capture_items
+                    or not normalized_augment
+                    or (allowed_hosts and (augment_parsed.hostname or "").lower() not in allowed_hosts)
+                ):
+                    errors.append(
+                        f"{label}.augment_listing_url requires captured items on crawler.allowed_hosts"
+                    )
+            require_item_count_match = endpoint.get(
+                "require_item_count_match",
+                False,
+            )
+            if not isinstance(require_item_count_match, bool):
+                errors.append(f"{label}.require_item_count_match must be a boolean")
+            elif require_item_count_match and (
+                not capture_items
+                or not str(endpoint.get("total_items_key") or "").strip()
+            ):
+                errors.append(
+                    f"{label}.require_item_count_match requires capture_items and total_items_key"
+                )
+            for key, minimum in (
+                ("max_pages", 1),
+                ("minimum_urls", 0),
+                ("minimum_items", 0),
+            ):
                 value = endpoint.get(key, 250 if key == "max_pages" else 0)
                 try:
                     if int(value) < minimum:
                         raise ValueError
                 except (TypeError, ValueError):
                     errors.append(f"{label}.{key} must be an integer >= {minimum}")
+            try:
+                configured_minimum_items = int(endpoint.get("minimum_items", 0))
+            except (TypeError, ValueError):
+                configured_minimum_items = 0
+            if configured_minimum_items > 0 and not capture_items:
+                errors.append(f"{label}.minimum_items requires capture_items")
+
+        seed_inventory_transport = str(
+            crawler.get("seed_inventory_transport", "http") or "http"
+        ).strip().lower()
+        if seed_inventory_transport not in {"http", "browser"}:
+            errors.append("crawler.seed_inventory_transport must be http or browser")
+        elif seed_inventory_transport == "browser" and seed_inventory_endpoints:
+            try:
+                import playwright.async_api  # noqa: F401
+            except ImportError:
+                errors.append(
+                    "playwright is required when crawler.seed_inventory_transport is browser"
+                )
 
         dynamic_specs, dynamic_errors = normalize_dynamic_collection_specs(
             crawler.get("dynamic_collections"),
@@ -2907,6 +3097,18 @@ class Crawl4AICrawler(CrawlerStage):
                     errors.append(f"crawler.{key} must be > 0")
             except (TypeError, ValueError):
                 errors.append(f"crawler.{key} must be numeric")
+
+        seed_inventory_request_delay = crawler.get(
+            "seed_inventory_request_delay_sec"
+        )
+        if seed_inventory_request_delay is not None:
+            try:
+                if float(seed_inventory_request_delay) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(
+                    "crawler.seed_inventory_request_delay_sec must be numeric and >= 0"
+                )
 
         for depth_key in ("max_depth", "sitemap_max_depth"):
             max_depth = crawler.get(depth_key)
@@ -3172,6 +3374,13 @@ class Crawl4AICrawler(CrawlerStage):
             0.0,
             float(self.config.get("seed_inventory_retry_backoff_sec", 0.75)),
         )
+        self.seed_inventory_request_delay = max(
+            0.0,
+            float(self.config.get("seed_inventory_request_delay_sec", 0.0)),
+        )
+        self.seed_inventory_transport = str(
+            self.config.get("seed_inventory_transport", "http") or "http"
+        ).strip().lower()
         self.dynamic_collection_specs, dynamic_collection_errors = (
             normalize_dynamic_collection_specs(
                 self.config.get("dynamic_collections"),
@@ -4594,6 +4803,36 @@ class Crawl4AICrawler(CrawlerStage):
     async def _discover_seed_inventory_urls(self) -> List[str]:
         """Expand bounded JSON inventories into crawl seeds with audit evidence."""
 
+        if getattr(self, "seed_inventory_transport", "http") != "browser":
+            return await self._discover_seed_inventory_urls_with_transport()
+
+        browser_kwargs = {
+            "headless": self.headless,
+            "timeout_sec": self.timeout,
+            "user_agent": str(self.config.get("user_agent") or ""),
+            "headers": getattr(
+                self,
+                "request_headers",
+                self.config.get("headers") or {},
+            ),
+            "cookies": [
+                *(self.config.get("cookies") or []),
+                *getattr(self, "environment_browser_cookies", []),
+            ],
+            "ignore_https_errors": self.ignore_https_errors,
+            "viewport": self.config.get("viewport"),
+            "proxy": self.proxy,
+            "storage_state": self.config.get("storage_state"),
+        }
+        async with PlaywrightDynamicCollectionBrowser(**browser_kwargs) as browser:
+            return await self._discover_seed_inventory_urls_with_transport(browser)
+
+    async def _discover_seed_inventory_urls_with_transport(
+        self,
+        browser: Optional[PlaywrightDynamicCollectionBrowser] = None,
+    ) -> List[str]:
+        """Perform seed discovery using HTTP or a primed browser session."""
+
         endpoints = list(getattr(self, "seed_inventory_endpoints", []) or [])
         if not endpoints:
             self.seed_inventory = {"endpoints": [], "urls": []}
@@ -4607,28 +4846,44 @@ class Crawl4AICrawler(CrawlerStage):
             endpoint_url: str,
             page_param: str,
             page_index: int,
+            browser_context_url: str,
         ) -> Tuple[Optional[Any], Dict[str, Any]]:
             request_url = _url_with_query_param(endpoint_url, page_param, page_index)
             last_error_type = ""
             last_status: Optional[int] = None
             for attempt in range(1, self.seed_inventory_fetch_attempts + 1):
                 try:
-                    async with semaphore:
-                        async with self._get_with_safe_redirects(
-                            session=self._session,
-                            url=request_url,
-                            enforce_allowed_domain=True,
-                            enforce_robots=self.respect_robots_txt,
-                        ) as response:
-                            last_status = int(response.status)
-                            if response.status != 200:
-                                raise RuntimeError(
-                                    f"seed inventory returned HTTP {response.status}"
-                                )
-                            raw_payload = await _read_bounded_response(
-                                response,
-                                self.seed_inventory_max_response_bytes,
+                    if browser is not None:
+                        async with semaphore:
+                            last_status, raw_payload = await browser.fetch_json(
+                                request_url,
+                                context_url=browser_context_url,
+                                max_bytes=self.seed_inventory_max_response_bytes,
+                                reprime=attempt > 1,
                             )
+                    else:
+                        async with semaphore:
+                            async with self._get_with_safe_redirects(
+                                session=self._session,
+                                url=request_url,
+                                enforce_allowed_domain=True,
+                                enforce_robots=self.respect_robots_txt,
+                            ) as response:
+                                last_status = int(response.status)
+                                if response.status != 200:
+                                    raise RuntimeError(
+                                        f"seed inventory returned HTTP {response.status}"
+                                    )
+                                raw_payload = await _read_bounded_response(
+                                    response,
+                                    self.seed_inventory_max_response_bytes,
+                                )
+                    if last_status != 200:
+                        raise RuntimeError(
+                            f"seed inventory returned HTTP {last_status}"
+                        )
+                    if self.seed_inventory_request_delay:
+                        await asyncio.sleep(self.seed_inventory_request_delay)
                     payload = json.loads(raw_payload.decode("utf-8"))
                     return payload, {
                         "page": page_index,
@@ -4659,21 +4914,45 @@ class Crawl4AICrawler(CrawlerStage):
                 )
 
             page_param = str(raw_endpoint.get("page_param") or "page").strip()
+            browser_context_url = (
+                _normalize_http_url(
+                    raw_endpoint.get("browser_context_url"),
+                    self.start_url,
+                )
+                or self.start_url
+            )
             page_start = int(raw_endpoint.get("page_start", 0))
             max_pages = max(1, int(raw_endpoint.get("max_pages", 250)))
             total_pages_key = str(
                 raw_endpoint.get("total_pages_key") or "totalPages"
             ).strip()
+            total_items_key = str(
+                raw_endpoint.get("total_items_key") or ""
+            ).strip()
+            items_per_page_key = str(
+                raw_endpoint.get("items_per_page_key") or ""
+            ).strip()
             url_keys = list(raw_endpoint.get("url_keys") or ["url"])
             item_element = str(raw_endpoint.get("item_element") or "").strip()
+            capture_items = bool(raw_endpoint.get("capture_items", False))
+            item_text_keys = list(raw_endpoint.get("item_text_keys") or [])
+            augment_listing_url = _normalize_http_url(
+                raw_endpoint.get("augment_listing_url"),
+                self.start_url,
+            )
             required = bool(raw_endpoint.get("required", True))
             require_all_pages = bool(raw_endpoint.get("require_all_pages", True))
             minimum_urls = max(0, int(raw_endpoint.get("minimum_urls", 0)))
+            minimum_items = max(0, int(raw_endpoint.get("minimum_items", 0)))
+            require_item_count_match = bool(
+                raw_endpoint.get("require_item_count_match", False)
+            )
 
             first_payload, first_record = await _fetch_page(
                 endpoint_url,
                 page_param,
                 page_start,
+                browser_context_url,
             )
             if first_payload is None:
                 if required:
@@ -4692,7 +4971,13 @@ class Crawl4AICrawler(CrawlerStage):
                 continue
 
             discovered_total_pages = (
-                _seed_inventory_total_pages(first_payload, total_pages_key) or 1
+                _seed_inventory_total_pages(
+                    first_payload,
+                    total_pages_key,
+                    total_items_key=total_items_key,
+                    items_per_page_key=items_per_page_key,
+                )
+                or 1
             )
             if discovered_total_pages > max_pages:
                 raise RuntimeError(
@@ -4709,7 +4994,12 @@ class Crawl4AICrawler(CrawlerStage):
             ]
             remaining_results = await asyncio.gather(
                 *(
-                    _fetch_page(endpoint_url, page_param, page_index)
+                    _fetch_page(
+                        endpoint_url,
+                        page_param,
+                        page_index,
+                        browser_context_url,
+                    )
                     for page_index in remaining_indices
                 )
             )
@@ -4732,15 +5022,26 @@ class Crawl4AICrawler(CrawlerStage):
                 )
 
             endpoint_urls: List[str] = []
+            items_by_id: Dict[str, Dict[str, Any]] = {}
             for page_index in sorted(payloads_by_page):
+                payload = payloads_by_page[page_index]
                 endpoint_urls.extend(
                     _extract_seed_inventory_urls(
-                        payloads_by_page[page_index],
+                        payload,
                         base_url=self.start_url,
                         url_keys=url_keys,
                         item_element=item_element,
                     )
                 )
+                if capture_items:
+                    for item in _extract_seed_inventory_items(
+                        payload,
+                        base_url=self.start_url,
+                        item_element=item_element,
+                        url_keys=url_keys,
+                        text_keys=item_text_keys,
+                    ):
+                        items_by_id.setdefault(str(item["item_id"]), item)
             eligible_urls = sorted(
                 {url for url in endpoint_urls if self._allow_frontier_url(url)}
             )
@@ -4751,19 +5052,53 @@ class Crawl4AICrawler(CrawlerStage):
                     f"required={minimum_urls}"
                 )
 
+            captured_items = list(items_by_id.values())
+            expected_item_count = _seed_inventory_positive_int(
+                first_payload,
+                total_items_key,
+            )
+            if len(captured_items) < minimum_items:
+                raise RuntimeError(
+                    "Seed inventory item coverage gate failed: "
+                    f"endpoint={endpoint_url} discovered={len(captured_items)} "
+                    f"required={minimum_items}"
+                )
+            if (
+                require_item_count_match
+                and expected_item_count is not None
+                and len(captured_items) != expected_item_count
+            ):
+                raise RuntimeError(
+                    "Seed inventory item count does not match the published total: "
+                    f"endpoint={endpoint_url} discovered={len(captured_items)} "
+                    f"expected={expected_item_count}"
+                )
+
             collected_urls.extend(eligible_urls)
             endpoint_evidence.append(
                 {
                     "url": endpoint_url,
                     "page_param": page_param,
                     "page_start": page_start,
+                    "transport": self.seed_inventory_transport,
+                    "browser_context_url": (
+                        browser_context_url if browser is not None else ""
+                    ),
                     "total_pages_key": total_pages_key,
+                    "total_items_key": total_items_key,
+                    "items_per_page_key": items_per_page_key,
                     "discovered_total_pages": discovered_total_pages,
                     "fetched_pages": len(payloads_by_page),
                     "failed_pages": failed_pages,
                     "required": required,
                     "require_all_pages": require_all_pages,
                     "minimum_urls": minimum_urls,
+                    "minimum_items": minimum_items,
+                    "capture_items": capture_items,
+                    "augment_listing_url": augment_listing_url or "",
+                    "expected_item_count": expected_item_count,
+                    "captured_item_count": len(captured_items),
+                    "items": captured_items,
                     "eligible_url_count": len(eligible_urls),
                     "eligible_url_counts_by_host": self._count_urls_by_host(
                         eligible_urls
@@ -5833,6 +6168,82 @@ class Crawl4AICrawler(CrawlerStage):
         ) + 1
         return str(soup), True
 
+    def _seed_inventory_record_for_url(
+        self,
+        page_url: str,
+    ) -> Optional[Dict[str, Any]]:
+        normalized_page = _normalize_http_url(page_url)
+        if not normalized_page:
+            return None
+        for record in (
+            (getattr(self, "seed_inventory", {}) or {}).get("endpoints") or []
+        ):
+            if not isinstance(record, dict) or not record.get("items"):
+                continue
+            augment_url = _normalize_http_url(record.get("augment_listing_url"))
+            if augment_url == normalized_page:
+                return record
+        return None
+
+    def _augment_seed_inventory_html(
+        self,
+        page_url: str,
+        html: str,
+    ) -> Tuple[str, bool]:
+        record = self._seed_inventory_record_for_url(page_url)
+        if not record or not html:
+            return html, False
+
+        inventory_id = hashlib.sha256(
+            str(record.get("url") or page_url).encode("utf-8")
+        ).hexdigest()[:16]
+        soup = BeautifulSoup(html, "html.parser")
+        if soup.find(attrs={"data-crawl-seed-inventory": inventory_id}):
+            return html, False
+
+        section = soup.new_tag("section")
+        section["data-crawl-seed-inventory"] = inventory_id
+        section["aria-label"] = "Complete paginated listing"
+        heading = soup.new_tag("h2")
+        heading.string = "Complete paginated listing"
+        section.append(heading)
+        summary = soup.new_tag("p")
+        discovered = int(record.get("captured_item_count") or 0)
+        expected = record.get("expected_item_count")
+        pages = int(record.get("fetched_pages") or 0)
+        summary.string = (
+            f"Collected {discovered} of {expected} listed items across {pages} API pages."
+            if expected is not None
+            else f"Collected {discovered} listed items across {pages} API pages."
+        )
+        section.append(summary)
+        listing = soup.new_tag("ul")
+        for item in record.get("items") or []:
+            text = " ".join(str(item.get("text") or "").split())
+            if not text:
+                continue
+            list_item = soup.new_tag("li")
+            item_urls = [
+                normalized
+                for value in (item.get("urls") or [])
+                if (normalized := _normalize_http_url(value, page_url))
+                and self._allow_frontier_url(normalized)
+            ]
+            if item_urls:
+                anchor = soup.new_tag("a", href=item_urls[0])
+                anchor.string = text
+                list_item.append(anchor)
+            else:
+                list_item.string = text
+            listing.append(list_item)
+        section.append(listing)
+        target = soup.find("main") or soup.body or soup
+        target.append(section)
+        self.stats["seed_inventory_pages_augmented"] = int(
+            self.stats.get("seed_inventory_pages_augmented") or 0
+        ) + 1
+        return str(soup), True
+
     async def _process_result(self, result: Any, *, mark_failure: bool = True) -> bool:
         page_url = _normalize_http_url(getattr(result, "url", None))
         if not page_url:
@@ -5890,7 +6301,10 @@ class Crawl4AICrawler(CrawlerStage):
             raw_source_html, raw_source_status = await self._fetch_raw_source_page(page_url)
             if raw_source_html:
                 self.stats["source_html_validations"] += 1
-            if raw_source_status in AUTHORITATIVE_TERMINAL_PAGE_STATUSES:
+            if _is_authoritative_terminal_source_status(
+                raw_source_status,
+                getattr(self, "transient_page_statuses", set()),
+            ):
                 self._mark_url_skipped(
                     page_url,
                     status_code=raw_source_status,
@@ -5943,6 +6357,10 @@ class Crawl4AICrawler(CrawlerStage):
             page_url,
             html,
         )
+        html, seed_inventory_augmented = self._augment_seed_inventory_html(
+            page_url,
+            html,
+        )
         html_path = self.html_dir / f"{_url_digest(page_url)}.html"
         html_path.write_text(html, encoding="utf-8")
         self.url_mapping[page_url] = str(html_path)
@@ -5966,7 +6384,7 @@ class Crawl4AICrawler(CrawlerStage):
             page_url=page_url,
             rendered_markdown=rendered_markdown,
             capture_source=capture_source,
-            prefer_html=dynamic_collection_augmented,
+            prefer_html=(dynamic_collection_augmented or seed_inventory_augmented),
         )
         if md_text:
             md_path = self.md_dir / f"{html_path.stem}.md"
