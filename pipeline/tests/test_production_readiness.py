@@ -1748,6 +1748,7 @@ class TestCrawlerHelpers:
         crawler.recoverable_skip_retries = {}
         crawler.recoverable_skip_exhausted_urls = set()
         crawler.recoverable_skip_max_retries = 2
+        crawler.attempt_http_fallback_for_browser_failures = False
         crawler.sitemap_crawl_batch_size = 1
         crawler.fetch_concurrency = 1
         crawler.max_pages = 10
@@ -1766,7 +1767,9 @@ class TestCrawlerHelpers:
 
         run_config = SimpleNamespace(clone=lambda **_kwargs: SimpleNamespace())
         with patch.object(crawler, "_process_result", return_value=False), patch.object(
-            crawler, "_recover_url_with_http_retry", return_value=False
+            crawler,
+            "_recover_url_with_http_retry",
+            side_effect=AssertionError("HTTP fallback must remain disabled"),
         ), patch.object(crawler, "_flush_runtime_state"):
             run_async(
                 crawler._crawl_seed_frontier(

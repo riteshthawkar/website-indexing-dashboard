@@ -3070,6 +3070,14 @@ class Crawl4AICrawler(CrawlerStage):
                     )
                     break
 
+        if not isinstance(
+            crawler.get("attempt_http_fallback_for_browser_failures", True),
+            bool,
+        ):
+            errors.append(
+                "crawler.attempt_http_fallback_for_browser_failures must be a boolean"
+            )
+
         for key in (
             "max_pages",
             "fetch_concurrency",
@@ -3239,6 +3247,9 @@ class Crawl4AICrawler(CrawlerStage):
             int(value)
             for value in (self.config.get("transient_page_statuses") or [])
         }
+        self.attempt_http_fallback_for_browser_failures = bool(
+            self.config.get("attempt_http_fallback_for_browser_failures", True)
+        )
         self.retry_recoverable_skipped_on_resume = bool(
             self.config.get("retry_recoverable_skipped_on_resume", True)
         )
@@ -6010,10 +6021,19 @@ class Crawl4AICrawler(CrawlerStage):
             if failed_batch_urls:
                 recovered = 0
                 for url, failure in failed_batch_urls.items():
-                    if _should_retry_page_failure(
+                    retryable = _should_retry_page_failure(
                         failure.get("status_code"),
                         getattr(self, "transient_page_statuses", set()),
-                    ) and await self._recover_url_with_http_retry(url):
+                    )
+                    if (
+                        retryable
+                        and getattr(
+                            self,
+                            "attempt_http_fallback_for_browser_failures",
+                            True,
+                        )
+                        and await self._recover_url_with_http_retry(url)
+                    ):
                         recovered += 1
                         processed_page_urls.append(url)
                     else:

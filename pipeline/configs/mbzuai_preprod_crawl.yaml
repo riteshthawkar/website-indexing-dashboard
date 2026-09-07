@@ -27,6 +27,7 @@ crawler:
   max_depth: 8
   fetch_concurrency: 2
   download_concurrency: 4
+  sitemap_crawl_batch_size: 20
   timeout: 45
   # Run this profile under xvfb-run. A headed Linux Chromium session is needed
   # because the preprod WAF rejects API pagination from headless/non-browser clients.
@@ -193,9 +194,14 @@ crawler:
   raw_source_retry_backoff_sec: 1.25
   retry_recoverable_skipped_on_resume: true
   recoverable_skip_max_retries: 2
-  delay_before_return_html: 1.5
-  mean_delay: 0.75
-  max_range: 0.75
+  # Direct HTTP is deliberately challenged on this host, so browser failures
+  # are retried in the browser frontier instead of wasting time on raw fallback.
+  attempt_http_fallback_for_browser_failures: false
+  delay_before_return_html: 0.5
+  mean_delay: 0.35
+  max_range: 0.4
+  simulate_user: false
+  magic: false
 
   # SPA listings are covered by the required JSON inventories above. Avoid
   # depending on browser pagination because the frontend turns transient API
@@ -270,8 +276,10 @@ crawler:
     - "https://preprod.mbzuai.ac.ae/events"
     - "https://preprod.mbzuai.ac.ae/innovation-partnerships/national-engagement-outreach/startup-showcase"
 
-  validate_source_html: true
-  validate_source_html_mode: "always"
+  # The headed browser capture is authoritative for this protected SPA. Raw
+  # validation requests are blocked by the WAF and add no independent signal.
+  validate_source_html: false
+  validate_source_html_mode: "never"
   parse_source_html_for_media: true
   extract_images: true
   download_page_images: false
