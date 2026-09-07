@@ -323,6 +323,8 @@ SITEMAP_STATE_FILENAME = "sitemap_discovery.json"
 SITEMAP_COHORT_VERIFICATION_FILENAME = "sitemap_cohort_verification.json"
 SEED_INVENTORY_FILENAME = "seed_inventory.json"
 DYNAMIC_COLLECTION_INVENTORY_FILENAME = "dynamic_collection_inventory.json"
+TERMINAL_PAGE_VERIFICATION_FILENAME = "terminal_page_verification.json"
+TERMINAL_PAGE_VERIFICATION_SCHEMA_VERSION = 1
 
 
 class _RedirectEgressPolicyError(RuntimeError):
@@ -540,6 +542,91 @@ def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
 def _crawl_skip_status(value: Any) -> Optional[int]:
     match = re.match(r"^skipped_http_(\d{3})(?::|$)", str(value or "").lower())
     return int(match.group(1)) if match else None
+
+
+def _terminal_page_verification_sha256(payload: Mapping[str, Any]) -> str:
+    unsigned = dict(payload)
+    unsigned.pop("evidence_sha256", None)
+    serialized = json.dumps(
+        unsigned,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _finalize_terminal_page_verification(
+    records: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {
+        "schema_version": TERMINAL_PAGE_VERIFICATION_SCHEMA_VERSION,
+        "generated_at_epoch": time.time(),
+        "records": sorted(
+            [dict(record) for record in records],
+            key=lambda record: str(record.get("url") or ""),
+        ),
+    }
+    payload["evidence_sha256"] = _terminal_page_verification_sha256(payload)
+    return payload
+
+
+def _verified_terminal_page_urls(
+    payload: Any,
+    *,
+    allowed_statuses: Iterable[int],
+    minimum_attempts: int,
+) -> Dict[str, int]:
+    """Return only digest-valid, consistently observed terminal page errors."""
+
+    if not isinstance(payload, dict):
+        return {}
+    if payload.get("schema_version") != TERMINAL_PAGE_VERIFICATION_SCHEMA_VERSION:
+        return {}
+    if str(payload.get("evidence_sha256") or "") != (
+        _terminal_page_verification_sha256(payload)
+    ):
+        return {}
+    allowed = {int(value) for value in allowed_statuses}
+    required = max(1, int(minimum_attempts))
+    verified: Dict[str, int] = {}
+    for record in payload.get("records") or []:
+        if not isinstance(record, dict):
+            continue
+        url = _normalize_http_url(record.get("url"))
+        observations = record.get("observations") or []
+        try:
+            status = int(record.get("status") or 0)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not url
+            or record.get("classification") != "verified_terminal_error"
+            or status not in allowed
+            or len(observations) < required
+        ):
+            continue
+        valid = True
+        for observation in observations:
+            if not isinstance(observation, dict):
+                valid = False
+                break
+            try:
+                observed_status = int(observation.get("status") or 0)
+            except (TypeError, ValueError):
+                valid = False
+                break
+            response_sha256 = str(observation.get("response_sha256") or "")
+            if (
+                observed_status != status
+                or not _is_error_page_title(str(observation.get("title") or ""))
+                or not re.fullmatch(r"[0-9a-f]{64}", response_sha256)
+            ):
+                valid = False
+                break
+        if valid:
+            verified[url] = status
+    return verified
 
 
 def _is_benign_browser_close_error(exc: BaseException) -> bool:
@@ -2827,14 +2914,37 @@ class Crawl4AICrawler(CrawlerStage):
                 else configured_terminal_statuses
             )
         }
+        verified_terminal_urls = _verified_terminal_page_urls(
+            getattr(self, "terminal_page_verification", {}),
+            allowed_statuses=getattr(
+                self,
+                "browser_terminal_verification_statuses",
+                allowed_terminal_statuses,
+            ),
+            minimum_attempts=getattr(
+                self,
+                "browser_terminal_verification_attempts",
+                1,
+            ),
+        )
         allowed_terminal_inventory_urls = sorted(
             url
             for url in failed_inventory_urls
-            if _crawl_skip_status(
-                (getattr(self, "url_mapping", {}) or {}).get(url)
+            if (
+                (
+                    skip_status := _crawl_skip_status(
+                        (getattr(self, "url_mapping", {}) or {}).get(url)
+                    )
+                )
+                in allowed_terminal_statuses
+                and (
+                    any(
+                        re.search(pattern, url)
+                        for pattern in allowed_terminal_patterns
+                    )
+                    or verified_terminal_urls.get(url) == skip_status
+                )
             )
-            in allowed_terminal_statuses
-            and any(re.search(pattern, url) for pattern in allowed_terminal_patterns)
         )
         unexpected_failed_inventory_urls = sorted(
             set(failed_inventory_urls) - set(allowed_terminal_inventory_urls)
@@ -2870,6 +2980,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.stats["seed_inventory_allowed_terminal_urls"] = len(
             allowed_terminal_inventory_urls
         )
+        self.stats["terminal_pages_verified"] = len(verified_terminal_urls)
         self.stats["seed_inventory_unexpected_failed_urls"] = len(
             unexpected_failed_inventory_urls
         )
@@ -3288,6 +3399,51 @@ class Crawl4AICrawler(CrawlerStage):
             errors.append(
                 "crawler.recoverable_skip_retry_queue_position must be front or tail"
             )
+        terminal_verification_enabled = crawler.get(
+            "browser_terminal_verification_enabled", False
+        )
+        if not isinstance(terminal_verification_enabled, bool):
+            errors.append(
+                "crawler.browser_terminal_verification_enabled must be a boolean"
+            )
+        elif terminal_verification_enabled and frontier_fetch_transport != "browser_fetch":
+            errors.append(
+                "crawler.browser_terminal_verification_enabled requires "
+                "crawler.frontier_fetch_transport=browser_fetch"
+            )
+        terminal_verification_statuses = crawler.get(
+            "browser_terminal_verification_statuses", [404, 410]
+        )
+        if not isinstance(terminal_verification_statuses, list):
+            errors.append(
+                "crawler.browser_terminal_verification_statuses must be a list"
+            )
+        else:
+            normalized_verification_statuses: set[int] = set()
+            for value in terminal_verification_statuses:
+                try:
+                    status = int(value)
+                    if status < 400 or status > 599:
+                        raise ValueError
+                    normalized_verification_statuses.add(status)
+                except (TypeError, ValueError):
+                    errors.append(
+                        "crawler.browser_terminal_verification_statuses values "
+                        "must be HTTP statuses between 400 and 599"
+                    )
+                    break
+            if isinstance(allowed_terminal_statuses, list):
+                try:
+                    configured_allowed = {
+                        int(value) for value in allowed_terminal_statuses
+                    }
+                except (TypeError, ValueError):
+                    configured_allowed = set()
+                if not normalized_verification_statuses.issubset(configured_allowed):
+                    errors.append(
+                        "crawler.browser_terminal_verification_statuses must be a "
+                        "subset of crawler.seed_inventory_allowed_terminal_statuses"
+                    )
         if not isinstance(crawler.get("write_markdown", True), bool):
             errors.append("crawler.write_markdown must be a boolean")
 
@@ -3306,6 +3462,8 @@ class Crawl4AICrawler(CrawlerStage):
             "seed_inventory_max_response_bytes",
             "seed_inventory_fetch_attempts",
             "browser_fetch_max_response_bytes",
+            "browser_terminal_verification_attempts",
+            "browser_terminal_verification_max_urls",
         ):
             value = crawler.get(key)
             if value is None:
@@ -3342,6 +3500,18 @@ class Crawl4AICrawler(CrawlerStage):
                 errors.append(
                     "crawler.browser_fetch_request_delay_sec must be numeric and >= 0"
                 )
+        for key in (
+            "browser_terminal_verification_backoff_sec",
+            "browser_terminal_verification_request_delay_sec",
+        ):
+            value = crawler.get(key)
+            if value is None:
+                continue
+            try:
+                if float(value) < 0:
+                    raise ValueError
+            except (TypeError, ValueError):
+                errors.append(f"crawler.{key} must be numeric and >= 0")
 
         for depth_key in ("max_depth", "sitemap_max_depth"):
             max_depth = crawler.get(depth_key)
@@ -3486,6 +3656,33 @@ class Crawl4AICrawler(CrawlerStage):
             self.config.get("recoverable_skip_retry_queue_position", "front")
             or "front"
         ).strip().lower()
+        self.browser_terminal_verification_enabled = bool(
+            self.config.get("browser_terminal_verification_enabled", False)
+        )
+        self.browser_terminal_verification_statuses = {
+            int(value)
+            for value in self.config.get(
+                "browser_terminal_verification_statuses", [404, 410]
+            )
+        }
+        self.browser_terminal_verification_attempts = max(
+            1, int(self.config.get("browser_terminal_verification_attempts", 3))
+        )
+        self.browser_terminal_verification_backoff = max(
+            0.0,
+            float(self.config.get("browser_terminal_verification_backoff_sec", 2.0)),
+        )
+        self.browser_terminal_verification_request_delay = max(
+            0.0,
+            float(
+                self.config.get(
+                    "browser_terminal_verification_request_delay_sec", 1.5
+                )
+            ),
+        )
+        self.browser_terminal_verification_max_urls = max(
+            1, int(self.config.get("browser_terminal_verification_max_urls", 500))
+        )
         self.max_pages = max(1, int(self.config.get("max_pages", 1000)))
         self.max_depth = max(0, int(self.config.get("max_depth", 10)))
         self.max_file_size_bytes = int(float(self.config.get("max_file_size_mb", 100)) * 1024 * 1024)
@@ -3714,6 +3911,9 @@ class Crawl4AICrawler(CrawlerStage):
         self.dynamic_collection_inventory_file = (
             ctx.work_dir / DYNAMIC_COLLECTION_INVENTORY_FILENAME
         )
+        self.terminal_page_verification_file = (
+            ctx.work_dir / TERMINAL_PAGE_VERIFICATION_FILENAME
+        )
         self.sitemap_cohort_verification_file = (
             ctx.work_dir / SITEMAP_COHORT_VERIFICATION_FILENAME
         )
@@ -3755,6 +3955,9 @@ class Crawl4AICrawler(CrawlerStage):
             "skipped_urls": 0,
             "excluded_frontier_urls": 0,
             "recoverable_skips_exhausted": 0,
+            "terminal_pages_verified": 0,
+            "terminal_pages_recovered": 0,
+            "terminal_pages_unresolved": 0,
             "invalid_saved_pages_requeued": 0,
         }
         self.url_mapping: Dict[str, str] = {}
@@ -3767,6 +3970,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.downloaded_images: Dict[str, str] = {}
         self.recoverable_skip_retries: Dict[str, int] = {}
         self.recoverable_skip_exhausted_urls: set[str] = set()
+        self.terminal_page_verification: Dict[str, Any] = {}
         self._active_browser_fetch: Optional[PlaywrightDynamicCollectionBrowser] = None
         self._browser_fetch_document_lock = asyncio.Lock()
         self.crawl_state: Dict[str, Any] = {}
@@ -3899,11 +4103,45 @@ class Crawl4AICrawler(CrawlerStage):
                             max_response_bytes=self.browser_fetch_max_response_bytes,
                             request_delay=self.browser_fetch_request_delay,
                         )
-                        await self._crawl_seed_frontier(
-                            {"crawler": adapter},
-                            run_config,
-                            None,
-                        )
+                        while True:
+                            await self._crawl_seed_frontier(
+                                {"crawler": adapter},
+                                run_config,
+                                None,
+                            )
+                            recovered_urls = (
+                                await self._verify_exhausted_browser_pages()
+                            )
+                            if not recovered_urls:
+                                break
+                            pending = self._filter_pending_items(
+                                self.crawl_state.get("pending") or []
+                            )
+                            visited = [
+                                str(value)
+                                for value in (
+                                    self.crawl_state.get("visited") or []
+                                )
+                                if str(value)
+                            ]
+                            depths = dict(self.crawl_state.get("depths") or {})
+                            discovered = self._discover_link_frontier_items(
+                                recovered_urls,
+                                visited=visited,
+                                pending=pending,
+                                depths=depths,
+                            )
+                            if not discovered:
+                                break
+                            self._set_crawl_state(
+                                visited=visited,
+                                pending=[*pending, *discovered],
+                                depths=depths,
+                                pages_crawled=int(
+                                    self.crawl_state.get("pages_crawled") or 0
+                                ),
+                            )
+                            self._flush_runtime_state(force=True)
                     finally:
                         self._active_browser_fetch = None
             else:
@@ -4069,6 +4307,34 @@ class Crawl4AICrawler(CrawlerStage):
                             )
                         ]
                         if self.sitemap_cohort_verification
+                        else []
+                    ),
+                    *(
+                        [
+                            ctx.make_artifact(
+                                self.terminal_page_verification_file,
+                                artifact_type="terminal_page_verification",
+                                role="refreshed_terminal_page_evidence",
+                                metadata={
+                                    "verified_terminal_urls": int(
+                                        self.stats.get(
+                                            "terminal_pages_verified", 0
+                                        )
+                                    ),
+                                    "recovered_urls": int(
+                                        self.stats.get(
+                                            "terminal_pages_recovered", 0
+                                        )
+                                    ),
+                                    "unresolved_urls": int(
+                                        self.stats.get(
+                                            "terminal_pages_unresolved", 0
+                                        )
+                                    ),
+                                },
+                            )
+                        ]
+                        if self.terminal_page_verification
                         else []
                     ),
                 ],
@@ -4378,6 +4644,20 @@ class Crawl4AICrawler(CrawlerStage):
             for value in (state.get("recoverable_skip_exhausted_urls") or [])
             if (normalized := _normalize_http_url(value))
         }
+        terminal_verification_file = getattr(
+            self, "terminal_page_verification_file", None
+        )
+        stored_terminal_verification = (
+            load_json_safe(terminal_verification_file, {}) or {}
+            if terminal_verification_file is not None
+            else {}
+        )
+        runtime_terminal_verification = state.get("terminal_page_verification") or {}
+        self.terminal_page_verification = (
+            runtime_terminal_verification
+            if isinstance(runtime_terminal_verification, dict)
+            else stored_terminal_verification
+        )
 
         graph_payload = load_json_safe(self.page_link_graph_file, {}) or {}
         graph_links: Dict[str, List[Dict[str, Any]]] = {}
@@ -4816,6 +5096,162 @@ class Crawl4AICrawler(CrawlerStage):
             len(requeued),
         )
         return requeued
+
+    async def _verify_exhausted_browser_pages(self) -> List[str]:
+        """Refresh exhausted HTTP failures before accepting terminal evidence."""
+
+        browser = getattr(self, "_active_browser_fetch", None)
+        if not self.browser_terminal_verification_enabled or browser is None:
+            return []
+        if (self.crawl_state.get("pending") or []):
+            return []
+
+        existing_records = {
+            str(record.get("url") or ""): dict(record)
+            for record in (
+                (getattr(self, "terminal_page_verification", {}) or {}).get(
+                    "records"
+                )
+                or []
+            )
+            if isinstance(record, dict) and str(record.get("url") or "")
+        }
+        previously_verified = _verified_terminal_page_urls(
+            getattr(self, "terminal_page_verification", {}),
+            allowed_statuses=self.browser_terminal_verification_statuses,
+            minimum_attempts=self.browser_terminal_verification_attempts,
+        )
+        candidates = []
+        for url in sorted(self.recoverable_skip_exhausted_urls):
+            status = _crawl_skip_status(self.url_mapping.get(url))
+            if (
+                status in self.browser_terminal_verification_statuses
+                and previously_verified.get(url) != status
+            ):
+                candidates.append(url)
+        if not candidates:
+            return []
+        if len(candidates) > self.browser_terminal_verification_max_urls:
+            logger.warning(
+                "Browser terminal verification is bounded to %d/%d exhausted URL(s).",
+                self.browser_terminal_verification_max_urls,
+                len(candidates),
+            )
+            candidates = candidates[: self.browser_terminal_verification_max_urls]
+
+        logger.info(
+            "Refreshing %d exhausted page failure(s) for terminal verification.",
+            len(candidates),
+        )
+        recovered: List[str] = []
+        for index, url in enumerate(candidates, start=1):
+            original_mapping = str(self.url_mapping.get(url) or "")
+            status, html, final_url, headers, observations = (
+                await browser.fetch_html_with_refreshes(
+                    url,
+                    max_bytes=self.browser_fetch_max_response_bytes,
+                    attempts=self.browser_terminal_verification_attempts,
+                    backoff_sec=self.browser_terminal_verification_backoff,
+                )
+            )
+            processed = False
+            if status == 200 and html.strip():
+                processed = await self._process_result(
+                    SimpleNamespace(
+                        url=url,
+                        final_url=final_url,
+                        html=html,
+                        success=True,
+                        status_code=200,
+                        response_headers=headers,
+                        links={"internal": [], "external": []},
+                        markdown=None,
+                        error_message="",
+                    ),
+                    mark_failure=False,
+                )
+            if processed:
+                recovered.append(url)
+                self.recoverable_skip_exhausted_urls.discard(url)
+                self.recoverable_skip_retries.pop(url, None)
+                if original_mapping.startswith("SKIPPED"):
+                    self.stats["pages_failed"] = max(
+                        0, int(self.stats.get("pages_failed", 0)) - 1
+                    )
+                    self.stats["skipped_urls"] = max(
+                        0, int(self.stats.get("skipped_urls", 0)) - 1
+                    )
+                classification = "recovered_after_refresh"
+            else:
+                observed_statuses = {
+                    int(observation.get("status") or 0)
+                    for observation in observations
+                    if isinstance(observation, dict)
+                }
+                consistently_terminal = (
+                    len(observations)
+                    >= self.browser_terminal_verification_attempts
+                    and observed_statuses == {status}
+                    and status in self.browser_terminal_verification_statuses
+                    and all(
+                        _is_error_page_title(
+                            str(observation.get("title") or "")
+                        )
+                        for observation in observations
+                        if isinstance(observation, dict)
+                    )
+                )
+                classification = (
+                    "verified_terminal_error"
+                    if consistently_terminal
+                    else "unresolved_transient_error"
+                )
+            existing_records[url] = {
+                "url": url,
+                "classification": classification,
+                "status": int(status or 0),
+                "verified_at_epoch": time.time(),
+                "observations": observations,
+            }
+            self.terminal_page_verification = (
+                _finalize_terminal_page_verification(existing_records.values())
+            )
+            if index % 10 == 0 or index == len(candidates):
+                logger.info(
+                    "Browser terminal verification progress: checked=%d/%d recovered=%d",
+                    index,
+                    len(candidates),
+                    len(recovered),
+                )
+                self._flush_runtime_state(force=True)
+            if (
+                index < len(candidates)
+                and self.browser_terminal_verification_request_delay > 0
+            ):
+                await asyncio.sleep(self.browser_terminal_verification_request_delay)
+
+        records = self.terminal_page_verification.get("records") or []
+        self.stats["terminal_pages_recovered"] = sum(
+            1
+            for record in records
+            if isinstance(record, dict)
+            and record.get("classification") == "recovered_after_refresh"
+        )
+        self.stats["terminal_pages_unresolved"] = sum(
+            1
+            for record in records
+            if isinstance(record, dict)
+            and record.get("classification") == "unresolved_transient_error"
+        )
+        self.stats["terminal_pages_verified"] = len(
+            _verified_terminal_page_urls(
+                self.terminal_page_verification,
+                allowed_statuses=self.browser_terminal_verification_statuses,
+                minimum_attempts=self.browser_terminal_verification_attempts,
+            )
+        )
+        self._flush_runtime_state(force=True)
+        return recovered
 
     async def _open_http_session(self) -> None:
         headers = dict(
@@ -7827,6 +8263,10 @@ class Crawl4AICrawler(CrawlerStage):
             outputs["sitemap_cohort_verification_file"] = str(
                 self.sitemap_cohort_verification_file
             )
+        if getattr(self, "terminal_page_verification", {}):
+            outputs["terminal_page_verification_file"] = str(
+                self.terminal_page_verification_file
+            )
         return outputs
 
     def _serialize_runtime_state(self) -> Dict[str, Any]:
@@ -7844,6 +8284,9 @@ class Crawl4AICrawler(CrawlerStage):
             "recoverable_skip_retries": self.recoverable_skip_retries,
             "recoverable_skip_exhausted_urls": sorted(
                 self.recoverable_skip_exhausted_urls
+            ),
+            "terminal_page_verification": getattr(
+                self, "terminal_page_verification", {}
             ),
             "sitemap_cohort_verification": self.sitemap_cohort_verification,
             "discovered_sitemaps": self.discovered_sitemaps,
@@ -7878,6 +8321,11 @@ class Crawl4AICrawler(CrawlerStage):
         atomic_write_json(self.page_videos_file, self.page_videos)
         atomic_write_json(self.page_media_file, self.page_media)
         atomic_write_json(self.page_metadata_file, self.page_metadata)
+        if getattr(self, "terminal_page_verification", {}):
+            atomic_write_json(
+                self.terminal_page_verification_file,
+                self.terminal_page_verification,
+            )
         atomic_write_json(
             self.page_link_graph_file,
             _build_page_link_graph_payload(

@@ -463,6 +463,86 @@ def test_browser_binary_fetch_is_bounded_and_bypasses_cache():
     assert headers["content-type"] == "application/pdf"
 
 
+def test_browser_html_refresh_probe_recovers_transient_error():
+    class Response:
+        def __init__(self, status, payload):
+            self.status = status
+            self.url = "https://example.com/programs"
+            self.payload = payload
+
+        async def body(self):
+            return self.payload
+
+        async def all_headers(self):
+            return {"content-type": "text/html"}
+
+    class Page:
+        def __init__(self):
+            self.url = "about:blank"
+            self.responses = [
+                Response(404, b"<html><title>404 - Page Not Found</title></html>"),
+                Response(200, b"<html><title>Programs</title><body>Ready</body></html>"),
+            ]
+            self.current = None
+            self.route_handler = None
+            self.headers = None
+            self.closed = False
+
+        async def route(self, _pattern, handler):
+            self.route_handler = handler
+
+        async def set_extra_http_headers(self, headers):
+            self.headers = headers
+
+        async def goto(self, url, **_kwargs):
+            self.url = url
+            self.current = self.responses.pop(0)
+            return self.current
+
+        async def reload(self, **_kwargs):
+            self.current = self.responses.pop(0)
+            return self.current
+
+        async def title(self):
+            return "404 - Page Not Found" if self.current.status == 404 else "Programs"
+
+        async def close(self):
+            self.closed = True
+
+    class Context:
+        def __init__(self, page):
+            self.page = page
+
+        async def new_page(self):
+            return self.page
+
+    page = Page()
+    browser = PlaywrightDynamicCollectionBrowser(
+        headless=False,
+        timeout_sec=5,
+        allowed_origins=["https://example.com"],
+    )
+    browser._context = Context(page)
+
+    status, html, final_url, headers, observations = asyncio.run(
+        browser.fetch_html_with_refreshes(
+            "https://example.com/programs",
+            max_bytes=2048,
+            attempts=3,
+            backoff_sec=0,
+        )
+    )
+
+    assert status == 200
+    assert "Ready" in html
+    assert final_url == "https://example.com/programs"
+    assert headers["content-type"] == "text/html"
+    assert [record["status"] for record in observations] == [404, 200]
+    assert observations[0]["title"] == "404 - Page Not Found"
+    assert page.headers == {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+    assert page.closed is True
+
+
 def test_browser_origin_guard_blocks_cross_origin_before_network_egress():
     class Request:
         def __init__(self, url):

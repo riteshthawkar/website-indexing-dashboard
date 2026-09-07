@@ -219,6 +219,18 @@ crawler:
   # Revisit failures after untouched routes, rather than retrying the same
   # warming endpoint six times back-to-back.
   recoverable_skip_retry_queue_position: "tail"
+  # After the ordinary retries are exhausted, reproduce a real browser reload
+  # before accepting a 404/500 as a non-indexable terminal route. The signed
+  # observations become part of the run evidence and are checked by the
+  # inventory completion gate.
+  browser_terminal_verification_enabled: true
+  browser_terminal_verification_statuses:
+    - 404
+    - 500
+  browser_terminal_verification_attempts: 3
+  browser_terminal_verification_backoff_sec: 3.0
+  browser_terminal_verification_request_delay_sec: 2.0
+  browser_terminal_verification_max_urls: 500
   # Direct HTTP is deliberately challenged on this host, so browser failures
   # are retried in the browser frontier instead of wasting time on raw fallback.
   attempt_http_fallback_for_browser_failures: false

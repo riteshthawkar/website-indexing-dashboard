@@ -692,6 +692,131 @@ class PlaywrightDynamicCollectionBrowser:
         )
         return status, payload.decode("utf-8", errors="replace"), final_url, headers
 
+    async def fetch_html_with_refreshes(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        attempts: int,
+        backoff_sec: float,
+    ) -> Tuple[int, str, str, Dict[str, str], List[Dict[str, Any]]]:
+        """Recheck one HTML route using user-like navigation and reloads.
+
+        This is intentionally separate from the fast same-origin ``fetch``
+        transport. Some SSR deployments transiently return an error route that
+        recovers only after a real page refresh. Subresources are blocked to
+        keep the probe bounded, and every observation is safe to persist as
+        audit evidence without storing response content.
+        """
+
+        if self._context is None:
+            raise RuntimeError("dynamic collection browser is not open")
+        normalized_origin = _http_origin(url)
+        if not normalized_origin or (
+            self.allowed_origins is not None
+            and normalized_origin not in self.allowed_origins
+        ):
+            raise ValueError("browser navigation must use an allowed origin")
+
+        page = await self._context.new_page()
+
+        async def route_navigation_only(route: Any) -> None:
+            request = getattr(route, "request", None)
+            request_url = str(getattr(request, "url", "") or "")
+            request_origin = _http_origin(request_url)
+            resource_type = str(getattr(request, "resource_type", "") or "")
+            if resource_type and resource_type != "document":
+                await route.abort()
+                return
+            if request_origin and (
+                self.allowed_origins is not None
+                and request_origin not in self.allowed_origins
+            ):
+                await route.abort()
+                return
+            await route.continue_()
+
+        await page.route("**/*", route_navigation_only)
+        await page.set_extra_http_headers(
+            {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+        )
+        observations: List[Dict[str, Any]] = []
+        last_status = 0
+        last_html = ""
+        last_url = url
+        last_headers: Dict[str, str] = {}
+        attempt_count = max(1, int(attempts))
+        try:
+            for attempt in range(1, attempt_count + 1):
+                try:
+                    if attempt == 1 or str(getattr(page, "url", "")) in {
+                        "",
+                        "about:blank",
+                    }:
+                        response = await page.goto(
+                            url,
+                            wait_until="domcontentloaded",
+                            timeout=self.timeout_ms,
+                        )
+                    else:
+                        response = await page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=self.timeout_ms,
+                        )
+                    if response is None:
+                        raise RuntimeError("browser navigation returned no response")
+                    last_status = int(response.status or 0)
+                    last_url = str(response.url or url)
+                    final_origin = _http_origin(last_url)
+                    if self.allowed_origins is not None and (
+                        not final_origin or final_origin not in self.allowed_origins
+                    ):
+                        raise ValueError("browser navigation redirected outside allowed origins")
+                    payload = await response.body()
+                    if len(payload) > max(1, int(max_bytes)):
+                        raise ValueError(
+                            "browser response exceeds configured size limit "
+                            f"({int(max_bytes)} bytes)"
+                        )
+                    last_html = payload.decode("utf-8", errors="replace")
+                    last_headers = {
+                        str(key): str(value)
+                        for key, value in (await response.all_headers()).items()
+                    }
+                    title = _compact_text(await page.title(), limit=180)
+                    observations.append(
+                        {
+                            "attempt": attempt,
+                            "status": last_status,
+                            "final_url": last_url,
+                            "title": title,
+                            "response_bytes": len(payload),
+                            "response_sha256": hashlib.sha256(payload).hexdigest(),
+                        }
+                    )
+                    if last_status == 200 and bool(last_html.strip()):
+                        break
+                except ValueError:
+                    raise
+                except Exception as exc:
+                    observations.append(
+                        {
+                            "attempt": attempt,
+                            "status": 0,
+                            "final_url": str(getattr(page, "url", "") or url),
+                            "title": "",
+                            "response_bytes": 0,
+                            "response_sha256": hashlib.sha256(b"").hexdigest(),
+                            "error_type": type(exc).__name__,
+                        }
+                    )
+                if attempt < attempt_count and backoff_sec > 0:
+                    await asyncio.sleep(float(backoff_sec))
+        finally:
+            with contextlib.suppress(Exception):
+                await page.close()
+        return last_status, last_html, last_url, last_headers, observations
+
     async def fetch_bytes(
         self,
         url: str,

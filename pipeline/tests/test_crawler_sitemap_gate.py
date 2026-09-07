@@ -448,6 +448,78 @@ def test_completion_gate_allows_explicit_terminal_500_fixture_policy():
     assert crawler.stats["seed_inventory_unexpected_failed_urls"] == 0
 
 
+def test_refreshed_terminal_evidence_allows_inventory_404(monkeypatch):
+    url = "https://preprod.mbzuai.ac.ae/ar/retired-page"
+    observations = [
+        {
+            "attempt": attempt,
+            "status": 404,
+            "final_url": url,
+            "title": "404 - Page Not Found",
+            "response_bytes": 128,
+            "response_sha256": str(attempt) * 64,
+        }
+        for attempt in range(1, 4)
+    ]
+
+    class Browser:
+        async def fetch_html_with_refreshes(self, requested_url, **kwargs):
+            assert requested_url == url
+            assert kwargs == {
+                "max_bytes": 2048,
+                "attempts": 3,
+                "backoff_sec": 0,
+            }
+            return 404, "error", url, {"content-type": "text/html"}, observations
+
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.config = {
+        "require_complete_seed_inventory": True,
+        "require_successful_seed_inventory": True,
+        "seed_inventory_allowed_terminal_statuses": [404, 500],
+    }
+    crawler.max_pages = 100
+    crawler.crawl_state = {"pending": []}
+    crawler.seed_inventory = {"urls": [url]}
+    crawler.dynamic_collection_inventory = {"urls": []}
+    crawler.priority_seed_urls = []
+    crawler.url_mapping = {url: "SKIPPED_HTTP_404:browser_fetch_http_404"}
+    crawler.recoverable_skip_exhausted_urls = {url}
+    crawler.recoverable_skip_retries = {url: 6}
+    crawler.browser_terminal_verification_enabled = True
+    crawler.browser_terminal_verification_statuses = {404, 500}
+    crawler.browser_terminal_verification_attempts = 3
+    crawler.browser_terminal_verification_backoff = 0
+    crawler.browser_terminal_verification_request_delay = 0
+    crawler.browser_terminal_verification_max_urls = 10
+    crawler.browser_fetch_max_response_bytes = 2048
+    crawler._active_browser_fetch = Browser()
+    crawler.terminal_page_verification = {}
+    crawler.stats = {"pages_failed": 1, "skipped_urls": 1}
+    monkeypatch.setattr(crawler, "_flush_runtime_state", lambda *args, **kwargs: None)
+
+    recovered = asyncio.run(crawler._verify_exhausted_browser_pages())
+
+    assert recovered == []
+    assert crawler.stats["terminal_pages_verified"] == 1
+    assert crawler._crawl_completion_errors() == []
+    verified = crawler_module._verified_terminal_page_urls(
+        crawler.terminal_page_verification,
+        allowed_statuses={404, 500},
+        minimum_attempts=3,
+    )
+    assert verified == {url: 404}
+
+    crawler.terminal_page_verification["records"][0]["observations"][0][
+        "title"
+    ] = "Not an error"
+    assert crawler_module._verified_terminal_page_urls(
+        crawler.terminal_page_verification,
+        allowed_statuses={404, 500},
+        minimum_attempts=3,
+    ) == {}
+
+
 def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     crawler = crawler_module.Crawl4AICrawler()
     crawler.stats = {"pages_failed": 0, "skipped_urls": 0}
