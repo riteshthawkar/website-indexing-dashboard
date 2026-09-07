@@ -171,6 +171,70 @@ def test_missing_mapped_output_is_requeued_and_stale_mapping_removed(tmp_path, m
     assert crawler.url_mapping[skipped_url] == "SKIPPED_HTTP_404"
 
 
+def test_saved_http_200_error_shell_is_quarantined_and_requeued(tmp_path, monkeypatch):
+    page_url = "https://example.com/intermittent"
+    html_dir = tmp_path / "html"
+    html_dir.mkdir()
+    html_path = html_dir / "intermittent.html"
+    html_path.write_text(
+        "<html><head><title>500 - Something Went Wrong</title></head>"
+        "<body><main>Please try again later.</main></body></html>",
+        encoding="utf-8",
+    )
+
+    crawler = object.__new__(crawler_module.Crawl4AICrawler)
+    crawler.crawl_state = {
+        "visited": [page_url],
+        "pending": [],
+        "depths": {page_url: 1},
+        "pages_crawled": 1,
+    }
+    crawler.url_mapping = {page_url: str(html_path)}
+    crawler.url_to_md_mapping = {}
+    crawler.page_metadata = {page_url: {"title": "500 - Something Went Wrong"}}
+    crawler.page_links = {page_url: []}
+    crawler.page_images = {}
+    crawler.page_videos = {}
+    crawler.page_media = {}
+    crawler.max_pages = 5
+    crawler.start_url = "https://example.com/"
+    crawler.allowed_domains = {"example.com"}
+    crawler.allowed_hosts = {"example.com"}
+    crawler.link_discovery_hosts = {"example.com"}
+    crawler.excluded_subdomains = set()
+    crawler.excluded_path_prefixes = set()
+    crawler.require_https = True
+    crawler.allow_query_urls = False
+    crawler.allowed_query_param_names = set()
+    crawler.invalid_capture_dir = tmp_path / "invalid_crawl_captures"
+    crawler.stats = {
+        "pages_scraped": 1,
+        "markdown_written": 0,
+        "bytes_downloaded": html_path.stat().st_size,
+        "skipped_urls": 0,
+        "excluded_frontier_urls": 0,
+        "invalid_saved_pages_requeued": 0,
+    }
+    monkeypatch.setattr(
+        crawler_module,
+        "_host_resolves_to_private_or_reserved",
+        lambda _host: False,
+    )
+
+    recovered = crawler._requeue_unprocessed_visited_urls()
+
+    assert recovered == [page_url]
+    assert crawler.crawl_state["visited"] == []
+    assert crawler.crawl_state["pending"] == [
+        {"url": page_url, "parent_url": None}
+    ]
+    assert page_url not in crawler.url_mapping
+    assert not html_path.exists()
+    assert len(list(crawler.invalid_capture_dir.glob("*.html.invalid"))) == 1
+    assert crawler.stats["pages_scraped"] == 0
+    assert crawler.stats["invalid_saved_pages_requeued"] == 1
+
+
 def test_newer_public_frontier_wins_and_merges_lagging_runtime_checkpoint(tmp_path, monkeypatch):
     root = "https://example.com/a"
     target = "https://example.com/target"

@@ -268,6 +268,13 @@ CONTENT_ERROR_PATTERNS = (
     re.compile(r"\benable\s+javascript\s+and\s+cookies\b", re.I),
     re.compile(r"\bjust\s+a\s+moment\b", re.I),
 )
+ERROR_PAGE_TITLE_PATTERNS = (
+    re.compile(r"^\s*(?:error\s*[-:]?\s*)?(?:4\d{2}|5\d{2})\b", re.I),
+    re.compile(
+        r"\b(?:page\s+not\s+found|internal\s+server\s+error|something\s+went\s+wrong|access\s+denied)\b",
+        re.I,
+    ),
+)
 URL_TOKEN_STOPWORDS = {
     "www",
     "http",
@@ -789,6 +796,10 @@ def _contains_error_or_block_text(text: str) -> bool:
     return any(pattern.search(text) for pattern in CONTENT_ERROR_PATTERNS)
 
 
+def _is_error_page_title(title: str) -> bool:
+    return bool(title) and any(pattern.search(title) for pattern in ERROR_PAGE_TITLE_PATTERNS)
+
+
 def _is_generic_mbzuai_title(title: str) -> bool:
     normalized = re.sub(r"\s+", " ", str(title or "").strip().lower())
     return normalized in GENERIC_MBZUAI_PAGE_TITLES
@@ -908,6 +919,9 @@ def _html_quality_report(html: str, page_url: str, markdown: str = "") -> Dict[s
         reasons.append("empty_html")
         critical = True
     if _contains_error_or_block_text(combined_text):
+        reasons.append("blocked_or_error_page")
+        critical = True
+    elif _is_error_page_title(title):
         reasons.append("blocked_or_error_page")
         critical = True
     if path_tokens and _is_generic_mbzuai_title(title):
@@ -3640,6 +3654,7 @@ class Crawl4AICrawler(CrawlerStage):
         self.md_dir = ensure_dir(ctx.work_dir / "markdown")
         self.download_dir = ensure_dir(ctx.work_dir / "downloads")
         self.images_dir = ensure_dir(ctx.work_dir / "downloaded_page_images")
+        self.invalid_capture_dir = ensure_dir(ctx.work_dir / "invalid_crawl_captures")
 
         self.mapping_file = ctx.work_dir / MAPPINGS_FILENAME
         self.page_images_file = ctx.work_dir / PAGE_IMAGES_FILENAME
@@ -3696,6 +3711,7 @@ class Crawl4AICrawler(CrawlerStage):
             "skipped_urls": 0,
             "excluded_frontier_urls": 0,
             "recoverable_skips_exhausted": 0,
+            "invalid_saved_pages_requeued": 0,
         }
         self.url_mapping: Dict[str, str] = {}
         self.url_to_md_mapping: Dict[str, str] = {}
@@ -4438,6 +4454,56 @@ class Crawl4AICrawler(CrawlerStage):
                 "Resumable crawl state is missing configured sitemap cohort evidence"
             )
 
+    def _quarantine_invalid_saved_page(self, page_url: str, html_path: Path) -> None:
+        """Remove an error shell from the usable corpus while preserving evidence."""
+
+        quarantine_dir = ensure_dir(
+            getattr(
+                self,
+                "invalid_capture_dir",
+                html_path.parent / "invalid_crawl_captures",
+            )
+        )
+        token = f"{html_path.stem}-{int(time.time() * 1000)}"
+        destination = quarantine_dir / f"{token}{html_path.suffix}.invalid"
+        html_bytes = html_path.stat().st_size
+        html_path.replace(destination)
+
+        markdown_path_value = str(self.url_to_md_mapping.pop(page_url, "") or "")
+        if markdown_path_value:
+            markdown_path = Path(markdown_path_value)
+            if markdown_path.is_file():
+                markdown_destination = quarantine_dir / (
+                    f"{token}{markdown_path.suffix}.invalid"
+                )
+                markdown_path.replace(markdown_destination)
+                self.stats["markdown_written"] = max(
+                    0,
+                    int(self.stats.get("markdown_written") or 0) - 1,
+                )
+
+        self.page_metadata.pop(page_url, None)
+        self.page_links.pop(page_url, None)
+        self.page_images.pop(page_url, None)
+        self.page_videos.pop(page_url, None)
+        self.page_media.pop(page_url, None)
+        self.stats["pages_scraped"] = max(
+            0,
+            int(self.stats.get("pages_scraped") or 0) - 1,
+        )
+        self.stats["bytes_downloaded"] = max(
+            0,
+            int(self.stats.get("bytes_downloaded") or 0) - html_bytes,
+        )
+        self.stats["invalid_saved_pages_requeued"] = int(
+            self.stats.get("invalid_saved_pages_requeued") or 0
+        ) + 1
+        logger.warning(
+            "Quarantined unusable saved crawl page for fresh retry: url=%s evidence=%s",
+            page_url,
+            destination,
+        )
+
     def _requeue_unprocessed_visited_urls(self) -> List[str]:
         """Recover Crawl4AI list-mode results not yet durably consumed.
 
@@ -4462,9 +4528,17 @@ class Crawl4AICrawler(CrawlerStage):
                 durable_mapped_urls.add(normalized)
                 continue
             try:
-                output_is_durable = bool(stored_value) and Path(stored_value).is_file()
+                stored_path = Path(stored_value)
+                output_is_durable = bool(stored_value) and stored_path.is_file()
             except (OSError, ValueError):
                 output_is_durable = False
+                stored_path = Path()
+            if output_is_durable and stored_path.suffix.lower() in {".html", ".htm"}:
+                html = stored_path.read_text(encoding="utf-8", errors="replace")
+                quality = _html_quality_report(html, normalized)
+                if not bool(quality.get("usable", True)):
+                    self._quarantine_invalid_saved_page(normalized, stored_path)
+                    output_is_durable = False
             if output_is_durable:
                 durable_mapped_urls.add(normalized)
         depths = dict(self.crawl_state.get("depths") or {})
