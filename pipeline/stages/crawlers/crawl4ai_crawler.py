@@ -2816,13 +2816,24 @@ class Crawl4AICrawler(CrawlerStage):
                 self.config.get("seed_inventory_allowed_terminal_url_patterns") or []
             )
         ]
+        configured_terminal_statuses = self.config.get(
+            "seed_inventory_allowed_terminal_statuses"
+        )
+        allowed_terminal_statuses = {
+            int(value)
+            for value in (
+                [404, 410]
+                if configured_terminal_statuses is None
+                else configured_terminal_statuses
+            )
+        }
         allowed_terminal_inventory_urls = sorted(
             url
             for url in failed_inventory_urls
             if _crawl_skip_status(
                 (getattr(self, "url_mapping", {}) or {}).get(url)
             )
-            in {404, 410}
+            in allowed_terminal_statuses
             and any(re.search(pattern, url) for pattern in allowed_terminal_patterns)
         )
         unexpected_failed_inventory_urls = sorted(
@@ -3241,6 +3252,26 @@ class Crawl4AICrawler(CrawlerStage):
                         f"contains an invalid regex: {exc}"
                     )
                     break
+        allowed_terminal_statuses = crawler.get(
+            "seed_inventory_allowed_terminal_statuses"
+        )
+        if allowed_terminal_statuses is not None:
+            if not isinstance(allowed_terminal_statuses, list):
+                errors.append(
+                    "crawler.seed_inventory_allowed_terminal_statuses must be a list"
+                )
+            else:
+                for value in allowed_terminal_statuses:
+                    try:
+                        status = int(value)
+                        if status < 400 or status > 599:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        errors.append(
+                            "crawler.seed_inventory_allowed_terminal_statuses values "
+                            "must be HTTP statuses between 400 and 599"
+                        )
+                        break
 
         if not isinstance(
             crawler.get("attempt_http_fallback_for_browser_failures", True),

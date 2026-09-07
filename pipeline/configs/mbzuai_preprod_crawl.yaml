@@ -42,6 +42,14 @@ crawler:
   # explicit terminal inventory evidence, not silently dropped content.
   seed_inventory_allowed_terminal_url_patterns:
     - "^https://preprod\\.mbzuai\\.ac\\.ae/annette-black(?:-[0-9]+)?/?$"
+    # This search-index fixture remained HTTP 500 across the six production
+    # retries plus three independent fresh headed-browser sessions. Preserve
+    # the failure as evidence without treating it as indexable content.
+    - "^https://preprod\\.mbzuai\\.ac\\.ae/keegan-test-page-aspire-phd-fellowship-program/?$"
+  seed_inventory_allowed_terminal_statuses:
+    - 404
+    - 410
+    - 500
   require_complete_priority_seeds: true
   require_https: true
   ignore_https_errors: false

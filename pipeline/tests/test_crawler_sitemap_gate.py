@@ -418,6 +418,36 @@ def test_completion_gate_requires_successful_seed_inventory_with_explicit_404_po
     assert crawler.stats["seed_inventory_unexpected_failed_urls"] == 1
 
 
+def test_completion_gate_allows_explicit_terminal_500_fixture_policy():
+    broken_fixture = (
+        "https://preprod.mbzuai.ac.ae/"
+        "keegan-test-page-aspire-phd-fellowship-program"
+    )
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.config = {
+        "require_complete_seed_inventory": True,
+        "require_successful_seed_inventory": True,
+        "seed_inventory_allowed_terminal_url_patterns": [
+            r"^https://preprod\.mbzuai\.ac\.ae/keegan-test-page-"
+            r"aspire-phd-fellowship-program/?$"
+        ],
+        "seed_inventory_allowed_terminal_statuses": [404, 410, 500],
+    }
+    crawler.max_pages = 100
+    crawler.crawl_state = {"pending": []}
+    crawler.seed_inventory = {"urls": [broken_fixture]}
+    crawler.url_mapping = {
+        broken_fixture: "SKIPPED_HTTP_500:browser_fetch_http_500"
+    }
+    crawler.stats = {}
+
+    errors = crawler._crawl_completion_errors()
+
+    assert errors == []
+    assert crawler.stats["seed_inventory_allowed_terminal_urls"] == 1
+    assert crawler.stats["seed_inventory_unexpected_failed_urls"] == 0
+
+
 def test_rendered_http_404_is_never_saved_as_successful_page(monkeypatch):
     crawler = crawler_module.Crawl4AICrawler()
     crawler.stats = {"pages_failed": 0, "skipped_urls": 0}
