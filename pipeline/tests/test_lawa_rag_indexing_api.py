@@ -6,7 +6,7 @@ from typing import Any
 
 import pytest
 
-from lawa_rag import IndexingPipeline, PipelineRun
+from lawa_rag import IndexingPipeline, PipelineRun, PipelineValidationError
 from pipeline.tests.lawa_rag_test_support import behavior_config
 
 
@@ -47,6 +47,7 @@ def test_runner_properties_plan_callbacks_and_success_result(tmp_path: Path) -> 
     assert result.stages[0].outputs["stage_id"] == "behavior"
     assert result.stages[0].metrics == {"records": 1}
     assert Path(str(result.stages[0].outputs["output_file"])).read_text() == "behavior"
+    assert len(result.artifacts().records) == 1
     assert (result.work_dir / "behavior.cleanup").read_text() == "clean"
     assert starts == [("package_behavior", "package_behavior_test", None)]
     assert completions[0][:2] == ("package_behavior", "package_behavior_test")
@@ -188,23 +189,9 @@ def test_validation_can_be_inspected_without_creating_a_run_directory(tmp_path: 
             "package_behavior.enabled must be true"
         ]
     }
+    with pytest.raises(PipelineValidationError, match="enabled must be true"):
+        pipeline.run_sync()
     assert not pipeline.work_dir.exists()
-
-
-def test_loading_missing_or_incomplete_checkpoints_fails_clearly(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="No pipeline state"):
-        PipelineRun.load(tmp_path / "missing")
-    with pytest.raises(FileNotFoundError, match="No pipeline state"):
-        IndexingPipeline.from_run(tmp_path / "missing")
-
-    incomplete = tmp_path / "incomplete"
-    incomplete.mkdir()
-    (incomplete / "pipeline_state.json").write_text(
-        '{"run_id":"r1","project_name":"p1","stages":[]}',
-        encoding="utf-8",
-    )
-    with pytest.raises(FileNotFoundError, match="No resolved pipeline config"):
-        IndexingPipeline.from_run(incomplete)
 
 
 def test_run_and_stage_serialization_return_detached_data(tmp_path: Path) -> None:

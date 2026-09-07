@@ -34,6 +34,11 @@ class PackageBehaviorStage(PipelineStage):
         prior = ctx.get_stage_outputs(str(ctx.stage_config.get("read_stage") or ""))
         output_file = ctx.output_dir("behavior") / "output.txt"
         output_file.write_text(ctx.stage_id, encoding="utf-8")
+        artifact = ctx.make_artifact(
+            output_file,
+            artifact_type="package_behavior_result",
+            role="test_output",
+        )
         return StageResult.success(
             outputs={
                 "stage_id": ctx.stage_id,
@@ -41,6 +46,7 @@ class PackageBehaviorStage(PipelineStage):
                 "prior_stage_id": str(prior.get("stage_id") or ""),
             },
             metrics={"records": 1},
+            artifacts=[artifact],
         )
 
     async def cleanup(self, ctx: StageContext) -> None:

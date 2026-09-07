@@ -97,6 +97,7 @@ jobs:
             -m pipeline.service.retrieval_runner --help >/dev/null
           docker run --rm --entrypoint python \
             --volume "${PWD}/ci/smoke_retriever_runtime.py:/tmp/smoke_retriever_runtime.py:ro" \
+            --volume "${PWD}/ci/retriever_smoke_fixture.py:/tmp/retriever_smoke_fixture.py:ro" \
             "${RETRIEVER_IMAGE}" /tmp/smoke_retriever_runtime.py
 
           set +e

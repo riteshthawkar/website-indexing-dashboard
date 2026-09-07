@@ -29,17 +29,48 @@ For package development:
 python -m pip install -e ".[indexing,test]"
 ```
 
-Run the package-management suite across configuration, execution, checkpoint,
-failure, release, lazy-import, service-factory, representation, and wheel
-contracts:
+Run the fast package suite across configuration, execution, checkpoint,
+failure, release, lazy-import, representation, and wheel contracts:
 
 ```bash
-python -m pytest -q pipeline/tests/test_lawa_rag_*.py
+python -m pytest -q -m "not production_contract" pipeline/tests/test_lawa_rag_*.py
 ```
 
-CI runs this suite on Python 3.10, 3.11, and 3.12, builds the wheel, rejects
-internal tests, bytecode, and environment files in the archive, and performs a
-clean installed-wheel import check.
+Run the deployment-facing contracts separately:
+
+```bash
+python -m pytest -q -m production_contract pipeline/tests/test_lawa_rag_*.py
+```
+
+The production contracts load the canonical `mbzuai_production` profile through
+the public package, resolve every real stage plugin, validate deployment
+credentials without running a job, and verify that missing secrets fail before
+creating a run directory. They also execute the real routed dense/local/graph
+retriever, evidence packing, and FastAPI lifespan against a synthetic immutable
+release. Only the external vector-store network boundary is replaced.
+
+CI runs both tiers on Python 3.10, 3.11, and 3.12. It then builds the wheel,
+rejects internal tests, bytecode, and environment files in the archive, installs
+the wheel into an isolated directory, verifies that both `lawa_rag` and
+`pipeline` load from that directory, and repeats the production-plan,
+retrieval, and service-startup smoke through the installed artifact.
+
+These tests protect concrete operational risks:
+
+| Test boundary | Production failure prevented |
+| --- | --- |
+| Dependency parity and isolated wheel smoke | A wheel imports locally but is incomplete in a clean deployment |
+| Canonical plan and plugin validation | A renamed, missing, or invalid production stage reaches a release job |
+| Missing-secret fail-closed contract | A deployment starts work before required provider or ingest credentials exist |
+| Pause, resume, failure, and artifact tests | A retry skips work, loses checkpoint state, or reports a failed run as successful |
+| Routed retrieval and evidence smoke | Dense retrieval succeeds while graph expansion, fusion, or citations are broken |
+| Service lifespan smoke | The packaged FastAPI service cannot initialize the production retriever boundary |
+| Release identity and digest contracts | Serving accepts a mismatched, unpromotable, or modified release |
+
+Maintainability tests are intentionally classified as quality guardrails, not
+as proof that a deployment works. Internal routing, graph, fusion, evidence,
+and service code is never mocked; only external APIs and databases may be
+substituted at their client boundary.
 
 The package supports Python 3.10 through 3.12. Provider credentials continue
 to come from environment variables and are never accepted as package defaults.
@@ -61,14 +92,14 @@ if not validation.ok:
 for stage in pipeline.plan_sync():
     print(stage.index, stage.id, stage.plugin)
 
-result = pipeline.run_sync(stop_after_stage="crawl_web")
+result = pipeline.run_sync(stop_after_stage="verify_selected_profile")
 print(result.status, result.work_dir)
 ```
 
 The async form uses the same object:
 
 ```python
-result = await pipeline.run(stop_after_stage="crawl_web")
+result = await pipeline.run(stop_after_stage="verify_selected_profile")
 ```
 
 Resume an existing checkpoint without reconstructing its configuration:
@@ -76,8 +107,8 @@ Resume an existing checkpoint without reconstructing its configuration:
 ```python
 from lawa_rag import IndexingPipeline
 
-pipeline = IndexingPipeline.from_run("runs/mbzuai_indexing/candidate-2026-09-06")
-result = pipeline.run_sync(resume=True, stop_after_stage="clean_html")
+pipeline = IndexingPipeline.from_run("runs/mbzuai_main/candidate-2026-09-06")
+result = pipeline.run_sync(resume=True, stop_after_stage="format_assertion_slices")
 ```
 
 For production resume operations, pass the canonical config name to

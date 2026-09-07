@@ -92,3 +92,8 @@ exclude = ["pipeline.tests*"]
 [tool.setuptools.package-data]
 lawa_rag = ["py.typed"]
 pipeline = ["configs/*.yaml", "configs/*.yml"]
+
+[tool.pytest.ini_options]
+markers = [
+  "production_contract: exercises production configuration or runtime boundaries without external network calls",
+]

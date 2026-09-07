@@ -10338,7 +10338,14 @@ class TestAdaptiveHybridRetriever:
 
         class FakeRetriever:
             @classmethod
-            def from_config(cls, *, config_name, work_dir):
+            def from_config(
+                cls,
+                *,
+                config_name,
+                work_dir,
+                validate_existing_release_manifest,
+            ):
+                assert validate_existing_release_manifest is False
                 return cls()
 
             def retrieve(self, query):
@@ -10374,7 +10381,8 @@ class TestAdaptiveHybridRetriever:
 
         assert result["row_count"] == 1
         rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert rows[0]["response"] == "Insufficient evidence."
+        assert rows[0]["response"].startswith("Insufficient evidence.")
+        assert "source-grounded answer" in rows[0]["response"]
 
     def test_answer_generation_composes_multi_slot_role_answer_without_model(self, tmp_dir, monkeypatch):
         from pipeline.evaluation.answer_generation import generate_answer_predictions
@@ -10422,7 +10430,14 @@ class TestAdaptiveHybridRetriever:
                 }
 
             @classmethod
-            def from_config(cls, *, config_name, work_dir):
+            def from_config(
+                cls,
+                *,
+                config_name,
+                work_dir,
+                validate_existing_release_manifest,
+            ):
+                assert validate_existing_release_manifest is False
                 return cls()
 
             def retrieve(self, query):
@@ -10515,7 +10530,14 @@ class TestAdaptiveHybridRetriever:
                 }
 
             @classmethod
-            def from_config(cls, *, config_name, work_dir):
+            def from_config(
+                cls,
+                *,
+                config_name,
+                work_dir,
+                validate_existing_release_manifest,
+            ):
+                assert validate_existing_release_manifest is False
                 return cls()
 
             def retrieve(self, query):
@@ -10564,7 +10586,11 @@ class TestAdaptiveHybridRetriever:
         rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
         assert rows[0]["response"] == "The chair of MBZUAI's Board of Trustees is Khaldoon Khalifa Al Mubarak."
 
-    def test_answer_generation_returns_insufficient_evidence_for_structured_subject_mismatch(self, tmp_dir, monkeypatch):
+    def test_answer_generation_defers_structured_subject_mismatch_to_grounded_model(
+        self,
+        tmp_dir,
+        monkeypatch,
+    ):
         from pipeline.evaluation.answer_generation import generate_answer_predictions
 
         run_dir = self._build_leadership_run(tmp_dir)
@@ -10601,7 +10627,14 @@ class TestAdaptiveHybridRetriever:
                 }
 
             @classmethod
-            def from_config(cls, *, config_name, work_dir):
+            def from_config(
+                cls,
+                *,
+                config_name,
+                work_dir,
+                validate_existing_release_manifest,
+            ):
+                assert validate_existing_release_manifest is False
                 return cls()
 
             def retrieve(self, query):
@@ -10627,11 +10660,19 @@ class TestAdaptiveHybridRetriever:
                     "media": [],
                 }
 
+        generation_prompts = []
+
         class FakeClient:
             class models:
                 @staticmethod
                 def generate_content(*args, **kwargs):
-                    raise AssertionError("generator should not be called when structured evidence mismatches the requested subject")
+                    generation_prompts.append(str(kwargs.get("contents") or ""))
+                    return SimpleNamespace(
+                        text=(
+                            "Insufficient evidence. The sources do not establish a "
+                            "president for an MBZUAI New York campus."
+                        )
+                    )
 
         import pipeline.evaluation.answer_generation as mod
 
@@ -10648,7 +10689,9 @@ class TestAdaptiveHybridRetriever:
 
         assert result["row_count"] == 1
         rows = [json.loads(line) for line in output_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        assert rows[0]["response"] == "Insufficient evidence."
+        assert rows[0]["response"].startswith("Insufficient evidence.")
+        assert len(generation_prompts) == 1
+        assert "New York campus" in generation_prompts[0]
 
     def test_compose_structured_answer_prefers_general_admissions_email_for_generic_query(self):
         from pipeline.evaluation.answer_generation import _compose_structured_answer
@@ -18583,6 +18626,11 @@ class TestOpenAIAssertionPipeline:
         retriever.evidence_adjudicator_answer_limit = 4
         retriever.evidence_adjudicator_fact_limit = 4
         retriever.evidence_adjudicator_chunk_limit = 6
+        retriever.vector = SimpleNamespace(
+            media_map={},
+            page_card_map={},
+            chunk_map={},
+        )
 
         original = mod.adjudicate_factual_evidence
         try:
