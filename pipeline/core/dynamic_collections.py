@@ -9,6 +9,7 @@ detail URLs that must be admitted to the crawl frontier.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import hashlib
 import json
@@ -647,15 +648,109 @@ class PlaywrightDynamicCollectionBrowser:
         )
         return status, payload.decode("utf-8", errors="replace"), final_url, headers
 
-    async def _fetch_text_response(
+    async def fetch_bytes(
         self,
         url: str,
         *,
         context_url: str,
         max_bytes: int,
-        accept: str,
-        reprime: bool,
+        reprime: bool = False,
     ) -> Tuple[int, bytes, str, Dict[str, str]]:
+        """Fetch bounded same-origin binary content through the browser session."""
+
+        page, prime_failure = await self._primed_request_page(
+            url,
+            context_url=context_url,
+            reprime=reprime,
+        )
+        if page is None:
+            status, final_url = prime_failure
+            return status, b"", final_url, {}
+
+        result = await page.evaluate(
+            """async ({url, maxBytes}) => {
+                const response = await fetch(url, {
+                    cache: "no-store",
+                    credentials: "include",
+                    redirect: "manual"
+                });
+                const headers = Object.fromEntries(response.headers.entries());
+                const declaredLength = Number(headers["content-length"] || 0);
+                if (declaredLength > maxBytes) {
+                    return {
+                        status: response.status,
+                        finalUrl: response.url,
+                        headers,
+                        tooLarge: true,
+                        byteLength: declaredLength,
+                        bodyChunks: []
+                    };
+                }
+                const bytes = new Uint8Array(await response.arrayBuffer());
+                if (bytes.byteLength > maxBytes) {
+                    return {
+                        status: response.status,
+                        finalUrl: response.url,
+                        headers,
+                        tooLarge: true,
+                        byteLength: bytes.byteLength,
+                        bodyChunks: []
+                    };
+                }
+                const bodyChunks = [];
+                const chunkSize = 32766;
+                for (let offset = 0; offset < bytes.length; offset += chunkSize) {
+                    const chunk = bytes.subarray(offset, offset + chunkSize);
+                    bodyChunks.push(btoa(String.fromCharCode(...chunk)));
+                }
+                return {
+                    status: response.status,
+                    finalUrl: response.url,
+                    headers,
+                    tooLarge: false,
+                    byteLength: bytes.byteLength,
+                    bodyChunks
+                };
+            }""",
+            {"url": url, "maxBytes": max(1, int(max_bytes))},
+        )
+        if bool(result.get("tooLarge")):
+            raise ValueError(
+                "browser response exceeds configured size limit "
+                f"({int(max_bytes)} bytes)"
+            )
+        try:
+            payload = b"".join(
+                base64.b64decode(str(chunk), validate=True)
+                for chunk in (result.get("bodyChunks") or [])
+            )
+        except (ValueError, TypeError) as exc:
+            raise ValueError("browser returned invalid binary response encoding") from exc
+        if len(payload) > max(1, int(max_bytes)):
+            raise ValueError(
+                "browser response exceeds configured size limit "
+                f"({int(max_bytes)} bytes)"
+            )
+        headers = {
+            str(key): str(value)
+            for key, value in (result.get("headers") or {}).items()
+        }
+        return (
+            int(result.get("status") or 0),
+            payload,
+            str(result.get("finalUrl") or url),
+            headers,
+        )
+
+    async def _primed_request_page(
+        self,
+        url: str,
+        *,
+        context_url: str,
+        reprime: bool,
+    ) -> Tuple[Any, Tuple[int, str]]:
+        """Return a same-origin browser page, priming it once when necessary."""
+
         if self._context is None:
             raise RuntimeError("dynamic collection browser is not open")
         parsed_url = urlparse(url)
@@ -682,7 +777,26 @@ class PlaywrightDynamicCollectionBrowser:
             if response is None or int(response.status) >= 400:
                 status = int(response.status) if response is not None else 0
                 final_url = str(response.url) if response is not None else context_url
-                return status, b"", final_url, {}
+                return None, (status, final_url)
+        return page, (0, "")
+
+    async def _fetch_text_response(
+        self,
+        url: str,
+        *,
+        context_url: str,
+        max_bytes: int,
+        accept: str,
+        reprime: bool,
+    ) -> Tuple[int, bytes, str, Dict[str, str]]:
+        page, prime_failure = await self._primed_request_page(
+            url,
+            context_url=context_url,
+            reprime=reprime,
+        )
+        if page is None:
+            status, final_url = prime_failure
+            return status, b"", final_url, {}
 
         result = await page.evaluate(
             """async ({url, accept}) => {

@@ -106,6 +106,47 @@ def test_pdf_403_recovers_with_fresh_cookie_isolated_session(tmp_path: Path):
     assert crawler.stats["bytes_downloaded"] == len(path.read_bytes())
 
 
+def test_protected_pdf_recovers_through_active_browser_session(tmp_path: Path):
+    url = "https://mbzuai.ac.ae/content/media/guide.pdf"
+    payload = b"%PDF-1.7\nprotected browser document"
+
+    class Browser:
+        def __init__(self):
+            self.calls = []
+
+        async def fetch_bytes(self, requested_url, **kwargs):
+            self.calls.append((requested_url, kwargs))
+            return 200, payload, requested_url, {"content-type": "application/pdf"}
+
+    crawler = _crawler(_FakeSession([]))
+    browser = Browser()
+    crawler._active_browser_fetch = browser
+    crawler._browser_fetch_document_lock = asyncio.Lock()
+    crawler.browser_fetch_context_url = "https://mbzuai.ac.ae/"
+    crawler.download_dir = tmp_path
+    crawler.max_file_size_bytes = 1024 * 1024
+    crawler.stats["documents_downloaded"] = 0
+    crawler.stats["skipped_urls"] = 1
+    crawler.url_mapping[url] = "SKIPPED_HTTP_403"
+    crawler._robots_allows_url = lambda _url: True
+
+    asyncio.run(crawler._download_document(url))
+
+    downloaded = Path(crawler.url_mapping[url])
+    assert downloaded.read_bytes() == payload
+    assert crawler.stats["documents_downloaded"] == 1
+    assert crawler.stats["skipped_urls"] == 0
+    assert browser.calls == [
+        (
+            url,
+            {
+                "context_url": "https://mbzuai.ac.ae/",
+                "max_bytes": 1024 * 1024,
+            },
+        )
+    ]
+
+
 def test_same_site_pdf_redirect_is_followed_and_streamed(tmp_path: Path):
     url = "https://mbzuai.ac.ae/uploads/guide.pdf"
     final_url = "https://mbzuai.ac.ae/documents/guide.pdf"

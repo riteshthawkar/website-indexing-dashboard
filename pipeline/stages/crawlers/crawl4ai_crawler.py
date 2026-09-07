@@ -3643,6 +3643,8 @@ class Crawl4AICrawler(CrawlerStage):
         self.downloaded_images: Dict[str, str] = {}
         self.recoverable_skip_retries: Dict[str, int] = {}
         self.recoverable_skip_exhausted_urls: set[str] = set()
+        self._active_browser_fetch: Optional[PlaywrightDynamicCollectionBrowser] = None
+        self._browser_fetch_document_lock = asyncio.Lock()
         self.crawl_state: Dict[str, Any] = {}
         self.discovered_sitemaps: Dict[str, Any] = {"sources": [], "urls": []}
         self.seed_inventory: Dict[str, Any] = {"endpoints": [], "urls": []}
@@ -3764,17 +3766,22 @@ class Crawl4AICrawler(CrawlerStage):
                 async with PlaywrightDynamicCollectionBrowser(
                     **self._playwright_browser_kwargs()
                 ) as browser:
-                    adapter = _BrowserFetchCrawlerAdapter(
-                        browser,
-                        context_url=self.browser_fetch_context_url,
-                        max_response_bytes=self.browser_fetch_max_response_bytes,
-                        request_delay=self.browser_fetch_request_delay,
-                    )
-                    await self._crawl_seed_frontier(
-                        {"crawler": adapter},
-                        run_config,
-                        None,
-                    )
+                    self._active_browser_fetch = browser
+                    try:
+                        await self._retry_skipped_browser_documents()
+                        adapter = _BrowserFetchCrawlerAdapter(
+                            browser,
+                            context_url=self.browser_fetch_context_url,
+                            max_response_bytes=self.browser_fetch_max_response_bytes,
+                            request_delay=self.browser_fetch_request_delay,
+                        )
+                        await self._crawl_seed_frontier(
+                            {"crawler": adapter},
+                            run_config,
+                            None,
+                        )
+                    finally:
+                        self._active_browser_fetch = None
             else:
                 crawler_holder = {"crawler": AsyncWebCrawler(config=browser_config)}
                 await crawler_holder["crawler"].__aenter__()
@@ -7013,7 +7020,8 @@ class Crawl4AICrawler(CrawlerStage):
             self.stats["images_downloaded"] += 1
 
     async def _download_document(self, url: str) -> None:
-        if url in self.url_mapping and not str(self.url_mapping[url]).startswith("SKIPPED_"):
+        previous_mapping = str(self.url_mapping.get(url) or "")
+        if previous_mapping and not previous_mapping.startswith("SKIPPED_"):
             return
 
         ext = _url_extension(url)
@@ -7029,18 +7037,164 @@ class Crawl4AICrawler(CrawlerStage):
             )
             return
 
-        path = await self._download_binary(
-            url=url,
-            destination_dir=self.download_dir,
-            max_bytes=self.max_file_size_bytes,
-            expected_prefix=None,
-            status_on_failure="SKIPPED_DOWNLOAD_FAILED",
-            validate_document=True,
-            enforce_allowed_domain=True,
-        )
+        if getattr(self, "_active_browser_fetch", None) is not None:
+            path = await self._download_binary_via_browser(
+                url=url,
+                destination_dir=self.download_dir,
+                max_bytes=self.max_file_size_bytes,
+                expected_prefix=None,
+                status_on_failure="SKIPPED_DOWNLOAD_FAILED",
+                validate_document=True,
+            )
+        else:
+            path = await self._download_binary(
+                url=url,
+                destination_dir=self.download_dir,
+                max_bytes=self.max_file_size_bytes,
+                expected_prefix=None,
+                status_on_failure="SKIPPED_DOWNLOAD_FAILED",
+                validate_document=True,
+                enforce_allowed_domain=True,
+            )
         if path:
             self.url_mapping[url] = str(path)
             self.stats["documents_downloaded"] += 1
+            if previous_mapping.startswith("SKIPPED_"):
+                self.stats["skipped_urls"] = max(
+                    0,
+                    int(self.stats.get("skipped_urls") or 0) - 1,
+                )
+
+    async def _retry_skipped_browser_documents(self) -> None:
+        """Recover protected documents skipped before a browser session was available."""
+
+        candidates = [
+            url
+            for url, mapping in sorted(self.url_mapping.items())
+            if str(mapping).startswith("SKIPPED_")
+            and _url_extension(url) in DOWNLOADABLE_EXTENSIONS
+            and self._url_allowed_for_fetch(url)
+            and self._robots_allows_url(url)
+        ]
+        if not candidates:
+            return
+        recovered_before = int(self.stats.get("documents_downloaded") or 0)
+        for url in candidates:
+            await self._download_document(url)
+        recovered = int(self.stats.get("documents_downloaded") or 0) - recovered_before
+        logger.info(
+            "Browser document recovery completed: recovered=%d attempted=%d",
+            recovered,
+            len(candidates),
+        )
+        self._flush_runtime_state(force=True)
+
+    async def _download_binary_via_browser(
+        self,
+        *,
+        url: str,
+        destination_dir: Path,
+        max_bytes: int,
+        expected_prefix: Optional[str],
+        status_on_failure: Optional[str],
+        validate_document: bool,
+    ) -> Optional[Path]:
+        """Persist a bounded same-origin binary response from the active browser."""
+
+        normalized = _normalize_http_url(url)
+        browser = getattr(self, "_active_browser_fetch", None)
+        if not normalized or browser is None:
+            return None
+        if not self._url_allowed_for_fetch(normalized):
+            self._record_download_failure(
+                normalized,
+                "SKIPPED_EGRESS_POLICY",
+                status_on_failure,
+            )
+            return None
+
+        tmp_path: Optional[Path] = None
+        try:
+            lock = getattr(self, "_browser_fetch_document_lock", None)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._browser_fetch_document_lock = lock
+            async with lock:
+                status, payload, final_url, headers = await browser.fetch_bytes(
+                    normalized,
+                    context_url=self.browser_fetch_context_url,
+                    max_bytes=max_bytes,
+                )
+            normalized_final = _normalize_http_url(final_url)
+            if not normalized_final or not self._url_allowed_for_fetch(normalized_final):
+                self._record_download_failure(
+                    normalized,
+                    "SKIPPED_EGRESS_POLICY",
+                    status_on_failure,
+                )
+                return None
+            if status != 200:
+                failure_reason = (
+                    f"SKIPPED_HTTP_{status}"
+                    if status
+                    else "SKIPPED_BROWSER_FETCH_FAILED"
+                )
+                self._record_download_failure(
+                    normalized,
+                    failure_reason,
+                    status_on_failure,
+                )
+                return None
+
+            content_type = str(
+                headers.get("content-type") or headers.get("Content-Type") or ""
+            )
+            if expected_prefix and content_type and not content_type.lower().startswith(
+                expected_prefix
+            ):
+                self._record_download_failure(
+                    normalized,
+                    "SKIPPED_UNEXPECTED_CONTENT_TYPE",
+                    status_on_failure,
+                )
+                return None
+            if validate_document and not _is_valid_downloaded_document_payload(
+                payload[:1024],
+                extension=_url_extension(normalized),
+                content_type=content_type,
+            ):
+                self._record_download_failure(
+                    normalized,
+                    "SKIPPED_INVALID_DOCUMENT",
+                    status_on_failure,
+                )
+                return None
+
+            target_path = _build_stable_output_path(
+                destination_dir,
+                normalized,
+                content_type=content_type,
+            )
+            tmp_path = target_path.with_suffix(target_path.suffix + ".part")
+            with open(tmp_path, "wb") as handle:
+                handle.write(payload)
+            tmp_path.replace(target_path)
+            self.stats["bytes_downloaded"] += len(payload)
+            return target_path
+        except ValueError:
+            self._record_download_failure(
+                normalized,
+                "SKIPPED_TOO_LARGE",
+                status_on_failure,
+            )
+            return None
+        except Exception as exc:
+            logger.debug("Browser binary download failed for %s: %s", normalized, exc)
+            self._record_download_failure(normalized, None, status_on_failure)
+            return None
+        finally:
+            if tmp_path and tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
     @contextlib.asynccontextmanager
     async def _fresh_cookie_isolated_download_session(self):

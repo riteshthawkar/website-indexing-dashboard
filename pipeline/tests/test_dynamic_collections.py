@@ -1,4 +1,5 @@
 import asyncio
+import base64
 
 from pipeline.core.dynamic_collections import (
     DynamicCollectionSpec,
@@ -411,3 +412,46 @@ def test_browser_json_fetch_primes_same_origin_and_enforces_size_limit():
         assert "same-origin" in str(exc)
     else:
         raise AssertionError("cross-origin browser JSON fetch must be rejected")
+
+
+def test_browser_binary_fetch_is_bounded_and_bypasses_cache():
+    payload = b"%PDF-1.7\nprotected document"
+
+    class Response:
+        status = 200
+
+    class Page:
+        async def goto(self, _url, **_kwargs):
+            return Response()
+
+        async def evaluate(self, script, argument):
+            assert 'cache: "no-store"' in script
+            assert argument["maxBytes"] == 1024
+            return {
+                "status": 200,
+                "finalUrl": argument["url"],
+                "headers": {"content-type": "application/pdf"},
+                "tooLarge": False,
+                "byteLength": len(payload),
+                "bodyChunks": [base64.b64encode(payload).decode("ascii")],
+            }
+
+    class Context:
+        async def new_page(self):
+            return Page()
+
+    browser = PlaywrightDynamicCollectionBrowser(headless=False, timeout_sec=5)
+    browser._context = Context()
+
+    status, actual, final_url, headers = asyncio.run(
+        browser.fetch_bytes(
+            "https://example.com/files/guide.pdf",
+            context_url="https://example.com/",
+            max_bytes=1024,
+        )
+    )
+
+    assert status == 200
+    assert actual == payload
+    assert final_url == "https://example.com/files/guide.pdf"
+    assert headers["content-type"] == "application/pdf"
