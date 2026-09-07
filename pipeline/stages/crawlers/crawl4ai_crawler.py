@@ -4534,9 +4534,11 @@ class Crawl4AICrawler(CrawlerStage):
                 output_is_durable = False
                 stored_path = Path()
             if output_is_durable and stored_path.suffix.lower() in {".html", ".htm"}:
-                html = stored_path.read_text(encoding="utf-8", errors="replace")
-                quality = _html_quality_report(html, normalized)
-                if not bool(quality.get("usable", True)):
+                metadata = (getattr(self, "page_metadata", {}) or {}).get(
+                    normalized
+                ) or {}
+                title = str(metadata.get("title") or "")
+                if _is_error_page_title(title):
                     self._quarantine_invalid_saved_page(normalized, stored_path)
                     output_is_durable = False
             if output_is_durable:
