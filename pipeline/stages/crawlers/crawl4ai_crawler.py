@@ -24,6 +24,8 @@ import socket
 import ssl
 import time
 import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from functools import lru_cache
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -367,11 +369,20 @@ class _BrowserFetchCrawlerAdapter:
         context_url: str,
         max_response_bytes: int,
         request_delay: float,
+        rate_limit_attempts: int = 1,
+        rate_limit_backoff: float = 5.0,
+        rate_limit_max_backoff: float = 60.0,
     ):
         self.browser = browser
         self.context_url = context_url
         self.max_response_bytes = max(1, int(max_response_bytes))
         self.request_delay = max(0.0, float(request_delay))
+        self.rate_limit_attempts = max(1, int(rate_limit_attempts))
+        self.rate_limit_backoff = max(0.0, float(rate_limit_backoff))
+        self.rate_limit_max_backoff = max(
+            self.rate_limit_backoff,
+            float(rate_limit_max_backoff),
+        )
 
     async def arun_many(self, *, urls: Sequence[str], config: Any) -> List[Any]:
         del config
@@ -381,11 +392,36 @@ class _BrowserFetchCrawlerAdapter:
             if not normalized:
                 continue
             try:
-                status, html, final_url, headers = await self.browser.fetch_html(
-                    normalized,
-                    context_url=self.context_url,
-                    max_bytes=self.max_response_bytes,
-                )
+                status = 0
+                html = ""
+                final_url = normalized
+                headers: Dict[str, str] = {}
+                for attempt in range(1, self.rate_limit_attempts + 1):
+                    status, html, final_url, headers = await self.browser.fetch_html(
+                        normalized,
+                        context_url=self.context_url,
+                        max_bytes=self.max_response_bytes,
+                    )
+                    if status != 429 or attempt >= self.rate_limit_attempts:
+                        break
+                    retry_after = _retry_after_seconds(
+                        headers,
+                        max_delay=self.rate_limit_max_backoff,
+                    )
+                    exponential_backoff = min(
+                        self.rate_limit_max_backoff,
+                        self.rate_limit_backoff * (2 ** (attempt - 1)),
+                    )
+                    delay = max(retry_after, exponential_backoff)
+                    logger.warning(
+                        "Browser fetch was rate limited for %s; retrying attempt %d/%d after %.1fs.",
+                        normalized,
+                        attempt + 1,
+                        self.rate_limit_attempts,
+                        delay,
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
                 success = status == 200 and bool(html.strip())
                 results.append(
                     SimpleNamespace(
@@ -419,6 +455,40 @@ class _BrowserFetchCrawlerAdapter:
             if self.request_delay:
                 await asyncio.sleep(self.request_delay)
         return results
+
+
+def _retry_after_seconds(
+    headers: Mapping[str, Any],
+    *,
+    max_delay: float,
+    now: Optional[datetime] = None,
+) -> float:
+    """Return a bounded Retry-After delay from seconds or an HTTP date."""
+
+    raw_value = next(
+        (
+            str(value).strip()
+            for key, value in (headers or {}).items()
+            if str(key).casefold() == "retry-after" and str(value).strip()
+        ),
+        "",
+    )
+    if not raw_value:
+        return 0.0
+    try:
+        delay = float(raw_value)
+    except ValueError:
+        try:
+            retry_at = parsedate_to_datetime(raw_value)
+            if retry_at.tzinfo is None:
+                retry_at = retry_at.replace(tzinfo=timezone.utc)
+            current = now or datetime.now(timezone.utc)
+            if current.tzinfo is None:
+                current = current.replace(tzinfo=timezone.utc)
+            delay = (retry_at - current).total_seconds()
+        except (TypeError, ValueError, OverflowError):
+            return 0.0
+    return min(max(0.0, delay), max(0.0, float(max_delay)))
 
 
 def _compact_failure_reason(value: Any, *, max_chars: int = 220) -> str:
@@ -513,8 +583,11 @@ def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
     text = str(value or "").lower()
     if not text.startswith("skipped"):
         return False
-    if re.match(r"^skipped_http_(?:301|302|307|308)(?::|$)", text):
-        return True
+    status_match = re.match(r"^skipped_http_(\d{3})(?::|$)", text)
+    if status_match:
+        status = int(status_match.group(1))
+        if status in RETRYABLE_STATUSES or status in SAFE_REDIRECT_STATUSES:
+            return True
     if re.match(
         r"^skipped_http_403:blocked by anti-bot protection(?:[\s:.,;!()\[\]-]|$)",
         text,
@@ -532,6 +605,7 @@ def _is_recoverable_crawl_skip_reason(value: Any) -> bool:
         "net::err_connection_closed",
         "net::err_connection_timed_out",
         "browser_fetch_http_unknown",
+        "skipped_error:browser_fetch_",
         "skipped_no_result",
         "skipped_http_403:content_quality",
         "skipped_low_quality:content_quality:blocked_or_error_page",
@@ -2946,6 +3020,36 @@ class Crawl4AICrawler(CrawlerStage):
                 )
             )
         )
+        allowed_terminal_frontier_urls = {
+            url
+            for url, verified_status in verified_terminal_urls.items()
+            if _crawl_skip_status(
+                (getattr(self, "url_mapping", {}) or {}).get(url)
+            )
+            == verified_status
+        }
+        for url, reason in (getattr(self, "url_mapping", {}) or {}).items():
+            normalized = _normalize_http_url(url)
+            skip_status = _crawl_skip_status(reason)
+            if (
+                normalized
+                and skip_status in allowed_terminal_statuses
+                and any(re.search(pattern, normalized) for pattern in allowed_terminal_patterns)
+            ):
+                allowed_terminal_frontier_urls.add(normalized)
+        unexpected_failed_frontier_urls = sorted(
+            normalized
+            for url, reason in (getattr(self, "url_mapping", {}) or {}).items()
+            if (normalized := _normalize_http_url(url))
+            and str(reason or "").startswith("SKIPPED")
+            and not str(reason or "").startswith(
+                (
+                    "SKIPPED_EXCLUDED",
+                    "SKIPPED_ROBOTS_POLICY",
+                )
+            )
+            and normalized not in allowed_terminal_frontier_urls
+        )
         unexpected_failed_inventory_urls = sorted(
             set(failed_inventory_urls) - set(allowed_terminal_inventory_urls)
         )
@@ -2981,6 +3085,7 @@ class Crawl4AICrawler(CrawlerStage):
             allowed_terminal_inventory_urls
         )
         self.stats["terminal_pages_verified"] = len(verified_terminal_urls)
+        self.stats["frontier_urls_failed"] = len(unexpected_failed_frontier_urls)
         self.stats["seed_inventory_unexpected_failed_urls"] = len(
             unexpected_failed_inventory_urls
         )
@@ -2992,6 +3097,14 @@ class Crawl4AICrawler(CrawlerStage):
             errors.append(
                 "Crawler frontier is incomplete after reaching a terminal condition: "
                 f"pending={len(pending)} max_pages={self.max_pages}"
+            )
+        if unexpected_failed_frontier_urls and bool(
+            self.config.get("require_successful_frontier", False)
+        ):
+            errors.append(
+                "Crawler frontier contains non-terminal failed URLs: "
+                f"failed={len(unexpected_failed_frontier_urls)} "
+                f"sample={unexpected_failed_frontier_urls[:10]}"
             )
         if bool(self.config.get("require_complete_priority_seeds", False)):
             if unmapped_priority_urls:
@@ -3346,6 +3459,8 @@ class Crawl4AICrawler(CrawlerStage):
             errors.append(
                 "crawler.require_successful_seed_inventory must be a boolean"
             )
+        if not isinstance(crawler.get("require_successful_frontier", False), bool):
+            errors.append("crawler.require_successful_frontier must be a boolean")
         allowed_terminal_patterns = crawler.get(
             "seed_inventory_allowed_terminal_url_patterns"
         ) or []
@@ -3462,6 +3577,7 @@ class Crawl4AICrawler(CrawlerStage):
             "seed_inventory_max_response_bytes",
             "seed_inventory_fetch_attempts",
             "browser_fetch_max_response_bytes",
+            "browser_fetch_rate_limit_attempts",
             "browser_terminal_verification_attempts",
             "browser_terminal_verification_max_urls",
         ):
@@ -3501,6 +3617,8 @@ class Crawl4AICrawler(CrawlerStage):
                     "crawler.browser_fetch_request_delay_sec must be numeric and >= 0"
                 )
         for key in (
+            "browser_fetch_rate_limit_backoff_sec",
+            "browser_fetch_rate_limit_max_backoff_sec",
             "browser_terminal_verification_backoff_sec",
             "browser_terminal_verification_request_delay_sec",
         ):
@@ -3512,6 +3630,15 @@ class Crawl4AICrawler(CrawlerStage):
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"crawler.{key} must be numeric and >= 0")
+
+        retry_generation = crawler.get("recoverable_skip_retry_generation", 0)
+        try:
+            if isinstance(retry_generation, bool) or int(retry_generation) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append(
+                "crawler.recoverable_skip_retry_generation must be a non-negative integer"
+            )
 
         for depth_key in ("max_depth", "sitemap_max_depth"):
             max_depth = crawler.get(depth_key)
@@ -3651,6 +3778,9 @@ class Crawl4AICrawler(CrawlerStage):
         )
         self.recoverable_skip_max_retries = max(
             0, int(self.config.get("recoverable_skip_max_retries", 2))
+        )
+        self.recoverable_skip_retry_generation = max(
+            0, int(self.config.get("recoverable_skip_retry_generation", 0))
         )
         self.recoverable_skip_retry_queue_position = str(
             self.config.get("recoverable_skip_retry_queue_position", "front")
@@ -3836,6 +3966,23 @@ class Crawl4AICrawler(CrawlerStage):
         self.browser_fetch_request_delay = max(
             0.0,
             float(self.config.get("browser_fetch_request_delay_sec", 0.5)),
+        )
+        self.browser_fetch_rate_limit_attempts = max(
+            1,
+            int(self.config.get("browser_fetch_rate_limit_attempts", 1)),
+        )
+        self.browser_fetch_rate_limit_backoff = max(
+            0.0,
+            float(self.config.get("browser_fetch_rate_limit_backoff_sec", 5.0)),
+        )
+        self.browser_fetch_rate_limit_max_backoff = max(
+            self.browser_fetch_rate_limit_backoff,
+            float(
+                self.config.get(
+                    "browser_fetch_rate_limit_max_backoff_sec",
+                    60.0,
+                )
+            ),
         )
         self.dynamic_collection_specs, dynamic_collection_errors = (
             normalize_dynamic_collection_specs(
@@ -4102,6 +4249,11 @@ class Crawl4AICrawler(CrawlerStage):
                             context_url=self.browser_fetch_context_url,
                             max_response_bytes=self.browser_fetch_max_response_bytes,
                             request_delay=self.browser_fetch_request_delay,
+                            rate_limit_attempts=self.browser_fetch_rate_limit_attempts,
+                            rate_limit_backoff=self.browser_fetch_rate_limit_backoff,
+                            rate_limit_max_backoff=(
+                                self.browser_fetch_rate_limit_max_backoff
+                            ),
                         )
                         while True:
                             await self._crawl_seed_frontier(
@@ -4644,6 +4796,33 @@ class Crawl4AICrawler(CrawlerStage):
             for value in (state.get("recoverable_skip_exhausted_urls") or [])
             if (normalized := _normalize_http_url(value))
         }
+        try:
+            stored_retry_generation = max(
+                0,
+                int(state.get("recoverable_skip_retry_generation") or 0),
+            )
+        except (TypeError, ValueError):
+            stored_retry_generation = 0
+        configured_retry_generation = int(
+            getattr(self, "recoverable_skip_retry_generation", 0)
+        )
+        if stored_retry_generation > configured_retry_generation:
+            raise RuntimeError(
+                "Crawler retry generation cannot move backwards: "
+                f"checkpoint={stored_retry_generation} "
+                f"configured={configured_retry_generation}"
+            )
+        self._recoverable_skip_retry_generation_advanced = (
+            configured_retry_generation > stored_retry_generation
+        )
+        if self._recoverable_skip_retry_generation_advanced:
+            logger.warning(
+                "Opening crawler recoverable-skip retry generation %d (previous=%d).",
+                configured_retry_generation,
+                stored_retry_generation,
+            )
+            self.recoverable_skip_retries = {}
+            self.recoverable_skip_exhausted_urls = set()
         terminal_verification_file = getattr(
             self, "terminal_page_verification_file", None
         )
@@ -4691,6 +4870,8 @@ class Crawl4AICrawler(CrawlerStage):
         self.downloaded_images = dict(state.get("downloaded_images") or {})
         loaded_stats = state.get("stats") or {}
         self.stats = _merge_counter_dict(self.stats, loaded_stats)
+        if getattr(self, "_recoverable_skip_retry_generation_advanced", False):
+            self.stats["recoverable_skips_exhausted"] = 0
 
         frontier_candidates: List[Tuple[Dict[str, Any], float, int]] = []
         for runtime_payload, _path, freshness, priority in runtime_sources:
@@ -5018,6 +5199,19 @@ class Crawl4AICrawler(CrawlerStage):
         requeued: List[str] = []
         requeued_set: set[str] = set()
         recoverable_mapping_urls: set[str] = set()
+        verified_terminal_urls = _verified_terminal_page_urls(
+            getattr(self, "terminal_page_verification", {}),
+            allowed_statuses=getattr(
+                self,
+                "browser_terminal_verification_statuses",
+                {404, 410},
+            ),
+            minimum_attempts=getattr(
+                self,
+                "browser_terminal_verification_attempts",
+                1,
+            ),
+        )
         exhausted = 0
         for url, reason in list(self.url_mapping.items()):
             normalized = _normalize_http_url(url)
@@ -5025,6 +5219,11 @@ class Crawl4AICrawler(CrawlerStage):
             if not normalized or not (
                 _is_recoverable_crawl_skip_reason(reason)
                 or skip_status in getattr(self, "transient_page_statuses", set())
+            ):
+                continue
+            if (
+                skip_status is not None
+                and verified_terminal_urls.get(normalized) == skip_status
             ):
                 continue
             recoverable_mapping_urls.add(normalized)
@@ -8282,6 +8481,9 @@ class Crawl4AICrawler(CrawlerStage):
             "page_links": self.page_links,
             "downloaded_images": self.downloaded_images,
             "recoverable_skip_retries": self.recoverable_skip_retries,
+            "recoverable_skip_retry_generation": int(
+                getattr(self, "recoverable_skip_retry_generation", 0)
+            ),
             "recoverable_skip_exhausted_urls": sorted(
                 self.recoverable_skip_exhausted_urls
             ),

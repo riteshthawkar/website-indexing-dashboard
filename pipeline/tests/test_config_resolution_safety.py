@@ -199,6 +199,59 @@ def test_incomplete_config_migration_rejects_completed_stage(tmp_path: Path) -> 
         orchestrator._migrate_incomplete_config_snapshot()
 
 
+def test_completed_nonproduction_migration_requires_full_restart(tmp_path: Path) -> None:
+    work_root = tmp_path / "runs"
+    work_dir = work_root / "mbzuai_main" / "run-1"
+    work_dir.mkdir(parents=True)
+    saved_config = _production_config(chunk_size=800, work_root=work_root)
+    saved_config["pipeline"]["production_profile"] = False
+    current_config = _production_config(chunk_size=900, work_root=work_root)
+    current_config["pipeline"]["production_profile"] = False
+    saved_hashes = {"stages/crawlers/crawl4ai_crawler.py": "saved-build"}
+    atomic_write_json(
+        work_dir / "resolved_config.json",
+        {
+            "run_id": "run-1",
+            "production_indexing_contract_fingerprint": (
+                production_indexing_contract_fingerprint(
+                    saved_config,
+                    implementation_hashes=saved_hashes,
+                )
+            ),
+            "indexing_build": {"implementation_sha256": saved_hashes},
+            "config": saved_config,
+        },
+    )
+    save_state(
+        PipelineState(
+            run_id="run-1",
+            project_name="mbzuai_main",
+            status="completed",
+            stages=[
+                StageState(
+                    name="crawl4ai",
+                    stage_type="crawler",
+                    stage_id="crawl",
+                    status="completed",
+                )
+            ],
+        ),
+        work_dir,
+    )
+    orchestrator = PipelineOrchestrator(
+        current_config,
+        work_dir=work_dir,
+        run_id="run-1",
+    )
+    orchestrator._build_stages()
+
+    orchestrator._migrate_incomplete_config_snapshot(restart_from_index=0)
+
+    migrations = load_json_safe(work_dir / "config_migrations.json", [])
+    assert migrations[-1]["reason"] == "explicit_full_restart_config_migration"
+    assert migrations[-1]["restart_from_index"] == 0
+
+
 def test_resolved_config_snapshot_and_fingerprint_exclude_embedded_secrets(tmp_path: Path) -> None:
     config = _production_config(chunk_size=800, work_root=tmp_path / "runs")
     config["graph"] = {"neo4j_password": "do-not-archive", "store_backend": "local_json"}

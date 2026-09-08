@@ -1520,6 +1520,12 @@ class TestCrawlerHelpers:
             "SKIPPED_ERROR:Unexpected error in _crawl_web: "
             "Page.goto: net::ERR_INTERNET_DISCONNECTED at https://mbzuai.ac.ae/news/example"
         )
+        assert _is_recoverable_crawl_skip_reason(
+            "SKIPPED_HTTP_429:browser_fetch_http_429"
+        )
+        assert _is_recoverable_crawl_skip_reason(
+            "SKIPPED_ERROR:browser_fetch_Error"
+        )
 
     def test_browser_close_connection_error_is_benign_shutdown_error(self):
         from pipeline.stages.crawlers.crawl4ai_crawler import _is_benign_browser_close_error
@@ -1580,6 +1586,69 @@ class TestCrawlerHelpers:
         # must remain URL counts rather than growing once per later batch.
         assert crawler._requeue_recoverable_skipped_urls() == []
         assert crawler.stats["recoverable_skips_exhausted"] == 1
+
+    def test_requeue_preserves_verified_terminal_page_evidence(self, monkeypatch):
+        from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module
+        from pipeline.stages.crawlers.crawl4ai_crawler import Crawl4AICrawler
+
+        url = "https://mbzuai.ac.ae/retired"
+        observations = [
+            {
+                "attempt": attempt,
+                "status": 404,
+                "final_url": url,
+                "title": "404 - Page Not Found",
+                "response_bytes": 128,
+                "response_sha256": str(attempt) * 64,
+            }
+            for attempt in range(1, 4)
+        ]
+        crawler = object.__new__(Crawl4AICrawler)
+        crawler.crawl_state = {
+            "pending": [],
+            "visited": [url],
+            "pages_crawled": 0,
+            "depths": {},
+        }
+        crawler.url_mapping = {url: "SKIPPED_HTTP_404:browser_fetch_http_404"}
+        crawler.stats = {
+            "pages_failed": 1,
+            "skipped_urls": 1,
+            "recoverable_skips_exhausted": 0,
+            "excluded_frontier_urls": 0,
+        }
+        crawler.recoverable_skip_retries = {}
+        crawler.recoverable_skip_exhausted_urls = set()
+        crawler.recoverable_skip_max_retries = 2
+        crawler.transient_page_statuses = {404}
+        crawler.browser_terminal_verification_statuses = {404, 500}
+        crawler.browser_terminal_verification_attempts = 3
+        crawler.terminal_page_verification = (
+            crawler_module._finalize_terminal_page_verification(
+                [
+                    {
+                        "url": url,
+                        "classification": "verified_terminal_error",
+                        "status": 404,
+                        "verified_at_epoch": 1,
+                        "observations": observations,
+                    }
+                ]
+            )
+        )
+        crawler.excluded_path_prefixes = set()
+        crawler.start_url = "https://mbzuai.ac.ae"
+        crawler.allowed_domains = {"mbzuai.ac.ae"}
+        crawler.excluded_subdomains = set()
+        monkeypatch.setattr(
+            crawler_module,
+            "_host_resolves_to_private_or_reserved",
+            lambda _host: False,
+        )
+
+        assert crawler._requeue_recoverable_skipped_urls() == []
+        assert crawler.crawl_state["pending"] == []
+        assert crawler.url_mapping[url].startswith("SKIPPED_HTTP_404")
 
     def test_requeue_anti_bot_403_without_requeueing_generic_403(self, monkeypatch):
         from pipeline.stages.crawlers import crawl4ai_crawler as crawler_module

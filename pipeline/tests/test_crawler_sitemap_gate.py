@@ -639,6 +639,120 @@ def test_browser_fetch_adapter_returns_processable_html_results():
     assert results[1].error_message == "browser_fetch_http_503"
 
 
+def test_browser_fetch_adapter_honors_rate_limit_backoff(monkeypatch):
+    calls = 0
+    sleeps = []
+
+    class Browser:
+        async def fetch_html(self, url, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return 429, "limited", url, {"Retry-After": "5"}
+            return 200, "<html><body>Recovered</body></html>", url, {}
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+
+    monkeypatch.setattr(crawler_module.asyncio, "sleep", fake_sleep)
+    adapter = crawler_module._BrowserFetchCrawlerAdapter(
+        Browser(),
+        context_url="https://example.com",
+        max_response_bytes=2048,
+        request_delay=0,
+        rate_limit_attempts=3,
+        rate_limit_backoff=2,
+        rate_limit_max_backoff=10,
+    )
+
+    results = asyncio.run(
+        adapter.arun_many(
+            urls=["https://example.com/rate-limited"],
+            config=SimpleNamespace(),
+        )
+    )
+
+    assert calls == 2
+    assert sleeps == [5]
+    assert results[0].success is True
+    assert results[0].status_code == 200
+
+
+def test_retry_after_parser_supports_seconds_dates_and_bounds():
+    from datetime import datetime, timezone
+
+    now = datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc)
+
+    assert crawler_module._retry_after_seconds(
+        {"retry-after": "7"}, max_delay=20, now=now
+    ) == 7
+    assert crawler_module._retry_after_seconds(
+        {"Retry-After": "Tue, 08 Sep 2026 12:00:30 GMT"},
+        max_delay=20,
+        now=now,
+    ) == 20
+    assert crawler_module._retry_after_seconds(
+        {"Retry-After": "invalid"}, max_delay=20, now=now
+    ) == 0
+
+
+def test_successful_frontier_gate_rejects_unresolved_rate_limits():
+    verified_url = "https://preprod.mbzuai.ac.ae/retired"
+    limited_url = "https://preprod.mbzuai.ac.ae/current"
+    excluded_url = "https://preprod.mbzuai.ac.ae/cdn-cgi/l/email-protection"
+    observations = [
+        {
+            "attempt": attempt,
+            "status": 404,
+            "final_url": verified_url,
+            "title": "404 - Page Not Found",
+            "response_bytes": 128,
+            "response_sha256": str(attempt) * 64,
+        }
+        for attempt in range(1, 4)
+    ]
+    crawler = crawler_module.Crawl4AICrawler()
+    crawler.config = {
+        "require_successful_frontier": True,
+        "seed_inventory_allowed_terminal_statuses": [404, 500],
+    }
+    crawler.max_pages = 100
+    crawler.crawl_state = {"pending": []}
+    crawler.seed_inventory = {"urls": []}
+    crawler.dynamic_collection_inventory = {"urls": []}
+    crawler.priority_seed_urls = []
+    crawler.browser_terminal_verification_statuses = {404, 500}
+    crawler.browser_terminal_verification_attempts = 3
+    crawler.terminal_page_verification = (
+        crawler_module._finalize_terminal_page_verification(
+            [
+                {
+                    "url": verified_url,
+                    "classification": "verified_terminal_error",
+                    "status": 404,
+                    "verified_at_epoch": 1,
+                    "observations": observations,
+                }
+            ]
+        )
+    )
+    crawler.url_mapping = {
+        verified_url: "SKIPPED_HTTP_404:browser_fetch_http_404",
+        limited_url: "SKIPPED_HTTP_429:browser_fetch_http_429",
+        excluded_url: "SKIPPED_EXCLUDED_FRONTIER:path_prefix",
+    }
+    crawler.stats = {}
+
+    errors = crawler._crawl_completion_errors()
+
+    assert len(errors) == 1
+    assert "non-terminal failed URLs" in errors[0]
+    assert limited_url in errors[0]
+    assert verified_url not in errors[0]
+    assert excluded_url not in errors[0]
+    assert crawler.stats["frontier_urls_failed"] == 1
+
+
 def test_successful_internal_redirect_maps_alias_to_one_canonical_artifact(
     tmp_path,
     monkeypatch,

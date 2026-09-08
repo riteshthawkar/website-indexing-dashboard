@@ -1097,8 +1097,8 @@ def main() -> int:
         "--migrate-incomplete-config",
         action="store_true",
         help=(
-            "Explicitly migrate an unfinished non-production run to the current "
-            "config while preserving its active-stage checkpoint"
+            "Explicitly migrate a non-production run to the current config; "
+            "completed runs also require --restart-from-stage selecting stage zero"
         ),
     )
     p_run.add_argument(

@@ -405,14 +405,17 @@ class PipelineOrchestrator:
                 f"(saved={actual_fingerprint}, requested={requested_fingerprint}); create a new run ID"
             )
 
-    def _migrate_incomplete_config_snapshot(self) -> None:
-        """Audit and migrate an unfinished non-production run to current config.
+    def _migrate_incomplete_config_snapshot(
+        self,
+        *,
+        restart_from_index: Optional[int] = None,
+    ) -> None:
+        """Audit and migrate a non-production run to the current config.
 
-        This deliberately does not permit completed stages or production runs:
-        those artifacts are immutable and must use a fresh run ID.  The narrow
-        migration path exists for a checkpointed development crawl whose active
-        stage needs a corrected contract without discarding already captured raw
-        artifacts.
+        Production runs remain immutable. An unfinished development run may
+        preserve its active-stage checkpoint. A completed non-production run is
+        eligible only when the caller explicitly restarts from stage zero, which
+        invalidates every completed stage while preserving resumable raw files.
         """
 
         snapshot_path = self.work_dir / "resolved_config.json"
@@ -442,9 +445,13 @@ class PipelineOrchestrator:
             raise RunConfigMismatchError(
                 "Cannot migrate incomplete run config for a different run ID"
             )
-        if any(stage.status == "completed" for stage in state.stages):
+        has_completed_stages = any(
+            stage.status == "completed" for stage in state.stages
+        )
+        if has_completed_stages and restart_from_index != 0:
             raise RunConfigMismatchError(
-                "Cannot migrate run config after any stage has completed; create a new run ID"
+                "Cannot migrate run config after any stage has completed unless "
+                "the non-production run is explicitly restarted from stage zero"
             )
         if len(state.stages) != len(self._stages):
             raise RunConfigMismatchError(
@@ -496,6 +503,11 @@ class PipelineOrchestrator:
             raise RunConfigMismatchError(
                 "Cannot migrate incomplete run config because its migration audit is invalid"
             )
+        migration_reason = (
+            "explicit_full_restart_config_migration"
+            if has_completed_stages
+            else "explicit_incomplete_run_config_migration"
+        )
         migrations.append(
             {
                 "migrated_at": now_iso(),
@@ -504,7 +516,8 @@ class PipelineOrchestrator:
                 "current_stage_index": state.current_stage_index,
                 "saved_fingerprint": recorded_fingerprint,
                 "requested_fingerprint": requested_fingerprint,
-                "reason": "explicit_incomplete_run_config_migration",
+                "restart_from_index": restart_from_index,
+                "reason": migration_reason,
             }
         )
         atomic_write_json(migrations_path, migrations)
@@ -661,7 +674,9 @@ class PipelineOrchestrator:
                 self._validate_fresh_production_run_directory()
                 self._raise_if_active_upload_would_run(state=None)
             elif migrate_incomplete_config:
-                self._migrate_incomplete_config_snapshot()
+                self._migrate_incomplete_config_snapshot(
+                    restart_from_index=restart_from_index,
+                )
             else:
                 self._validate_resume_config_snapshot()
 

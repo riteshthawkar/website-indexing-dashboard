@@ -38,6 +38,9 @@ crawler:
   enable_stealth: true
   fail_on_empty_result: true
   fail_on_incomplete_frontier: true
+  # Every discovered content route must either be captured, explicitly
+  # excluded, or backed by signed terminal-page verification evidence.
+  require_successful_frontier: true
   require_complete_seed_inventory: true
   require_successful_seed_inventory: true
   # These leaked Drupal fixture routes are present in the live search API but
@@ -202,7 +205,13 @@ crawler:
   frontier_fetch_transport: "browser_fetch"
   browser_fetch_context_url: "https://preprod.mbzuai.ac.ae/"
   browser_fetch_max_response_bytes: 16777216
-  browser_fetch_request_delay_sec: 0.6
+  # The preprod edge begins throttling sustained sessions near 20 requests per
+  # minute. Stay below that observed limit and cool down rather than converting
+  # HTTP 429 responses into permanent crawl outcomes.
+  browser_fetch_request_delay_sec: 3.5
+  browser_fetch_rate_limit_attempts: 4
+  browser_fetch_rate_limit_backoff_sec: 20.0
+  browser_fetch_rate_limit_max_backoff_sec: 90.0
   # Boundary checkpoints remain mandatory. Avoid serializing the growing
   # ~50-MB runtime state after nearly every individual page inside a batch.
   checkpoint_flush_interval_sec: 60
@@ -212,6 +221,7 @@ crawler:
   # bounded backoff before accepting a page as terminally unavailable.
   transient_page_statuses:
     - 404
+    - 429
     - 500
     - 502
     - 503
@@ -221,9 +231,12 @@ crawler:
   raw_source_retry_attempts: 4
   raw_source_retry_backoff_sec: 1.25
   retry_recoverable_skipped_on_resume: true
-  recoverable_skip_max_retries: 6
+  # Incrementing this generation is an explicit, checkpointed operator action
+  # that reopens transient failures after a crawler policy correction.
+  recoverable_skip_retry_generation: 1
+  recoverable_skip_max_retries: 2
   # Revisit failures after untouched routes, rather than retrying the same
-  # warming endpoint six times back-to-back.
+  # warming endpoint back-to-back.
   recoverable_skip_retry_queue_position: "tail"
   # After the ordinary retries are exhausted, reproduce a real browser reload
   # before accepting a 404/500 as a non-indexable terminal route. The signed
@@ -236,7 +249,7 @@ crawler:
   browser_terminal_verification_attempts: 3
   browser_terminal_verification_backoff_sec: 3.0
   browser_terminal_verification_request_delay_sec: 2.0
-  browser_terminal_verification_max_urls: 500
+  browser_terminal_verification_max_urls: 1000
   # Direct HTTP is deliberately challenged on this host, so browser failures
   # are retried in the browser frontier instead of wasting time on raw fallback.
   attempt_http_fallback_for_browser_failures: false
@@ -263,6 +276,7 @@ crawler:
   excluded_path_prefixes:
     - "/_nuxt/"
     - "/api/"
+    - "/cdn-cgi/"
     - "/ce-api"
     - "/nuxt-component-preview"
     - "/content/media/"
