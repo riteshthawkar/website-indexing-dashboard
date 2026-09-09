@@ -233,7 +233,7 @@ crawler:
   retry_recoverable_skipped_on_resume: true
   # Incrementing this generation is an explicit, checkpointed operator action
   # that reopens transient failures after a crawler policy correction.
-  recoverable_skip_retry_generation: 1
+  recoverable_skip_retry_generation: 2
   recoverable_skip_max_retries: 2
   # Revisit failures after untouched routes, rather than retrying the same
   # warming endpoint back-to-back.
