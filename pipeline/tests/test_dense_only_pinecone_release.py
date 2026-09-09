@@ -78,6 +78,40 @@ def test_selected_dense_only_pinecone_manifest_is_supported():
     assert errors == []
 
 
+def test_selected_pinecone_resolves_bounded_lane_specific_batch_sizes():
+    from pipeline.stages.embedders.selected_pinecone import (
+        _selected_lane_batch_sizes,
+    )
+
+    sizes = _selected_lane_batch_sizes(
+        {
+            "batch_size": 100,
+            "parent_batch_size": 16,
+            "page_card_batch_size": 32,
+            "media_text_batch_size": 64,
+        }
+    )
+
+    assert sizes["chunks"] == 100
+    assert sizes["parents"] == 16
+    assert sizes["page_cards"] == 32
+    assert sizes["media"] == 64
+    assert sizes["actions"] == 100
+
+
+def test_selected_pinecone_rejects_provider_oversized_lane_batch():
+    from pipeline.stages.embedders.selected_pinecone import (
+        _selected_lane_batch_sizes,
+    )
+
+    try:
+        _selected_lane_batch_sizes({"batch_size": 100, "parent_batch_size": 101})
+    except ValueError as exc:
+        assert str(exc) == "embedder.parent_batch_size must be between 1 and 100"
+    else:
+        raise AssertionError("oversized Gemini lane batches must fail closed")
+
+
 def test_deployment_validator_prefers_complete_summarized_community_graph(tmp_path):
     validator = _validator_module()
     community_dir = tmp_path / "stage_outputs" / "community_graph"

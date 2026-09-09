@@ -29,6 +29,10 @@ embedder:
   # round-trips without changing the evaluated representation.
   batch_size: 100
   media_text_batch_size: 100
+  # Parent records can approach the 4,096-token representation ceiling. Keep
+  # their aggregate request size near the proven short-chunk request envelope.
+  parent_batch_size: 16
+  page_card_batch_size: 32
 
 formatter:
   selected_release_assembly:

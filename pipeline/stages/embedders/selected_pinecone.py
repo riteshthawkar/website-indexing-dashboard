@@ -39,6 +39,46 @@ from pipeline.stages.embedders.gemini_pinecone_embedder import (
 logger = logging.getLogger(__name__)
 
 
+_SELECTED_LANE_BATCH_SIZE_KEYS = {
+    "chunks": "chunk_batch_size",
+    "parents": "parent_batch_size",
+    "media": "media_text_batch_size",
+    "page_cards": "page_card_batch_size",
+    "actions": "action_batch_size",
+    "facts": "fact_batch_size",
+    "evidence_spans": "evidence_span_batch_size",
+    "summaries": "summary_batch_size",
+    "assertions": "assertion_batch_size",
+    "entities": "entity_batch_size",
+    "communities": "community_batch_size",
+}
+
+
+def _selected_lane_batch_sizes(config: Mapping[str, Any]) -> Dict[str, int]:
+    """Resolve bounded Gemini text batch sizes for each selected lane.
+
+    Parent and Page Card records can be much longer than ordinary chunks. A
+    single global batch size can therefore exceed provider capacity even when
+    the same size is healthy for short records.
+    """
+
+    try:
+        default = int(config.get("batch_size") or 32)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("embedder.batch_size must be an integer") from exc
+    sizes: Dict[str, int] = {}
+    for lane, key in _SELECTED_LANE_BATCH_SIZE_KEYS.items():
+        raw = config.get(key, default)
+        try:
+            value = int(raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"embedder.{key} must be an integer") from exc
+        if not 1 <= value <= 100:
+            raise ValueError(f"embedder.{key} must be between 1 and 100")
+        sizes[lane] = value
+    return sizes
+
+
 def _zero_progress(totals: Mapping[str, int]) -> Dict[str, int]:
     return {lane: 0 for lane in totals}
 
@@ -125,6 +165,7 @@ def execute_selected_profile_pinecone(
             embedder_config=config,
         )
         media_input = _apply_selected_media_input_contract(lanes["media"], assembly)
+        lane_batch_sizes = _selected_lane_batch_sizes(config)
     except (OSError, RuntimeError, ValueError) as exc:
         return StageResult.failure(str(exc))
 
@@ -164,7 +205,6 @@ def execute_selected_profile_pinecone(
     max_retries = max(1, int(config.get("max_retries") or 6))
     retry_base = float(config.get("retry_base_delay_sec") or 5.0)
     retry_max = float(config.get("retry_max_delay_sec") or 120.0)
-    text_batch_size = max(1, int(config.get("batch_size") or 32))
     upsert_batch_size = max(1, int(config.get("upsert_batch_size") or 100))
     request_timeout = (
         float(config.get("pinecone_connect_timeout_sec") or 10.0),
@@ -211,7 +251,7 @@ def execute_selected_profile_pinecone(
         )
         for lane, records in lanes.items():
             remaining = records[uploaded[lane] :]
-            for batch in _iter_batches(remaining, text_batch_size):
+            for batch in _iter_batches(remaining, lane_batch_sizes[lane]):
                 batch_records = list(batch)
                 vectors = _call_with_retry(
                     f"embed_selected_pinecone_{lane}_batch",
@@ -303,6 +343,7 @@ def execute_selected_profile_pinecone(
         "model": model,
         "output_dimensionality": dimensions,
         "media_input": media_input,
+        "embedding_batch_sizes": lane_batch_sizes,
         "namespaces": namespaces,
         "namespace_strategy": namespace_strategy,
         "namespace_release_id": ctx.run_id,
