@@ -9,11 +9,11 @@ vector_store:
   dimensions: 1536
 
 assertions:
-  # The formatters enforce a 32-worker ceiling. This host and the configured
+  # The formatters enforce a 64-worker ceiling. This host and the configured
   # provider quota can sustain that ceiling, cutting the refreshed corpus's
   # assertion build time without changing prompts, models, or output schema.
-  extract_concurrency: 32
-  validate_concurrency: 32
+  extract_concurrency: 64
+  validate_concurrency: 64
 
 embedder:
   pinecone_index: "mbzuai-gemini-retrieval-v3"

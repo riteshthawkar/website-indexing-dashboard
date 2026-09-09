@@ -21,7 +21,7 @@ from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONCURRENCY = 32
+_MAX_CONCURRENCY = 64
 
 _EXTRACTION_JSON_SCHEMA = {
     "name": "assertion_extraction",

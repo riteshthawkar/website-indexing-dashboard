@@ -208,11 +208,11 @@ def test_assertion_stage_concurrency_is_bounded(
 
     errors = asyncio.run(
         formatter().validate_config(
-            {"assertions": {config_key: 33}}
+            {"assertions": {config_key: 65}}
         )
     )
 
-    assert errors == [f"assertions.{config_key} must be between 1 and 32"]
+    assert errors == [f"assertions.{config_key} must be between 1 and 64"]
 
 
 def test_assertion_grouping_prefers_exact_slice_and_indexes_chunk_fallback():
