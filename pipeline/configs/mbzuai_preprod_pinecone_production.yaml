@@ -8,6 +8,13 @@ vector_store:
   provider: "pinecone"
   dimensions: 1536
 
+assertions:
+  # The formatters enforce a 32-worker ceiling. This host and the configured
+  # provider quota can sustain that ceiling, cutting the refreshed corpus's
+  # assertion build time without changing prompts, models, or output schema.
+  extract_concurrency: 32
+  validate_concurrency: 32
+
 embedder:
   pinecone_index: "mbzuai-gemini-retrieval-v3"
   pinecone_sparse_index: ""
