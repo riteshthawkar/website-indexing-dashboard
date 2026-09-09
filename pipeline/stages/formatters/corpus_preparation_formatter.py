@@ -70,6 +70,172 @@ def _load_aliases(path: Any) -> List[Dict[str, Any]]:
     return [dict(value) for value in aliases or [] if isinstance(value, dict)]
 
 
+def _identity_urls(canonical_url: Any, metadata: Mapping[str, Any]) -> List[str]:
+    """Return URL aliases that belong to one canonical page identity.
+
+    Locale variants are intentionally excluded because they are separate
+    documents and must never be rebound to another language's Markdown.
+    """
+    values: List[Any] = [
+        canonical_url,
+        metadata.get("url"),
+        metadata.get("source_url"),
+        metadata.get("normalized_url"),
+    ]
+    redirected_from = metadata.get("redirected_from") or []
+    if isinstance(redirected_from, (list, tuple, set)):
+        values.extend(redirected_from)
+
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        url = str(value or "").strip()
+        normalized = _normalized_url(url)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        output.append(url)
+    return output
+
+
+def _expand_canonical_url_aliases(
+    mapping: Mapping[str, Any],
+    page_metadata: Mapping[str, Any],
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Bind canonical and redirected URLs to one already verified Markdown path."""
+    expanded = dict(mapping)
+    normalized_paths: Dict[str, set[str]] = defaultdict(set)
+    for raw_url, raw_path in mapping.items():
+        if isinstance(raw_url, str) and isinstance(raw_path, str):
+            normalized = _normalized_url(raw_url)
+            if normalized:
+                normalized_paths[normalized].add(raw_path)
+
+    aliases_added = 0
+    identities_expanded = 0
+    identity_conflicts = 0
+    for canonical_url in sorted(page_metadata):
+        metadata = page_metadata.get(canonical_url)
+        if not isinstance(metadata, dict):
+            continue
+        urls = _identity_urls(canonical_url, metadata)
+        candidate_paths = {
+            path
+            for url in urls
+            for path in normalized_paths.get(_normalized_url(url), set())
+        }
+        if not candidate_paths:
+            continue
+        if len(candidate_paths) != 1:
+            identity_conflicts += 1
+            continue
+        target_path = next(iter(candidate_paths))
+        added_for_identity = 0
+        for url in urls:
+            current = expanded.get(url)
+            if current is None:
+                expanded[url] = target_path
+                normalized_paths[_normalized_url(url)].add(target_path)
+                aliases_added += 1
+                added_for_identity += 1
+            elif current != target_path:
+                identity_conflicts += 1
+                added_for_identity = 0
+                break
+        if added_for_identity:
+            identities_expanded += 1
+
+    return expanded, {
+        "aliases_added": aliases_added,
+        "identities_expanded": identities_expanded,
+        "identity_conflicts": identity_conflicts,
+    }
+
+
+def _expand_html_artifact_aliases(
+    mapping: Mapping[str, Any],
+    page_metadata: Mapping[str, Any],
+    markdown_metadata_by_path: Mapping[str, Mapping[str, Any]],
+) -> Tuple[Dict[str, Any], Dict[str, int]]:
+    """Bridge page URLs through an exact shared crawl-artifact filename."""
+    page_urls_by_html_stem: Dict[str, List[str]] = defaultdict(list)
+    for page_url, raw_metadata in page_metadata.items():
+        if not isinstance(raw_metadata, Mapping):
+            continue
+        html_path = str(raw_metadata.get("html_path") or "").strip()
+        html_stem = Path(html_path).stem if html_path else ""
+        if html_stem:
+            page_urls_by_html_stem[html_stem].append(str(page_url))
+
+    markdown_paths_by_html_stem: Dict[str, set[str]] = defaultdict(set)
+    for markdown_path, metadata in markdown_metadata_by_path.items():
+        source_html_path = str(metadata.get("source_html_path") or "").strip()
+        html_stem = Path(source_html_path).stem if source_html_path else ""
+        if html_stem:
+            markdown_paths_by_html_stem[html_stem].add(str(markdown_path))
+
+    expanded = dict(mapping)
+    aliases_added = 0
+    identities_expanded = 0
+    identity_conflicts = 0
+    for html_stem in sorted(
+        set(page_urls_by_html_stem) & set(markdown_paths_by_html_stem)
+    ):
+        markdown_paths = markdown_paths_by_html_stem[html_stem]
+        if len(markdown_paths) != 1:
+            identity_conflicts += 1
+            continue
+        target_path = next(iter(markdown_paths))
+        added_for_identity = 0
+        conflict = False
+        for page_url in sorted(set(page_urls_by_html_stem[html_stem])):
+            current = expanded.get(page_url)
+            if current is None:
+                expanded[page_url] = target_path
+                aliases_added += 1
+                added_for_identity += 1
+            elif _resolved(current) != _resolved(target_path):
+                identity_conflicts += 1
+                conflict = True
+                break
+        if added_for_identity and not conflict:
+            identities_expanded += 1
+
+    return expanded, {
+        "aliases_added": aliases_added,
+        "identities_expanded": identities_expanded,
+        "identity_conflicts": identity_conflicts,
+    }
+
+
+def _is_media_only_pdf_eligible(item: Mapping[str, Any]) -> bool:
+    """Require complete provenance before accepting a PDF image without Markdown."""
+    if item.get("type") != "image" or str(item.get("source_type") or "").lower() != "pdf":
+        return False
+    if str(item.get("annotation_status") or "") != "completed":
+        return False
+    try:
+        parsed_source_url = urlsplit(str(item.get("source_url") or "").strip())
+    except ValueError:
+        return False
+    if parsed_source_url.scheme.lower() not in {"http", "https"} or not parsed_source_url.netloc:
+        return False
+    source_file = Path(str(item.get("source_file") or ""))
+    local_path = Path(str(item.get("local_path") or ""))
+    if (
+        not source_file.is_file()
+        or source_file.suffix.lower() != ".pdf"
+        or not local_path.is_file()
+        or not str(item.get("document_id") or "").strip()
+        or not str(item.get("content_hash") or "").strip()
+    ):
+        return False
+    try:
+        return int(item.get("page_number")) >= 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _media_reference_key(item: Mapping[str, Any]) -> Tuple[Any, ...]:
     return (
         str(item.get("context_reference_id") or ""),
@@ -229,6 +395,24 @@ class CorpusPreparationFormatter(FormatterStage):
 
         mapping = payloads["md_mapping_file"]
         page_metadata = payloads["canonical_page_metadata_file"]
+        alias_expansion = {
+            "aliases_added": 0,
+            "identities_expanded": 0,
+            "identity_conflicts": 0,
+        }
+        if bool(config.get("expand_canonical_url_aliases", True)):
+            mapping, alias_expansion = _expand_canonical_url_aliases(
+                mapping,
+                page_metadata,
+            )
+            mapping_path = (
+                ctx.stage_work_dir / sidecar_specs["md_mapping_file"][0]
+            )
+            atomic_write_json(mapping_path, mapping)
+            payloads["md_mapping_file"] = mapping
+            input_evidence["md_mapping_file"]["prepared_sha256"] = sha256_file(
+                mapping_path
+            )
         page_media = payloads["page_media_file"]
         page_media_by_normalized_url: Dict[str, List[Dict[str, Any]]] = defaultdict(
             list
@@ -253,6 +437,35 @@ class CorpusPreparationFormatter(FormatterStage):
             _resolved(record.local_path): dict(record.metadata or {})
             for record in markdown_records
             if record.local_path and Path(record.local_path).is_file()
+        }
+        html_alias_expansion = {
+            "aliases_added": 0,
+            "identities_expanded": 0,
+            "identity_conflicts": 0,
+        }
+        if bool(config.get("expand_html_artifact_aliases", True)):
+            mapping, html_alias_expansion = _expand_html_artifact_aliases(
+                mapping,
+                page_metadata,
+                metadata_by_path,
+            )
+            mapping_path = (
+                ctx.stage_work_dir / sidecar_specs["md_mapping_file"][0]
+            )
+            atomic_write_json(mapping_path, mapping)
+            payloads["md_mapping_file"] = mapping
+            input_evidence["md_mapping_file"]["prepared_sha256"] = sha256_file(
+                mapping_path
+            )
+        alias_expansion = {
+            "aliases_added": alias_expansion["aliases_added"]
+            + html_alias_expansion["aliases_added"],
+            "identities_expanded": alias_expansion["identities_expanded"]
+            + html_alias_expansion["identities_expanded"],
+            "identity_conflicts": alias_expansion["identity_conflicts"]
+            + html_alias_expansion["identity_conflicts"],
+            "canonical_metadata": alias_expansion,
+            "html_artifact_identity": html_alias_expansion,
         }
         live_markdown_paths = set(metadata_by_path)
         source_urls_by_path: Dict[str, List[str]] = defaultdict(list)
@@ -299,8 +512,16 @@ class CorpusPreparationFormatter(FormatterStage):
                 mapped_source_urls = sorted(
                     set(mapped_source_urls) | {metadata_source_url}
                 )
-            source_url = metadata_source_url or (
-                mapped_source_urls[0] if mapped_source_urls else ""
+            canonical_source_urls = [
+                candidate_url
+                for candidate_url in mapped_source_urls
+                if isinstance(page_metadata.get(candidate_url), dict)
+            ]
+            source_url = (
+                canonical_source_urls[0]
+                if canonical_source_urls
+                else metadata_source_url
+                or (mapped_source_urls[0] if mapped_source_urls else "")
             )
             for candidate_url in mapped_source_urls:
                 identity = page_metadata.get(candidate_url)
@@ -435,7 +656,19 @@ class CorpusPreparationFormatter(FormatterStage):
         ocr_adjudicated = sum(
             status in _TERMINAL_OCR_STATUSES for status in ocr_status_by_hash.values()
         )
-        unbound_media_hashes = unique_media_hashes - referenced_image_hashes
+        raw_unbound_media_hashes = unique_media_hashes - referenced_image_hashes
+        media_only_pdf_by_hash: Dict[str, Dict[str, Any]] = {}
+        if bool(config.get("allow_media_only_pdf_assets", False)):
+            for item in all_media:
+                content_hash = str(item.get("content_hash") or "").lower()
+                if (
+                    content_hash in raw_unbound_media_hashes
+                    and content_hash not in media_only_pdf_by_hash
+                    and _is_media_only_pdf_eligible(item)
+                ):
+                    media_only_pdf_by_hash[content_hash] = dict(item)
+        media_only_pdf_hashes = set(media_only_pdf_by_hash)
+        unbound_media_hashes = raw_unbound_media_hashes - media_only_pdf_hashes
         dangling_document_media_hashes = referenced_image_hashes - unique_media_hashes
         unbound_media_record_count = sum(
             item.get("type") == "image"
@@ -457,6 +690,14 @@ class CorpusPreparationFormatter(FormatterStage):
             "document_count_passed": len(documents)
             >= int(config.get("minimum_document_count", 0)),
             "mapping_paths_valid": invalid_mapping_count == 0,
+            "canonical_url_aliases_added": alias_expansion["aliases_added"],
+            "canonical_url_identity_conflict_count": alias_expansion[
+                "identity_conflicts"
+            ],
+            "canonical_url_alias_expansion_passed": alias_expansion[
+                "identity_conflicts"
+            ]
+            == 0,
             "url_mapping_document_count": len(mapped_paths),
             "url_mapping_targets_are_live": mapped_paths <= live_markdown_paths,
             "source_file_only_document_count": source_file_only_document_count,
@@ -483,7 +724,10 @@ class CorpusPreparationFormatter(FormatterStage):
             ),
             "unbound_media_asset_count": len(unbound_media_hashes),
             "unbound_media_record_count": unbound_media_record_count,
-            "all_media_linked_to_documents": len(unbound_media_hashes)
+            "raw_unbound_media_asset_count": len(raw_unbound_media_hashes),
+            "media_only_pdf_asset_count": len(media_only_pdf_hashes),
+            "all_media_linked_to_documents": not raw_unbound_media_hashes,
+            "all_media_accounted_for": len(unbound_media_hashes)
             <= int(config.get("maximum_unbound_media_assets", 0)),
             "dangling_document_media_hash_count": len(
                 dangling_document_media_hashes
@@ -511,13 +755,14 @@ class CorpusPreparationFormatter(FormatterStage):
             for key in (
                 "document_count_passed",
                 "mapping_paths_valid",
+                "canonical_url_alias_expansion_passed",
                 "url_mapping_targets_are_live",
                 "all_documents_have_source_provenance",
                 "inventory_matches_live_markdown",
                 "unique_media_assets_passed",
                 "missing_media_files_passed",
                 "media_hashes_passed",
-                "all_media_linked_to_documents",
+                "all_media_accounted_for",
                 "document_media_references_resolve",
                 "semantic_annotation_passed",
                 "ocr_adjudication_passed",
@@ -533,6 +778,18 @@ class CorpusPreparationFormatter(FormatterStage):
             "representation_status": "undecided",
             "document_count": len(documents),
             "documents": documents,
+            "media_only_asset_count": len(media_only_pdf_by_hash),
+            "media_only_assets": [
+                {
+                    **_compact_media_reference(item),
+                    "source_file": str(item.get("source_file") or ""),
+                    "local_path": str(item.get("local_path") or ""),
+                    "caption": str(
+                        item.get("semantic_caption") or item.get("caption") or ""
+                    ),
+                }
+                for _content_hash, item in sorted(media_only_pdf_by_hash.items())
+            ],
         }
         inventory_path = ctx.stage_work_dir / "prepared_corpus_inventory.json"
         atomic_write_json(inventory_path, inventory)
@@ -557,6 +814,8 @@ class CorpusPreparationFormatter(FormatterStage):
                 "document_linked_unique_media_assets": len(
                     referenced_image_hashes & unique_media_hashes
                 ),
+                "raw_unbound_media_assets": len(raw_unbound_media_hashes),
+                "media_only_pdf_assets": len(media_only_pdf_hashes),
                 "unbound_media_assets": len(unbound_media_hashes),
                 "dangling_document_media_hashes": len(
                     dangling_document_media_hashes
@@ -565,6 +824,7 @@ class CorpusPreparationFormatter(FormatterStage):
                 "ocr_status_counts": dict(sorted(ocr_status_counts.items())),
             },
             "gates": gates,
+            "canonical_url_alias_expansion": alias_expansion,
             "next_stage_boundary": {
                 "chunking_performed": False,
                 "document_representation_selected": False,

@@ -1,0 +1,29 @@
+_inherit: mbzuai_preprod_combined_selected_index_prep.yaml
+
+# Pre-embedding checkpoint for the audited September 2026 refresh. It reuses
+# the already selected c650 / Gemini-1536 / dense-graph profile and performs
+# only corpus import, lossless chunking, and graph bridging.
+project_name: "mbzuai_preprod_refresh_combined_selected_index_prep"
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 1
+    source_runs:
+      - role: "prepared_refresh_combined_corpus"
+        run_dir: "runs/mbzuai_preprod_refresh_combined_corpus_preparation/mbzuai-preprod-refresh-combined-corpus-20260909-v1"
+        project_name: "mbzuai_preprod_refresh_combined_corpus_preparation"
+        required_stage_ids:
+          - "prepare_corpus_boundary"
+        evidence:
+          pipeline_state_sha256: "90f00492bc17ca326274f0910cacd930b6aeebf6c27bf2372eef933988cd23f0"
+          artifact_catalog_sha256: "60ac727102dbd096cdba8c77524b12539ab2ae27ba8036db03093e8b90a0a689"
+          run_audit_sha256: "8b928fb0e134bb1235ed2b8d6051fd5282baee754357c7cdef837c8619216b4e"
+          resolved_config_sha256: "fe57f8abb27209e62b4d2577f256ceac413885b007d874f352f922c003858459"
+
+  page_graph_bridge:
+    source_representation_run_dir: "runs/mbzuai_preprod_refresh_combined_representation_v2/mbzuai-preprod-refresh-combined-representation-v2-20260909-v1"
+    source_corpus_run_dir: "runs/mbzuai_preprod_refresh_combined_corpus_preparation/mbzuai-preprod-refresh-combined-corpus-20260909-v1"
+    require_chunk_index: true
+    derive_document_sections: true

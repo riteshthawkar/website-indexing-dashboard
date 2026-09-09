@@ -10,7 +10,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 from pipeline.core.base import ConverterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe
@@ -18,6 +18,31 @@ from pipeline.core.media import build_media_markdown, dedupe_media_items
 from pipeline.core.registry import register_stage
 
 logger = logging.getLogger(__name__)
+
+
+def _unique_urls(values: Iterable[Any]) -> List[str]:
+    """Return non-empty URL strings in stable first-seen order."""
+    output: List[str] = []
+    seen = set()
+    for value in values:
+        url = str(value or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        output.append(url)
+    return output
+
+
+def _preferred_source_url(
+    urls: Iterable[Any],
+    canonical_page_metadata: Mapping[str, Any],
+) -> str:
+    """Prefer a URL recognized by the canonical page inventory."""
+    candidates = _unique_urls(urls)
+    for url in candidates:
+        if isinstance(canonical_page_metadata.get(url), dict):
+            return url
+    return candidates[0] if candidates else ""
 
 
 def _convert_one(
@@ -138,9 +163,21 @@ class MarkItDownConverter(ConverterStage):
                     all_page_images = load_json_safe(page_images_file, {}) or {}
             all_page_media = all_page_images
 
-        # Build html_path -> page_media lookup
+        canonical_page_metadata: Dict[str, Any] = {}
+        canonical_page_metadata_file = (
+            ctx.previous_outputs.get("canonical_page_metadata_file")
+            or ctx.previous_outputs.get("page_metadata_file")
+        )
+        if canonical_page_metadata_file:
+            loaded_page_metadata = load_json_safe(canonical_page_metadata_file, {}) or {}
+            if isinstance(loaded_page_metadata, dict):
+                canonical_page_metadata = loaded_page_metadata
+
+        # Build html_path -> page_media lookup. Keep every explicitly supplied
+        # URL identity: cleaned artifacts can have a legacy request URL plus a
+        # canonical redirect target, and both must resolve to the same Markdown.
         html_to_media: Dict[str, List[Dict[str, Any]]] = {}
-        html_to_url: Dict[str, str] = {}
+        html_to_urls: Dict[str, List[str]] = {}
         html_to_artifact_ids: Dict[str, List[str]] = {}
         html_relative_paths: Dict[str, Path] = {}
         for record in html_artifacts:
@@ -148,11 +185,22 @@ class MarkItDownConverter(ConverterStage):
                 continue
             html_key = str(Path(record.local_path).resolve())
             html_to_artifact_ids[html_key] = [record.artifact_id]
-            source_url = str(record.metadata.get("source_url") or "")
-            if source_url:
-                html_to_url[html_key] = source_url
-                if source_url in all_page_media:
-                    html_to_media[html_key] = all_page_media[source_url]
+            metadata_source_urls = record.metadata.get("source_urls") or []
+            if not isinstance(metadata_source_urls, (list, tuple, set)):
+                metadata_source_urls = [metadata_source_urls]
+            record_source_urls = _unique_urls(
+                [record.metadata.get("source_url"), *metadata_source_urls]
+            )
+            if record_source_urls:
+                html_to_urls[html_key] = record_source_urls
+                media_items = [
+                    item
+                    for source_url in record_source_urls
+                    for item in (all_page_media.get(source_url) or [])
+                    if isinstance(item, dict)
+                ]
+                if media_items:
+                    html_to_media[html_key] = dedupe_media_items(media_items)
             relative_path = record.metadata.get("relative_path")
             if relative_path:
                 html_relative_paths[html_key] = Path(str(relative_path))
@@ -161,8 +209,15 @@ class MarkItDownConverter(ConverterStage):
             html_path_str = url_mapping.get(page_url, "")
             if html_path_str:
                 html_key = str(Path(html_path_str).resolve())
-                html_to_media[html_key] = media_items
-                html_to_url[html_key] = page_url
+                html_to_urls[html_key] = _unique_urls(
+                    [*(html_to_urls.get(html_key) or []), page_url]
+                )
+                html_to_media[html_key] = dedupe_media_items(
+                    [
+                        *(html_to_media.get(html_key) or []),
+                        *(media_items or []),
+                    ]
+                )
 
         md_mapping: Dict[str, str] = {}
         lock = Lock()
@@ -210,9 +265,13 @@ class MarkItDownConverter(ConverterStage):
         # Build URL→MD mapping from URL→HTML mapping
         url_to_md: Dict[str, str] = {}
         for html_key, md_path_str in md_mapping.items():
-            source_url = html_to_url.get(html_key, "")
-            if source_url:
-                url_to_md[source_url] = md_path_str
+            source_urls = html_to_urls.get(html_key, [])
+            source_url = _preferred_source_url(
+                source_urls,
+                canonical_page_metadata,
+            )
+            for alias_url in source_urls:
+                url_to_md[alias_url] = md_path_str
             artifacts.append(
                 ctx.make_artifact(
                     md_path_str,
@@ -220,6 +279,7 @@ class MarkItDownConverter(ConverterStage):
                     role="content",
                     metadata={
                         "source_url": source_url,
+                        "source_urls": source_urls,
                         "source_html_path": html_key,
                         "source_type": "webpage",
                         "backend": "markitdown",

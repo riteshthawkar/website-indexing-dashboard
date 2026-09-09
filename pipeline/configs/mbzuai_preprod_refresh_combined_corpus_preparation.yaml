@@ -1,0 +1,103 @@
+# Representation-neutral handoff for the September 2026 preproduction
+# snapshot plus the last audited supplemental MBZUAI subdomain corpus. The
+# legacy source is host/prefix allowlisted so stale main-site pages and old
+# catalogue/prospectus documents cannot return to the release.
+
+project_name: "mbzuai_preprod_refresh_combined_corpus_preparation"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+quality:
+  dedup_threshold: 0.85
+  dedup_num_perm: 128
+  dedup_ngram_size: 5
+  preserve_duplicate_source_media: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 2
+    source_runs:
+      - role: "supplemental_subdomains_and_documents"
+        run_dir: "runs/mbzuai_preprod_combined_corpus_preparation/mbzuai-preprod-combined-corpus-20260831-v4"
+        project_name: "mbzuai_preprod_combined_corpus_preparation"
+        required_stage_ids:
+          - "prepare_corpus_boundary"
+        path_prefix_replacements:
+          "/Users/ritesh.thawkar/Ritesh/lawaAI/MBZUAI-APP/website-indexing-dashboard": "/home/fahadkhan/ritesh/mbzuai-preprod-refresh-20260907"
+        include_hosts:
+          - "careers.mbzuai.ac.ae"
+          - "research.mbzuai.ac.ae"
+          - "ai-nexus.mbzuai.ac.ae"
+          - "library.mbzuai.ac.ae"
+          - "metaverse.mbzuai.ac.ae"
+          - "buildit.mbzuai.ac.ae"
+          - "hpp.mbzuai.ac.ae"
+          - "ifm.mbzuai.ac.ae"
+          - "ifm.ai"
+          - "staticcdn.mbzuai.ac.ae"
+        include_url_prefixes:
+          - "https://mbzuai.ac.ae/wp-content/"
+        include_url_less_documents: true
+        exclude_source_path_patterns:
+          # The refreshed snapshot is authoritative for every current main-
+          # site download, even when an older conversion differs byte-for-byte.
+          - 'alumni-volunteer-recognition-ay-2025-26'
+          - 'emergency_contacts_mbzuai_2026'
+          - 'faculty-review-and-promotion-policy-mbzuai'
+          - 'mbzuai-canteen-sample-menu'
+          - 'ofea-newsletter-(?:january|february|march|april|may|june)-2026'
+          - '20-21-MBZUAI-Catalogue'
+          - 'MBZUAI_University_Catalogue_2021-22'
+          - 'MBZUAI_University_Catalog_2022'
+          - 'University-Catalogue-2023-24'
+          - 'University-Catalogue-2024-2025'
+          - 'University_Catalogue(?:_[0-9a-f]{12})?\.pdf'
+          - 'MBZUAI_Executive_Prospectus_2022'
+          - 'MBZUAI_Executive_Prospectus_FInal2022'
+          - 'mep-prospectus-v3-70'
+        preserve_media_ids_by_content_hash: true
+        evidence:
+          pipeline_state_sha256: "e904fead46871209219fc4930d52340ae4420354e66c606237ca834993ec5562"
+          artifact_catalog_sha256: "3dafb16ac10ba9cbfd9d96dd808550b44ae821ff3496ecb0bac4ed4ed756647a"
+          run_audit_sha256: "1502ab68e7f38e34c5d33c6bb41cef6a736ad30a0542cf03256e102fe7da36aa"
+          resolved_config_sha256: "c8f51725b843fa48cad78083f1702c21a045eb5b1c4fa43f643323cd04919c5b"
+      - role: "refreshed_preproduction_main_site"
+        run_dir: "runs/mbzuai_preprod_refresh_corpus_preparation/mbzuai-preprod-refresh-corpus-20260909-v1"
+        project_name: "mbzuai_preprod_refresh_corpus_preparation"
+        required_stage_ids:
+          - "prepare_corpus_boundary"
+        evidence:
+          pipeline_state_sha256: "735907116be3cf53efed5904a50d7432efd5060cbbd5496dbb3133526d1a5f80"
+          artifact_catalog_sha256: "595886c126e643e980973e5f4f519331d2af90dfd540f546ff86a68dea4823ae"
+          run_audit_sha256: "66d1ab1f7a709e7e3453c1930958ac20fed52211eea929da69f3b37ed6a983e5"
+          resolved_config_sha256: "3f4e3950fd1d569679d1e3b3083789b5a93d8655ab04f2f19f34d0a97f381f3c"
+
+  corpus_preparation:
+    expand_canonical_url_aliases: true
+    expand_html_artifact_aliases: true
+    allow_media_only_pdf_assets: true
+    minimum_document_count: 2500
+    minimum_unique_media_assets: 2300
+    maximum_missing_media_files: 0
+    maximum_unbound_media_assets: 0
+    minimum_semantically_annotated_visuals: 2300
+    minimum_ocr_adjudicated_visuals: 400
+
+stages:
+  - id: merge_corpora
+    type: formatter
+    plugin: corpus_merge
+  - id: deduplicate_markdown
+    type: quality_gate
+    plugin: dedup_filter
+  - id: prepare_corpus_boundary
+    type: formatter
+    plugin: corpus_preparation

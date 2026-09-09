@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, MutableMapping, Sequence, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
-from pipeline.core.artifacts import ArtifactRecord, load_artifact_catalog
+from pipeline.core.artifacts import ArtifactCatalog, ArtifactRecord, load_artifact_catalog
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe, sha256_file
 from pipeline.core.media import build_media_manifest, load_media_manifest_items, normalize_media_item
@@ -152,6 +152,73 @@ def _normalized_source_filters(raw_spec: Mapping[str, Any]) -> Dict[str, List[st
             }
         )
     return filters
+
+
+def _path_prefix_replacements(raw_spec: Mapping[str, Any]) -> Dict[str, str]:
+    raw = raw_spec.get("path_prefix_replacements") or {}
+    if not isinstance(raw, Mapping):
+        return {}
+    replacements: Dict[str, str] = {}
+    for source, destination in raw.items():
+        source_path = str(Path(str(source)).expanduser())
+        destination_path = str(Path(str(destination)).expanduser())
+        if source_path and destination_path:
+            replacements[source_path.rstrip("/")] = destination_path.rstrip("/")
+    return dict(sorted(replacements.items(), key=lambda item: -len(item[0])))
+
+
+def _rewrite_path_prefixes(
+    value: Any,
+    replacements: Mapping[str, str],
+) -> Any:
+    """Rewrite portable filesystem prefixes without mutating source evidence."""
+    if isinstance(value, dict):
+        return {
+            str(key): _rewrite_path_prefixes(item, replacements)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_rewrite_path_prefixes(item, replacements) for item in value]
+    if not isinstance(value, str) or not replacements:
+        return value
+
+    is_file_uri = value.startswith("file://")
+    candidate = value[7:] if is_file_uri else value
+    for source_prefix, destination_prefix in replacements.items():
+        if candidate != source_prefix and not candidate.startswith(source_prefix + "/"):
+            continue
+        rewritten = destination_prefix + candidate[len(source_prefix) :]
+        return Path(rewritten).resolve().as_uri() if is_file_uri else rewritten
+    return value
+
+
+def _apply_source_path_replacements(
+    descriptor: MutableMapping[str, Any],
+    replacements: Mapping[str, str],
+) -> None:
+    """Create an in-memory portable view of an immutable source run."""
+    if not replacements:
+        descriptor["path_prefix_replacements"] = {}
+        return
+    descriptor["path_prefix_replacements"] = dict(replacements)
+    descriptor["outputs"] = _rewrite_path_prefixes(
+        descriptor.get("outputs") or {},
+        replacements,
+    )
+    catalog = descriptor.get("catalog")
+    if not isinstance(catalog, ArtifactCatalog):
+        return
+    for record in catalog.records:
+        record.local_path = _rewrite_path_prefixes(record.local_path, replacements)
+        record.uri = _rewrite_path_prefixes(record.uri, replacements)
+        record.metadata = _rewrite_path_prefixes(record.metadata, replacements)
+
+
+def _source_payload(source: Mapping[str, Any], payload: Any) -> Any:
+    return _rewrite_path_prefixes(
+        payload,
+        source.get("path_prefix_replacements") or {},
+    )
 
 
 def _document_provenance_values(value: Mapping[str, Any]) -> List[str]:
@@ -312,6 +379,7 @@ def _allowed_page_media_associations(
 
     path = (source.get("outputs") or {}).get("page_media_file")
     payload = load_json_safe(path, {}) if path else {}
+    payload = _source_payload(source, payload)
     associations: Dict[str, set[str]] = defaultdict(set)
     if not isinstance(payload, dict):
         return {}
@@ -362,6 +430,7 @@ def _preferred_media_ids_by_content_hash(
             continue
         path = (source.get("outputs") or {}).get("media_manifest_file")
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         for item in load_media_manifest_items(payload):
             content_hash = str(item.get("content_hash") or "").lower()
             media_id = str(item.get("id") or "").strip()
@@ -600,6 +669,7 @@ def _merge_scalar_mapping(
     for source in sources:
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         if not isinstance(payload, dict):
             continue
         for raw_key, raw_value in payload.items():
@@ -654,6 +724,7 @@ def _merge_page_metadata(
             or source["outputs"].get("page_metadata_file")
         )
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         if not isinstance(payload, dict):
             continue
         for raw_url, raw_record in payload.items():
@@ -690,6 +761,7 @@ def _merge_page_media(
     for source in sources:
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         if not isinstance(payload, dict):
             continue
         for raw_url, raw_items in payload.items():
@@ -721,6 +793,7 @@ def _merge_media_manifest_items(
     for source in sources:
         path = source["outputs"].get(output_key)
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         for raw_item in load_media_manifest_items(payload):
             if not _source_allows_media_item(source, raw_item):
                 continue
@@ -739,6 +812,7 @@ def _merge_url_identity(
     for source in sources:
         path = source["outputs"].get("url_identity_map_file")
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         records = payload.get("records") if isinstance(payload, dict) else []
         for raw in records or []:
             if not isinstance(raw, dict):
@@ -804,6 +878,7 @@ def _merge_graphs(sources: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             or source["outputs"].get("page_link_graph_file")
         )
         payload = load_json_safe(path, {}) if path else {}
+        payload = _source_payload(source, payload)
         if not isinstance(payload, dict):
             continue
         raw_graphs.append((source, payload))
@@ -1060,6 +1135,21 @@ class CorpusMergeFormatter(FormatterStage):
                     f"formatter.corpus_merge.source_runs[{index}]."
                     "preserve_media_ids_by_content_hash must be a boolean"
                 )
+            replacements = raw.get("path_prefix_replacements") or {}
+            if not isinstance(replacements, Mapping):
+                errors.append(
+                    f"formatter.corpus_merge.source_runs[{index}]."
+                    "path_prefix_replacements must be a mapping"
+                )
+            else:
+                for source_prefix, destination_prefix in replacements.items():
+                    if not Path(str(source_prefix)).is_absolute() or not Path(
+                        str(destination_prefix)
+                    ).is_absolute():
+                        errors.append(
+                            f"formatter.corpus_merge.source_runs[{index}]."
+                            "path_prefix_replacements must use absolute paths"
+                        )
             for prefix_key in ("include_url_prefixes", "exclude_url_prefixes"):
                 for value in raw.get(prefix_key) or []:
                     normalized = _normalized_url(value)
@@ -1134,8 +1224,12 @@ class CorpusMergeFormatter(FormatterStage):
                         expected_evidence=raw_spec.get("evidence")
                         if isinstance(raw_spec.get("evidence"), Mapping)
                         else None,
-                        source_role=str(raw_spec.get("role") or "corpus"),
-                    )
+                    source_role=str(raw_spec.get("role") or "corpus"),
+                )
+                _apply_source_path_replacements(
+                    descriptor,
+                    _path_prefix_replacements(raw_spec),
+                )
                 descriptor.update(_normalized_source_filters(raw_spec))
                 descriptor["include_url_less_documents"] = bool(
                     raw_spec.get("include_url_less_documents", False)
@@ -1229,6 +1323,7 @@ class CorpusMergeFormatter(FormatterStage):
                     continue
                 source_path = str(Path(record.local_path).resolve())
                 payload = load_json_safe(source_path, {}) or {}
+                payload = _source_payload(_source, payload)
                 if isinstance(payload, dict):
                     atomic_write_json(path_map[source_path], _remap_paths(payload, path_map))
 

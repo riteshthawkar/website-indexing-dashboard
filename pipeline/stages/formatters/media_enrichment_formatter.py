@@ -33,6 +33,10 @@ from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe
 from pipeline.core.media import build_media_manifest, normalize_media_item
 from pipeline.core.registry import register_stage
+from pipeline.core.request_headers import (
+    request_header_config_errors,
+    resolve_request_headers,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -162,6 +166,20 @@ def _url_policy_reason(url: str, allowed_hosts: set[str]) -> str:
     return ""
 
 
+def _rewrite_fetch_host(url: str, aliases: Mapping[str, str] | None) -> str:
+    """Route an allowlisted public URL through its authenticated origin."""
+
+    normalized = _normalize_https_url(url)
+    if not normalized:
+        return ""
+    parsed = urlsplit(normalized)
+    source_host = (parsed.hostname or "").lower().strip(".")
+    target_host = str((aliases or {}).get(source_host) or "").lower().strip(".")
+    if not target_host:
+        return normalized
+    return urlunsplit(("https", target_host, parsed.path or "/", parsed.query, ""))
+
+
 async def _host_resolves_publicly(host: str, cache: MutableMapping[str, bool]) -> bool:
     if host in cache:
         return cache[host]
@@ -218,6 +236,7 @@ async def _download_image(
     allowed_hosts: set[str],
     dns_cache: MutableMapping[str, bool],
     config: Mapping[str, Any],
+    request_headers_by_host: Mapping[str, Mapping[str, str]] | None = None,
 ) -> Dict[str, Any]:
     normalized = _normalize_https_url(url)
     policy_reason = _url_policy_reason(normalized, allowed_hosts)
@@ -231,7 +250,12 @@ async def _download_image(
     last_reason = "download_failed"
 
     for attempt in range(1, attempts + 1):
-        current = normalized
+        current = _rewrite_fetch_host(
+            normalized,
+            config.get("fetch_host_aliases")
+            if isinstance(config.get("fetch_host_aliases"), Mapping)
+            else {},
+        )
         try:
             for redirect_index in range(redirect_limit + 1):
                 host = (urlsplit(current).hostname or "").lower()
@@ -239,7 +263,11 @@ async def _download_image(
                     return {"url": url, "status": "rejected", "reason": "redirect_policy_block"}
                 if not await _host_resolves_publicly(host, dns_cache):
                     return {"url": url, "status": "rejected", "reason": "non_public_destination"}
-                async with session.get(current, allow_redirects=False) as response:
+                async with session.get(
+                    current,
+                    allow_redirects=False,
+                    headers=(request_headers_by_host or {}).get(host),
+                ) as response:
                     if not _peer_is_public(response):
                         return {"url": url, "status": "rejected", "reason": "non_public_peer"}
                     if response.status in {301, 302, 303, 307, 308}:
@@ -307,6 +335,7 @@ async def _download_image_bounded(
     global_semaphore: asyncio.Semaphore,
     host_semaphores: MutableMapping[str, asyncio.Semaphore],
     per_host_concurrency: int,
+    request_headers_by_host: Mapping[str, Mapping[str, str]] | None = None,
 ) -> Dict[str, Any]:
     """Start the request timeout only after bounded queue admission.
 
@@ -331,6 +360,7 @@ async def _download_image_bounded(
                 allowed_hosts=allowed_hosts,
                 dns_cache=dns_cache,
                 config=config,
+                request_headers_by_host=request_headers_by_host,
             )
 
 
@@ -766,6 +796,49 @@ class MediaEnrichmentFormatter(FormatterStage):
                     raise ValueError
             except (TypeError, ValueError):
                 errors.append(f"formatter.media_enrichment.{field} must be positive")
+        credential_hosts = media_config.get("credential_header_hosts") or []
+        if not isinstance(credential_hosts, list):
+            errors.append("formatter.media_enrichment.credential_header_hosts must be a list")
+            credential_hosts = []
+        allowed_hosts = {
+            str(value or "").lower().strip(".")
+            for value in media_config.get("allowed_media_hosts") or []
+            if str(value or "").strip()
+        }
+        for host in credential_hosts:
+            normalized = str(host or "").lower().strip(".")
+            if not normalized or normalized not in allowed_hosts:
+                errors.append(
+                    "formatter.media_enrichment.credential_header_hosts must contain only exact allowed_media_hosts"
+                )
+                break
+        fetch_host_aliases = media_config.get("fetch_host_aliases") or {}
+        if not isinstance(fetch_host_aliases, dict):
+            errors.append("formatter.media_enrichment.fetch_host_aliases must be a mapping")
+        else:
+            for source, target in fetch_host_aliases.items():
+                source_host = str(source or "").lower().strip(".")
+                target_host = str(target or "").lower().strip(".")
+                if (
+                    not source_host
+                    or not target_host
+                    or "://" in str(source)
+                    or "/" in str(source)
+                    or "://" in str(target)
+                    or "/" in str(target)
+                    or source_host not in allowed_hosts
+                    or target_host not in allowed_hosts
+                ):
+                    errors.append(
+                        "formatter.media_enrichment.fetch_host_aliases must map exact allowed_media_hosts"
+                    )
+                    break
+        environment_bindings = media_config.get("request_header_env") or []
+        if environment_bindings and not credential_hosts:
+            errors.append(
+                "formatter.media_enrichment.credential_header_hosts is required when request_header_env is configured"
+            )
+        errors.extend(request_header_config_errors({}, environment_bindings))
         return errors
 
     async def execute(self, ctx: StageContext) -> StageResult:
@@ -802,6 +875,21 @@ class MediaEnrichmentFormatter(FormatterStage):
             str(value or "").lower().strip(".")
             for value in config.get("allowed_media_hosts") or []
             if str(value or "").strip()
+        }
+        try:
+            credential_headers = resolve_request_headers(
+                {},
+                config.get("request_header_env") or [],
+            )
+        except ValueError as exc:
+            return StageResult.failure(str(exc))
+        credential_hosts = {
+            str(value or "").lower().strip(".")
+            for value in config.get("credential_header_hosts") or []
+            if str(value or "").strip()
+        }
+        request_headers_by_host = {
+            host: credential_headers for host in credential_hosts
         }
         reasons: Counter[str] = Counter()
         to_download: List[str] = []
@@ -857,6 +945,7 @@ class MediaEnrichmentFormatter(FormatterStage):
                             global_semaphore=global_semaphore,
                             host_semaphores=host_semaphores,
                             per_host_concurrency=per_host_concurrency,
+                            request_headers_by_host=request_headers_by_host,
                         )
                     )
                     for url in to_download

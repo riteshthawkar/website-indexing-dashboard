@@ -16,9 +16,15 @@ from pipeline.core.base import StageContext, StageStatus
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.media import build_media_manifest, normalize_media_item
 from pipeline.core.state import PipelineState, StageState, save_state
-from pipeline.stages.formatters.corpus_merge_formatter import _load_source_descriptor
+from pipeline.stages.formatters.corpus_merge_formatter import (
+    _apply_source_path_replacements,
+    _load_source_descriptor,
+)
 from pipeline.stages.formatters.corpus_preparation_formatter import (
     CorpusPreparationFormatter,
+    _expand_canonical_url_aliases,
+    _expand_html_artifact_aliases,
+    _is_media_only_pdf_eligible,
 )
 from pipeline.stages.quality.dedup_filter import DedupFilter
 
@@ -28,6 +34,40 @@ HAS_DATASKETCH = importlib.util.find_spec("datasketch") is not None
 
 def _run(coro):
     return asyncio.run(coro)
+
+
+def test_source_path_replacement_builds_portable_in_memory_view():
+    old_root = "/legacy/workspace"
+    new_root = "/portable/workspace"
+    catalog = ArtifactCatalog.from_dict(
+        {
+            "records": [
+                {
+                    "artifact_id": "markdown-1",
+                    "artifact_type": "markdown",
+                    "role": "content",
+                    "producer_stage": "prepare",
+                    "uri": f"file://{old_root}/document.md",
+                    "local_path": f"{old_root}/document.md",
+                    "metadata": {"markdown_path": f"{old_root}/document.md"},
+                }
+            ]
+        }
+    )
+    descriptor = {
+        "outputs": {"md_mapping_file": f"{old_root}/mapping.json"},
+        "catalog": catalog,
+        "evidence": {"artifact_catalog_sha256": "immutable-digest"},
+    }
+
+    _apply_source_path_replacements(descriptor, {old_root: new_root})
+
+    record = catalog.records[0]
+    assert descriptor["outputs"]["md_mapping_file"] == f"{new_root}/mapping.json"
+    assert record.local_path == f"{new_root}/document.md"
+    assert record.uri == f"file://{new_root}/document.md"
+    assert record.metadata["markdown_path"] == f"{new_root}/document.md"
+    assert descriptor["evidence"]["artifact_catalog_sha256"] == "immutable-digest"
 
 
 def test_corpus_merge_accepts_only_explicit_completed_prefix_of_failed_run(
@@ -237,6 +277,8 @@ def test_dedup_preserves_media_occurrences_and_rebinds_shared_image(
 def test_corpus_preparation_seals_inventory_without_representation(
     tmp_path: Path,
 ):
+    legacy_url = "https://example.com/legacy-document"
+    canonical_url = "https://example.com/document"
     markdown = tmp_path / "document.md"
     markdown.write_text("# MBZUAI\n\nA grounded document with a table.\n", encoding="utf-8")
     source_pdf = tmp_path / "downloaded-document.pdf"
@@ -256,18 +298,37 @@ def test_corpus_preparation_seals_inventory_without_representation(
             "local_path": str(image),
             "content_hash": content_hash,
             "source_type": "html",
-            "source_url": "https://example.com/document",
+            "source_url": canonical_url,
             "annotation_status": "completed",
             "needs_ocr": True,
             "ocr_status": "completed",
             "ocr_text": "MBZUAI",
         }
     )
+    media_only_image = tmp_path / "media-only.png"
+    media_only_image.write_bytes(b"verified-media-only-image")
+    media_only_hash = hashlib.sha256(media_only_image.read_bytes()).hexdigest()
+    media_only_item = normalize_media_item(
+        {
+            "type": "image",
+            "url": "https://example.com/document.pdf#page=1",
+            "local_path": str(media_only_image),
+            "content_hash": media_only_hash,
+            "source_type": "pdf",
+            "source_url": "https://example.com/document.pdf",
+            "source_file": str(source_pdf),
+            "document_id": "document-pdf",
+            "page_number": 1,
+            "annotation_status": "completed",
+            "semantic_caption": "A verified chart from the PDF.",
+        }
+    )
     payloads = {
-        "md_mapping_file": {"https://example.com/document": str(markdown)},
+        "md_mapping_file": {legacy_url: str(markdown)},
         "canonical_page_metadata_file": {
-            "https://example.com/document": {
-                "source_url": "https://example.com/document",
+            canonical_url: {
+                "source_url": canonical_url,
+                "redirected_from": [legacy_url],
                 "title": "Document",
             }
         },
@@ -275,11 +336,11 @@ def test_corpus_preparation_seals_inventory_without_representation(
         "canonical_page_link_graph_file": {"nodes": [], "edges": []},
         # The crawler may preserve a root trailing slash while the URL mapping
         # canonicalizes it away; preparation must still bind the media.
-        "page_media_file": {"https://example.com/document/": [media_item]},
-        "page_images_file": {"https://example.com/document": [media_item]},
+        "page_media_file": {f"{canonical_url}/": [media_item]},
+        "page_images_file": {canonical_url: [media_item]},
         "page_videos_file": {},
-        "extracted_images_index_file": build_media_manifest([]),
-        "media_manifest_file": build_media_manifest([media_item]),
+        "extracted_images_index_file": build_media_manifest([media_only_item]),
+        "media_manifest_file": build_media_manifest([media_item, media_only_item]),
         "duplicate_source_aliases_file": {"aliases": []},
     }
     previous_outputs = {"md_dir": str(tmp_path)}
@@ -295,7 +356,7 @@ def test_corpus_preparation_seals_inventory_without_representation(
                 producer_stage="dedup",
                 uri=markdown.resolve().as_uri(),
                 local_path=markdown,
-                metadata={"source_url": "https://example.com/document"},
+                metadata={"source_url": legacy_url},
             ),
             build_artifact_record(
                 artifact_type="markdown",
@@ -317,11 +378,13 @@ def test_corpus_preparation_seals_inventory_without_representation(
         config={
             "formatter": {
                 "corpus_preparation": {
+                    "expand_canonical_url_aliases": True,
+                    "allow_media_only_pdf_assets": True,
                     "minimum_document_count": 2,
-                    "minimum_unique_media_assets": 1,
+                    "minimum_unique_media_assets": 2,
                     "maximum_missing_media_files": 0,
                     "maximum_unbound_media_assets": 0,
-                    "minimum_semantically_annotated_visuals": 1,
+                    "minimum_semantically_annotated_visuals": 2,
                     "minimum_ocr_adjudicated_visuals": 1,
                 }
             }
@@ -340,6 +403,8 @@ def test_corpus_preparation_seals_inventory_without_representation(
     report = load_json_safe(result.outputs["corpus_preparation_report_file"])
     assert inventory["representation_status"] == "undecided"
     assert inventory["document_count"] == 2
+    assert inventory["media_only_asset_count"] == 1
+    assert inventory["media_only_assets"][0]["content_hash"] == media_only_hash
     assert sum(
         document["media_reference_count"] for document in inventory["documents"]
     ) == 1
@@ -349,8 +414,19 @@ def test_corpus_preparation_seals_inventory_without_representation(
     assert source_kinds == {"url", "file"}
     assert report["gates"]["passed"] is True
     assert report["counts"]["source_file_only_documents"] == 1
+    assert report["counts"]["raw_unbound_media_assets"] == 1
+    assert report["counts"]["media_only_pdf_assets"] == 1
+    assert report["counts"]["unbound_media_assets"] == 0
+    prepared_mapping = load_json_safe(result.outputs["md_mapping_file"])
+    assert prepared_mapping[legacy_url] == prepared_mapping[canonical_url]
+    webpage_document = next(
+        document for document in inventory["documents"] if document["source_url"]
+    )
+    assert webpage_document["source_url"] == canonical_url
+    assert legacy_url in webpage_document["source_alias_urls"]
     assert report["gates"]["inventory_matches_live_markdown"] is True
-    assert report["gates"]["all_media_linked_to_documents"] is True
+    assert report["gates"]["all_media_linked_to_documents"] is False
+    assert report["gates"]["all_media_accounted_for"] is True
     assert report["gates"]["document_media_references_resolve"] is True
     assert report["next_stage_boundary"] == {
         "chunking_performed": False,
@@ -358,3 +434,72 @@ def test_corpus_preparation_seals_inventory_without_representation(
         "embedding_performed": False,
         "indexing_performed": False,
     }
+
+
+def test_canonical_alias_expansion_rejects_conflicting_document_targets():
+    canonical_url = "https://example.com/page"
+    old_url = "https://example.com/old-page"
+
+    expanded, report = _expand_canonical_url_aliases(
+        {canonical_url: "/tmp/a.md", old_url: "/tmp/b.md"},
+        {canonical_url: {"source_url": canonical_url, "redirected_from": [old_url]}},
+    )
+
+    assert expanded == {canonical_url: "/tmp/a.md", old_url: "/tmp/b.md"}
+    assert report["identity_conflicts"] == 1
+    assert report["aliases_added"] == 0
+
+
+def test_html_artifact_identity_expands_renamed_route_without_fuzzy_matching(
+    tmp_path: Path,
+):
+    markdown = tmp_path / "document.md"
+    markdown.write_text("# Institute", encoding="utf-8")
+    raw_html = tmp_path / "raw" / "capture-identity.html"
+    cleaned_html = tmp_path / "clean" / "capture-identity.html"
+    raw_html.parent.mkdir()
+    cleaned_html.parent.mkdir()
+    raw_html.write_text("<h1>Institute</h1>", encoding="utf-8")
+    cleaned_html.write_text("<h1>Institute</h1>", encoding="utf-8")
+    old_url = "https://example.com/research/institutes/institute"
+    new_url = "https://example.com/research/our-institutes/institute"
+
+    expanded, report = _expand_html_artifact_aliases(
+        {old_url: str(markdown)},
+        {new_url: {"html_path": str(raw_html)}},
+        {str(markdown.resolve()): {"source_html_path": str(cleaned_html)}},
+    )
+
+    assert expanded[old_url] == str(markdown)
+    assert expanded[new_url] == str(markdown.resolve())
+    assert report == {
+        "aliases_added": 1,
+        "identities_expanded": 1,
+        "identity_conflicts": 0,
+    }
+
+
+def test_media_only_contract_rejects_web_and_incomplete_pdf_evidence(tmp_path: Path):
+    source_pdf = tmp_path / "source.pdf"
+    source_pdf.write_bytes(b"pdf")
+    image = tmp_path / "image.png"
+    image.write_bytes(b"image")
+    valid = normalize_media_item(
+        {
+            "type": "image",
+            "source_type": "pdf",
+            "source_url": "https://example.com/source.pdf",
+            "source_file": str(source_pdf),
+            "local_path": str(image),
+            "content_hash": hashlib.sha256(image.read_bytes()).hexdigest(),
+            "document_id": "source",
+            "page_number": 1,
+            "annotation_status": "completed",
+        }
+    )
+
+    assert _is_media_only_pdf_eligible(valid) is True
+    assert _is_media_only_pdf_eligible({**valid, "source_type": "html"}) is False
+    assert _is_media_only_pdf_eligible({**valid, "annotation_status": "failed"}) is False
+    assert _is_media_only_pdf_eligible({**valid, "source_url": "not-a-url"}) is False
+    assert _is_media_only_pdf_eligible({**valid, "page_number": None}) is False

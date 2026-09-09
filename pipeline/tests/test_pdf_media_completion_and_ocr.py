@@ -538,6 +538,130 @@ def test_page_window_pdf_media_is_recovered_with_public_url(tmp_path: Path):
     assert report["extraction_metrics"]["layout_boxes_page_cap_filtered"] == 0
 
 
+def test_quarantined_pdf_layout_is_recovered_as_visual_evidence(tmp_path: Path):
+    raw_run = tmp_path / "raw"
+    downloads = raw_run / "downloads"
+    downloads.mkdir(parents=True)
+    source_pdf = downloads / "scanned-newsletter.pdf"
+    pdf = fitz.open()
+    page = pdf.new_page(width=300, height=300)
+    page.draw_rect(fitz.Rect(30, 40, 270, 240), fill=(0.1, 0.3, 0.8))
+    page.insert_text((65, 145), "Newsletter visual", fontsize=17, color=(1, 1, 1))
+    pdf.save(source_pdf)
+    pdf.close()
+    mapping = raw_run / "mappings.json"
+    source_url = "https://mbzuai.ac.ae/scanned-newsletter.pdf"
+    atomic_write_json(mapping, {source_url: str(source_pdf)})
+
+    conversion_run = tmp_path / "conversion"
+    quarantine = conversion_run / "quarantine"
+    quarantined_layouts = quarantine / "structured_documents"
+    quarantined_layouts.mkdir(parents=True)
+    atomic_write_json(
+        quarantined_layouts / "scanned-newsletter.docling.json",
+        {
+            "name": "scanned-newsletter",
+            "origin": {"filename": source_pdf.name},
+            "pages": {"1": {"size": {"width": 300, "height": 300}}},
+            "texts": [{"text": "Newsletter figure"}],
+            "pictures": [
+                {
+                    "captions": [{"$ref": "#/texts/0"}],
+                    "prov": [
+                        {
+                            "page_no": 1,
+                            "bbox": {
+                                "l": 30,
+                                "t": 260,
+                                "r": 270,
+                                "b": 60,
+                                "coord_origin": "BOTTOMLEFT",
+                            },
+                        }
+                    ],
+                }
+            ],
+        },
+    )
+    save_state(
+        PipelineState(
+            run_id="conversion",
+            project_name="conversion",
+            status="paused",
+            stages=[
+                StageState(
+                    name="docling",
+                    stage_type="converter",
+                    stage_id="convert_documents",
+                    status="completed",
+                    outputs={"quarantine_dir": str(quarantine)},
+                )
+            ],
+            current_stage_index=1,
+        ),
+        conversion_run,
+    )
+    save_artifact_catalog(ArtifactCatalog(records=[]), conversion_run)
+
+    empty_page = tmp_path / "page.json"
+    empty_document = tmp_path / "document.json"
+    empty_manifest = tmp_path / "manifest.json"
+    atomic_write_json(empty_page, {})
+    atomic_write_json(empty_document, build_media_manifest([]))
+    atomic_write_json(empty_manifest, build_media_manifest([]))
+    context = StageContext(
+        run_id="completion",
+        project_name="completion",
+        config={
+            "formatter": {
+                "pdf_media_completion": {
+                    "conversion_run_dirs": [str(conversion_run)],
+                    "raw_mapping_files": [str(mapping)],
+                    "include_unused_fallback_layouts": True,
+                    "include_quarantined_layouts": True,
+                    "fallback_full_page_max_pages": 3,
+                    "fallback_full_page_only_when_unrepresented": False,
+                    "pdf_crop_scale": 2.0,
+                    "min_pdf_crop_width": 96,
+                    "min_pdf_crop_height": 72,
+                    "minimum_pdf_documents": 1,
+                    "maximum_failed_documents": 0,
+                }
+            }
+        },
+        work_dir=tmp_path / "completion",
+        previous_outputs={
+            "page_media_file": str(empty_page),
+            "page_images_file": str(empty_page),
+            "extracted_images_index_file": str(empty_document),
+            "media_manifest_file": str(empty_manifest),
+        },
+        stage_definition={
+            "id": "complete_pdf_media",
+            "type": "formatter",
+            "plugin": "pdf_media_completion",
+        },
+        stage_id="complete_pdf_media",
+        artifact_catalog=ArtifactCatalog(records=[]),
+    )
+
+    result = asyncio.run(PdfMediaCompletionFormatter().execute(context))
+
+    assert result.status == StageStatus.COMPLETED
+    assert result.metrics["discovered_pdf_documents"] == 1
+    assert result.metrics["recovered_pdf_media"] == 2
+    items = load_json_safe(result.outputs["extracted_images_index_file"])["items"]
+    assert {item["crop_source"] for item in items} == {
+        "docling_layout_recovery",
+        "pdf_full_page_fallback",
+    }
+    assert {item["source_url"] for item in items} == {source_url}
+    report = load_json_safe(result.outputs["pdf_media_completion_report_file"])
+    assert report["conversion_run_evidence"][0]["quarantined_layout_count"] == 1
+    assert report["documents"][0]["from_quarantine"] is True
+    assert report["gates"]["passed"] is True
+
+
 def test_media_ocr_propagates_only_quality_gated_exact_text(tmp_path: Path, monkeypatch):
     image_path = tmp_path / "ocr.png"
     content_hash = _png(image_path)

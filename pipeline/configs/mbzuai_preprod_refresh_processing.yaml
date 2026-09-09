@@ -1,0 +1,60 @@
+# Derived processing profile for the immutable September 2026 preproduction
+# crawl. Stage zero must be bootstrapped from the completed
+# preprod-refresh-20260907-v2 run; this profile never crawls the site again.
+_inherit: mbzuai_preprod_processing.yaml
+
+project_name: "mbzuai_preprod_refresh_processing"
+
+# This derived run receives an already completed crawler stage through the
+# immutable bootstrap contract. It must not require or persist crawl-access
+# credentials merely to validate downstream processors.
+crawler:
+  request_header_env: []
+
+formatter:
+  # The Drupal API inventory is the authoritative published-content boundary
+  # for this snapshot. The crawl also retained 730 independently verified
+  # terminal routes discovered through rendered links; they remain explicit
+  # evidence and are not converted into documents.
+  expected_site_inventory_count: 1765
+  maximum_hard_failure_count: 730
+  critical_url_allow_html_fallback: true
+  critical_url_patterns:
+    - "/about-us/?$"
+    - "/office-the-president/?$"
+    - "/about-us/leadership/?$"
+    - "/about-us/contact-us/?$"
+    - "/research/?$"
+    - "/admissions/?$"
+    - "/admissions-aid/undergraduate-admissions/?$"
+    - "/graduate-masters-admissions/?$"
+    - "/admissions-aid/graduate-phd-admissions/?$"
+    - "/study/undergraduate-program/?$"
+    - "/study/msc-programs/?$"
+    - "/study/phd-programs/?$"
+
+  media_enrichment:
+    # Resolve the refreshed Cloudflare session at runtime and scope it to the
+    # exact protected host. It is never persisted in config or forwarded to
+    # another allowlisted host after a redirect.
+    allowed_media_hosts:
+      - "preprod.mbzuai.ac.ae"
+      - "mbzuai-euk.pages.dev"
+      - "i.ytimg.com"
+    fetch_host_aliases:
+      "preprod.mbzuai.ac.ae": "mbzuai-euk.pages.dev"
+    credential_header_hosts:
+      - "mbzuai-euk.pages.dev"
+    request_header_env:
+      - name: "Cookie"
+        env: "CLOUDFLARE_ACCESS_COOKIE"
+        required: true
+
+  media_semantics:
+    # Reuse only annotations whose content, occurrence, prompt revision, and
+    # surrounding context still match. Changed and newly discovered visuals
+    # are sent to Gemini; unchanged visuals incur no provider request.
+    reuse_input_annotations: true
+    reuse_annotation_manifest_files:
+      - path: "runs/mbzuai_preprod_processing/mbzuai-preprod-processing-20260831-v4/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
+        sha256: "d408a28bfc6fa03d30df79fb4e9b0354749da4b79a096c02b60a5c6dbb815774"

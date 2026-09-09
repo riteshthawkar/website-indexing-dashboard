@@ -495,6 +495,77 @@ def test_coverage_gate_accepts_substantive_indexable_critical_markdown(tmp_path)
     assert gate["ok"] is True
 
 
+def test_coverage_gate_accepts_substantive_html_when_crawler_markdown_was_suppressed(tmp_path):
+    html_path = tmp_path / "undergraduate-admissions.html"
+    html_path.write_text(
+        "<html><body><main><h1>Undergraduate Admissions</h1><p>"
+        + " ".join(
+            [
+                "Official undergraduate admission requirements application dates scholarships and supporting documents."
+            ]
+            * 30
+        )
+        + "</p></main></body></html>",
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://preprod.mbzuai.ac.ae/admissions-aid/undergraduate-admissions": {
+                "indexable": True,
+                "markdown_path": "",
+                "html_path": str(html_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={
+            "critical_url_patterns": [r"/admissions-aid/undergraduate-admissions/?$"],
+            "critical_url_allow_html_fallback": True,
+        },
+    )
+
+    assert gate["unhealthy_critical_count"] == 0
+    evidence = gate["ok"]
+    assert evidence is True
+
+
+def test_coverage_gate_html_fallback_ignores_script_only_payload(tmp_path):
+    html_path = tmp_path / "thin-admissions.html"
+    html_path.write_text(
+        "<html><body><script>" + ("application admission scholarship " * 200) + "</script><main>Admissions</main></body></html>",
+        encoding="utf-8",
+    )
+    gate = _coverage_gate(
+        canonical_metadata={
+            "https://preprod.mbzuai.ac.ae/admissions-aid/undergraduate-admissions": {
+                "indexable": True,
+                "html_path": str(html_path),
+            }
+        },
+        failure_manifest={
+            "hard_failure_count": 0,
+            "expected_site_inventory_count": 0,
+            "inventory_coverage_ratio": None,
+            "cohort_evidence_errors": [],
+            "failed_urls": [],
+        },
+        formatter_config={
+            "critical_url_patterns": [r"/admissions-aid/undergraduate-admissions/?$"],
+            "critical_url_allow_html_fallback": True,
+        },
+    )
+
+    evidence = gate["unhealthy_critical_patterns"][0]["unhealthy_matches"][0]
+    assert evidence["evidence_artifact_kind"] == "html"
+    assert evidence["reasons"] == ["thin_html"]
+    assert evidence["metrics"]["word_count"] == 1
+
+
 def test_stage2_fails_closed_for_present_but_noindex_critical_route(tmp_path):
     markdown_path = tmp_path / "student-resources.md"
     markdown_path.write_text(

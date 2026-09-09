@@ -1,0 +1,30 @@
+_inherit: mbzuai_preprod_refresh_combined_selected_index_prep.yaml
+
+# Immutable, offline release assembly for the refreshed MBZUAI preproduction
+# snapshot plus the audited supplemental-domain corpus. Every input is pinned
+# by SHA-256. This run performs no embedding, vector-store write, or promotion.
+project_name: "mbzuai_preprod_refresh_combined_selected_release_assembly"
+
+formatter:
+  selected_release_assembly:
+    checkpoint_run_dir: "runs/mbzuai_preprod_refresh_combined_selected_index_prep/mbzuai-preprod-refresh-combined-selected-index-prep-20260909-v1"
+    candidate_manifest_file: "runs/evaluation/mbzuai-preprod-refresh-combined-c650-20260909-v1/candidates/c650/manifest.json"
+    candidate_manifest_sha256: "6de8231e7b11806a820bac12a2d8b26240300597702a9ebd87eec6c75d329e36"
+    candidate_records_file: "runs/evaluation/mbzuai-preprod-refresh-combined-c650-20260909-v1/candidates/c650/records.jsonl"
+    candidate_records_sha256: "875e7fcf001fbdeed07a42f5f4b716c7f3cb3e6a0fc5fa45ce172601bb2d44e5"
+    checkpoint_evidence:
+      pipeline_state_sha256: "08d9dba8b6deba1dac76536930fd524cd4389d553f25cfb8cd7031bc2c052cb3"
+      artifact_catalog_sha256: "ca509c9d72cf7d0d64d01523c3913812b7bec5c16acec5549017a8bba609abcd"
+      run_audit_sha256: "a5f811aab974120e68a1b9986ca3fb196d96d3b52f5441815823b912377acc9d"
+      resolved_config_sha256: "bc55ee6dfb8529e339799ed89cbb36a8cfae962a4a8995e91675b4828c57e98d"
+      chunk_index_sha256: "19653d60d629379da9a4ab478ffedb0fd9d5d2861a6b2178023ae044c598024f"
+      page_graph_bridge_sha256: "40e22f2b544e7c65ce007ca2827746200c33df516217051d7d0feff52fae28e6"
+      navigation_catalog_sha256: "03b1e7c084ebfed51ea42109c6b655cb33711bb56441454be349b4331a886711"
+
+stages:
+  - id: verify_selected_profile
+    type: formatter
+    plugin: selected_profile_guard
+  - id: assemble_selected_release
+    type: formatter
+    plugin: selected_release_assembly

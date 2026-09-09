@@ -13,6 +13,8 @@ from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional
 
+from bs4 import BeautifulSoup
+
 from pipeline.core.base import FormatterStage, StageContext, StageResult
 from pipeline.core.io import atomic_write_json, load_json_safe
 from pipeline.core.knowledge_graph import validate_graph_bundle
@@ -84,6 +86,28 @@ def _critical_markdown_metrics(markdown: str) -> Dict[str, Any]:
     }
 
 
+def _critical_html_metrics(html: str) -> Dict[str, Any]:
+    """Measure visible HTML text with the same semantics as Markdown evidence."""
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    for element in soup.select("script, style, noscript, template, svg"):
+        element.decompose()
+    link_texts = [link.get_text(" ", strip=True) for link in soup.find_all("a")]
+    plain = " ".join(soup.get_text(" ", strip=True).split()).strip()
+    words = _MARKDOWN_WORD_RE.findall(plain)
+    link_words = _MARKDOWN_WORD_RE.findall(" ".join(link_texts))
+    word_count = len(words)
+    link_word_count = len(link_words)
+    return {
+        "character_count": len(plain),
+        "word_count": word_count,
+        "link_count": len(link_texts),
+        "link_word_count": link_word_count,
+        "substantive_word_count": max(0, word_count - link_word_count),
+        "link_word_ratio": round(link_word_count / max(1, word_count), 6),
+    }
+
+
 def _critical_url_health(
     url: str,
     metadata: Mapping[str, Any],
@@ -125,6 +149,7 @@ def _critical_url_health(
         ),
         "semantic_evidence_required": semantic_evidence_required,
         "markdown_path": str(metadata.get("markdown_path") or ""),
+        "html_path": str(metadata.get("html_path") or ""),
         "reasons": reasons,
         "metrics": {},
     }
@@ -132,21 +157,41 @@ def _critical_url_health(
         assessment["healthy"] = not reasons
         return assessment
 
+    evidence_kind = "markdown"
     path_text = str(metadata.get("markdown_path") or "").strip()
-    if not path_text:
+    evidence_path = Path(path_text).expanduser() if path_text else None
+    if evidence_path is not None and not evidence_path.is_absolute() and evidence_base_dir is not None:
+        evidence_path = evidence_base_dir / evidence_path
+    if evidence_path is not None:
+        evidence_path = evidence_path.resolve()
+
+    allow_html_fallback = bool(
+        formatter_config.get("critical_url_allow_html_fallback", False)
+    )
+    if (evidence_path is None or not evidence_path.is_file()) and allow_html_fallback:
+        html_path_text = str(metadata.get("html_path") or "").strip()
+        html_path = Path(html_path_text).expanduser() if html_path_text else None
+        if html_path is not None and not html_path.is_absolute() and evidence_base_dir is not None:
+            html_path = evidence_base_dir / html_path
+        if html_path is not None:
+            html_path = html_path.resolve()
+        if html_path is not None and html_path.is_file():
+            evidence_kind = "html"
+            evidence_path = html_path
+            assessment["html_path"] = str(html_path)
+
+    if evidence_path is None:
         reasons.append("missing_markdown_artifact")
         assessment["artifact_status"] = "not_declared"
         return assessment
-
-    markdown_path = Path(path_text).expanduser()
-    if not markdown_path.is_absolute() and evidence_base_dir is not None:
-        markdown_path = evidence_base_dir / markdown_path
-    markdown_path = markdown_path.resolve()
-    assessment["markdown_path"] = str(markdown_path)
-    if not markdown_path.is_file():
+    if not evidence_path.is_file():
         reasons.append("missing_markdown_artifact")
         assessment["artifact_status"] = "missing"
         return assessment
+
+    assessment["evidence_artifact_kind"] = evidence_kind
+    if evidence_kind == "markdown":
+        assessment["markdown_path"] = str(evidence_path)
 
     max_read_bytes = max(
         1,
@@ -158,28 +203,32 @@ def _critical_url_health(
         ),
     )
     try:
-        artifact_bytes = markdown_path.stat().st_size
-        with markdown_path.open("rb") as handle:
-            raw_markdown = handle.read(max_read_bytes + 1)
+        artifact_bytes = evidence_path.stat().st_size
+        with evidence_path.open("rb") as handle:
+            raw_evidence = handle.read(max_read_bytes + 1)
     except OSError:
-        reasons.append("unreadable_markdown_artifact")
+        reasons.append(f"unreadable_{evidence_kind}_artifact")
         assessment["artifact_status"] = "unreadable"
         return assessment
 
-    truncated = len(raw_markdown) > max_read_bytes
-    markdown = raw_markdown[:max_read_bytes].decode("utf-8", errors="replace")
+    truncated = len(raw_evidence) > max_read_bytes
+    evidence_text = raw_evidence[:max_read_bytes].decode("utf-8", errors="replace")
     assessment["artifact_status"] = "readable"
-    metrics = _critical_markdown_metrics(markdown)
+    metrics = (
+        _critical_html_metrics(evidence_text)
+        if evidence_kind == "html"
+        else _critical_markdown_metrics(evidence_text)
+    )
     metrics.update(
         {
             "artifact_bytes": artifact_bytes,
-            "analyzed_bytes": min(len(raw_markdown), max_read_bytes),
+            "analyzed_bytes": min(len(raw_evidence), max_read_bytes),
             "analysis_truncated": truncated,
         }
     )
     assessment["metrics"] = metrics
-    if not markdown.strip():
-        reasons.append("empty_markdown")
+    if not evidence_text.strip():
+        reasons.append(f"empty_{evidence_kind}")
         return assessment
 
     min_words = max(
@@ -236,12 +285,12 @@ def _critical_url_health(
         or metrics["character_count"] < min_characters
         or metrics["substantive_word_count"] < min_substantive_words
     ):
-        reasons.append("thin_markdown")
+        reasons.append(f"thin_{evidence_kind}")
     if (
         metrics["link_count"] >= navigation_min_links
         and metrics["link_word_ratio"] > max_link_word_ratio
     ):
-        reasons.append("navigation_heavy_markdown")
+        reasons.append(f"navigation_heavy_{evidence_kind}")
 
     assessment["healthy"] = not reasons
     return assessment

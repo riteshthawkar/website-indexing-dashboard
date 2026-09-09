@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Tuple
@@ -171,6 +171,11 @@ class RepresentationV2Formatter(FormatterStage):
                 raise ValueError
         except (TypeError, ValueError):
             errors.append("formatter.representation_v2.maximum_workers must be between 1 and 32")
+        executor_type = str(stage_config.get("executor_type") or "thread").lower()
+        if executor_type not in {"thread", "process"}:
+            errors.append(
+                "formatter.representation_v2.executor_type must be thread or process"
+            )
         try:
             ratio = float(stage_config.get("template_minimum_page_ratio", 0.03))
             if not 0 <= ratio <= 1:
@@ -229,13 +234,19 @@ class RepresentationV2Formatter(FormatterStage):
             official_hosts.discard("")
 
             maximum_workers = int(config.get("maximum_workers", 4))
+            executor_type = str(config.get("executor_type") or "thread").lower()
+            executor_class = (
+                ProcessPoolExecutor
+                if executor_type == "process"
+                else ThreadPoolExecutor
+            )
             maximum_topics = max(1, int(config.get("maximum_topics_per_page", 24)))
             drafts: List[Dict[str, Any]] = []
             parse_failures: List[Dict[str, str]] = []
             ordered_pages = sorted(
                 (str(url), dict(value)) for url, value in page_metadata.items()
             )
-            with ThreadPoolExecutor(max_workers=maximum_workers) as executor:
+            with executor_class(max_workers=maximum_workers) as executor:
                 future_urls = {
                     executor.submit(
                         extract_page_draft,
@@ -343,6 +354,8 @@ class RepresentationV2Formatter(FormatterStage):
                     "extractor": "deterministic_html_page_cards_v2",
                     "extractor_config": {
                         "maximum_topics_per_page": maximum_topics,
+                        "executor_type": executor_type,
+                        "maximum_workers": maximum_workers,
                         "template_minimum_page_count": max(
                             1, int(config.get("template_minimum_page_count", 20))
                         ),

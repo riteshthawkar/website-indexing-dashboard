@@ -121,6 +121,7 @@ def test_web_download_queue_is_bounded_before_request_timeout(monkeypatch, tmp_p
         allowed_hosts,
         dns_cache,
         config,
+        request_headers_by_host=None,
     ):
         nonlocal active_global, maximum_global
         host = urlsplit(url).hostname or ""
@@ -162,6 +163,68 @@ def test_web_download_queue_is_bounded_before_request_timeout(monkeypatch, tmp_p
     assert len(results) == 16
     assert maximum_global == 3
     assert maximum_by_host == {"one.example": 2, "two.example": 2}
+
+
+def test_media_credentials_are_not_forwarded_to_allowlisted_redirect_host(monkeypatch, tmp_path):
+    import pipeline.stages.formatters.media_enrichment_formatter as module
+
+    class FakeResponse:
+        def __init__(self, status, headers=None):
+            self.status = status
+            self.headers = headers or {}
+            self.content_length = 0
+            self.connection = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    class FakeSession:
+        def __init__(self):
+            self.calls = []
+            self.responses = [
+                FakeResponse(302, {"Location": "https://cdn.example/image.jpg"}),
+                FakeResponse(404),
+            ]
+
+        def get(self, url, *, allow_redirects, headers=None):
+            self.calls.append({"url": url, "headers": headers})
+            return self.responses.pop(0)
+
+    async def public_host(host, cache):
+        return True
+
+    monkeypatch.setattr(module, "_host_resolves_publicly", public_host)
+    monkeypatch.setattr(module, "_peer_is_public", lambda response: True)
+    session = FakeSession()
+
+    result = asyncio.run(
+        module._download_image(
+            session,
+            url="https://protected.example/image.jpg",
+            output_dir=tmp_path,
+            allowed_hosts={"protected.example", "access.example", "cdn.example"},
+            dns_cache={},
+            config={
+                "download_retry_attempts": 1,
+                "fetch_host_aliases": {"protected.example": "access.example"},
+            },
+            request_headers_by_host={
+                "access.example": {"Cookie": "private-session"}
+            },
+        )
+    )
+
+    assert result["reason"] == "http_404"
+    assert session.calls == [
+        {
+            "url": "https://access.example/image.jpg",
+            "headers": {"Cookie": "private-session"},
+        },
+        {"url": "https://cdn.example/image.jpg", "headers": None},
+    ]
 
 
 def test_media_normalization_preserves_multimodal_provenance():

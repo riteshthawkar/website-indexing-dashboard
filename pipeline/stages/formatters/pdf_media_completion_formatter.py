@@ -143,6 +143,7 @@ def _discover_layouts(
     url_by_path: Mapping[str, str],
     markdown_by_source: Mapping[str, str],
     include_unused_fallback_layouts: bool,
+    include_quarantined_layouts: bool,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]], List[Dict[str, Any]]]:
     layouts: List[Dict[str, Any]] = []
     documents: Dict[str, Dict[str, Any]] = {}
@@ -177,6 +178,7 @@ def _discover_layouts(
                     "picture_box_count": 0,
                     "from_window_wrapper": False,
                     "from_unused_fallback": False,
+                    "from_quarantine": False,
                 },
             )
             if not artifact.local_path or not Path(artifact.local_path).is_file():
@@ -264,6 +266,7 @@ def _discover_layouts(
                         "picture_box_count": 0,
                         "from_window_wrapper": False,
                         "from_unused_fallback": False,
+                        "from_quarantine": False,
                     },
                 )
                 key = (source_file, str(structured_path.resolve()))
@@ -286,6 +289,64 @@ def _discover_layouts(
                 run_layout_count += 1
                 fallback_count += 1
 
+        quarantined_count = 0
+        if include_quarantined_layouts:
+            quarantine = Path(str(outputs.get("quarantine_dir") or ""))
+            quarantined_dir = quarantine / "structured_documents"
+            for structured_path in (
+                sorted(quarantined_dir.glob("*.docling.json"))
+                if quarantined_dir.is_dir()
+                else []
+            ):
+                if _PAGE_WINDOW_MARKER in structured_path.name:
+                    continue
+                payload = load_json_safe(structured_path, {}) or {}
+                if not isinstance(payload, dict):
+                    continue
+                source_file = _source_file_from_payload(payload, path_by_name)
+                if not source_file or Path(source_file).suffix.lower() != ".pdf":
+                    continue
+                metadata = source_metadata.get(source_file, {})
+                document = documents.setdefault(
+                    source_file,
+                    {
+                        "source_file": source_file,
+                        "source_url": str(url_by_path.get(source_file) or ""),
+                        "source_markdown_path": str(
+                            markdown_by_source.get(source_file)
+                            or metadata.get("source_markdown_path")
+                            or ""
+                        ),
+                        "layout_count": 0,
+                        "picture_box_count": 0,
+                        "from_window_wrapper": False,
+                        "from_unused_fallback": False,
+                        "from_quarantine": False,
+                    },
+                )
+                key = (source_file, str(structured_path.resolve()))
+                if key in seen_layouts:
+                    continue
+                seen_layouts.add(key)
+                layouts.append(
+                    {
+                        "source_file": source_file,
+                        "source_url": str(url_by_path.get(source_file) or ""),
+                        "source_markdown_path": document["source_markdown_path"],
+                        "structured_path": str(structured_path.resolve()),
+                        "layout_source": "docling_quarantine",
+                        "page_range": [],
+                        # A quarantined text conversion is not trusted as
+                        # corpus evidence. Full-page visual OCR is the safe
+                        # recovery path for short scanned documents.
+                        "full_page_fallback": True,
+                    }
+                )
+                document["layout_count"] += 1
+                document["from_quarantine"] = True
+                run_layout_count += 1
+                quarantined_count += 1
+
         run_evidence.append(
             {
                 "run_dir": str(run_dir),
@@ -293,6 +354,7 @@ def _discover_layouts(
                 "layout_count": run_layout_count,
                 "window_wrapper_count": wrapper_count,
                 "unused_fallback_layout_count": fallback_count,
+                "quarantined_layout_count": quarantined_count,
             }
         )
     return layouts, documents, run_evidence
@@ -703,6 +765,9 @@ class PdfMediaCompletionFormatter(FormatterStage):
                 markdown_by_source=markdown_by_source,
                 include_unused_fallback_layouts=bool(
                     config.get("include_unused_fallback_layouts", True)
+                ),
+                include_quarantined_layouts=bool(
+                    config.get("include_quarantined_layouts", False)
                 ),
             )
 

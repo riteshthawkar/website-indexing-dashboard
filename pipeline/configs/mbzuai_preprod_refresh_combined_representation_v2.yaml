@@ -1,0 +1,30 @@
+# Page-aware Representation V2 for the September 2026 refreshed main site
+# and the audited supplemental subdomains. This remains a pre-chunking,
+# pre-embedding, and pre-indexing stage.
+
+project_name: "mbzuai_preprod_refresh_combined_representation_v2"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  representation_v2:
+    source_corpus_run_dir: "runs/mbzuai_preprod_refresh_combined_corpus_preparation/mbzuai-preprod-refresh-combined-corpus-20260909-v1"
+    expected_document_count: 2666
+    expected_page_count: 2712
+    expected_web_document_count: 2613
+    executor_type: "process"
+    maximum_workers: 24
+    maximum_topics_per_page: 24
+    template_minimum_page_count: 20
+    template_minimum_page_ratio: 0.03
+
+stages:
+  - id: extract_page_cards_and_actions
+    type: formatter
+    plugin: representation_v2

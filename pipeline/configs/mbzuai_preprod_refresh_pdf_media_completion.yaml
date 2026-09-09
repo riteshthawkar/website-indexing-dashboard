@@ -1,0 +1,105 @@
+# Immutable PDF-media completion for the September 2026 preproduction
+# snapshot. The malformed text of quarantined conversions is never imported;
+# their verified Docling layouts are recovered as figures/full-page images and
+# become retrievable only after semantic captioning and exact OCR.
+
+project_name: "mbzuai_preprod_refresh_pdf_media_completion"
+work_dir: "./runs"
+
+pipeline:
+  production_profile: false
+  require_production_preflight: false
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+formatter:
+  corpus_merge:
+    use_current_artifacts: false
+    require_source_audit_ok: true
+    minimum_source_count: 1
+    source_runs:
+      - role: "captioned_preproduction_snapshot"
+        run_dir: "runs/mbzuai_preprod_refresh_processing/mbzuai-preprod-refresh-processing-20260909-v3"
+        project_name: "mbzuai_preprod_refresh_processing"
+        required_stage_ids:
+          - "convert_documents"
+          - "convert_html"
+          - "enrich_media"
+          - "annotate_media"
+        evidence:
+          pipeline_state_sha256: "6d55cbcf8a55bda6cda60f3a15127066be1d1afe959227d383992e920431f8f4"
+          artifact_catalog_sha256: "57b4020d45182c843b1d95abae9652ad9f60da9222f09868ebb0b3aa4bcd2268"
+          run_audit_sha256: "387e102db3aefcbc91c865b9cb18b7b7338490283180e74368c2b70ceadd851a"
+          resolved_config_sha256: "96061dda74fd93cad4369d96af303d291080195eac22b2fe43f147165856df92"
+
+  pdf_media_completion:
+    conversion_stage_id: "convert_documents"
+    conversion_run_dirs:
+      - "runs/mbzuai_preprod_refresh_processing/mbzuai-preprod-refresh-processing-20260909-v3"
+    raw_mapping_files:
+      - "runs/mbzuai_preprod_crawl_user_session/preprod-refresh-20260907-v2/mappings.json"
+    include_unused_fallback_layouts: true
+    include_quarantined_layouts: true
+    pdf_crop_scale: 2.0
+    pdf_crop_padding_points: 3.0
+    min_pdf_bbox_area_ratio: 0.003
+    max_pdf_bbox_area_ratio: 0.90
+    min_pdf_crop_width: 96
+    min_pdf_crop_height: 72
+    min_pdf_crop_area: 12000
+    max_pdf_crop_aspect_ratio: 12.0
+    max_image_pixels: 50000000
+    min_visual_stddev: 2.0
+    pdf_perceptual_duplicate_distance: 2
+    fallback_full_page_max_pages: 5
+    fallback_full_page_only_when_unrepresented: false
+    minimum_pdf_documents: 10
+    maximum_failed_documents: 0
+
+  media_semantics:
+    mode: "gemini"
+    model: "gemini-3.5-flash-lite"
+    escalation_model: "gemini-3.7-flash"
+    enable_escalation: true
+    escalation_confidence_threshold: 0.72
+    escalation_image_kinds:
+      - "diagram"
+      - "chart"
+      - "infographic"
+      - "map"
+      - "document_fragment"
+    prompt_revision: "mbzuai-media-semantics-v2-section-context"
+    reuse_input_annotations: true
+    reuse_annotation_manifest_files:
+      - path: "runs/mbzuai_preprod_refresh_processing/mbzuai-preprod-refresh-processing-20260909-v3/stage_outputs/annotate_media/semantically_annotated_media_manifest.json"
+        sha256: "6ae92802c330253c77aff75a8cba169c33a98f4715668572f84eab92e25bd5c0"
+    context_before_blocks: 1
+    context_after_blocks: 2
+    context_max_chars: 1200
+    context_following_heading_max_distance: 4
+    context_html_fallback: true
+    max_reference_contexts_per_annotation: 12
+    concurrency: 4
+    request_timeout_sec: 90
+    retry_attempts: 3
+    retry_backoff_sec: 1.0
+    retry_max_delay_sec: 12.0
+    cache_flush_every: 10
+    max_output_tokens: 1200
+    image_max_side: 1600
+    image_max_pixels: 1800000
+    max_images: 0
+    require_complete: true
+    minimum_completion_ratio: 1.0
+
+stages:
+  - id: merge_captioned_corpus
+    type: formatter
+    plugin: corpus_merge
+  - id: complete_pdf_media
+    type: formatter
+    plugin: pdf_media_completion
+  - id: annotate_recovered_media
+    type: formatter
+    plugin: media_semantics

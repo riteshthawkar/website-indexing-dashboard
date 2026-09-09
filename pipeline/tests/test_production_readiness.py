@@ -7065,6 +7065,68 @@ class TestMarkItDownConverter:
         assert "## Embedded Media" in md_content
         assert "[Watch video](https://example.com/intro.mp4)" in md_content
 
+    def test_execute_preserves_redirect_aliases_and_prefers_canonical_url(self, tmp_dir):
+        from pipeline.core.artifacts import ArtifactCatalog
+        from pipeline.core.base import StageContext
+        from pipeline.core.io import atomic_write_json, load_json_safe
+        from pipeline.stages.converters.markitdown_converter import MarkItDownConverter
+
+        legacy_url = "https://example.com/old-page"
+        canonical_url = "https://example.com/new-page"
+        cleaned_dir = tmp_dir / "cleaned_html"
+        cleaned_dir.mkdir()
+        html_path = cleaned_dir / "page.html"
+        html_path.write_text(
+            "<html><body><h1>Canonical page</h1></body></html>",
+            encoding="utf-8",
+        )
+        page_metadata_file = tmp_dir / "canonical_page_metadata.json"
+        atomic_write_json(
+            page_metadata_file,
+            {canonical_url: {"source_url": canonical_url, "redirected_from": [legacy_url]}},
+        )
+        catalog = ArtifactCatalog.from_dict(
+            {
+                "records": [
+                    {
+                        "artifact_id": "clean-redirect",
+                        "artifact_type": "cleaned_html",
+                        "role": "content",
+                        "producer_stage": "clean_html",
+                        "uri": html_path.resolve().as_uri(),
+                        "local_path": str(html_path),
+                        "metadata": {
+                            "source_url": legacy_url,
+                            "source_urls": [legacy_url, canonical_url],
+                            "relative_path": "page.html",
+                        },
+                    }
+                ]
+            }
+        )
+        ctx = StageContext(
+            run_id="test-aliases",
+            project_name="test",
+            config={"converter": {"overwrite": True, "max_workers": 1}},
+            work_dir=tmp_dir / "run",
+            previous_outputs={
+                "canonical_page_metadata_file": str(page_metadata_file),
+            },
+            stage_definition={"type": "converter", "plugin": "markitdown"},
+            stage_id="convert_html",
+            artifact_catalog=catalog,
+        )
+
+        result = run_async(MarkItDownConverter().execute(ctx))
+
+        mapping = load_json_safe(result.outputs["md_mapping_file"])
+        assert mapping[legacy_url] == mapping[canonical_url]
+        markdown_artifact = next(
+            artifact for artifact in result.artifacts if artifact.artifact_type == "markdown"
+        )
+        assert markdown_artifact.metadata["source_url"] == canonical_url
+        assert markdown_artifact.metadata["source_urls"] == [legacy_url, canonical_url]
+
 
 class TestMediaHelpers:
     def test_build_retrieval_documents_parses_media_metadata(self):

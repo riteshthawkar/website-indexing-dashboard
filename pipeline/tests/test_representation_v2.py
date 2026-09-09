@@ -323,6 +323,7 @@ def test_representation_formatter_enforces_exact_coverage_and_writes_artifacts(t
                 "expected_document_count": 2,
                 "expected_page_count": 2,
                 "expected_web_document_count": 2,
+                "executor_type": "process",
                 "maximum_workers": 2,
                 "template_minimum_page_count": 20,
                 "template_minimum_page_ratio": 0.5,
