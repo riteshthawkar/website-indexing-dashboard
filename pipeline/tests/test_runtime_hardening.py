@@ -516,6 +516,59 @@ def test_retrieval_service_forwards_navigation_context_and_separates_cache(tmp_p
     assert different_context.json()["service_cache_hit"] is False
 
 
+def test_retrieval_service_forwards_context_page_and_separates_cache(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from pipeline.service.retrieval_api import create_retrieval_service_app
+
+    class ContextPageAwareRetriever:
+        supports_shared_parallel_retrieval = True
+
+        def __init__(self):
+            self.calls = []
+
+        def retrieve(self, query, *, context_page_url=None):
+            self.calls.append((query, context_page_url))
+            return {
+                "query": query,
+                "abstained": True,
+                "retrieval_documents": [],
+            }
+
+    retriever = ContextPageAwareRetriever()
+    monkeypatch.setattr(
+        "pipeline.service.retrieval_api.AdaptiveHybridRetriever.from_config",
+        lambda **_kwargs: retriever,
+    )
+    app = create_retrieval_service_app(config_name="cfg", work_dir=tmp_path)
+    job_page = "https://careers.mbzuai.ac.ae/careers/data-platform-engineer-iaai"
+    faculty_page = "https://mbzuai.ac.ae/study/faculty"
+
+    with TestClient(app) as client:
+        first = client.post(
+            "/retrieve",
+            json={"query": "What is required for this role?", "context_page_url": job_page},
+        )
+        cached = client.post(
+            "/retrieve",
+            json={"query": "What is required for this role?", "context_page_url": job_page},
+        )
+        different_page = client.post(
+            "/retrieve",
+            json={"query": "What is required for this role?", "context_page_url": faculty_page},
+        )
+
+    assert retriever.calls == [
+        ("What is required for this role?", job_page),
+        ("What is required for this role?", faculty_page),
+    ]
+    assert first.status_code == 200
+    assert first.json()["service_context_page_forwarded"] is True
+    assert first.json()["service_cache_hit"] is False
+    assert cached.json()["service_cache_hit"] is True
+    assert different_page.json()["service_cache_hit"] is False
+
+
 @pytest.mark.parametrize(
     "token",
     [

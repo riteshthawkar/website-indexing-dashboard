@@ -8777,6 +8777,59 @@ def test_actionable_navigation_target_becomes_a_required_evidence_page():
     ]
 
 
+def test_context_page_is_required_only_when_present_in_frozen_corpus():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    context_url = (
+        "https://careers.mbzuai.ac.ae/careers/data-platform-engineer-iaai"
+    )
+    context_record = {
+        "source_url": context_url,
+        "normalized_url": context_url,
+        "document_revision_ids": {"document-revision:job"},
+        "linked_chunk_ids": {"chunk:job:1"},
+    }
+    alias_record = {
+        "source_url": f"{context_url}/print",
+        "normalized_url": f"{context_url}/print",
+        "document_revision_ids": {"document-revision:job"},
+        "linked_chunk_ids": {"chunk:job:1"},
+    }
+    retriever._coverage_page_records_by_url = {
+        context_url: context_record,
+        f"{context_url}/print": alias_record,
+    }
+    retriever._coverage_page_records = [context_record, alias_record]
+    coverage_plan = {
+        "required_pages": [
+            f"{context_url}/print",
+            "https://mbzuai.ac.ae/news/unrelated",
+        ],
+        "required_pages_source": "retrieval_payload",
+    }
+
+    resolved = retriever._require_context_page(coverage_plan, f"{context_url}/")
+
+    assert resolved == context_url
+    assert coverage_plan["required_pages"] == [
+        context_url,
+        "https://mbzuai.ac.ae/news/unrelated",
+    ]
+    assert coverage_plan["required_pages_source"] == (
+        "context_page+retrieval_payload"
+    )
+    assert coverage_plan["context_page_url"] == context_url
+
+    unchanged = dict(coverage_plan)
+    rejected = retriever._require_context_page(
+        coverage_plan,
+        "https://example.com/untrusted-page",
+    )
+    assert rejected == ""
+    assert coverage_plan == unchanged
+
+
 def test_exact_navigation_action_scopes_coverage_to_its_owning_page():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

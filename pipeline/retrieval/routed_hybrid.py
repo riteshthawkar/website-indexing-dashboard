@@ -3320,6 +3320,57 @@ class RoutedHybridRetriever:
         coverage_plan["required_pages"] = [target_url, *required_pages]
         return True
 
+    def _require_context_page(
+        self,
+        coverage_plan: Dict[str, Any],
+        context_page_url: str | None,
+    ) -> str:
+        """Ground an explicitly contextual query in its frozen parent page.
+
+        The caller-provided URL is only an identity hint. It is never fetched and
+        only becomes a coverage requirement when it resolves to a page already in
+        the immutable retrieval bundle. This keeps page-context handling useful
+        for deictic widget questions without opening an external-content path.
+        """
+
+        requested_url = str(context_page_url or "").strip()
+        if not requested_url:
+            return ""
+        page_record = self._coverage_page_record_for_url(requested_url)
+        if not page_record:
+            return ""
+        resolved_url = str(page_record.get("source_url") or requested_url).strip()
+        if not resolved_url:
+            return ""
+
+        existing_pages = [
+            str(value).strip()
+            for value in coverage_plan.get("required_pages") or []
+            if str(value).strip()
+        ]
+        retained_pages = [
+            page
+            for page in existing_pages
+            if self._normalize_source_url(page)
+            != self._normalize_source_url(resolved_url)
+            and not self._coverage_pages_share_representation(page, resolved_url)
+        ]
+        coverage_plan["required_pages"] = [resolved_url, *retained_pages]
+        previous_source = str(
+            coverage_plan.get("required_pages_source") or "none"
+        ).strip()
+        coverage_plan["required_pages_source"] = (
+            previous_source
+            if previous_source.startswith("context_page")
+            else (
+                "context_page"
+                if previous_source in {"", "none", "verified_media_evidence"}
+                else f"context_page+{previous_source}"
+            )
+        )
+        coverage_plan["context_page_url"] = resolved_url
+        return resolved_url
+
     def retrieve(
         self,
         query: str,
@@ -3328,6 +3379,7 @@ class RoutedHybridRetriever:
         skip_query_planner: bool = False,
         navigation_context: Mapping[str, Any] | None = None,
         original_query: str | None = None,
+        context_page_url: str | None = None,
     ) -> Dict[str, Any]:
         routing_started = time.perf_counter()
         coverage_query = str(original_query or "").strip() or query
@@ -3619,6 +3671,23 @@ class RoutedHybridRetriever:
             payload=payload,
             mode=mode,
         )
+        resolved_context_page_url = self._require_context_page(
+            coverage_plan,
+            context_page_url,
+        )
+        payload["context_page_requested"] = bool(
+            str(context_page_url or "").strip()
+        )
+        payload["context_page_status"] = (
+            "resolved_in_frozen_corpus"
+            if resolved_context_page_url
+            else (
+                "not_in_frozen_corpus"
+                if payload["context_page_requested"]
+                else "not_requested"
+            )
+        )
+        payload["context_page_resolved_url"] = resolved_context_page_url
         if self._augment_payload_for_required_coverage(
             query=coverage_query,
             payload=payload,
@@ -3632,6 +3701,7 @@ class RoutedHybridRetriever:
                 payload=payload,
                 mode=mode,
             )
+            self._require_context_page(coverage_plan, resolved_context_page_url)
         postprocess_stage_latency_ms["coverage_planning_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,
             3,
@@ -3793,6 +3863,9 @@ class RoutedHybridRetriever:
             "navigation_target_page_required": bool(
                 payload.get("navigation_target_page_required")
             ),
+            "context_page_requested": bool(payload.get("context_page_requested")),
+            "context_page_status": payload.get("context_page_status") or "not_requested",
+            "context_page_resolved_url": payload.get("context_page_resolved_url") or "",
             "media_evidence_verified": bool(
                 payload.get("media_evidence_verified")
             ),
