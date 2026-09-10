@@ -14,7 +14,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Sequence, Tuple
 
 from pipeline.core.config import (
     indexing_implementation_hashes,
@@ -1527,6 +1527,7 @@ def build_release_manifest(
     answer_readiness_waiver_reason: str = "",
     query_cache_path: str | Path | None = None,
     retrieval_cache_path: str | Path | None = None,
+    splits: Sequence[str] | None = None,
     parallelism: int = 1,
     skip_stage_validation: bool = False,
     progress_callback: ReleaseProgressCallback | None = None,
@@ -1739,6 +1740,7 @@ def build_release_manifest(
                     gates_path=str(resolved_gates),
                     query_cache_path=str(query_cache_path) if query_cache_path else None,
                     retrieval_cache_path=str(retrieval_cache_path) if retrieval_cache_path else None,
+                    splits=splits,
                     parallelism=max(1, int(parallelism or 1)),
                     progress_callback=progress_callback,
                 )
@@ -1804,6 +1806,7 @@ def build_release_manifest(
                     probe_mode=answer_probe_mode,
                     eval_request_mode=answer_eval_request_mode,
                     resume_predictions=answer_resume_predictions,
+                    splits=splits,
                     judge_enabled=judge_enabled,
                     judge_model=judge_model,
                     judge_timeout_seconds=judge_timeout_seconds,

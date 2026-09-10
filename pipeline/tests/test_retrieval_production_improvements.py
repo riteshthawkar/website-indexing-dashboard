@@ -6112,6 +6112,7 @@ def test_release_check_manifest_and_promotion(tmp_path, monkeypatch):
         work_dir=work_dir,
         dataset_path=dataset,
         gates_path=gates,
+        splits=["selection"],
         skip_stage_validation=True,
     )
     assert passed
