@@ -1895,6 +1895,9 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     arabic_divisions_markers = retriever._explicit_required_page_markers(
         "ما هي أقسام جامعة محمد بن زايد للذكاء الاصطناعي؟"
     )
+    english_divisions_markers = retriever._explicit_required_page_markers(
+        "Which divisions does MBZUAI have?"
+    )
     admissions_funding_markers = retriever._explicit_required_page_markers(
         "Summarize master's admissions requirements and funding at MBZUAI."
     )
@@ -1906,6 +1909,7 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     assert "/study/msc-programs" in maai_markers
     assert housing_markers == ["/campus-community/housing"]
     assert arabic_divisions_markers[0] == "/research/our-divisions"
+    assert english_divisions_markers[0] == "/research/our-divisions"
     assert admissions_funding_markers[:2] == [
         "/graduate-masters-admissions",
         "/study/msc-programs",
@@ -1925,6 +1929,7 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
             "scholarship status?"
         ),
         "List every current master's degree program offered by the university.",
+        "Tell me about master's admissions.",
     ],
 )
 def test_aggregate_program_query_injects_complete_page_parent(query):

@@ -69,6 +69,12 @@ _COLLECTION_QUERY_RE = re.compile(
     r"|(?:اذكر|اعرض|جميع|كل|ما هي|ما عدد|ماهي|المتاحة)",
     re.IGNORECASE,
 )
+_BROAD_OVERVIEW_QUERY_RE = re.compile(
+    r"\b(?:tell me (?:more )?about|give me (?:an )?overview(?: of)?|"
+    r"give me information (?:about|on)|information (?:about|on)|explain)\b"
+    r"|(?:أخبرني عن|اخبرني عن|حدثني عن|نبذة عن|معلومات عن|اشرح)",
+    re.IGNORECASE,
+)
 _COLLECTION_TARGET_ALIASES = {
     "article": "article",
     "articles": "article",
@@ -174,6 +180,7 @@ def _is_collection_landing_path_part(value: str, targets: set[str]) -> bool:
 def _is_aggregate_required_page_query(query: str) -> bool:
     return bool(
         _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
+        or _BROAD_OVERVIEW_QUERY_RE.search(str(query or ""))
         or (
             _COLLECTION_QUERY_RE.search(str(query or ""))
             and _collection_target_tokens(query)
@@ -1108,7 +1115,11 @@ class RoutedHybridRetriever:
             query_lower,
         ):
             return "multi_page_aggregation"
-        if re.search(r"\b(overview|summary|summarize|complete page|whole page|full page|entire page|large page)\b", query_lower):
+        if re.search(
+            r"\b(overview|summary|summarize|complete page|whole page|full page|"
+            r"entire page|large page)\b",
+            query_lower,
+        ) or _BROAD_OVERVIEW_QUERY_RE.search(query):
             return "large_page"
         if mode == QueryMode.SYNTHESIS:
             return "broad_synthesis"
@@ -2013,6 +2024,11 @@ class RoutedHybridRetriever:
             not careers_division_scope
             and (
                 re.search(r"\b(?:our|research|university) divisions?\b", lower)
+                or re.search(
+                    r"\b(?:what|which)\s+(?:are\s+)?"
+                    r"(?:(?:academic|research|university|mbzuai)\s+)?divisions?\b",
+                    lower,
+                )
                 or (
                     _COLLECTION_QUERY_RE.search(query)
                     and re.search(r"\bdivisions?\b", lower)
