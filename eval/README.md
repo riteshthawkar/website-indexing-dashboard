@@ -77,7 +77,7 @@ Production promotion uses the governed multilingual V2 suite and release gates b
 - `eval/gates/retrieval_gate.multilingual_v2_release.json`
 - `eval/gates/answer_readiness_gate.multilingual_v2_release.json`
 
-Production policy `mbzuai-production-eval-v3` requires all 160 governed retrieval queries and 160 Gemini-judged answers: 80 English and 80 Arabic cases, including 24 sealed no-answer checks and explicit multimodal, navigation, cross-lingual, and subdomain coverage. Its 96-row selection and 26-row regression splits may be used before release; the 38-row holdout remains sealed until a final candidate is frozen.
+Production policy `mbzuai-production-eval-v4` requires all 160 governed retrieval queries and 160 Gemini-judged answers: 80 English and 80 Arabic cases, including 24 sealed no-answer checks and explicit multimodal, navigation, cross-lingual, and subdomain coverage. Its 96-row selection and 26-row regression splits may be used before release; the 38-row holdout remains sealed until a final candidate is frozen. Version 4 binds the policy to the refreshed preproduction website and its current document, Page Card, section, action, and media identities.
 
 The v2 suite is generated from the internal v4 gold set with:
 

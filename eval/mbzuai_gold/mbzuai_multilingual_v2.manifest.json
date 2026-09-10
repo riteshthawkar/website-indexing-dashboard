@@ -5,37 +5,29 @@
   "generation": {
     "provider": "openai",
     "model": "gpt-5.4-mini",
-    "prompt_revision": "mbzuai-multilingual-eval-v2-source-grounded-20260822",
+    "prompt_revision": "mbzuai-multilingual-eval-v2-current-preprod-20260910",
     "temperature": "provider_default",
     "web_search_enabled": false,
-    "repair_rounds": 2,
+    "repair_rounds": 5,
     "usage": {
-      "prompt_tokens": 350971,
-      "completion_tokens": 46740,
-      "total_tokens": 397711
-    },
-    "manual_corrections": [
-      {
-        "date": "2026-08-29",
-        "example_id": "mlv2-ar-synthesis-001-168375e6",
-        "field": "reference_answer",
-        "reason": "Removed an unsupported claim that scholarships cover up to 100% of tuition and attendance costs; neither frozen evidence quote states that coverage level."
-      }
-    ]
+      "prompt_tokens": 266420,
+      "completion_tokens": 43141,
+      "total_tokens": 309561
+    }
   },
   "source_snapshot": {
-    "representation_bundle": "runs/mbzuai_representation_v2/mbzuai-representation-v2-20260821-v2/stage_outputs/extract_page_cards_and_actions/representation_v2_bundle.json",
-    "representation_bundle_sha256": "8d46c453c8f53525af50efd6b5b38be126117c40f7f2547a7356ca5c04232430",
+    "representation_bundle": "runs/mbzuai_preprod_refresh_combined_representation_v2/mbzuai-preprod-refresh-combined-representation-v2-20260909-v1/stage_outputs/extract_page_cards_and_actions/representation_v2_bundle.json",
+    "representation_bundle_sha256": "7e79a3a67104d9fb75de22cfa20225a5a79a1666cd18b91b0cc953f5842d8166",
     "representation_schema_version": "mbzuai.representation.v2",
-    "media_manifest": "runs/mbzuai_corpus_preparation/mbzuai-corpus-preparation-20260821-v4/stage_outputs/prepare_corpus_boundary/prepared_media_manifest.json",
-    "media_manifest_sha256": "578f356e2f3fbe4668be9cb2df9c8f9caf111528a588835c136054ab0a66372d",
+    "media_manifest": "runs/mbzuai_preprod_refresh_combined_corpus_preparation/mbzuai-preprod-refresh-combined-corpus-20260909-v1/stage_outputs/prepare_corpus_boundary/prepared_media_manifest.json",
+    "media_manifest_sha256": "b4122538c3161cf185ef6d7b389dc62611a301327299c7b229523fb544916c5f",
     "media_manifest_version": 2,
-    "navigation_catalog": "runs/mbzuai_page_graph_bridge/mbzuai-page-graph-bridge-20260822-v4/stage_outputs/bridge_page_graph/page_graph_navigation_catalog.json",
-    "navigation_catalog_sha256": "a720dc921637a65d61f811d4ca227d0de1b18e827757fab41ef6d88229f48165"
+    "navigation_catalog": "runs/mbzuai_main/mbzuai-preprod-refresh-pinecone-production-20260909-v4/stage_outputs/assemble_selected_release/page_graph_navigation_catalog.json",
+    "navigation_catalog_sha256": "54aaa6bc8ce7f6d527a0ae78ec4f5652f1d16bea1a310e28dbc360b3672ef1b1"
   },
   "dataset": {
     "path": "eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl",
-    "sha256": "fa400a69bcb9f1a61b6cdb9c8033fed3b16426d2d58b8cec1b427fe097499ac8",
+    "sha256": "2f34a329411d5de5a7749ac64c0906a1b9bccf237f45cd69ad89b0f3ddcd0db2",
     "coverage": {
       "query_count": 160,
       "language_counts": {
@@ -68,12 +60,12 @@
         "abstention": 24,
         "adversarial_no_answer": 24,
         "cross_lingual": 18,
-        "easy": 96,
+        "easy": 106,
         "fact": 52,
-        "hard": 3,
+        "hard": 1,
         "image": 12,
         "mbzuai_multilingual_v2": 160,
-        "medium": 37,
+        "medium": 29,
         "mixed": 4,
         "multi_source": 20,
         "multilingual": 160,
@@ -87,22 +79,23 @@
         "webpage": 108
       },
       "source_host_counts": {
-        "ai-nexus.mbzuai.ac.ae": 8,
-        "careers.mbzuai.ac.ae": 14,
+        "ai-nexus.mbzuai.ac.ae": 5,
+        "careers.mbzuai.ac.ae": 15,
         "hpp.mbzuai.ac.ae": 3,
         "ifm.ai": 5,
-        "library.mbzuai.ac.ae": 12,
-        "mbzuai.ac.ae": 68,
+        "library.mbzuai.ac.ae": 14,
+        "mbzuai.ac.ae": 2,
         "metaverse.mbzuai.ac.ae": 9,
+        "preprod.mbzuai.ac.ae": 69,
         "research.mbzuai.ac.ae": 8,
-        "staticcdn.mbzuai.ac.ae": 14
+        "staticcdn.mbzuai.ac.ae": 11
       },
       "with_evidence_quotes": 136,
       "with_page_cards": 124,
-      "with_sections": 108,
+      "with_sections": 94,
       "with_actions": 16,
       "with_media": 24,
-      "source_connected_group_count": 122,
+      "source_connected_group_count": 130,
       "source_group_split_leak_count": 0
     }
   },
@@ -130,9 +123,9 @@
         "with_gold_chunks": 0,
         "with_gold_parents": 0,
         "with_gold_media": 24,
-        "with_gold_documents": 136,
+        "with_gold_documents": 133,
         "with_gold_page_cards": 124,
-        "with_gold_sections": 108,
+        "with_gold_sections": 94,
         "with_gold_actions": 16
       },
       "ok": true,
@@ -177,12 +170,12 @@
           "abstention": 24,
           "adversarial_no_answer": 24,
           "cross_lingual": 18,
-          "easy": 96,
+          "easy": 106,
           "fact": 52,
-          "hard": 3,
+          "hard": 1,
           "image": 12,
           "mbzuai_multilingual_v2": 160,
-          "medium": 37,
+          "medium": 29,
           "mixed": 4,
           "multi_source": 20,
           "multilingual": 160,
@@ -196,22 +189,23 @@
           "webpage": 108
         },
         "source_host_counts": {
-          "ai-nexus.mbzuai.ac.ae": 8,
-          "careers.mbzuai.ac.ae": 14,
+          "ai-nexus.mbzuai.ac.ae": 5,
+          "careers.mbzuai.ac.ae": 15,
           "hpp.mbzuai.ac.ae": 3,
           "ifm.ai": 5,
-          "library.mbzuai.ac.ae": 12,
-          "mbzuai.ac.ae": 68,
+          "library.mbzuai.ac.ae": 14,
+          "mbzuai.ac.ae": 2,
           "metaverse.mbzuai.ac.ae": 9,
+          "preprod.mbzuai.ac.ae": 69,
           "research.mbzuai.ac.ae": 8,
-          "staticcdn.mbzuai.ac.ae": 14
+          "staticcdn.mbzuai.ac.ae": 11
         },
         "with_evidence_quotes": 136,
         "with_page_cards": 124,
-        "with_sections": 108,
+        "with_sections": 94,
         "with_actions": 16,
         "with_media": 24,
-        "source_connected_group_count": 122,
+        "source_connected_group_count": 130,
         "source_group_split_leak_count": 0
       },
       "errors": [],
