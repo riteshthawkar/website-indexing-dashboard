@@ -691,7 +691,7 @@ def test_arabic_qualification_query_keeps_english_requirements_span():
     source_url = "https://careers.mbzuai.ac.ae/careers/data-platform-engineer-iaai"
     pack = build_evidence_pack(
         query=(
-            "ما المؤهل الأكاديمي المطلوب لوظيفة Data Platform Engineer "
+            "ما المؤهل الدراسي المطلوب لوظيفة Data Platform Engineer "
             "في معهد IAAI؟"
         ),
         result={
@@ -8471,14 +8471,17 @@ def test_arabic_nonvisual_fact_query_does_not_route_to_the_media_lane():
     assert _is_media_query("ما متطلبات القبول في برنامج الماجستير؟") is False
 
 
-def test_arabic_academic_qualification_query_adds_english_retrieval_aliases():
+@pytest.mark.parametrize(
+    "query",
+    [
+        "ما المؤهل الأكاديمي المطلوب لوظيفة Data Platform Engineer؟",
+        "ما المؤهل الدراسي المطلوب لهذا المنصب؟",
+    ],
+)
+def test_arabic_academic_qualification_query_adds_english_retrieval_aliases(query):
     from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
 
-    aliases = set(
-        _semantic_query_alias_tokens(
-            "ما المؤهل الأكاديمي المطلوب لوظيفة Data Platform Engineer؟"
-        )
-    )
+    aliases = set(_semantic_query_alias_tokens(query))
 
     assert {"academic", "degree", "bachelor", "master", "preferred"} <= aliases
 
