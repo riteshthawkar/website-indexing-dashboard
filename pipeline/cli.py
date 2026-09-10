@@ -1194,6 +1194,13 @@ def main() -> int:
     )
     p_release.add_argument("--query-cache", default=None, help="Optional persistent query-embedding cache JSON path")
     p_release.add_argument("--retrieval-cache", default=None, help="Optional persistent retrieval-result cache JSON path")
+    p_release.add_argument(
+        "--split",
+        action="append",
+        choices=("selection", "holdout", "regression"),
+        default=None,
+        help="Evaluate only one governed split; repeat to combine splits",
+    )
     p_release.add_argument("--parallelism", type=int, default=1, help="Number of retrieval and network answer-eval workers")
     p_release.add_argument(
         "--promote",

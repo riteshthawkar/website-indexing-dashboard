@@ -220,3 +220,19 @@ def test_direct_production_release_check_promote_fails_before_evaluation(tmp_pat
     assert result.returncode == 2
     assert "Direct production release-check --promote is forbidden" in result.stderr
     assert not (tmp_path / "does-not-exist" / "release").exists()
+
+
+def test_release_check_cli_declares_governed_split_option() -> None:
+    result = subprocess.run(
+        [sys.executable, "-m", "pipeline", "release-check", "--help"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert "--split" in result.stdout
+    assert "selection" in result.stdout
+    assert "holdout" in result.stdout
+    assert "regression" in result.stdout
