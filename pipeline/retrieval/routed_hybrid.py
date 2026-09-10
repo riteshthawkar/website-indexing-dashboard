@@ -126,6 +126,51 @@ def _collection_target_tokens(value: str) -> set[str]:
     }
 
 
+_COLLECTION_LANDING_MODIFIERS = {
+    "academic",
+    "academics",
+    "all",
+    "bachelor",
+    "bachelors",
+    "campus",
+    "catalog",
+    "catalogue",
+    "current",
+    "degree",
+    "directory",
+    "graduate",
+    "master",
+    "masters",
+    "msc",
+    "our",
+    "phd",
+    "research",
+    "student",
+    "study",
+    "undergraduate",
+    "university",
+}
+
+
+def _is_collection_landing_path_part(value: str, targets: set[str]) -> bool:
+    """Distinguish a collection landing slug from a named child slug."""
+
+    tokens = list(_tokenize(str(value or "").replace("-", " ")))
+    if not tokens or not targets:
+        return False
+    mapped = {
+        token: _COLLECTION_TARGET_ALIASES[token]
+        for token in tokens
+        if token in _COLLECTION_TARGET_ALIASES
+    }
+    if not (targets & set(mapped.values())):
+        return False
+    return all(
+        token in mapped or token in _COLLECTION_LANDING_MODIFIERS
+        for token in tokens
+    )
+
+
 def _is_aggregate_required_page_query(query: str) -> bool:
     return bool(
         _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
@@ -1833,7 +1878,14 @@ class RoutedHybridRetriever:
             if collection_targets & final_path_targets:
                 # Prefer the collection landing page over one child that
                 # merely repeats generic words such as "current degree".
-                score += 0.95
+                score += (
+                    0.95
+                    if _is_collection_landing_path_part(
+                        path_parts[-1] if path_parts else "",
+                        collection_targets,
+                    )
+                    else 0.10
+                )
             elif collection_targets & ancestor_path_targets:
                 score -= 0.28
             if collection_targets & _collection_target_tokens(
@@ -1961,6 +2013,10 @@ class RoutedHybridRetriever:
             not careers_division_scope
             and (
                 re.search(r"\b(?:our|research|university) divisions?\b", lower)
+                or (
+                    _COLLECTION_QUERY_RE.search(query)
+                    and re.search(r"\bdivisions?\b", lower)
+                )
                 or re.search(r"(?:أقسامها|اقسامها|الأقسام|الاقسام|أقسام|اقسام)", lower)
             )
         )
@@ -2499,6 +2555,7 @@ class RoutedHybridRetriever:
         collection_targets = _collection_target_tokens(query)
         if _COLLECTION_QUERY_RE.search(query) and collection_targets:
             collection_pages = []
+            landing_collection_pages = []
             for score, page in scored:
                 try:
                     final_path_part = (
@@ -2512,10 +2569,15 @@ class RoutedHybridRetriever:
                     final_path_part.replace("-", " ")
                 ):
                     collection_pages.append((score, page))
+                    if _is_collection_landing_path_part(
+                        final_path_part,
+                        collection_targets,
+                    ):
+                        landing_collection_pages.append((score, page))
             if collection_pages:
                 # One complete collection parent is safer than arbitrarily
                 # mixing a few children and calling that a complete list.
-                scored = collection_pages
+                scored = landing_collection_pages or collection_pages
                 max_pages = 1
         pages = [page["source_url"] for _score, page in scored[:max_pages]]
         entities: List[str] = []

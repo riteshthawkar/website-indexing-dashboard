@@ -1862,6 +1862,21 @@ def test_routed_collection_query_prefers_complete_landing_page_over_child():
     assert plan["required_pages_source"] == "heuristic"
 
 
+def test_collection_landing_detection_rejects_named_division_child_slug():
+    from pipeline.retrieval.routed_hybrid import _is_collection_landing_path_part
+
+    assert _is_collection_landing_path_part("our-divisions", {"division"})
+    assert _is_collection_landing_path_part("msc-programs", {"program"})
+    assert not _is_collection_landing_path_part(
+        "biological-life-sciences-division",
+        {"division"},
+    )
+    assert not _is_collection_landing_path_part(
+        "divisions-undergraduate-studies",
+        {"division"},
+    )
+
+
 def test_updated_program_and_housing_markers_resolve_current_pages():
     from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
