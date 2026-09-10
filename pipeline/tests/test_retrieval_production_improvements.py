@@ -2466,6 +2466,7 @@ def test_evidence_pack_reserves_complete_collection_parent_before_list_fragments
         "Computer Vision; Machine Learning; Natural Language Processing; Robotics; "
         "Statistics and Data Science."
     )
+    complete_parent = complete_inventory + " " + ("General page context. " * 180)
     result = {
         "retrieval_documents": [
             {
@@ -2475,7 +2476,7 @@ def test_evidence_pack_reserves_complete_collection_parent_before_list_fragments
             },
             {
                 "id": "parent:masters:page",
-                "text": complete_inventory,
+                "text": complete_parent,
                 "source_url": page_url,
                 "coverage_aggregate": True,
             },
@@ -2495,7 +2496,8 @@ def test_evidence_pack_reserves_complete_collection_parent_before_list_fragments
     )
 
     assert pack["items"][0]["id"] == "parent:masters:page"
-    assert pack["items"][0]["text"] == complete_inventory
+    assert pack["items"][0]["text"].startswith(complete_inventory)
+    assert "Computational Biology" in pack["items"][0]["text"]
 
 
 def test_evidence_pack_reserves_leaf_chunk_for_required_multi_detail_page():

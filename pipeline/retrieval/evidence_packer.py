@@ -1278,6 +1278,16 @@ def build_evidence_pack(
                 query=query,
                 max_chars=item_char_limit,
             )
+        elif (
+            kind == "chunk"
+            and bool(doc.get("coverage_aggregate"))
+            and intent in {"multi_page_aggregation", "large_page"}
+        ):
+            # Collection parents begin with a compact page synopsis whose
+            # section inventory is complete. Query-centering this text can
+            # jump into a later child and silently drop an early list item.
+            item_char_limit = min(item_char_limit, 2600)
+            item_text = item_text[:item_char_limit]
         elif kind == "chunk" and _MULTI_DETAIL_QUERY_RE.search(str(query or "")):
             # A complete structured block is safer than a short extracted span,
             # but sending a full page chunk adds latency and the answer runtime
