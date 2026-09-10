@@ -6362,9 +6362,15 @@ def test_release_check_manifest_and_promotion(tmp_path, monkeypatch):
     (work_dir / "stage_outputs" / "upload_graph").mkdir(parents=True)
     (work_dir / "stage_outputs" / "format_retrieval").mkdir(parents=True)
     (work_dir / "stage_outputs" / "promote_graph").mkdir(parents=True)
+    vector_manifest = _valid_modern_vector_manifest()
+    vector_manifest["media_input"] = "caption_text"
+    vector_manifest["selected_profile"] = {
+        "embedding_spec": {"media_input": "caption_text"},
+        "media_input": "caption_text",
+    }
     atomic_write_json(
         work_dir / "stage_outputs" / "upload_retrieval" / "index_upload_manifest.json",
-        _valid_modern_vector_manifest(),
+        vector_manifest,
     )
     atomic_write_json(
         work_dir / "stage_outputs" / "upload_graph" / "neo4j_upload_manifest.json",
@@ -6465,6 +6471,10 @@ def test_release_check_manifest_and_promotion(tmp_path, monkeypatch):
     assert passed
     assert manifest["vector_index"]["uploaded"]["summaries"] == 2
     assert manifest["vector_index"]["expected_uploads"]["sparse_summaries"] == 2
+    assert manifest["vector_index"]["media_input"] == "caption_text"
+    assert manifest["vector_index"]["selected_profile"] == vector_manifest[
+        "selected_profile"
+    ]
     assert manifest["answer_evaluation"]["overall"]["pass_rate"] == 1.0
     manifest_path = release.write_release_manifest(manifest, work_dir)
     active_path = release.promote_release_manifest(
