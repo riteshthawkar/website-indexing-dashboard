@@ -66,8 +66,15 @@ def _set_stream_timeout(stream: Any, timeout_seconds: float) -> None:
 
     setter = getattr(stream, "set_socket_timeout", None)
     if callable(setter):
-        setter(max(0.001, timeout_seconds))
-        return
+        try:
+            setter(max(0.001, timeout_seconds))
+        except (AttributeError, OSError, TypeError):
+            # Botocore implements this method by walking urllib3's private
+            # response/socket attributes. That layout can differ across
+            # compatible urllib3 releases, so retain the fallback below.
+            pass
+        else:
+            return
     fp = getattr(stream, "fp", None)
     raw = getattr(fp, "raw", None)
     candidates = (

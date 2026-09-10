@@ -53,6 +53,25 @@ class _FakeStreamingBody:
         self.closed = True
 
 
+def test_stream_timeout_falls_back_when_provider_setter_uses_changed_internals() -> None:
+    module = _load_hydrator_module()
+    observed: list[float] = []
+
+    class FakeSocket:
+        def settimeout(self, timeout: float) -> None:
+            observed.append(timeout)
+
+    class IncompatibleStreamingBody:
+        fp = types.SimpleNamespace(raw=types.SimpleNamespace(_sock=FakeSocket()))
+
+        def set_socket_timeout(self, _timeout: float) -> None:
+            raise AttributeError("provider response internals changed")
+
+    module._set_stream_timeout(IncompatibleStreamingBody(), 12.5)
+
+    assert observed == [12.5]
+
+
 def _install_fake_s3(monkeypatch: pytest.MonkeyPatch, *, content: bytes, declared: int | None = None):
     captured: dict[str, object] = {}
     body = _FakeStreamingBody(content)
