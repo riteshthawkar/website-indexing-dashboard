@@ -2457,6 +2457,47 @@ def test_routed_required_page_backfill_injects_complete_parent_for_list_query():
     assert "See 15 more" in pack["items"][0]["text"]
 
 
+def test_evidence_pack_reserves_complete_collection_parent_before_list_fragments():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    page_url = "https://example.edu/study/masters"
+    complete_inventory = (
+        "Master's programs: Applied AI; Computational Biology; Computer Science; "
+        "Computer Vision; Machine Learning; Natural Language Processing; Robotics; "
+        "Statistics and Data Science."
+    )
+    result = {
+        "retrieval_documents": [
+            {
+                "id": "chunk-admissions",
+                "text": "Graduate admissions require an accredited degree.",
+                "source_url": page_url,
+            },
+            {
+                "id": "parent:masters:page",
+                "text": complete_inventory,
+                "source_url": page_url,
+                "coverage_aggregate": True,
+            },
+        ]
+    }
+
+    pack = build_evidence_pack(
+        query="List all master's programs.",
+        result=result,
+        max_items=2,
+        max_chars=2000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "multi_page_aggregation",
+            "required_pages": [page_url],
+        },
+    )
+
+    assert pack["items"][0]["id"] == "parent:masters:page"
+    assert pack["items"][0]["text"] == complete_inventory
+
+
 def test_evidence_pack_reserves_leaf_chunk_for_required_multi_detail_page():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
 

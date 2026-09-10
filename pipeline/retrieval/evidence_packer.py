@@ -1401,6 +1401,22 @@ def build_evidence_pack(
                 break
 
     for required_page in required_pages:
+        if intent in {"multi_page_aggregation", "large_page"}:
+            aggregate_added = False
+            for _score, kind, doc in candidates:
+                if (
+                    bool(doc.get("coverage_aggregate"))
+                    and _candidate_matches_requirement(
+                        doc,
+                        required_page,
+                        page=True,
+                    )
+                    and _append_candidate(kind, doc)
+                ):
+                    aggregate_added = True
+                    break
+            if aggregate_added:
+                continue
         for _score, kind, doc in candidates:
             if _candidate_matches_requirement(doc, required_page, page=True) and _append_candidate(kind, doc):
                 break
