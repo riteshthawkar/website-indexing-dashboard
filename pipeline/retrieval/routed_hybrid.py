@@ -125,6 +125,16 @@ def _collection_target_tokens(value: str) -> set[str]:
     }
 
 
+def _is_aggregate_required_page_query(query: str) -> bool:
+    return bool(
+        _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
+        or (
+            _COLLECTION_QUERY_RE.search(str(query or ""))
+            and _collection_target_tokens(query)
+        )
+    )
+
+
 def _with_retriever_backend(config: Dict[str, Any], backend: str) -> Dict[str, Any]:
     payload = deepcopy(config or {})
     retrieval_cfg = dict(payload.get("retrieval") or {})
@@ -2940,7 +2950,7 @@ class RoutedHybridRetriever:
     ) -> Dict[str, Any] | None:
         """Return one complete-page parent for explicit list/detail queries."""
 
-        if not _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or "")):
+        if not _is_aggregate_required_page_query(query):
             return None
         scored: List[tuple[float, Dict[str, Any]]] = []
         parent_map = getattr(self.vector, "parent_map", {})
@@ -3086,9 +3096,7 @@ class RoutedHybridRetriever:
         existing_fact_ids = {str(value) for value in (payload.get("selected_fact_ids") or []) if str(value)}
         existing_chunk_ids = {str(value) for value in (payload.get("selected_chunk_ids") or []) if str(value)}
         changed = False
-        aggregate_page_query = bool(
-            _AGGREGATE_REQUIRED_PAGE_QUERY_RE.search(str(query or ""))
-        )
+        aggregate_page_query = _is_aggregate_required_page_query(query)
         fact_limit = 4 if aggregate_page_query else 1
         chunk_limit = 3 if aggregate_page_query else 2
         span_limit = 4 if aggregate_page_query else 2

@@ -1891,7 +1891,17 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     )
 
 
-def test_multi_aspect_program_query_injects_complete_page_parent():
+@pytest.mark.parametrize(
+    "query",
+    [
+        (
+            "What are the duration, study mode, credit load, tuition, and "
+            "scholarship status?"
+        ),
+        "List every current master's degree program offered by the university.",
+    ],
+)
+def test_aggregate_program_query_injects_complete_page_parent(query):
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
@@ -1929,10 +1939,7 @@ def test_multi_aspect_program_query_injects_complete_page_parent():
     }
 
     changed = retriever._augment_payload_for_required_coverage(
-        query=(
-            "What are the duration, study mode, credit load, tuition, and "
-            "scholarship status?"
-        ),
+        query=query,
         payload=payload,
         coverage_plan={"intent": "broad_synthesis", "required_pages": [page_url]},
     )
