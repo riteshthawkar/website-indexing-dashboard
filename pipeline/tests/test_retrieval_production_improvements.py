@@ -1825,6 +1825,123 @@ def test_routed_coverage_planner_treats_official_working_hours_as_specific_targe
     assert "/about/faq" in retriever._explicit_required_page_markers("What are MBZUAI's official working hours?")
 
 
+def test_routed_collection_query_prefers_complete_landing_page_over_child():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode, _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.unsupported_intent_guard_enabled = False
+    landing_url = "https://example.edu/academics/departments"
+    child_url = "https://example.edu/academics/departments/robotics"
+    retriever._coverage_page_records = [
+        {
+            "source_url": landing_url,
+            "normalized_url": retriever._normalize_source_url(landing_url),
+            "search_text": "departments robotics computing biology",
+            "tokens": set(_tokenize("departments robotics computing biology")),
+            "identity_text": "academic departments",
+            "identity_tokens": set(_tokenize("academic departments")),
+        },
+        {
+            "source_url": child_url,
+            "normalized_url": retriever._normalize_source_url(child_url),
+            "search_text": "current robotics department degree research",
+            "tokens": set(_tokenize("current robotics department degree research")),
+            "identity_text": "robotics department",
+            "identity_tokens": set(_tokenize("robotics department")),
+        },
+    ]
+
+    query = "List all current departments available at the university."
+    plan = retriever._infer_coverage_requirements(
+        query,
+        retriever._coverage_intent(query, QueryMode.FACT),
+    )
+
+    assert plan["required_pages"] == [landing_url]
+    assert plan["required_pages_source"] == "heuristic"
+
+
+def test_updated_program_and_housing_markers_resolve_current_pages():
+    from pipeline.retrieval.adaptive_hybrid import _semantic_query_alias_tokens
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    masters_markers = retriever._explicit_required_page_markers(
+        "List all current master's degree programs offered by MBZUAI."
+    )
+    maai_markers = retriever._explicit_required_page_markers(
+        "What are MAAI's duration, credits, tuition, and scholarship status?"
+    )
+    housing_markers = retriever._explicit_required_page_markers(
+        "هل أحتاج إلى إحضار مسحوق الغسيل للسكن الجامعي؟"
+    )
+
+    assert masters_markers[0] == "/study/msc-programs"
+    assert maai_markers[0] == (
+        "/study/msc-programs/masters-in-applied-artificial-intelligence"
+    )
+    assert "/study/msc-programs" in maai_markers
+    assert housing_markers == ["/campus-community/housing"]
+    assert {"laundry", "detergent", "housing"} <= set(
+        _semantic_query_alias_tokens(
+            "هل أحتاج إلى إحضار مسحوق الغسيل للسكن الجامعي؟"
+        )
+    )
+
+
+def test_multi_aspect_program_query_injects_complete_page_parent():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    page_url = "https://example.edu/study/programs/applied-ai"
+    parent_id = "parent:c650:applied-ai:page"
+    retriever.vector = SimpleNamespace(
+        page_card_map={},
+        evidence_span_map={},
+        fact_map={},
+        summary_map={},
+        chunk_map={},
+        parent_map={
+            parent_id: {
+                "id": parent_id,
+                "source_url": page_url,
+                "document_title": "Applied AI",
+                "text": "Duration, study mode, credits, tuition, and scholarships.",
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    retriever._coverage_page_records = retriever._build_coverage_page_records()
+    retriever._coverage_page_records_by_url = {
+        page["normalized_url"]: page
+        for page in retriever._coverage_page_records
+    }
+    retriever._coverage_record_indexes = retriever._build_coverage_record_indexes()
+    payload = {
+        "selected_chunk_ids": [],
+        "selected_parent_ids": [],
+        "selected_fact_ids": [],
+        "selected_evidence_span_ids": [],
+        "retrieval_documents": [],
+        "abstained": False,
+    }
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query=(
+            "What are the duration, study mode, credit load, tuition, and "
+            "scholarship status?"
+        ),
+        payload=payload,
+        coverage_plan={"intent": "broad_synthesis", "required_pages": [page_url]},
+    )
+
+    assert changed is True
+    assert payload["retrieval_documents"][0]["id"] == parent_id
+    assert payload["retrieval_documents"][0]["coverage_aggregate"] is True
+
+
 def test_explicit_page_marker_establishes_specificity_for_arabic_visitor_contact():
     from pipeline.retrieval.adaptive_hybrid import _tokenize
     from pipeline.retrieval.adaptive_hybrid import QueryMode

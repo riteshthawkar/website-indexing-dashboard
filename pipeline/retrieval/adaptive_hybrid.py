@@ -2288,7 +2288,15 @@ def _degree_program_source_bonus(query: str, lower_url: str, source_blob: str) -
         (("robotics",), ("robotics",)),
         (("computer science",), ("computer-science",)),
         (("statistics and data science", "statistics data science", "data science"), ("statistics-and-data-science",)),
-        (("applied artificial intelligence", "applied ai", "maai"), ("master-in-applied-ai", "applied-ai")),
+        (
+            ("applied artificial intelligence", "applied ai", "maai"),
+            (
+                "master-in-applied-ai",
+                "masters-in-applied-artificial-intelligence",
+                "master-applied-artificial-intelligence",
+                "applied-ai",
+            ),
+        ),
         (("artificial intelligence engineering stream", "engineering stream"), ("artificial-intelligence-engineering-stream",)),
         (("artificial intelligence business stream", "business stream"), ("artificial-intelligence-business-stream",)),
         (("undergraduate research internship", "ugrip"), ("undergraduate-research-internship-program", "ugrip")),
@@ -2811,6 +2819,40 @@ def _semantic_query_alias_tokens(query: str) -> List[str]:
     ):
         return []
     aliases: List[str] = []
+    if any(
+        term in normalized
+        for term in ("maai", "applied artificial intelligence", "applied ai")
+    ):
+        aliases.extend(
+            [
+                "master",
+                "applied",
+                "artificial",
+                "intelligence",
+                "program",
+            ]
+        )
+    if any(
+        term in normalized
+        for term in (
+            "مسحوق الغسيل",
+            "منظف الغسيل",
+            "الغسيل",
+            "مغسلة",
+        )
+    ):
+        aliases.extend(
+            [
+                "laundry",
+                "detergent",
+                "washing",
+                "machines",
+                "housing",
+                "accommodation",
+            ]
+        )
+    if any(term in normalized for term in ("السكن الجامعي", "السكن", "الإقامة الجامعية")):
+        aliases.extend(["housing", "accommodation", "residence", "campus"])
     if any(term in normalized for term in ("بعد المطر", "بعد هطول المطر", "ما بعد المطر")):
         aliases.extend(["after", "rain", "rainfall", "post", "water", "accumulation", "flood"])
     if "صورة" in normalized or "الصورة" in normalized:

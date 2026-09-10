@@ -51,14 +51,54 @@ _AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|roles|responsibilities|features|benefits|"
     r"differences|criteria|items|articles|entries|listed|shown|displayed|sections|"
     r"categories|stages|process|support|services|uses|options|focus areas|"
-    r"research interests|hands-on access|offerings|committees|industry engagement)\b"
+    r"research interests|hands-on access|offerings|committees|industry engagement|"
+    r"divisions|programs|degrees|each|duration|study mode|delivery mode|credit load|"
+    r"credit hours?|credits|tuition|fees?|scholarships?|funding)\b"
     r"|(?:المتطلبات|المؤهلات|الأدوار|المسؤوليات|المزايا|الفروقات|المعايير|العناصر|"
     r"المقالات|أقسام|اقسام|فئات|مراحل|عملية|الدعم|دعم|الخدمات|خدمات|استخدامات|"
-    r"خيارات|المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان)"
+    r"خيارات|المجالات|مجالات|الاهتمامات البحثية|اهتماماتها البحثية|وصول عملي|تجارب بحثية|اللجان|"
+    r"المدة|مدة|نظام الدراسة|الساعات المعتمدة|الرسوم|المنح|التمويل|كل)"
     r"|(?:engag\w*(?:\s+\w+){0,4}\s+industry|captur\w*\s+value)"
     r"|(?:ما\s+.{0,180}\s+وأين|أين\s+.{0,180}\s+وما|ما\s+.{0,180}\s+وما)",
     re.IGNORECASE,
 )
+
+_COLLECTION_QUERY_RE = re.compile(
+    r"\b(?:list|all|every|each|how many|what are|which are|name|show|offered|available)\b"
+    r"|(?:اذكر|اعرض|جميع|كل|ما هي|ما عدد|ماهي|المتاحة)",
+    re.IGNORECASE,
+)
+_COLLECTION_TARGET_TERMS = {
+    "articles",
+    "centers",
+    "centres",
+    "courses",
+    "degrees",
+    "departments",
+    "divisions",
+    "events",
+    "facilities",
+    "faculty",
+    "institutes",
+    "members",
+    "options",
+    "programs",
+    "requirements",
+    "schools",
+    "services",
+    "أقسام",
+    "اقسام",
+    "الأقسام",
+    "الاقسام",
+    "برامج",
+    "البرامج",
+    "درجات",
+    "الدرجات",
+    "خدمات",
+    "الخدمات",
+    "مرافق",
+    "المرافق",
+}
 
 
 def _with_retriever_backend(config: Dict[str, Any], backend: str) -> Dict[str, Any]:
@@ -981,7 +1021,12 @@ class RoutedHybridRetriever:
         query_lower = query.lower()
         if self._unsupported_intent_reason(query):
             return "unsupported"
-        if re.search(r"\b(compare|all|list|across|multiple|programs|departments|schools|faculty members|aggregate)\b", query_lower):
+        if re.search(
+            r"\b(compare|all|list|across|multiple|programs|degrees|divisions|departments|"
+            r"schools|institutes|centers|centres|faculty members|aggregate|each)\b"
+            r"|(?:قارن|جميع|كل|برامج|درجات|أقسام|اقسام|المعاهد|المراكز)",
+            query_lower,
+        ):
             return "multi_page_aggregation"
         if re.search(r"\b(overview|summary|summarize|complete page|whole page|full page|entire page|large page)\b", query_lower):
             return "large_page"
@@ -1503,6 +1548,13 @@ class RoutedHybridRetriever:
         lower = query.casefold()
         if self._explicit_required_page_markers(query):
             return True
+        if _COLLECTION_QUERY_RE.search(query) and (
+            set(_tokenize(query)) & _COLLECTION_TARGET_TERMS
+        ):
+            # Collection requests have a concrete landing-page target even
+            # when the caller does not know its URL. Page Cards resolve that
+            # target from the frozen corpus.
+            return True
         if re.search(r"\bcontact\b.{0,60}\badmissions?\b", lower) or re.search(
             r"\badmissions?\b.{0,60}\bcontact\b",
             lower,
@@ -1724,6 +1776,37 @@ class RoutedHybridRetriever:
             score += 0.28 * (
                 len(identity_overlap) / float(len(informative_query_tokens))
             )
+        alias_tokens = set(_semantic_query_alias_tokens(query))
+        if alias_tokens:
+            score += min(0.84, 0.14 * len(alias_tokens & page_tokens))
+            score += min(0.56, 0.18 * len(alias_tokens & identity_tokens))
+
+        collection_targets = query_tokens & _COLLECTION_TARGET_TERMS
+        if _COLLECTION_QUERY_RE.search(query) and collection_targets:
+            try:
+                path_parts = [
+                    part
+                    for part in unquote(urlparse(url).path or "").strip("/").split("/")
+                    if part
+                ]
+            except Exception:
+                path_parts = []
+            final_path_tokens = (
+                set(_tokenize(path_parts[-1].replace("-", " ")))
+                if path_parts
+                else set()
+            )
+            ancestor_path_tokens = set(
+                _tokenize(" ".join(path_parts[:-1]).replace("-", " "))
+            )
+            if collection_targets & final_path_tokens:
+                # Prefer the collection landing page over one child that
+                # merely repeats generic words such as "current degree".
+                score += 0.95
+            elif collection_targets & ancestor_path_tokens:
+                score -= 0.28
+            if collection_targets & identity_tokens:
+                score += 0.30
         if any(marker in lower_query for marker in ("page", "homepage", "site", "صفحة", "الصفحة", "موقع", "الموقع")):
             score += min(0.24, 0.08 * float(len(identity_overlap)))
         query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
@@ -1851,6 +1934,14 @@ class RoutedHybridRetriever:
         )
         if divisions_requested:
             markers.append("/research/our-divisions")
+        query_tokens = set(_tokenize(query))
+        masters_collection_requested = bool(
+            _COLLECTION_QUERY_RE.search(query)
+            and {"programs", "degrees"} & query_tokens
+            and {"master", "masters", "msc"} & query_tokens
+        )
+        if masters_collection_requested:
+            markers.append("/study/msc-programs")
         if institutes_requested and (
             "research" in lower
             or "division" in lower
@@ -2269,7 +2360,23 @@ class RoutedHybridRetriever:
                     ]
                 )
         if "master in applied artificial intelligence" in lower or "maai" in lower or "applied ai" in lower:
-            markers.append("/study/master-in-applied-ai")
+            markers.extend(
+                [
+                    "/study/msc-programs/masters-in-applied-artificial-intelligence",
+                    "/study/master-in-applied-ai",
+                ]
+            )
+            if re.search(
+                r"\b(?:scholarships?|funding)\b|(?:المنح|التمويل)",
+                lower,
+            ):
+                markers.append("/study/msc-programs")
+        if re.search(
+            r"(?:مسحوق\s+الغسيل|منظف\s+الغسيل|الغسيل|مغسلة|السكن\s+الجامعي)"
+            r"|\b(?:laundry|detergent)\b",
+            lower,
+        ):
+            markers.append("/campus-community/housing")
         return list(dict.fromkeys(markers))
 
     def _infer_coverage_requirements(self, query: str, intent: str) -> Dict[str, Any]:
@@ -2290,6 +2397,19 @@ class RoutedHybridRetriever:
                     for marker in explicit_markers
                 ):
                     explicit_pages.append(str(page.get("source_url") or ""))
+            explicit_pages.sort(
+                key=lambda page: (
+                    min(
+                        (
+                            index
+                            for index, marker in enumerate(explicit_markers)
+                            if self._coverage_marker_matches(marker, page)
+                        ),
+                        default=len(explicit_markers),
+                    ),
+                    self._normalize_source_url(page),
+                )
+            )
             if explicit_pages and not re.search(r"[\u0600-\u06FF]", query):
                 english_pages = [
                     page
@@ -2323,6 +2443,27 @@ class RoutedHybridRetriever:
         scored = [(score, page) for score, page in scored if score >= 0.58]
         scored.sort(key=lambda item: (-item[0], item[1]["normalized_url"]))
         max_pages = 6 if intent == "multi_page_aggregation" else 3
+        collection_targets = set(_tokenize(query)) & _COLLECTION_TARGET_TERMS
+        if _COLLECTION_QUERY_RE.search(query) and collection_targets:
+            collection_pages = []
+            for score, page in scored:
+                try:
+                    final_path_part = (
+                        unquote(urlparse(str(page.get("source_url") or "")).path or "")
+                        .strip("/")
+                        .split("/")[-1]
+                    )
+                except Exception:
+                    final_path_part = ""
+                if collection_targets & set(
+                    _tokenize(final_path_part.replace("-", " "))
+                ):
+                    collection_pages.append((score, page))
+            if collection_pages:
+                # One complete collection parent is safer than arbitrarily
+                # mixing a few children and calling that a complete list.
+                scored = collection_pages
+                max_pages = 1
         pages = [page["source_url"] for _score, page in scored[:max_pages]]
         entities: List[str] = []
         for phrase in re.findall(r"\b[A-Z][A-Za-z]+(?:[- ][A-Z][A-Za-z]+){1,5}\b", query):
