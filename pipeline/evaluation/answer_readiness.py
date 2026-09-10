@@ -2003,6 +2003,20 @@ def _eval_session_id(example: EvalExample) -> str:
     return str(uuid.uuid5(uuid.NAMESPACE_URL, f"mbzuai-release-readiness:{example.id}"))
 
 
+def _eval_request_referrer(example: EvalExample) -> str:
+    """Return an explicitly authored browser context for a contextual test.
+
+    The evaluator never derives this from gold IDs or expected citations: a
+    benchmark author must opt in with ``metadata.request_referrer``.  That
+    keeps standalone retrieval tests candidate-independent while allowing a
+    faithful production test of queries such as "this position" or "the
+    image", which the widget sends together with its current page URL.
+    """
+
+    metadata = example.metadata if isinstance(example.metadata, Mapping) else {}
+    return _text(metadata.get("request_referrer"))[:2048]
+
+
 def _chat_prediction_row_from_payload(
     *,
     payload: Mapping[str, Any],
@@ -2109,6 +2123,9 @@ def _post_chat_request(
         "conversation_turn": 1,
         "device_type": "release-check",
     }
+    request_referrer = _eval_request_referrer(example)
+    if request_referrer:
+        payload["referrer"] = request_referrer
     resolved_widget_key = _resolve_widget_key(widget_key)
     if resolved_widget_key:
         payload["widget_key"] = resolved_widget_key
@@ -2198,6 +2215,9 @@ async def _websocket_chat_request_async(
         "conversation_turn": 1,
         "device_type": "release-check",
     }
+    request_referrer = _eval_request_referrer(example)
+    if request_referrer:
+        payload["referrer"] = request_referrer
     resolved_widget_key = _resolve_widget_key(widget_key)
     if resolved_widget_key:
         payload["widget_key"] = resolved_widget_key

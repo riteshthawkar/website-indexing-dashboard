@@ -100,6 +100,9 @@ def test_http_answer_prediction_sends_dataset_language_and_protocol(monkeypatch)
             query="أين تقع جامعة محمد بن زايد للذكاء الاصطناعي؟",
             query_type="fact",
             language="Arabic",
+            metadata={
+                "request_referrer": "https://preprod.mbzuai.ac.ae/ar/about-us"
+            },
         ),
         auth_token=None,
         timeout_seconds=5,
@@ -107,6 +110,7 @@ def test_http_answer_prediction_sends_dataset_language_and_protocol(monkeypatch)
 
     assert captured["payload"]["language"] == "Arabic"
     assert captured["payload"]["protocol_version"] == "1.0"
+    assert captured["payload"]["referrer"] == "https://preprod.mbzuai.ac.ae/ar/about-us"
     assert row["language"] == "Arabic"
 
 
@@ -390,6 +394,9 @@ def test_websocket_answer_prediction_captures_first_content_latency_and_arabic_p
                 query="أين تقع الجامعة؟",
                 query_type="fact",
                 language="Arabic",
+                metadata={
+                    "request_referrer": "https://preprod.mbzuai.ac.ae/ar/about-us"
+                },
             ),
             auth_token=None,
             timeout_seconds=1,
@@ -398,6 +405,7 @@ def test_websocket_answer_prediction_captures_first_content_latency_and_arabic_p
 
     assert sent_payloads[0]["language"] == "Arabic"
     assert sent_payloads[0]["protocol_version"] == "1.0"
+    assert sent_payloads[0]["referrer"] == "https://preprod.mbzuai.ac.ae/ar/about-us"
     assert row["metadata"]["terminal_event"] == "final"
     assert 0.0 <= row["first_content_latency_ms"] <= row["latency_ms"]
 
