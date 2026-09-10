@@ -4221,6 +4221,27 @@ def test_required_page_backfill_keeps_unsupported_premise_abstained():
     assert payload["adjudication_reason"] == "presupposed_entity_or_scope_not_supported"
 
 
+def test_existing_abstention_preserves_premise_requirement_for_later_backfill():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+
+    payload = retriever._apply_evidence_adjudication(
+        "What are the opening hours of MBZUAI's polar research center?",
+        {
+            "mode": "fact",
+            "abstained": True,
+            "verification_status": "abstained",
+            "retrieval_documents": [],
+        },
+    )
+
+    assert payload["abstained"] is True
+    assert payload["premise_grounding_required"] is True
+    assert payload["verification_status"] == "abstained"
+
+
 def test_current_program_markers_cover_arabic_queries_and_public_routes():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
