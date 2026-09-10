@@ -721,6 +721,139 @@ def test_premise_grounding_fallback_rejects_generic_scoped_evidence():
     assert result["reason"] == "presupposed_entity_or_scope_not_supported"
 
 
+def test_arabic_program_premises_match_english_content_without_overcapturing():
+    from pipeline.core.evidence_adjudicator import (
+        extract_premise_requirements,
+        premise_requirements_supported,
+    )
+
+    robotics_query = "كم عدد الساعات المعتمدة الدنيا لدرجة دكتوراه الفلسفة في الروبوتات؟"
+    reach_query = "كم عدد الطلاب الذين يضمهم برنامج «ريتش» للذكاء الاصطناعي في الدفعة الواحدة؟"
+    facilities_query = (
+        "ما المرافق والخدمات المتاحة للطلاب في الحرم الجامعي حسب هذين المصدرين، "
+        "وأين يمكن العثور على غرفة الصلاة للذكور وخدمة المساعدة الطبية الأولى؟"
+    )
+    activities_query = (
+        "ما الذي يقدمه برنامج الأنشطة المرتبط بالاستكشاف الثقافي "
+        "في صفحة المعيشة في أبوظبي؟"
+    )
+
+    assert premise_requirements_supported(
+        robotics_query,
+        {},
+        ["Doctor of Philosophy in Robotics requires a minimum of 60 credits."],
+    )
+    assert extract_premise_requirements(reach_query) == ["ريتش برنامج"]
+    assert premise_requirements_supported(
+        reach_query,
+        {},
+        ["The AI Reach program accepts 30 students in each cohort."],
+    )
+    assert extract_premise_requirements(facilities_query) == []
+    assert extract_premise_requirements(activities_query) == ["الأنشطة"]
+    assert premise_requirements_supported(
+        activities_query,
+        {},
+        ["Curated cultural exploration activities help students understand their new home."],
+    )
+
+
+def test_evidence_spans_are_prioritized_for_factual_adjudication(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    captured = []
+
+    def adjudicate(**kwargs):
+        captured.extend(kwargs["retrieval_documents"])
+        return {
+            "used": True,
+            "method": "test",
+            "abstain": False,
+            "selected_answer_ids": [],
+            "selected_fact_ids": [],
+            "selected_chunk_ids": ["deadline-span"],
+            "reason": "supported",
+            "confidence": 1.0,
+        }
+
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", adjudicate)
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.selective_adjudication_enabled = False
+    retriever.evidence_adjudicator_model = "test"
+    retriever.evidence_adjudicator_reasoning_effort = "minimal"
+    retriever.evidence_adjudicator_min_confidence = 0.5
+    retriever.evidence_adjudicator_max_completion_tokens = 100
+    retriever.evidence_adjudicator_retries = 1
+    retriever.evidence_adjudicator_retry_delay_sec = 0.0
+    retriever.evidence_adjudicator_per_request_delay_sec = 0.0
+    retriever.evidence_adjudicator_timeout_sec = 1.0
+    retriever.evidence_adjudicator_provider_timeout_sec = 0.8
+    retriever.evidence_adjudicator_max_workers = 1
+    retriever.evidence_adjudicator_answer_limit = 2
+    retriever.evidence_adjudicator_fact_limit = 2
+    retriever.evidence_adjudicator_chunk_limit = 2
+
+    try:
+        result = retriever._apply_evidence_adjudication(
+            "What is the undergraduate application deadline?",
+            {
+                "mode": "fact",
+                "abstained": False,
+                "answer_documents": [],
+                "fact_documents": [],
+                "evidence_span_documents": [
+                    {"id": "deadline-span", "text": "Applications close on 30 April."}
+                ],
+                "retrieval_documents": [
+                    {"id": "generic-chunk", "text": "General admissions information."},
+                    {"id": "deadline-span", "text": "Applications close on 30 April."},
+                ],
+            },
+        )
+    finally:
+        retriever.close()
+
+    assert [row["id"] for row in captured] == ["deadline-span", "generic-chunk"]
+    assert result["abstained"] is False
+
+
+def test_model_cannot_override_closed_world_premise_failure(monkeypatch):
+    import pipeline.core.evidence_adjudicator as module
+
+    monkeypatch.setattr(
+        module,
+        "make_openai_client",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("unsupported premises must not call the provider")
+        ),
+    )
+    result = module.adjudicate_factual_evidence(
+        query="What is the phone number for MBZUAI's Singapore office?",
+        intent_summary={
+            "answer_types": ["phone"],
+            "requested_roles": [],
+            "subject_tokens": [],
+            "subject_phrases": [],
+            "strict_answer_required": True,
+        },
+        answer_documents=[
+            {
+                "id": "generic-phone",
+                "answer_type": "phone",
+                "value": "+971 2 811 3333",
+                "text": "The general MBZUAI phone number is +971 2 811 3333.",
+            }
+        ],
+        fact_documents=[],
+        retrieval_documents=[],
+        model="gpt-test",
+    )
+
+    assert result["abstain"] is True
+    assert result["reason"] == "presupposed_entity_or_scope_not_supported"
+
+
 def test_premise_grounding_routes_non_fact_queries(monkeypatch):
     import pipeline.retrieval.routed_hybrid as module
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
@@ -866,6 +999,67 @@ def test_verified_media_evidence_skips_text_only_adjudication(monkeypatch):
     assert result["media_evidence_verified"] is True
     assert result["verification_status"] == "verified_media_evidence"
     assert result["adjudication_reason"] == "grounded_media_evidence"
+
+
+def test_verified_media_does_not_bypass_scoped_premise_adjudication(monkeypatch):
+    import pipeline.retrieval.routed_hybrid as module
+
+    calls = []
+
+    def adjudicate(**kwargs):
+        calls.append(kwargs)
+        return {
+            "used": False,
+            "method": "heuristic",
+            "abstain": True,
+            "selected_answer_ids": [],
+            "selected_fact_ids": [],
+            "selected_chunk_ids": [],
+            "reason": "presupposed_entity_or_scope_not_supported",
+            "confidence": 0.9,
+        }
+
+    monkeypatch.setattr(module, "adjudicate_factual_evidence", adjudicate)
+    retriever = module.RoutedHybridRetriever.__new__(module.RoutedHybridRetriever)
+    retriever.evidence_adjudicator_enabled = True
+    retriever.selective_adjudication_enabled = False
+    retriever.evidence_adjudicator_model = "gpt-test"
+    retriever.evidence_adjudicator_reasoning_effort = "minimal"
+    retriever.evidence_adjudicator_min_confidence = 0.58
+    retriever.evidence_adjudicator_max_completion_tokens = 100
+    retriever.evidence_adjudicator_retries = 1
+    retriever.evidence_adjudicator_retry_delay_sec = 0.0
+    retriever.evidence_adjudicator_per_request_delay_sec = 0.0
+    retriever.evidence_adjudicator_timeout_sec = 1.0
+    retriever.evidence_adjudicator_provider_timeout_sec = 1.0
+    retriever.evidence_adjudicator_max_workers = 1
+    retriever.evidence_adjudicator_answer_limit = 1
+    retriever.evidence_adjudicator_fact_limit = 1
+    retriever.evidence_adjudicator_chunk_limit = 1
+    retriever.vector = SimpleNamespace(
+        _has_grounded_media_candidates=lambda **_kwargs: True,
+    )
+
+    try:
+        result = retriever._apply_evidence_adjudication(
+            "What is the shuttle timetable for MBZUAI's Mars research campus?",
+            {
+                "mode": "fact",
+                "abstained": False,
+                "selected_media_ids": ["media-campus"],
+                "dense_media_ids": ["media-campus"],
+                "media": [{"id": "media-campus", "text": "Masdar City campus map"}],
+                "retrieval_documents": [
+                    {"id": "campus", "text": "MBZUAI is based in Masdar City."}
+                ],
+            },
+        )
+    finally:
+        retriever.close()
+
+    assert calls
+    assert result["abstained"] is True
+    assert result["adjudication_reason"] == "presupposed_entity_or_scope_not_supported"
 
 
 def test_adaptive_retrieval_uses_request_local_timing_diagnostics():

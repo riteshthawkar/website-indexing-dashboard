@@ -491,6 +491,32 @@ def test_navigation_intent_is_explicit_and_multilingual():
     assert infer_navigation_context(
         "What are the steps in the graduate admission process?"
     )["intent"] == "follow_steps"
+    assert infer_navigation_context(
+        "On the Campus facilities page, where does the official action open?"
+    )["intent"] == "follow_steps"
+    assert infer_navigation_context(
+        "إذا ضغطت على زر تكريم المتطوعين، ماذا يفتح؟"
+    )["intent"] == "follow_steps"
+    assert infer_navigation_context(
+        "إذا استخدمت زر Get in touch، فما الذي يؤدي إليه؟"
+    )["intent"] == "contact"
+    assert infer_navigation_context(
+        "ما الإجراء الرسمي الذي يجب استخدامه للتقديم، وإلى أين يقود؟"
+    )["intent"] == "apply"
+
+
+def test_contact_action_uses_its_grounded_section_context():
+    from pipeline.retrieval.navigation_planner import _action_satisfies_intent
+
+    assert _action_satisfies_intent(
+        {
+            "action_type": "contact",
+            "label": "[email protected]",
+            "context_label": "Contact us",
+            "target_url": "https://preprod.mbzuai.ac.ae/cdn-cgi/l/email-protection#abc",
+        },
+        "contact",
+    )
 
 
 def test_upstream_planner_cannot_promote_informational_process_page_to_navigation():
@@ -567,6 +593,76 @@ def test_navigation_planner_preserves_direct_page_and_action_evidence():
     assert plan["target_page"]["page_card_id"] == "page:admissions"
     assert plan["steps"][1]["action_id"] == "action:apply-login"
     assert plan["steps"][1]["action_type"] == "login"
+
+
+def test_navigation_planner_prefers_explicitly_named_owning_page():
+    catalog = build_navigation_catalog(_ready_bridge())
+    pathway = next(
+        page for page in catalog["pages"] if page["page_card_id"] == "page:admissions"
+    )
+    pathway["title"] = "Pathway programs"
+    contact_page = next(
+        page for page in catalog["pages"] if page["page_card_id"] == "page:portal"
+    )
+    contact_page["title"] = "Contact us"
+    contact_page["action_ids"] = ["action:generic-contact"]
+    catalog["actions"].append(
+        {
+            "action_id": "action:generic-contact",
+            "page_card_id": "page:portal",
+            "label": "Contact us",
+            "context_label": "General enquiries",
+            "source_section_heading": "Contact",
+            "action_type": "contact",
+            "target_url": "mailto:info@mbzuai.ac.ae",
+            "canonical_target_url": "mailto:info@mbzuai.ac.ae",
+            "target_kind": "email",
+            "official_target": True,
+        }
+    )
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query=(
+            "إذا أردت التواصل بخصوص البرامج، فما الجهة التي يقود إليها زر "
+            "التواصل في صفحة Pathway programs؟"
+        ),
+        result={
+            "dense_page_card_ids": ["page:admissions", "page:portal"],
+            "dense_action_ids": ["action:generic-contact"],
+        },
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["target_page"]["page_card_id"] == "page:admissions"
+    assert plan["steps"][1]["action_id"] == "action:email"
+
+
+def test_navigation_planner_matches_reordered_explicit_page_title():
+    catalog = build_navigation_catalog(_ready_bridge())
+    job_page = next(
+        page for page in catalog["pages"] if page["page_card_id"] == "page:admissions"
+    )
+    job_page["title"] = "Research Scientist Gender AI"
+    listing_page = next(
+        page for page in catalog["pages"] if page["page_card_id"] == "page:portal"
+    )
+    listing_page["title"] = "Research Vacancies Careers"
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    plan = planner.plan(
+        query=(
+            "في صفحة Careers الخاصة بمنصب Research Scientist Gender AI، "
+            "إلى أين يقود إجراء Apply Now؟"
+        ),
+        result={
+            "dense_page_card_ids": ["page:admissions", "page:portal"],
+            "dense_action_ids": ["action:apply"],
+        },
+    )
+
+    assert plan["status"] == "ready"
+    assert plan["target_page"]["page_card_id"] == "page:admissions"
 
 
 def test_navigation_planner_prefers_canonical_phd_workflow_over_action_rich_news():
@@ -754,6 +850,22 @@ def test_navigation_planner_late_fuses_page_cards_with_selected_chunk_identity()
     )
 
     assert fused == ["page:admissions", "page:portal"]
+
+
+def test_navigation_planner_late_fusion_adds_catalog_backed_chunk_owner():
+    catalog = build_navigation_catalog(_ready_bridge())
+    planner = GroundedNavigationPlanner(catalog=catalog)
+
+    fused = planner.fuse_page_card_ranking(
+        {
+            "dense_page_card_ids": ["page:portal"],
+            "selected_chunk_ids": ["chunk:requirements"],
+        },
+        evidence_weight=1.0,
+        rrf_k=60,
+    )
+
+    assert fused == ["page:portal", "page:admissions"]
 
 
 def test_navigation_planner_bridges_selected_chunks_to_query_relevant_sections():

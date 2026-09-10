@@ -3854,6 +3854,106 @@ def test_required_page_span_backfill_clears_stale_abstention():
     assert payload["selected_evidence_span_ids"] == ["ai-reach-purpose"]
 
 
+def test_required_page_backfill_keeps_unsupported_premise_abstained():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    target_url = "https://preprod.mbzuai.ac.ae/campus-community/campus-facilities"
+    retriever._intent_summary = lambda _query: {}
+    retriever.vector = SimpleNamespace(
+        evidence_span_map={
+            "masdar-shuttle": {
+                "id": "masdar-shuttle",
+                "text": "A shuttle serves the Masdar City campus.",
+                "source_url": target_url,
+                "linked_chunk_ids": ["chunk-masdar"],
+                "span_type": "transport",
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    payload = {
+        "abstained": True,
+        "premise_grounding_required": True,
+        "verification_status": "abstained",
+        "adjudication_reason": "presupposed_entity_or_scope_not_supported",
+        "selected_evidence_span_ids": [],
+        "selected_chunk_ids": [],
+        "evidence_span_documents": [],
+        "retrieval_documents": [],
+    }
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query="What is the shuttle timetable for MBZUAI's Mars research campus?",
+        payload=payload,
+        coverage_plan={"required_pages": [target_url]},
+    )
+
+    assert changed is True
+    assert payload["abstained"] is True
+    assert payload["verification_status"] == "abstained"
+    assert payload["adjudication_reason"] == "presupposed_entity_or_scope_not_supported"
+
+
+def test_current_program_markers_cover_arabic_queries_and_public_routes():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert (
+        "/academics/phd-programs/doctoral-robotics"
+        in retriever._explicit_required_page_markers(
+            "كم عدد الساعات المطلوبة لدكتوراه الفلسفة في الروبوتات؟"
+        )
+    )
+    assert (
+        "/academics/msc-programs/masters-in-computer-science"
+        in retriever._explicit_required_page_markers(
+            "What does the Master of Science in Computer Science require?"
+        )
+    )
+
+
+def test_current_multisource_markers_cover_research_admissions_and_student_support():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+
+    assert set(
+        retriever._explicit_required_page_markers(
+            "كيف تصف الجامعة أقسامها ومعاهدها ومراكزها البحثية؟"
+        )
+    ) >= {
+        "/research/our-divisions",
+        "/research/institutes-centers",
+    }
+    assert set(
+        retriever._explicit_required_page_markers(
+            "Combine the undergraduate admissions criteria and program description."
+        )
+    ) >= {
+        "/admissions-aid/undergraduate-admissions",
+        "/academics/undergraduate-program",
+    }
+    assert set(
+        retriever._explicit_required_page_markers(
+            "What campus amenities and student support services are available?"
+        )
+    ) >= {
+        "/campus-community/campus-facilities",
+        "/about-us/office-of-student-postdoctoral-affairs",
+    }
+    assert "governance_structure.pdf" in retriever._explicit_required_page_markers(
+        "How does the chair's biography relate to university governance?"
+    )
+    assert (
+        "mbzuai_research_showcase_20250417-final.pdf"
+        in retriever._explicit_required_page_markers(
+            "How do the divisions and research showcase describe innovation?"
+        )
+    )
+
+
 def test_required_page_fact_backfill_injects_exact_faq_admissions_contact():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
@@ -8680,6 +8780,46 @@ def test_conflicting_navigation_action_cannot_override_explicit_page_requirement
     assert navigation_plan["warnings"] == [
         "navigation_action_suppressed_by_explicit_page_requirement"
     ]
+
+
+def test_catalog_action_named_in_goal_can_resolve_equivalent_page_surface():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    target_url = (
+        "https://mbzuai.ac.ae/about/office-of-student-postdoctoral-affairs"
+    )
+    coverage_plan = {
+        "required_pages": ["https://mbzuai.ac.ae/ar/node/861"],
+        "required_pages_source": "explicit_markers",
+    }
+    navigation_plan = {
+        "status": "ready",
+        "confidence": 1.0,
+        "source": "page_graph_navigation_catalog",
+        "goal": "What happens if I use the Get in touch action?",
+        "target_page": {"url": target_url},
+        "steps": [
+            {
+                "action_id": "page-action:student-affairs-contact",
+                "action_type": "contact",
+                "label": "Get in touch",
+                "target_url": "https://mbzuai.ac.ae/contact-us",
+            }
+        ],
+        "evidence": {"action_ids": ["page-action:student-affairs-contact"]},
+        "warnings": [],
+    }
+
+    changed = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+
+    assert changed is True
+    assert coverage_plan["required_pages"] == [target_url]
+    assert navigation_plan["status"] == "ready"
+    assert navigation_plan["warnings"] == []
 
 
 def test_navigation_action_can_use_catalog_verified_previous_page_alias():

@@ -30,6 +30,29 @@ _PREMISE_STOPWORDS = {
     "رسوم", "الرسوم", "الدراسية", "العام", "الأكاديمي", "الاكاديمي",
 }
 
+# Premise validation is deliberately lexical and fail-closed, but Arabic
+# routes can legitimately contain English programme copy. These small,
+# domain-level translation groups do not translate or guess named entities;
+# unsupported names and locations must still occur in one candidate.
+_PREMISE_EQUIVALENT_TOKEN_GROUPS = (
+    frozenset({"phd", "doctor", "doctorate", "دكتوراه", "الدكتوراه"}),
+    frozenset({"philosophy", "فلسفة", "الفلسفة"}),
+    frozenset({"robotics", "روبوتات", "الروبوتات"}),
+    frozenset({"computer", "حاسوب", "الحاسوب", "حاسوبي", "الحاسوبي", "الحاسوبية"}),
+    frozenset({"science", "sciences", "علوم", "العلوم"}),
+    frozenset({"vision", "رؤية", "الرؤية"}),
+    frozenset({"reach", "ريتش"}),
+    frozenset({"program", "programme", "برنامج"}),
+    frozenset({"activity", "activities", "نشاط", "الأنشطة"}),
+    frozenset({"master", "masters", "ماجستير", "الماجستير"}),
+    frozenset({"bachelor", "bachelors", "بكالوريوس", "البكالوريوس"}),
+)
+_PREMISE_TOKEN_EQUIVALENTS = {
+    token: group
+    for group in _PREMISE_EQUIVALENT_TOKEN_GROUPS
+    for token in group
+}
+
 _EVIDENCE_ADJUDICATION_JSON_SCHEMA = {
     "name": "evidence_adjudication",
     "strict": True,
@@ -147,25 +170,68 @@ def extract_premise_requirements(
         )
         if cleaned:
             requirements.append(cleaned)
+    # Capture formal Arabic degree titles without absorbing the requested
+    # attribute into the programme premise. The formal "Philosophy" token is
+    # retained because many Arabic routes currently expose English body copy.
+    degree_spans: List[tuple[int, int]] = []
     for match in re.finditer(
-        r"(?:^|\s)ل?(دكتوراه|ال?ماجستير|ال?بكالوريوس)\s+(?!في\s+جامعة|بجامعة|بالجامعة)(.+?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
+        r"(?:^|\s)ل?(دكتوراه|ال?ماجستير|ال?بكالوريوس)"
+        r"(?:\s+(الفلسفة|فلسفة|العلوم|علوم))?\s+في\s+"
+        r"([^؟?،,]{2,65}?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
         text,
         flags=re.IGNORECASE,
     ):
+        degree_spans.append(match.span())
+        cleaned = _clean_requirement(
+            f"{match.group(2) or ''} {match.group(3)} {match.group(1)}",
+            preserve={
+                "دكتوراه", "ماجستير", "الماجستير", "بكالوريوس",
+                "البكالوريوس", "فلسفة", "الفلسفة", "علوم", "العلوم",
+            },
+        )
+        if cleaned:
+            requirements.append(cleaned)
+    for match in re.finditer(
+        r"(?:^|\s)ل?(دكتوراه|ال?ماجستير|ال?بكالوريوس)\s+"
+        r"(?!في\s+جامعة|بجامعة|بالجامعة)([^؟?،,]{2,65}?)"
+        r"(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        if any(start <= match.start() and match.end() <= end for start, end in degree_spans):
+            continue
         cleaned = _clean_requirement(
             f"{match.group(2)} {match.group(1)}",
             preserve={"دكتوراه", "ماجستير", "الماجستير", "بكالوريوس", "البكالوريوس"},
         )
         if cleaned:
             requirements.append(cleaned)
+
+    quoted_program_spans: List[tuple[int, int]] = []
     for match in re.finditer(
-        r"(برنامج)\s+(.+?)(?=\s+(?:في\s+جامعة|بجامعة|بالجامعة)|[؟?،,]|$)",
+        r"(برنامج)\s*[«\"“]\s*([^»\"”]{2,60}?)\s*[»\"”]",
         text,
         flags=re.IGNORECASE,
     ):
+        quoted_program_spans.append(match.span())
         cleaned = _clean_requirement(
             f"{match.group(2)} {match.group(1)}",
             preserve={"برنامج"},
+        )
+        if cleaned:
+            requirements.append(cleaned)
+    for match in re.finditer(
+        r"(برنامج)\s+(?![«\"“]|دكتوراه|ال?ماجستير|ال?بكالوريوس)"
+        r"(.+?)(?=\s+(?:في\s+جامعة|في\s+صفحة|بجامعة|بالجامعة|بصفحة|"
+        r"المرتبط|المرتبطة|المتعلق|المتعلقة|للذكاء|لكل|للدفعة|"
+        r"الذي|التي|كم|ما|ماذا|من|أين|اين|متى|كيف)|[؟?،,]|$)",
+        text,
+        flags=re.IGNORECASE,
+    ):
+        if any(start <= match.start() and match.end() <= end for start, end in quoted_program_spans):
+            continue
+        cleaned = _clean_requirement(
+            match.group(2),
         )
         if cleaned and not set(_tokenize(cleaned)) <= {
             "برنامج", "دكتوراه", "ماجستير", "الماجستير", "بكالوريوس", "البكالوريوس"
@@ -208,6 +274,14 @@ def extract_premise_requirements(
         "location": ("location", "موقع"),
     }
     for location, unit, arabic in location_matches:
+        location_tokens = _tokenize(location)
+        if arabic and location_tokens[:1] and location_tokens[0] in {
+            "غرفة", "الغرفة", "خدمة", "الخدمة", "مرافق", "المرافق",
+            "صلاة", "الصلاة", "مساعدة", "المساعدة",
+        }:
+            # Here "على" belongs to "العثور على" (find), not a location.
+            # Do not turn the requested campus service into a false location.
+            continue
         suffixes = [
             labels[1 if arabic else 0]
             for answer_type, labels in answer_type_labels.items()
@@ -346,16 +420,21 @@ def _subject_supported(intent_summary: Mapping[str, Any], texts: Sequence[str]) 
 
 
 def _token_supported(token: str, candidate_tokens: set[str]) -> bool:
-    if token in candidate_tokens:
+    equivalent_tokens = set(_PREMISE_TOKEN_EQUIVALENTS.get(token, {token}))
+    if equivalent_tokens & candidate_tokens:
         return True
-    if not token.isascii() or len(token) < 5:
+    ascii_tokens = {
+        value for value in equivalent_tokens if value.isascii() and len(value) >= 5
+    }
+    if not ascii_tokens:
         return False
-    variants = {token}
-    if token.endswith("ies") and len(token) > 5:
-        variants.add(f"{token[:-3]}y")
-    for suffix in ("s", "ed", "ing"):
-        if token.endswith(suffix) and len(token) > len(suffix) + 3:
-            variants.add(token[: -len(suffix)])
+    variants = set(ascii_tokens)
+    for value in ascii_tokens:
+        if value.endswith("ies") and len(value) > 5:
+            variants.add(f"{value[:-3]}y")
+        for suffix in ("s", "ed", "ing"):
+            if value.endswith(suffix) and len(value) > len(suffix) + 3:
+                variants.add(value[: -len(suffix)])
     for candidate in candidate_tokens:
         if candidate in variants:
             return True
@@ -380,6 +459,22 @@ def _premises_supported(requirements: Sequence[str], texts: Sequence[str]) -> bo
         ):
             return False
     return True
+
+
+def premise_requirements_supported(
+    query: str,
+    intent_summary: Mapping[str, Any] | None,
+    candidates: Sequence[Mapping[str, Any] | str],
+) -> bool:
+    """Check that each closed-world premise occurs within one candidate."""
+
+    requirements = extract_premise_requirements(query, intent_summary)
+    texts = [
+        _candidate_text(value) if isinstance(value, Mapping) else str(value or "")
+        for value in candidates
+        if isinstance(value, Mapping) or str(value or "").strip()
+    ]
+    return _premises_supported(requirements, texts)
 
 
 def _premise_explicitly_refuted(query: str, texts: Sequence[str]) -> bool:
@@ -685,6 +780,15 @@ def adjudicate_factual_evidence(
         max_fact_ids=max_fact_ids,
         max_chunk_ids=max_chunk_ids,
     )
+
+    # The model may choose among supported candidates, but it must not
+    # override a deterministic closed-world premise failure. This also skips
+    # a provider round trip for unsupported locations, programmes, or assets.
+    if fallback.get("abstain") and fallback.get("reason") in {
+        "presupposed_entity_or_scope_not_supported",
+        "presupposed_claim_explicitly_refuted",
+    }:
+        return fallback
 
     try:
         client = make_openai_client(timeout_sec=provider_timeout_sec)

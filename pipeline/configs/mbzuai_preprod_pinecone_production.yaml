@@ -34,6 +34,13 @@ embedder:
   parent_batch_size: 16
   page_card_batch_size: 32
 
+retrieval:
+  # Treat a highly ranked chunk as equally strong corroboration for its
+  # catalog-backed owning Page Card. This recovers source identity when the
+  # dense Page Card lane returns a route alias or misses a specialized
+  # subdomain page, without adding another provider request.
+  page_card_evidence_fusion_weight: 1.0
+
 formatter:
   selected_release_assembly:
     checkpoint_run_dir: "runs/mbzuai_preprod_refresh_combined_selected_index_prep/mbzuai-preprod-refresh-combined-selected-index-prep-20260909-v1"

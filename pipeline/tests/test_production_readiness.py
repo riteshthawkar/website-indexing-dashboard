@@ -11814,6 +11814,47 @@ class TestAdaptiveHybridRetriever:
         assert plan["media_dense"] > 0
         assert plan["media_sparse"] > 0
 
+    def test_lane_top_ks_skip_namespaces_disabled_by_upload_contract(self, tmp_dir, monkeypatch):
+        from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
+
+        run_dir = self._build_retrieval_run(tmp_dir)
+        config = {
+            "embedder": {
+                "pinecone_index": "idx",
+                "model": "gemini-embedding-2-preview",
+                "output_dimensionality": 2,
+                "enable_dense_facts": False,
+                "enable_dense_evidence_spans": False,
+                "enable_dense_assertions": False,
+                "enable_dense_summaries": False,
+            },
+            "retrieval": {"enable_sparse": False, "enable_rerank": False},
+        }
+
+        monkeypatch.setenv("PINECONE_API_KEY", "x")
+        monkeypatch.setenv("GEMINI_API_KEY", "x")
+        import pipeline.retrieval.adaptive_hybrid as mod
+        monkeypatch.setattr(mod, "_embed_query", lambda *args, **kwargs: [0.1, 0.2])
+
+        retriever = AdaptiveHybridRetriever(config=config, work_dir=run_dir)
+        fact_plan = retriever._lane_top_ks(
+            query="What is the admissions phone number?",
+            mode=QueryMode.FACT,
+            media_query=False,
+        )
+        synthesis_plan = retriever._lane_top_ks(
+            query="Summarize campus facilities.",
+            mode=QueryMode.SYNTHESIS,
+            media_query=False,
+        )
+
+        assert fact_plan["fact_dense"] == 0
+        assert fact_plan["evidence_span_dense"] == 0
+        assert fact_plan["assertion_dense"] == 0
+        assert synthesis_plan["summary_dense"] == 0
+        assert synthesis_plan["evidence_span_dense"] == 0
+        assert fact_plan["fact_local"] > 0
+
     def test_run_query_lanes_skips_zero_top_k_tasks(self, tmp_dir, monkeypatch):
         from pipeline.retrieval.adaptive_hybrid import AdaptiveHybridRetriever, QueryMode
 

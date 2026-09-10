@@ -3479,6 +3479,19 @@ class AdaptiveHybridRetriever:
         self.namespace_summaries = str(embed_cfg.get("namespace_summaries") or retrieval_cfg.get("namespace_summaries") or "summaries")
         self.namespace_assertions = str(embed_cfg.get("namespace_assertions") or "assertions")
         self.sparse_index_name = str(embed_cfg.get("pinecone_sparse_index") or "").strip()
+        # The selected release may keep some representations lexical-only.
+        # Do not issue remote vector queries against namespaces the upload
+        # contract explicitly left empty.
+        self.enable_dense_facts = bool(embed_cfg.get("enable_dense_facts", True))
+        self.enable_dense_evidence_spans = bool(
+            embed_cfg.get("enable_dense_evidence_spans", True)
+        )
+        self.enable_dense_assertions = bool(
+            embed_cfg.get("enable_dense_assertions", True)
+        )
+        self.enable_dense_summaries = bool(
+            embed_cfg.get("enable_dense_summaries", True)
+        )
 
         self.dense_chunk_top_k = int(retrieval_cfg.get("dense_chunk_top_k", 12))
         self.dense_parent_top_k = int(retrieval_cfg.get("dense_parent_top_k", 6))
@@ -4347,6 +4360,18 @@ class AdaptiveHybridRetriever:
             text_tokens=_token_set(text),
         )
 
+    def _record_tokens(
+        self,
+        *,
+        namespace: str,
+        record_id: str,
+        text: str,
+    ) -> set[str]:
+        """Use cached tokens, falling back safely for uncached records."""
+        namespace_tokens = getattr(self, "_namespace_tokens_by_id", {})
+        cached_tokens = namespace_tokens.get(namespace, {}).get(str(record_id))
+        return set(cached_tokens) if cached_tokens else _token_set(text)
+
     def _score_preindexed_text_match(
         self,
         query: str,
@@ -4383,7 +4408,15 @@ class AdaptiveHybridRetriever:
             if not chunk:
                 continue
             chunk_text = chunk.get("dense_text") or chunk.get("text") or ""
-            score = self._score_text_match(query, chunk_text)
+            score = self._score_preindexed_text_match(
+                query,
+                text=chunk_text,
+                text_tokens=self._record_tokens(
+                    namespace=getattr(self, "namespace_chunks", "chunks"),
+                    record_id=chunk_id,
+                    text=chunk_text,
+                ),
+            )
             score += _lookup_signal_bonus(query, chunk_text)
             score += self._fact_query_bonus(query, chunk_text)
             score += _answer_focus_match_bonus(query, chunk_text)
@@ -4535,7 +4568,15 @@ class AdaptiveHybridRetriever:
         media_text = self.media_texts_by_id.get(media_id) or _clean_text(media.get("text") or "")
         if not media_text:
             return 0.0
-        score = self._score_text_match(query, media_text) + self._media_query_bonus(query, media)
+        score = self._score_preindexed_text_match(
+            query,
+            text=media_text,
+            text_tokens=self._record_tokens(
+                namespace=getattr(self, "namespace_media", "media"),
+                record_id=media_id,
+                text=media_text,
+            ),
+        ) + self._media_query_bonus(query, media)
         query_keywords = set(self._media_keywords(query))
         media_tokens = set(_tokenize(media_text))
         if query_keywords:
@@ -6076,7 +6117,15 @@ class AdaptiveHybridRetriever:
             fact_text = _clean_text(fact.get("text") or fact.get("dense_text") or "")
             if not fact_text:
                 continue
-            score = self._score_text_match(query, fact_text) + self._fact_query_bonus(query, fact_text)
+            score = self._score_preindexed_text_match(
+                query,
+                text=fact_text,
+                text_tokens=self._record_tokens(
+                    namespace=getattr(self, "namespace_facts", "facts"),
+                    record_id=fact_id,
+                    text=fact_text,
+                ),
+            ) + self._fact_query_bonus(query, fact_text)
             fact_lookup_text = _fact_lookup_text(fact) or fact_text
             if _contextual_contact_fact_match(query, fact_text, fact_lookup_text):
                 score += 0.85
@@ -6132,7 +6181,19 @@ class AdaptiveHybridRetriever:
                     )
                 )
             )
-            score = self._score_text_match(query, text)
+            score = self._score_preindexed_text_match(
+                query,
+                text=text,
+                text_tokens=self._record_tokens(
+                    namespace=getattr(
+                        self,
+                        "namespace_evidence_spans",
+                        "evidence_spans",
+                    ),
+                    record_id=str(span_id),
+                    text=text,
+                ),
+            )
             score += _lookup_signal_bonus(query, text)
             score += self._fact_query_bonus(query, text)
             score += _answer_focus_match_bonus(query, text)
@@ -8735,13 +8796,23 @@ class AdaptiveHybridRetriever:
             "chunk_dense": chunk_dense_top_k,
             "chunk_sparse": chunk_sparse_top_k,
             "chunk_local": local_chunk_top_k,
-            "assertion_dense": assertion_dense_top_k if answer_lane_enabled and not legacy_text_only else 0,
+            "assertion_dense": (
+                assertion_dense_top_k
+                if answer_lane_enabled
+                and self.enable_dense_assertions
+                and not legacy_text_only
+                else 0
+            ),
             "assertion_sparse": assertion_sparse_top_k if answer_lane_enabled and not legacy_text_only else 0,
             "answer_local": answer_local_top_k,
             "parent_dense": self.dense_parent_top_k if parent_lane_enabled else 0,
             "parent_sparse": self.sparse_parent_top_k if parent_lane_enabled else 0,
             "parent_local": self.sparse_parent_top_k if local_parent_lane_enabled else 0,
-            "summary_dense": self.dense_summary_top_k if summary_lane_enabled else 0,
+            "summary_dense": (
+                self.dense_summary_top_k
+                if summary_lane_enabled and self.enable_dense_summaries
+                else 0
+            ),
             "summary_sparse": self.sparse_summary_top_k if summary_lane_enabled else 0,
             "media_dense": self.dense_media_top_k if media_lane_enabled else 0,
             "media_sparse": self.sparse_media_top_k if media_lane_enabled else 0,
@@ -8754,8 +8825,10 @@ class AdaptiveHybridRetriever:
             ),
             "fact_dense": (
                 fact_dense_top_k
-                if fact_lane_enabled and mode == QueryMode.FACT
-                else scoped_fact_top_k if fact_lane_enabled else 0
+                if fact_lane_enabled and self.enable_dense_facts and mode == QueryMode.FACT
+                else scoped_fact_top_k
+                if fact_lane_enabled and self.enable_dense_facts
+                else 0
             ),
             "fact_sparse": (
                 fact_sparse_top_k
@@ -8767,7 +8840,11 @@ class AdaptiveHybridRetriever:
                 if fact_lane_enabled and mode == QueryMode.FACT
                 else scoped_sparse_fact_top_k if fact_lane_enabled else 0
             ),
-            "evidence_span_dense": evidence_span_dense_top_k if evidence_span_lane_enabled else 0,
+            "evidence_span_dense": (
+                evidence_span_dense_top_k
+                if evidence_span_lane_enabled and self.enable_dense_evidence_spans
+                else 0
+            ),
             "evidence_span_sparse": evidence_span_sparse_top_k if evidence_span_lane_enabled else 0,
             "evidence_span_local": evidence_span_local_top_k if evidence_span_lane_enabled else 0,
         }

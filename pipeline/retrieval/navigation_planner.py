@@ -307,7 +307,13 @@ def _contact_action_is_semantic(action: Mapping[str, Any]) -> bool:
         return True
     material = " ".join(
         _clean_text(action.get(key))
-        for key in ("label", "target_url", "canonical_target_url")
+        for key in (
+            "label",
+            "context_label",
+            "source_section_heading",
+            "target_url",
+            "canonical_target_url",
+        )
     ).casefold()
     return bool(
         re.search(
@@ -693,9 +699,12 @@ class GroundedNavigationPlanner:
     ) -> List[str]:
         """Late-fuse Page Card semantics with selected-chunk page identity.
 
-        The candidate set remains the dense Page Card lane. Selected chunks
-        only corroborate and reorder those existing candidates, so this cannot
-        invent a Page Card that the semantic lane did not retrieve.
+        A selected chunk is direct, catalog-backed evidence for its owning
+        Page Card. Include those owners as candidates instead of only
+        reordering Page Cards already returned by the dense lane. The result is
+        still bounded to the original lane width (or the available evidence
+        width when the dense lane is empty), so graph bridging cannot expand
+        into an unbounded catalog search.
         """
 
         dense_page_ids = list(
@@ -705,10 +714,10 @@ class GroundedNavigationPlanner:
                 if _clean_text(value)
             )
         )
-        if len(dense_page_ids) < 2 or evidence_weight <= 0.0:
+        if evidence_weight <= 0.0:
             return dense_page_ids
         evidence_page_ids: List[str] = []
-        for chunk_id in result.get("selected_chunk_ids") or []:
+        for chunk_id in list(result.get("selected_chunk_ids") or [])[:10]:
             chunk = self.chunks_by_id.get(_clean_text(chunk_id)) or {}
             page_id = _clean_text(chunk.get("page_card_id"))
             if page_id and page_id not in evidence_page_ids:
@@ -719,15 +728,38 @@ class GroundedNavigationPlanner:
             page_id: rank
             for rank, page_id in enumerate(evidence_page_ids, start=1)
         }
-        scored: List[tuple[float, int, str]] = []
-        for dense_rank, page_id in enumerate(dense_page_ids, start=1):
-            score = 1.0 / float(max(1, rrf_k) + dense_rank)
+        dense_ranks = {
+            page_id: rank
+            for rank, page_id in enumerate(dense_page_ids, start=1)
+        }
+        candidate_page_ids = list(
+            dict.fromkeys([*dense_page_ids, *evidence_page_ids])
+        )
+        scored: List[tuple[float, int, int, str]] = []
+        for page_id in candidate_page_ids:
+            dense_rank = dense_ranks.get(page_id)
+            score = (
+                1.0 / float(max(1, rrf_k) + dense_rank)
+                if dense_rank is not None
+                else 0.0
+            )
             evidence_rank = evidence_ranks.get(page_id)
             if evidence_rank is not None:
                 score += evidence_weight / float(max(1, rrf_k) + evidence_rank)
-            scored.append((-score, dense_rank, page_id))
+            scored.append(
+                (
+                    -score,
+                    dense_rank if dense_rank is not None else 10**9,
+                    evidence_rank if evidence_rank is not None else 10**9,
+                    page_id,
+                )
+            )
         scored.sort()
-        return [page_id for _score, _dense_rank, page_id in scored]
+        output_limit = min(10, len(candidate_page_ids))
+        return [
+            page_id
+            for _score, _dense_rank, _evidence_rank, page_id in scored[:output_limit]
+        ]
 
     def _empty_plan(
         self,
@@ -832,6 +864,7 @@ class GroundedNavigationPlanner:
         intent: str,
     ) -> tuple[List[tuple[float, str]], set[str]]:
         query_tokens = _tokens(query)
+        normalized_query = _normalized_boundary_text(query)
         lane_scores: Dict[str, Dict[str, float]] = {
             "source": {},
             "chunk": {},
@@ -887,11 +920,22 @@ class GroundedNavigationPlanner:
                     4.0,
                     2.0 * float(len(query_tokens & context_tokens)),
                 )
+                normalized_action_label = _normalized_boundary_text(
+                    action.get("label")
+                )
+                exact_action_label_bonus = (
+                    40.0
+                    if normalized_action_label
+                    and len(normalized_action_label.split()) >= 2
+                    and normalized_action_label in normalized_query
+                    else 0.0
+                )
                 record_lane_score(
                     "action",
                     page_id,
                     max(10.0, 30.0 - (3.0 * float(rank - 1)))
-                    + context_overlap_bonus,
+                    + context_overlap_bonus
+                    + exact_action_label_bonus,
                 )
                 evidence_page_ids.add(page_id)
                 target_url = _clean_text(
@@ -957,6 +1001,7 @@ class GroundedNavigationPlanner:
         candidate_ids = set(scores)
         if not candidate_ids:
             return [], evidence_page_ids
+        query_is_arabic = _is_arabic(query)
         for page_id in candidate_ids:
             page = self.pages_by_id[page_id]
             page_search_text = self._page_search_text(page)
@@ -965,6 +1010,24 @@ class GroundedNavigationPlanner:
             if query_tokens:
                 scores[page_id] += 5.0 * overlap / float(len(query_tokens))
             scores[page_id] += _query_phrase_match_score(query, page_search_text)
+            normalized_title = _normalized_boundary_text(page.get("title"))
+            title_tokens = _tokens(page.get("title"))
+            unordered_title_match = bool(
+                len(title_tokens) >= 2
+                and len(query_tokens & title_tokens) >= 2
+                and len(query_tokens & title_tokens) / float(len(title_tokens)) >= 0.75
+            )
+            explicit_title_match = bool(
+                normalized_title
+                and len(normalized_title.split()) >= 2
+                and normalized_title in normalized_query
+            ) or unordered_title_match
+            if explicit_title_match:
+                # An explicitly named owning page is stronger than a generic,
+                # action-rich destination such as "Contact us". The page must
+                # still be present in a retrieval lane; this is not a catalog
+                # search or a hardcoded question answer.
+                scores[page_id] += 64.0
             scores[page_id] += _page_surface_constraint_score(query, page)
             if page_id in evidence_page_ids:
                 # Canonical-surface routing may break ties among independently
@@ -983,7 +1046,28 @@ class GroundedNavigationPlanner:
                 scores[page_id] += 3.5
             if page_id in traversed_page_ids and overlap == 0:
                 scores[page_id] -= 1.0
-            if _is_arabic(query) == _is_arabic(
+            page_language = _clean_text(page.get("language")).casefold()
+            if query_is_arabic and page_language.startswith("ar"):
+                explicit_action_match = False
+                for action in self.actions_by_page.get(page_id, []):
+                    normalized_label = _normalized_boundary_text(
+                        action.get("label")
+                    )
+                    if (
+                        normalized_label
+                        and len(normalized_label.split()) >= 2
+                        and normalized_label in normalized_query
+                    ):
+                        explicit_action_match = True
+                        break
+                # Prefer the Arabic owning surface strongly only when the
+                # user independently named its title or action. This resolves
+                # bilingual route aliases without letting an unrelated Arabic
+                # page beat stronger English evidence.
+                scores[page_id] += (
+                    55.0 if explicit_title_match or explicit_action_match else 2.0
+                )
+            elif query_is_arabic == _is_arabic(
                 f"{page.get('title')} {page.get('purpose_summary')}"
             ):
                 scores[page_id] += 0.3

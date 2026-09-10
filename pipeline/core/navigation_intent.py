@@ -31,7 +31,14 @@ _FOLLOW_STEPS_PATTERN = (
     r"instructions? (?:to|for|on)|"
     r"(?:explain|describe|show me) (?:the )?(?:application|admission|registration) (?:process|procedure)"
     r")\b|"
-    r"(?:ما هي الخطوات|ما الخطوات|كيفية|الإجراءات|الاجراءات|أرشدني|ارشدني)"
+    r"(?:if i (?:click|press|use)|where does (?:the )?(?:official )?(?:action|button|link)|"
+    r"what does (?:the )?(?:official )?(?:action|button|link) (?:open|launch)|"
+    r"what (?:page|destination) does (?:the )?(?:action|button|link) (?:open|lead to)|"
+    r"(?:click|press|use) (?:the )?.{0,80}\b(?:action|button|link)\b)"
+    r"|(?:ما هي الخطوات|ما الخطوات|كيفية|الإجراءات|الاجراءات|أرشدني|ارشدني|"
+    r"إذا\s+(?:ضغط|استخدم)|اذا\s+(?:ضغط|استخدم)|ماذا\s+يفتح|ما\s+الذي\s+(?:يفتح|يؤدي)|"
+    r"إلى\s+أين\s+(?:يقود|يؤدي)|الى\s+اين\s+(?:يقود|يؤدي)|"
+    r"ما\s+الجهة\s+التي\s+يقود\s+إليها|ما\s+الجهة\s+التي\s+يقود\s+اليها)"
 )
 
 
@@ -58,12 +65,12 @@ def infer_navigation_context(query: str) -> Dict[str, Any]:
         ),
         (
             "contact",
-            r"\b(?:contact|email|e-mail|phone|telephone|call)\b|تواصل|اتصل|مراسلة|تراسل|(?:عنوان\s+)?البريد|هاتف",
+            r"\b(?:contact|get in touch|email|e-mail|phone|telephone|call)\b|تواصل|اتصل|مراسلة|تراسل|(?:عنوان\s+)?البريد|هاتف",
             0.94,
         ),
         (
             "apply",
-            r"\b(?:apply|application portal|submit (?:my |an )?application)\b|(?:\bقد[ّ]?م\b|\bتقديم\b|\bالتقديم\b|\bطلب (?:التوظيف|الالتحاق)\b)",
+            r"\b(?:apply|application portal|submit (?:my |an )?application)\b|(?:\bقد[ّ]?م\b|\bتقديم\b|\bالتقديم\b|للتقديم|\bطلب (?:التوظيف|الالتحاق)\b)",
             0.94,
         ),
         (

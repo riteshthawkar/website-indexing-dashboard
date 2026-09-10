@@ -15,6 +15,7 @@ from urllib.parse import unquote, urlparse
 from pipeline.core.evidence_adjudicator import (
     adjudicate_factual_evidence,
     heuristic_adjudicate_factual_evidence,
+    premise_requirements_supported,
     query_requires_premise_grounding,
 )
 from pipeline.core.admissions_routing import (
@@ -728,7 +729,7 @@ class RoutedHybridRetriever:
                     media_rankings=media_rankings,
                 )
             )
-        if media_evidence_verified:
+        if media_evidence_verified and not premise_grounding_required:
             # Media records carry OCR, captions, source URLs, and independent
             # dense/sparse ranks. A text-only adjudicator cannot validate that
             # evidence and can incorrectly discard the exact visual because
@@ -767,9 +768,25 @@ class RoutedHybridRetriever:
         fact_documents = [
             doc for doc in (payload.get("fact_documents") or []) if isinstance(doc, dict) and str(doc.get("id") or "")
         ]
-        retrieval_documents = [
+        evidence_span_documents = [
+            doc
+            for doc in (payload.get("evidence_span_documents") or [])
+            if isinstance(doc, dict) and str(doc.get("id") or "")
+        ]
+        raw_retrieval_documents = [
             doc for doc in (payload.get("retrieval_documents") or []) if isinstance(doc, dict) and str(doc.get("id") or "")
         ]
+        # Evidence spans are purpose-built, bounded answer passages. Give them
+        # first-class adjudication priority while retaining the broader fused
+        # retrieval list as fallback context.
+        retrieval_documents: List[Dict[str, Any]] = []
+        seen_retrieval_ids: set[str] = set()
+        for doc in [*evidence_span_documents, *raw_retrieval_documents]:
+            record_id = str(doc.get("id") or "")
+            if record_id in seen_retrieval_ids:
+                continue
+            seen_retrieval_ids.add(record_id)
+            retrieval_documents.append(doc)
         if not answer_documents and not fact_documents and not retrieval_documents:
             payload.setdefault("adjudication_used", False)
             payload.setdefault("verification_status", "skipped_no_evidence")
@@ -1817,6 +1834,75 @@ class RoutedHybridRetriever:
             )
         if "office of the registrar" in lower or "مكتب التسجيل" in lower:
             markers.append("/student-resources/office-of-the-registrar")
+        divisions_requested = bool(
+            re.search(r"\b(?:our|research|university) divisions?\b", lower)
+            or re.search(r"(?:أقسامها|اقسامها|الأقسام|الاقسام)", lower)
+        )
+        institutes_requested = bool(
+            re.search(r"\b(?:research )?institutes?\b", lower)
+            or re.search(r"(?:معاهدها|المعاهد)", lower)
+            or (
+                divisions_requested
+                and (
+                    re.search(r"\b(?:centers?|centres?)\b", lower)
+                    or re.search(r"(?:مراكزها|المراكز)", lower)
+                )
+            )
+        )
+        if divisions_requested:
+            markers.append("/research/our-divisions")
+        if institutes_requested and (
+            "research" in lower
+            or "division" in lower
+            or "بحث" in lower
+            or divisions_requested
+        ):
+            markers.extend(
+                [
+                    "/research/institutes-centers",
+                    "/research/our-institutes-centers",
+                ]
+            )
+        if (
+            ("frequently asked questions" in lower or "faq" in lower or "الأسئلة الشائعة" in lower)
+            and ("admission" in lower or "القبول" in lower)
+        ):
+            markers.extend(
+                [
+                    "/about-us/frequently-asked-questions",
+                    "/admissions-mbzuai",
+                    "/admissions",
+                ]
+            )
+        if (
+            re.search(r"\bundergraduate\b", lower)
+            and re.search(r"\b(?:applicant|admissions?|criteria|program(?:me)?|description)\b", lower)
+        ):
+            markers.extend(
+                [
+                    "/admissions-aid/undergraduate-admissions",
+                    "/academics/undergraduate-program",
+                ]
+            )
+        campus_facilities_requested = bool(
+            re.search(
+                r"\b(?:campus (?:facilities|amenities|services)|student-life support|student support services)\b",
+                lower,
+            )
+            or (
+                re.search(r"(?:الحرم الجامعي|الحرم)", lower)
+                and re.search(r"(?:المرافق|الخدمات|غرفة الصلاة|المساعدة الطبية|الإسعافات الأولية)", lower)
+            )
+        )
+        if campus_facilities_requested:
+            markers.append("/campus-community/campus-facilities")
+        if (
+            re.search(r"\b(?:student support services|student affairs|postdoctoral affairs)\b", lower)
+            or re.search(r"(?:دعم الطلاب|خدمات دعم الطلاب|شؤون الطلبة|شؤون الطلاب)", lower)
+        ):
+            markers.append("/about-us/office-of-student-postdoctoral-affairs")
+        if re.search(r"(?:غرفة الصلاة|المساعدة الطبية الأولى|الإسعافات الأولية)", lower):
+            markers.extend(["campus_map", "campus-map"])
         research_projects_page_requested = any(
             phrase in lower
             for phrase in (
@@ -1945,10 +2031,13 @@ class RoutedHybridRetriever:
                 "welcomes-400-students-including-inaugural-undergraduate-cohort"
             )
         if (
-            "وثيقة الحوكمة" in lower
-            or re.search(r"\bgovernance (?:structure )?(?:document|pdf)\b", lower)
+            "حوكمة" in lower
+            or "وثيقة الحوكمة" in lower
+            or re.search(r"\bgovernance(?: structure| document| pdf)?\b", lower)
         ):
             markers.append("governance_structure.pdf")
+        if "research showcase" in lower or "عرض الأبحاث" in lower:
+            markers.append("mbzuai_research_showcase_20250417-final.pdf")
         if re.search(r"(?:جميع|كل).{0,40}(?:برامج الدكتوراه|برنامج الدكتوراه)", lower):
             markers.append("/study/phd-programs")
         if "برامج الماجستير" in lower and re.search(r"(?:القبول|الالتحاق|المعدل|الوثائق|اللغة)", lower):
@@ -2033,6 +2122,7 @@ class RoutedHybridRetriever:
         if re.search(r"\b(campus facilities|campus amenities|support facilities|campus services|knowledge center|medical center)\b", lower) or (
             "campus" in lower and re.search(r"\b(facilities|facility|services|amenities|amenity)\b", lower)
         ):
+            markers.append("/campus-community/campus-facilities")
             markers.append("/student-resources/campus-facilities")
             if re.search(r"\b(core|amenities|support|student|accommodation|available)\b", lower):
                 markers.append("/study/undergraduate-application-submission")
@@ -2144,6 +2234,15 @@ class RoutedHybridRetriever:
             "statistics & data science": "statistics-and-data-science",
             "human-computer interaction": "human-computer-interaction",
             "hci": "human-computer-interaction",
+            "تعلم الآلة": "machine-learning",
+            "التعلم الآلي": "machine-learning",
+            "الرؤية الحاسوبية": "computer-vision",
+            "معالجة اللغات الطبيعية": "natural-language-processing",
+            "الأحياء الحاسوبية": "computational-biology",
+            "علوم الحاسوب": "computer-science",
+            "الروبوتات": "robotics",
+            "الإحصاء وعلوم البيانات": "statistics-and-data-science",
+            "التفاعل بين الإنسان والحاسوب": "human-computer-interaction",
         }
         matched_program_slug = ""
         for phrase, slug in program_slug_by_phrase.items():
@@ -2151,10 +2250,24 @@ class RoutedHybridRetriever:
                 matched_program_slug = slug
                 break
         if matched_program_slug:
-            if re.search(r"\b(master|msc|m\.sc)\b", lower):
-                markers.append(f"/study/msc-programs/master-of-science-in-{matched_program_slug}")
-            if re.search(r"\b(doctor|phd|ph\.d)\b", lower):
-                markers.append(f"/study/phd-programs/doctor-of-philosophy-in-{matched_program_slug}")
+            if re.search(r"\b(master|msc|m\.sc)\b", lower) or any(
+                value in lower for value in ("ماجستير", "الماجستير")
+            ):
+                markers.extend(
+                    [
+                        f"/academics/msc-programs/masters-in-{matched_program_slug}",
+                        f"/study/msc-programs/master-of-science-in-{matched_program_slug}",
+                    ]
+                )
+            if re.search(r"\b(doctor|phd|ph\.d)\b", lower) or any(
+                value in lower for value in ("دكتوراه", "الدكتوراه")
+            ):
+                markers.extend(
+                    [
+                        f"/academics/phd-programs/doctoral-{matched_program_slug}",
+                        f"/study/phd-programs/doctoral-{matched_program_slug}",
+                    ]
+                )
         if "master in applied artificial intelligence" in lower or "maai" in lower or "applied ai" in lower:
             markers.append("/study/master-in-applied-ai")
         return list(dict.fromkeys(markers))
@@ -2901,12 +3014,29 @@ class RoutedHybridRetriever:
                             payload["selected_parent_ids"].insert(0, parent_id)
                 changed = True
         if changed and payload.get("abstained"):
-            payload["abstained"] = False
-            payload["adjudication_used"] = False
-            payload["adjudication_method"] = "required_page_evidence_backfill"
-            payload["adjudication_reason"] = "cleared_abstention_after_required_page_span_backfill"
-            payload["adjudication_confidence"] = 0.0
-            payload["verification_status"] = "backfilled_required_page_evidence"
+            premise_supported = True
+            if payload.get("premise_grounding_required"):
+                premise_supported = premise_requirements_supported(
+                    query,
+                    self._intent_summary(query),
+                    [
+                        *[doc for doc in payload.get("answer_documents") or [] if isinstance(doc, Mapping)],
+                        *[doc for doc in payload.get("fact_documents") or [] if isinstance(doc, Mapping)],
+                        *[doc for doc in payload.get("evidence_span_documents") or [] if isinstance(doc, Mapping)],
+                        *[doc for doc in payload.get("retrieval_documents") or [] if isinstance(doc, Mapping)],
+                        *[doc for doc in payload.get("media") or [] if isinstance(doc, Mapping)],
+                    ],
+                )
+            if premise_supported:
+                payload["abstained"] = False
+                payload["adjudication_used"] = False
+                payload["adjudication_method"] = "required_page_evidence_backfill"
+                payload["adjudication_reason"] = "cleared_abstention_after_required_page_span_backfill"
+                payload["adjudication_confidence"] = 0.0
+                payload["verification_status"] = "backfilled_required_page_evidence"
+            else:
+                payload["adjudication_reason"] = "presupposed_entity_or_scope_not_supported"
+                payload["verification_status"] = "abstained"
         return changed
 
     def _navigation_target_parent_ids(
@@ -3071,6 +3201,18 @@ class RoutedHybridRetriever:
             for step in navigation_plan.get("steps") or []
         )
         if has_exact_action_target:
+            normalized_goal = " ".join(
+                _tokenize(str(navigation_plan.get("goal") or ""))
+            )
+            explicit_action_label_match = any(
+                len(_tokenize(str(step.get("label") or ""))) >= 2
+                and " ".join(_tokenize(str(step.get("label") or "")))
+                in normalized_goal
+                for step in navigation_plan.get("steps") or []
+                if isinstance(step, Mapping)
+                and str(step.get("action_type") or "").strip().casefold()
+                != "open_page"
+            )
             target_matches_required_page = any(
                 self._normalize_source_url(value) == normalized_target
                 for value in required_pages
@@ -3091,6 +3233,7 @@ class RoutedHybridRetriever:
                 and required_pages
                 and not target_matches_required_page
                 and not target_aliases_required_page
+                and not explicit_action_label_match
             ):
                 # Deterministic page requirements encode an explicit entity or
                 # page named by the user. A semantically similar action on a
@@ -3504,11 +3647,15 @@ class RoutedHybridRetriever:
             for value in (payload.get("selected_parent_ids") or [])
             if str(value)
         ]
-        if selected_parent_ids:
-            payload["selected_parent_ids"] = self.vector._diversify_parent_ids_for_query(
+        if selected_parent_ids or payload.get("selected_chunk_ids"):
+            promoted_parent_ids = self.vector._promote_selected_chunk_parent_ids(
                 coverage_query,
                 selected_parent_ids,
-                limit=len(selected_parent_ids),
+                payload.get("selected_chunk_ids") or [],
+            )
+            payload["selected_parent_ids"] = self.vector._preserve_dense_parent_recall(
+                promoted_parent_ids,
+                payload.get("dense_chunk_ids") or [],
             )
         postprocess_stage_latency_ms["parent_diversification_ms"] = round(
             (time.perf_counter() - stage_started) * 1000.0,

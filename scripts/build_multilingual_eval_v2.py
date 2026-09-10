@@ -33,7 +33,7 @@ from pipeline.evaluation.multilingual_v2 import (
 )
 
 
-PROMPT_REVISION = "mbzuai-multilingual-eval-v2-source-grounded-20260822"
+PROMPT_REVISION = "mbzuai-multilingual-eval-v2-current-preprod-20260910"
 SUITE_NAME = "mbzuai_multilingual_v2"
 DEFAULT_REPRESENTATION = (
     PROJECT_ROOT
@@ -56,8 +56,19 @@ DEFAULT_PLAN = PROJECT_ROOT / "eval/mbzuai_gold/mbzuai_multilingual_v2.plan.json
 DEFAULT_CACHE_DIR = PROJECT_ROOT / "runs/evaluation/mbzuai-multilingual-v2-generation-cache"
 
 MAIN_HOST = "mbzuai.ac.ae"
+MAIN_HOSTS = frozenset(
+    {
+        MAIN_HOST,
+        "www.mbzuai.ac.ae",
+        "preprod.mbzuai.ac.ae",
+    }
+)
+PRODUCTION_MIN_SUBDOMAIN_TASKS = 59
 ARABIC_RE = re.compile(r"[\u0600-\u06ff]")
-WORD_RE = re.compile(r"[a-z0-9\u0600-\u06ff]+", flags=re.IGNORECASE)
+WORD_RE = re.compile(
+    r"[a-z0-9]+|[\u0621-\u063a\u0641-\u064a\u0660-\u0669]+",
+    flags=re.IGNORECASE,
+)
 IMPORTANT_TERMS = (
     "admission",
     "apply",
@@ -296,6 +307,10 @@ def _host(url: str) -> str:
     return urlsplit(_normalize_url(url)).netloc.lower()
 
 
+def _is_main_host(value: Any) -> bool:
+    return _clean(value).casefold() in MAIN_HOSTS
+
+
 def _stable_fraction(*parts: Any) -> float:
     raw = "\0".join(str(part or "") for part in parts)
     return int(hashlib.sha256(raw.encode()).hexdigest()[:12], 16) / float(16**12)
@@ -352,6 +367,40 @@ def _page_score(pack: Mapping[str, Any]) -> float:
     important = 8 * sum(1 for term in IMPORTANT_TERMS if term.casefold() in searchable)
     word_count = min(25, int(pack.get("word_count") or 0) / 100)
     return type_score + important + word_count + _stable_fraction(pack.get("source_key"))
+
+
+def _preferred_page_url_key(pack: Mapping[str, Any]) -> tuple[int, int, str]:
+    """Prefer public, current routes when aliases expose identical content."""
+
+    source_url = _normalize_url(pack.get("source_url"))
+    path = urlsplit(source_url).path.casefold()
+    legacy_penalty = 0
+    if "/node/" in path:
+        legacy_penalty += 100
+    if path.startswith("/study/") or path.startswith("/ar/study/"):
+        legacy_penalty += 20
+    if path.startswith("/division-") or path.startswith("/ar/division-"):
+        legacy_penalty += 10
+    if path in {"/research/divisions", "/ar/research/divisions"}:
+        legacy_penalty += 2
+    return legacy_penalty, len(path), source_url
+
+
+def _deduplicate_identical_pages(
+    pages: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Collapse exact rendered-content aliases without merging translations."""
+
+    selected: Dict[str, Dict[str, Any]] = {}
+    for page in pages:
+        content_hash = hashlib.sha256(
+            _clean(page.get("full_text")).encode("utf-8")
+        ).hexdigest()
+        content_key = f"{_clean(page.get('language')).casefold()}:{content_hash}"
+        current = selected.get(content_key)
+        if current is None or _preferred_page_url_key(page) < _preferred_page_url_key(current):
+            selected[content_key] = page
+    return list(selected.values())
 
 
 def _public_source(pack: Mapping[str, Any]) -> Dict[str, Any]:
@@ -596,6 +645,7 @@ def _build_source_catalog(
         }
         media.append(pack)
 
+    pages = _deduplicate_identical_pages(pages)
     pages.sort(key=lambda row: (-_page_score(row), str(row.get("source_key"))))
     pdfs.sort(key=lambda row: (-int(row.get("word_count") or 0), str(row.get("source_key"))))
     media.sort(
@@ -629,7 +679,7 @@ def _diverse_select(
     pool.sort(
         key=lambda row: (
             used[str(row.get("source_key"))],
-            0 if prefer_subdomains and row.get("host") not in {MAIN_HOST, "www.mbzuai.ac.ae"} else 1,
+            0 if prefer_subdomains and not _is_main_host(row.get("host")) else 1,
             -_page_score(row) if row.get("source_kind") == "webpage" else -int(row.get("word_count") or 0),
             str(row.get("source_key")),
         )
@@ -644,7 +694,7 @@ def _diverse_select(
                 used[str(row.get("source_key"))],
                 host_counts[str(row.get("host"))],
                 type_counts[str(row.get("page_type"))],
-                0 if prefer_subdomains and row.get("host") not in {MAIN_HOST, "www.mbzuai.ac.ae"} else 1,
+                0 if prefer_subdomains and not _is_main_host(row.get("host")) else 1,
                 -_page_score(row) if row.get("source_kind") == "webpage" else -int(row.get("word_count") or 0),
                 str(row.get("source_key")),
             )
@@ -680,7 +730,29 @@ def _task(
                 str(action.get("action_id")),
             )
         )
-        required_action_ids = [str(actions[0]["action_id"])]
+        primary_action = actions[0]
+
+        def visible_action_signature(action: Mapping[str, Any]) -> tuple[str, ...]:
+            return tuple(
+                _clean(action.get(key)).casefold()
+                for key in (
+                    "action_type",
+                    "label",
+                    "context_label",
+                    "source_section_heading",
+                )
+            )
+
+        # Cloudflare-protected email links can have different destinations
+        # while exposing the same visible label and section context. A user
+        # cannot distinguish those IDs from the rendered page, so treat every
+        # visually indistinguishable sibling as an acceptable gold action.
+        primary_signature = visible_action_signature(primary_action)
+        required_action_ids = [
+            str(action["action_id"])
+            for action in actions
+            if visible_action_signature(action) == primary_signature
+        ]
     return {
         "task_id": task_id,
         "language": language,
@@ -691,6 +763,65 @@ def _task(
         "required_action_ids": required_action_ids,
         "sources": list(packs),
     }
+
+
+def _task_uses_subdomain(task: Mapping[str, Any]) -> bool:
+    return any(
+        not _is_main_host(source.get("host"))
+        and _clean(source.get("host")).casefold() != "staticcdn.mbzuai.ac.ae"
+        for source in task.get("sources") or []
+    )
+
+
+def _ensure_subdomain_task_floor(
+    tasks: Sequence[Dict[str, Any]],
+    *,
+    candidates: Sequence[Dict[str, Any]],
+    minimum: int,
+) -> List[Dict[str, Any]]:
+    """Keep release coverage stable when the main preprod host is classified correctly."""
+
+    output = list(tasks)
+    deficit = max(0, minimum - sum(_task_uses_subdomain(task) for task in output))
+    if not deficit:
+        return output
+    used_source_keys = {
+        str(source.get("source_key") or "")
+        for task in output
+        for source in task.get("sources") or []
+    }
+    replacements = sorted(
+        (
+            source
+            for source in candidates
+            if str(source.get("source_key") or "") not in used_source_keys
+        ),
+        key=lambda source: (-_page_score(source), str(source.get("source_key"))),
+    )
+    target_indices = [
+        index
+        for index, task in enumerate(output)
+        if task.get("language") == "English"
+        and task.get("query_type") == "fact"
+        and task.get("source_type") == "webpage"
+        and not task.get("navigation")
+        and len(task.get("sources") or []) == 1
+        and not _task_uses_subdomain(task)
+    ]
+    if len(replacements) < deficit or len(target_indices) < deficit:
+        raise RuntimeError(
+            f"Cannot satisfy the {minimum}-task subdomain coverage floor"
+        )
+    for target_index, source in zip(target_indices[:deficit], replacements[:deficit]):
+        original = output[target_index]
+        output[target_index] = _task(
+            str(original["task_id"]),
+            language="English",
+            query_type="fact",
+            source_type="webpage",
+            packs=[source],
+        )
+    return output
 
 
 def _pair_sources(
@@ -777,6 +908,25 @@ def _find_page_exact(pages: Sequence[Dict[str, Any]], url: str) -> Dict[str, Any
     return matches[0]
 
 
+def _find_page_first(pages: Sequence[Dict[str, Any]], *urls: str) -> Dict[str, Any]:
+    """Resolve the first available route from newest to oldest compatibility URL."""
+
+    for url in urls:
+        normalized = _normalize_url(url)
+        matches = [
+            page
+            for page in pages
+            if _normalize_url(page.get("source_url")) == normalized
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Expected one frozen page for {normalized}, found {len(matches)}"
+            )
+    raise RuntimeError(f"None of the expected frozen pages exist: {list(urls)}")
+
+
 def _find_pdf_title(pdfs: Sequence[Dict[str, Any]], title_marker: str) -> Dict[str, Any]:
     marker = title_marker.casefold()
     matches = [pdf for pdf in pdfs if marker in str(pdf.get("title") or "").casefold()]
@@ -785,35 +935,96 @@ def _find_pdf_title(pdfs: Sequence[Dict[str, Any]], title_marker: str) -> Dict[s
     return matches[0]
 
 
+def _find_pdf_first_title(
+    pdfs: Sequence[Dict[str, Any]], *title_markers: str
+) -> Dict[str, Any]:
+    for title_marker in title_markers:
+        marker = title_marker.casefold()
+        matches = [
+            pdf
+            for pdf in pdfs
+            if marker in str(pdf.get("title") or "").casefold()
+        ]
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise RuntimeError(
+                f"Expected one frozen document containing {title_marker!r}, "
+                f"found {len(matches)}"
+            )
+    raise RuntimeError(
+        f"None of the expected frozen documents exist: {list(title_markers)}"
+    )
+
+
 def _curated_synthesis_sources(
     pages: Sequence[Dict[str, Any]],
     pdfs: Sequence[Dict[str, Any]],
 ) -> Dict[str, List[List[Dict[str, Any]]]]:
-    page = lambda url: _find_page_exact(pages, url)
+    page = lambda *urls: _find_page_first(pages, *urls)
     english = [
         [
-            page("https://mbzuai.ac.ae/study/graduate-admission-process"),
-            page("https://mbzuai.ac.ae/study/msc-programs"),
+            page(
+                "https://preprod.mbzuai.ac.ae/admissions/graduate-masters-admissions",
+                "https://preprod.mbzuai.ac.ae/graduate-masters-admissions",
+                "https://mbzuai.ac.ae/study/graduate-admission-process",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/academics/msc-programs",
+                "https://preprod.mbzuai.ac.ae/study/msc-programs",
+                "https://mbzuai.ac.ae/study/msc-programs",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/study/ug-admission-process"),
-            page("https://mbzuai.ac.ae/study/undergraduate-program"),
+            page(
+                "https://preprod.mbzuai.ac.ae/admissions-aid/undergraduate-admissions",
+                "https://mbzuai.ac.ae/study/ug-admission-process",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/academics/undergraduate-program",
+                "https://preprod.mbzuai.ac.ae/study/undergraduate-program",
+                "https://mbzuai.ac.ae/study/undergraduate-program",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/student-resources/campus-facilities"),
-            page("https://mbzuai.ac.ae/student-resources/educational-affairs"),
+            page(
+                "https://preprod.mbzuai.ac.ae/campus-community/campus-facilities",
+                "https://mbzuai.ac.ae/student-resources/campus-facilities",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/about-us/office-of-student-postdoctoral-affairs",
+                "https://preprod.mbzuai.ac.ae/about-us/leadership/office-student-postdoctoral-affairs",
+                "https://mbzuai.ac.ae/student-resources/educational-affairs",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/about/leadership"),
-            page("https://mbzuai.ac.ae/about/mission-and-vision"),
+            page(
+                "https://preprod.mbzuai.ac.ae/about-us/leadership",
+                "https://mbzuai.ac.ae/about/leadership",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/about-us",
+                "https://mbzuai.ac.ae/about/mission-and-vision",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/research/research-centers"),
-            page("https://mbzuai.ac.ae/research/projects"),
+            page(
+                "https://preprod.mbzuai.ac.ae/research/our-institutes-centers",
+                "https://preprod.mbzuai.ac.ae/research/our-institutes-centers/institute-agriculture-artificial-intelligence",
+                "https://mbzuai.ac.ae/research/research-centers",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/research/our-divisions",
+                "https://preprod.mbzuai.ac.ae/research/divisions",
+                "https://mbzuai.ac.ae/research/projects",
+            ),
         ],
         [
             page("https://hpp.mbzuai.ac.ae/"),
-            page("https://mbzuai.ac.ae/news/new-human-phenotype-project-findings-illuminate-pathways-to-precision-medicine"),
+            page(
+                "https://preprod.mbzuai.ac.ae/research/project-hub/human-phenotype-project",
+                "https://mbzuai.ac.ae/news/new-human-phenotype-project-findings-illuminate-pathways-to-precision-medicine",
+            ),
         ],
         [page("https://ifm.ai/about"), page("https://ifm.ai/collaborate")],
         [
@@ -823,52 +1034,106 @@ def _curated_synthesis_sources(
     ]
     arabic = [
         [
-            page("https://mbzuai.ac.ae/ar/study/ug-admission-process"),
-            page("https://mbzuai.ac.ae/ar/study/mbzuai-undergraduate"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/admissions-aid/undergraduate-admissions",
+                "https://mbzuai.ac.ae/ar/study/ug-admission-process",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/study/undergraduate-program",
+                "https://mbzuai.ac.ae/ar/study/mbzuai-undergraduate",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/ar/study/msc-programs"),
-            page("https://mbzuai.ac.ae/ar/study/phd-programs"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/node/217",
+                "https://mbzuai.ac.ae/ar/study/msc-programs",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/node/335",
+                "https://mbzuai.ac.ae/ar/study/phd-programs",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/ar/about/leadership"),
-            page("https://mbzuai.ac.ae/ar/about/mission"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/about-us",
+                "https://mbzuai.ac.ae/ar/about/mission",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/about-us/leadership/he-khaldoon-khalifa-al-mubarak",
+                "https://mbzuai.ac.ae/ar/about/leadership",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/ar/student-resources/campus-facilities"),
-            page("https://mbzuai.ac.ae/ar/student-resources/educational-affairs"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/campus-community/campus-facilities",
+                "https://mbzuai.ac.ae/ar/student-resources/campus-facilities",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/campus-community/housing",
+                "https://mbzuai.ac.ae/ar/student-resources/educational-affairs",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/ar/research/research-centers"),
-            page("https://mbzuai.ac.ae/ar/research/projects"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/research/institutes-centers",
+                "https://mbzuai.ac.ae/ar/research/research-centers",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/research/our-divisions",
+                "https://mbzuai.ac.ae/ar/research/projects",
+            ),
         ],
         [
-            page("https://mbzuai.ac.ae/ar/student-resources/office-of-the-registrar"),
-            page("https://mbzuai.ac.ae/ar/student-resources/student-careers-and-internships"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/about-us/frequently-asked-questions",
+                "https://mbzuai.ac.ae/ar/student-resources/office-of-the-registrar",
+            ),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/admissions-mbzuai",
+                "https://mbzuai.ac.ae/ar/student-resources/student-careers-and-internships",
+            ),
         ],
     ]
     cross_arabic = [
         [page("https://ifm.ai/about"), page("https://ifm.ai/collaborate")],
-        [page("https://careers.mbzuai.ac.ae/"), page("https://careers.mbzuai.ac.ae/vacancies")],
+        [
+            page("https://careers.mbzuai.ac.ae/"),
+            page(
+                "https://careers.mbzuai.ac.ae/faculty",
+                "https://careers.mbzuai.ac.ae/vacancies",
+            ),
+        ],
     ]
     english_mixed = [
         [
-            page("https://mbzuai.ac.ae/study/graduate-admission-process"),
-            _find_pdf_title(pdfs, "University-Catalogue-2024-2025"),
+            page(
+                "https://preprod.mbzuai.ac.ae/research/our-divisions",
+                "https://preprod.mbzuai.ac.ae/research/divisions",
+            ),
+            _find_pdf_first_title(pdfs, "MBZUAI Research Showcase 20250417 Final"),
         ],
         [
-            page("https://mbzuai.ac.ae/student-resources/campus-facilities"),
-            _find_pdf_title(pdfs, "MBZUAI_Campus_Map_V1044331768"),
+            page(
+                "https://preprod.mbzuai.ac.ae/campus-community/campus-facilities",
+                "https://mbzuai.ac.ae/student-resources/campus-facilities",
+            ),
+            _find_pdf_first_title(pdfs, "MBZUAI Campus Map V1044331768"),
         ],
     ]
     arabic_mixed = [
         [
-            page("https://mbzuai.ac.ae/ar/about/leadership"),
-            _find_pdf_title(pdfs, "Governance_structure"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/about-us/leadership/he-khaldoon-khalifa-al-mubarak",
+                "https://mbzuai.ac.ae/ar/about/leadership",
+            ),
+            _find_pdf_first_title(pdfs, "Governance Structure"),
         ],
         [
-            page("https://mbzuai.ac.ae/ar/student-resources/campus-facilities"),
-            _find_pdf_title(pdfs, "MBZUAI_Campus_Map_V1044331768"),
+            page(
+                "https://preprod.mbzuai.ac.ae/ar/campus-community/campus-facilities",
+                "https://mbzuai.ac.ae/ar/student-resources/campus-facilities",
+            ),
+            _find_pdf_first_title(pdfs, "MBZUAI Campus Map V1044331768"),
         ],
     ]
     return {
@@ -887,12 +1152,21 @@ def build_task_plan(catalog: Mapping[str, Any]) -> List[Dict[str, Any]]:
     english_pages = [row for row in pages if row["language"] == "English"]
     arabic_pages = [row for row in pages if row["language"] == "Arabic"]
     english_subdomain_pages = [
-        row for row in english_pages if row.get("host") not in {MAIN_HOST, "www.mbzuai.ac.ae"}
+        row for row in english_pages if not _is_main_host(row.get("host"))
     ]
     used: Counter[str] = Counter()
     tasks: List[Dict[str, Any]] = []
 
-    for index, source in enumerate(_diverse_select(english_pages, 26, used=used, seed=101), start=1):
+    for index, source in enumerate(
+        _diverse_select(
+            english_pages,
+            26,
+            used=used,
+            prefer_subdomains=True,
+            seed=101,
+        ),
+        start=1,
+    ):
         tasks.append(_task(f"en-fact-{index:03d}", language="English", query_type="fact", source_type="webpage", packs=[source]))
     for index, source in enumerate(_diverse_select(english_pages, 12, used=used, seed=102), start=1):
         tasks.append(_task(f"en-scoped-{index:03d}", language="English", query_type="scoped", source_type="webpage", packs=[source]))
@@ -958,6 +1232,12 @@ def build_task_plan(catalog: Mapping[str, Any]) -> List[Dict[str, Any]]:
         for index, source in enumerate(selected, start=1):
             tasks.append(_task(f"{prefix}-{index:03d}", language="Arabic", query_type="multimodal", source_type=source_kind, packs=[source], cross_lingual=source["language"] != "Arabic"))
 
+    tasks = _ensure_subdomain_task_floor(
+        tasks,
+        candidates=english_subdomain_pages,
+        minimum=PRODUCTION_MIN_SUBDOMAIN_TASKS,
+    )
+
     expected = Counter((task["language"], task["query_type"]) for task in tasks)
     if len(tasks) != 136:
         raise RuntimeError(f"Task plan must contain 136 answerable tasks, got {len(tasks)}")
@@ -1015,7 +1295,7 @@ def _generation_prompt(tasks: Sequence[Mapping[str, Any]]) -> str:
         "- fact asks for one precise fact; scoped asks for a bounded explanation or procedure; synthesis must combine every supplied source; multimodal asks about information visible in or semantically conveyed by the supplied image record.\n"
         "- Each answerable item needs at least one exact evidence quote from every supplied source. Quotes must be 8-500 characters after whitespace normalization.\n"
         "- Do not quote the labels 'Semantic caption' or 'Contextual caption' alone; quote their substantive text.\n"
-        "- For navigation tasks, the question should naturally require finding the supplied action and the answer should explain where the official action leads. Do not invent steps beyond the action evidence.\n"
+        "- For navigation tasks, the question must include the supplied owning page title (keep it verbatim even in a cross-lingual question), naturally require finding the supplied action, and explain where the official action leads. Do not use deictic phrases such as 'this page' without its title, and do not invent steps beyond the action evidence.\n"
         "- section_ids may contain only IDs shown in that task and only when the heading is relevant.\n"
         "- Avoid trivia based only on dates in generic news pages when a more enduring question is possible.\n"
         "- Preserve names, numbers, requirements, and qualifications exactly.\n"
@@ -1077,6 +1357,53 @@ def _as_list(value: Any) -> List[str]:
     return [_clean(value)] if _clean(value) else []
 
 
+_NAVIGATION_IDENTITY_STOPWORDS = {
+    "a", "ai", "and", "artificial", "bin", "careers", "for", "in",
+    "intelligence", "mbzuai", "mohamed", "of", "page", "the", "university",
+    "zayed",
+    "صفحة", "جامعة", "محمد", "بن", "زايد", "للذكاء", "الاصطناعي",
+}
+
+
+def _navigation_query_has_source_identity(
+    query: str,
+    sources: Sequence[Mapping[str, Any]],
+) -> bool:
+    """Require a navigation question to identify its owning page."""
+
+    query_tokens = set(
+        WORD_RE.findall(normalize_evidence_text(query).casefold())
+    )
+    for source in sources:
+        identity_values = [
+            source.get("title") or "",
+            *[
+                action.get(key) or ""
+                for action in (source.get("actions") or [])
+                if isinstance(action, Mapping)
+                for key in ("label", "context_label")
+            ],
+        ]
+        for identity_value in identity_values:
+            identity_tokens = [
+                token
+                for token in WORD_RE.findall(
+                    normalize_evidence_text(identity_value).casefold()
+                )
+                if token not in _NAVIGATION_IDENTITY_STOPWORDS
+            ]
+            if not identity_tokens:
+                continue
+            overlap = query_tokens & set(identity_tokens)
+            required = 1 if len(set(identity_tokens)) == 1 else 2
+            if (
+                len(overlap) >= required
+                and len(overlap) / float(len(set(identity_tokens))) >= 0.5
+            ):
+                return True
+    return False
+
+
 def _normalize_generated_item(task: Mapping[str, Any], item: Mapping[str, Any]) -> EvalExample:
     query = _clean(item.get("query"))
     answer = _clean(item.get("reference_answer"))
@@ -1087,6 +1414,12 @@ def _normalize_generated_item(task: Mapping[str, Any], item: Mapping[str, Any]) 
         raise ValueError(f"query does not match target language {language}")
     if not looks_like_language(answer, language):
         raise ValueError(f"reference answer does not match target language {language}")
+    if task.get("navigation") and not _navigation_query_has_source_identity(
+        query, task.get("sources") or []
+    ):
+        raise ValueError(
+            "navigation query must identify the owning page by its supplied title"
+        )
     source_by_key = {str(source["source_key"]): source for source in task["sources"]}
     evidence_rows = item.get("evidence") or []
     if not isinstance(evidence_rows, list):
@@ -1216,7 +1549,10 @@ def _normalize_generated_item(task: Mapping[str, Any], item: Mapping[str, Any]) 
         tags.append("multimodal")
     if any(source.get("source_kind") in {"pdf", "pdf_image"} for source in task["sources"]):
         tags.append("pdf")
-    if any(host not in {MAIN_HOST, "www.mbzuai.ac.ae", "staticcdn.mbzuai.ac.ae"} for host in source_hosts):
+    if any(
+        not _is_main_host(host) and host != "staticcdn.mbzuai.ac.ae"
+        for host in source_hosts
+    ):
         tags.append("subdomain")
     if len(task["sources"]) > 1:
         tags.append("multi_source")
