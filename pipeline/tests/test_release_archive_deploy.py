@@ -33,6 +33,14 @@ HYDRATOR = DEPLOY_DIR / "hydrate-release-archive.py"
 VALIDATOR = DEPLOY_DIR / "validate-release-artifacts.py"
 
 
+def test_retriever_image_declares_page_card_parser_dependency() -> None:
+    requirements = (PROJECT_ROOT / "requirements-retriever.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+
+    assert "beautifulsoup4==4.13.3" in requirements
+
+
 def _load_hydrator_module():
     spec = importlib.util.spec_from_file_location("mbzuai_release_hydrator", HYDRATOR)
     assert spec is not None and spec.loader is not None
