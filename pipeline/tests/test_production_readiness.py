@@ -10347,6 +10347,7 @@ class TestAdaptiveHybridRetriever:
         result = retriever.retrieve("Who are the president and provost of MBZUAI?")
         answer_texts = [str(doc.get("text") or "").lower() for doc in result.get("answer_documents") or []]
 
+        assert len(result.get("answer_documents") or []) == 2
         assert any("eric xing" in text for text in answer_texts)
         assert any("timothy baldwin" in text for text in answer_texts)
 
@@ -10372,6 +10373,7 @@ class TestAdaptiveHybridRetriever:
 
         assert result["answer_documents"]
         top_answer = result["answer_documents"][0]
+        assert len(result["answer_documents"]) == 1
         assert top_answer["answer_type"] == "role_holder"
         assert top_answer["answer_subtype"] == "provost"
         assert "timothy baldwin" in str(top_answer["value"]).lower()

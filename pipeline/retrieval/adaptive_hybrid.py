@@ -3832,6 +3832,7 @@ class AdaptiveHybridRetriever:
         self.answer_token_index: Dict[str, List[str]] = defaultdict(list)
         self.answer_ids_by_type: Dict[str, List[str]] = defaultdict(list)
         self.answer_ids_by_subtype: Dict[Tuple[str, str], List[str]] = defaultdict(list)
+        self.answer_ids_by_effective_subtype: Dict[Tuple[str, str], List[str]] = defaultdict(list)
         self.answer_context_texts_by_id: Dict[str, str] = {}
         self.answer_subjects_by_id: Dict[str, str] = {}
         self.answer_texts_by_chunk: Dict[str, List[str]] = {}
@@ -3898,6 +3899,21 @@ class AdaptiveHybridRetriever:
                 if part
             )
             self.answer_context_texts_by_id[answer_id] = answer_text
+            effective_subtype = self._effective_answer_subtype(
+                answer,
+                combined_text=_clean_text(
+                    " ".join(
+                        part
+                        for part in (answer.get("value"), answer.get("text"))
+                        if part
+                    )
+                ),
+                context_text=answer_text,
+            )
+            if effective_subtype:
+                self.answer_ids_by_effective_subtype[
+                    (answer_type, effective_subtype)
+                ].append(answer_id)
             answer_tokens = _tokenize(answer_text)
             self.answer_tokens_by_id[answer_id] = answer_tokens
             for token in dict.fromkeys(answer_tokens):
@@ -3920,6 +3936,14 @@ class AdaptiveHybridRetriever:
         for answer_key, answer_ids in list(self.answer_ids_by_subtype.items()):
             self.answer_ids_by_subtype[answer_key] = sorted(
                 answer_ids,
+                key=lambda answer_id: (
+                    -float((self.answer_map.get(answer_id) or {}).get("confidence") or 0.0),
+                    str(answer_id),
+                ),
+            )
+        for answer_key, answer_ids in list(self.answer_ids_by_effective_subtype.items()):
+            self.answer_ids_by_effective_subtype[answer_key] = sorted(
+                dict.fromkeys(answer_ids),
                 key=lambda answer_id: (
                     -float((self.answer_map.get(answer_id) or {}).get("confidence") or 0.0),
                     str(answer_id),
@@ -5129,6 +5153,21 @@ class AdaptiveHybridRetriever:
             normalized = _service_availability_subtype(" ".join(part for part in (answer_subtype, combined_text, context_text) if part))
             if normalized:
                 return normalized
+        if answer_type == "role_holder":
+            role_text = " ".join(part for part in (lower_text, lower_context) if part)
+            if re.search(r"\bassociate\s+provost\b", role_text):
+                return "associate_provost"
+            if re.search(r"\bassistant\s+provost\b", role_text):
+                return "assistant_provost"
+            if re.search(r"\bdeputy\s+provost\b", role_text):
+                return "deputy_provost"
+            if re.search(r"\bvice\s+provost\b", role_text):
+                return "vice_provost"
+            if "provost" in answer_subtype.casefold() and re.search(
+                r"\b(?:acting\s+)?provost\b",
+                role_text,
+            ):
+                return "provost"
         return answer_subtype
 
     def _role_holder_currentness_bonus(
@@ -5148,6 +5187,17 @@ class AdaptiveHybridRetriever:
         lower_url = str(answer.get("source_url") or "").lower()
         lower_source = " ".join(part for part in (lower_title, lower_url, lower_context) if part)
         bonus = 0.0
+
+        query_tokens = set(_tokenize(query))
+        qualifiers = set(_tokenize(" ".join(answer.get("qualifiers") or [])))
+        asks_current = bool(query_tokens & {"current", "currently", "now", "present"})
+        if asks_current:
+            if qualifiers & {"current", "currently", "active"}:
+                bonus += 0.48
+            if qualifiers & {"former", "previous", "past", "served", "retired"}:
+                bonus -= 1.45
+        if not lower_url:
+            bonus -= 0.42
 
         is_official_leadership = any(
             marker in lower_source
@@ -5569,7 +5619,10 @@ class AdaptiveHybridRetriever:
                 scoped_answer_ids = [
                     answer_id
                     for role in requested_roles
-                    for answer_id in (self.answer_ids_by_subtype.get((answer_type, role)) or [])
+                    for answer_id in (
+                        self.answer_ids_by_effective_subtype.get((answer_type, role))
+                        or []
+                    )
                 ]
             else:
                 scoped_answer_ids = self.answer_ids_by_type.get(answer_type) or []
@@ -5667,8 +5720,26 @@ class AdaptiveHybridRetriever:
             answer = self.answer_map.get(str(answer_id)) or {}
             if str(answer.get("answer_type") or "") != answer_type:
                 return False
-            if answer_subtype and str(answer.get("answer_subtype") or "") != answer_subtype:
-                return False
+            if answer_subtype:
+                record_subtype = str(answer.get("answer_subtype") or "")
+                if answer_type == "role_holder":
+                    combined_text = _clean_text(
+                        " ".join(
+                            part
+                            for part in (answer.get("value"), answer.get("text"))
+                            if part
+                        )
+                    )
+                    record_subtype = self._effective_answer_subtype(
+                        answer,
+                        combined_text=combined_text,
+                        context_text=_clean_text(
+                            self.answer_context_texts_by_id.get(str(answer_id))
+                            or combined_text
+                        ),
+                    )
+                if record_subtype != answer_subtype:
+                    return False
             return True
 
         def _append(answer_id: str) -> None:
@@ -5706,7 +5777,9 @@ class AdaptiveHybridRetriever:
                 return selected
 
         scoped_answer_ids = (
-            self.answer_ids_by_subtype.get((answer_type, answer_subtype))
+            self.answer_ids_by_effective_subtype.get((answer_type, answer_subtype))
+            if answer_type == "role_holder" and answer_subtype
+            else self.answer_ids_by_subtype.get((answer_type, answer_subtype))
             if answer_subtype
             else self.answer_ids_by_type.get(answer_type)
         ) or []
@@ -5815,15 +5888,9 @@ class AdaptiveHybridRetriever:
                 selected.append(answer_id)
                 seen_signatures.add(signature)
                 break
-        for answer_id in ranked_answer_ids:
-            answer_id = str(answer_id)
-            signature = _answer_signature(answer_id)
-            if not answer_id or answer_id in selected or signature in seen_signatures:
-                continue
-            selected.append(answer_id)
-            seen_signatures.add(signature)
-            if len(selected) >= top_k:
-                break
+        # Exact office-holder questions need one strongest citable candidate
+        # per requested role. Appending historical and subordinate-role rows
+        # after those winners creates artificial conflicts for adjudication.
         return selected[:top_k]
 
     def _rank_answer_anchor_chunk_ids(
