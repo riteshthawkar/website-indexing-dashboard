@@ -2697,8 +2697,21 @@ class RoutedHybridRetriever:
         required_page: str,
         *,
         limit: int = 2,
+        dense_chunk_ids: Sequence[str] | None = None,
     ) -> List[Dict[str, Any]]:
-        scored: List[tuple[float, Dict[str, Any]]] = []
+        # Dense retrieval is multilingual, while the local lexical scorer is
+        # intentionally lightweight and language-specific.  Once coverage has
+        # resolved the correct page, retain the existing dense ranking when
+        # choosing sections from that page.  This prevents an Arabic query for
+        # an English-only page from falling back to the first chunks merely
+        # because every lexical score is zero.  The dense IDs already came
+        # from the main retrieval pass, so this adds no provider call.
+        dense_rank = {
+            str(chunk_id): rank
+            for rank, chunk_id in enumerate(dense_chunk_ids or [])
+            if str(chunk_id)
+        }
+        scored: List[tuple[int, int, float, Dict[str, Any]]] = []
         chunk_map = getattr(self.vector, "chunk_map", {})
         candidate_chunks = self._coverage_candidates_for_required_page(
             record_type="chunks",
@@ -2734,11 +2747,27 @@ class RoutedHybridRetriever:
                 text,
                 self._source_url_from_record(chunk),
             )
-            scored.append((score, chunk))
-        scored.sort(key=lambda item: (-item[0], str(item[1].get("id") or "")))
+            chunk_id = str(chunk.get("id") or "")
+            rank = dense_rank.get(chunk_id)
+            scored.append(
+                (
+                    0 if rank is not None else 1,
+                    rank if rank is not None else len(dense_rank),
+                    score,
+                    chunk,
+                )
+            )
+        scored.sort(
+            key=lambda item: (
+                item[0],
+                item[1],
+                -item[2],
+                str(item[3].get("id") or ""),
+            )
+        )
         return [
             self._chunk_payload_from_record(chunk, required_page=required_page)
-            for _score, chunk in scored[:limit]
+            for _dense_bucket, _dense_rank, _score, chunk in scored[:limit]
         ]
 
     def _best_required_page_parent(
@@ -2953,6 +2982,7 @@ class RoutedHybridRetriever:
                 query,
                 required_page,
                 limit=chunk_limit,
+                dense_chunk_ids=payload.get("dense_chunk_ids") or [],
             )
             if injected_chunks:
                 payload.setdefault("selected_chunk_ids", [])

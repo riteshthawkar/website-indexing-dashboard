@@ -2197,6 +2197,81 @@ def test_routed_required_page_backfill_bridges_page_alias_to_shared_chunks():
     assert payload["retrieval_documents"][0]["canonical_url"] == canonical_url
 
 
+def test_required_page_backfill_preserves_multilingual_dense_section_rank():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    page_url = "https://preprod.mbzuai.ac.ae/study/phd-programs/doctoral-robotics"
+    revision_id = "document-revision:robotics"
+    overview_id = f"chunk:c650:{revision_id}:00000:overview"
+    outcomes_id = f"chunk:c650:{revision_id}:00001:outcomes"
+    requirements_id = f"chunk:c650:{revision_id}:00002:requirements"
+    retriever.vector = SimpleNamespace(
+        page_card_map={
+            "robotics": {
+                "id": "page-card:robotics",
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "linked_chunk_ids": [overview_id, outcomes_id, requirements_id],
+                "title": "Doctor of Philosophy in Robotics",
+            }
+        },
+        evidence_span_map={},
+        fact_map={},
+        summary_map={},
+        parent_map={},
+        chunk_map={
+            overview_id: {
+                "id": overview_id,
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "section_heading": "Overview",
+                "text": "The program prepares students for robotics research.",
+            },
+            outcomes_id: {
+                "id": outcomes_id,
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "section_heading": "Program learning outcomes",
+                "text": "Graduates formulate and solve robotics research problems.",
+            },
+            requirements_id: {
+                "id": requirements_id,
+                "source_url": page_url,
+                "document_revision_id": revision_id,
+                "section_heading": "Completion requirements",
+                "text": "The minimum degree requirement is 60 credits.",
+            },
+        },
+        # Arabic query against English-only page content has no lexical overlap.
+        _score_text_match=lambda query, text: 0.0,
+    )
+    retriever._coverage_page_records = retriever._build_coverage_page_records()
+    retriever._coverage_page_records_by_url = {
+        page["normalized_url"]: page
+        for page in retriever._coverage_page_records
+    }
+    retriever._coverage_record_indexes = retriever._build_coverage_record_indexes()
+    payload = {
+        "dense_chunk_ids": [requirements_id, outcomes_id],
+        "selected_chunk_ids": [],
+        "selected_fact_ids": [],
+        "selected_evidence_span_ids": [],
+        "retrieval_documents": [],
+        "abstained": False,
+    }
+
+    changed = retriever._augment_payload_for_required_coverage(
+        query="كم عدد الساعات المعتمدة الدنيا لدرجة الدكتوراه في الروبوتات؟",
+        payload=payload,
+        coverage_plan={"required_pages": [page_url]},
+    )
+
+    assert changed is True
+    assert payload["retrieval_documents"][0]["id"] == requirements_id
+    assert payload["selected_chunk_ids"][0] == requirements_id
+
+
 def test_routed_required_page_backfill_injects_complete_parent_for_list_query():
     from pipeline.retrieval.evidence_packer import build_evidence_pack
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
