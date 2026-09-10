@@ -68,37 +68,61 @@ _COLLECTION_QUERY_RE = re.compile(
     r"|(?:اذكر|اعرض|جميع|كل|ما هي|ما عدد|ماهي|المتاحة)",
     re.IGNORECASE,
 )
-_COLLECTION_TARGET_TERMS = {
-    "articles",
-    "centers",
-    "centres",
-    "courses",
-    "degrees",
-    "departments",
-    "divisions",
-    "events",
-    "facilities",
-    "faculty",
-    "institutes",
-    "members",
-    "options",
-    "programs",
-    "requirements",
-    "schools",
-    "services",
-    "أقسام",
-    "اقسام",
-    "الأقسام",
-    "الاقسام",
-    "برامج",
-    "البرامج",
-    "درجات",
-    "الدرجات",
-    "خدمات",
-    "الخدمات",
-    "مرافق",
-    "المرافق",
+_COLLECTION_TARGET_ALIASES = {
+    "article": "article",
+    "articles": "article",
+    "center": "center",
+    "centers": "center",
+    "centre": "center",
+    "centres": "center",
+    "course": "course",
+    "courses": "course",
+    "degree": "degree",
+    "degrees": "degree",
+    "department": "department",
+    "departments": "department",
+    "division": "division",
+    "divisions": "division",
+    "event": "event",
+    "events": "event",
+    "facility": "facility",
+    "facilities": "facility",
+    "faculty": "faculty",
+    "institute": "institute",
+    "institutes": "institute",
+    "member": "member",
+    "members": "member",
+    "option": "option",
+    "options": "option",
+    "program": "program",
+    "programs": "program",
+    "requirement": "requirement",
+    "requirements": "requirement",
+    "school": "school",
+    "schools": "school",
+    "service": "service",
+    "services": "service",
+    "أقسام": "أقسام",
+    "اقسام": "أقسام",
+    "الأقسام": "أقسام",
+    "الاقسام": "أقسام",
+    "برامج": "برامج",
+    "البرامج": "برامج",
+    "درجات": "درجات",
+    "الدرجات": "درجات",
+    "خدمات": "خدمات",
+    "الخدمات": "خدمات",
+    "مرافق": "مرافق",
+    "المرافق": "مرافق",
 }
+def _collection_target_tokens(value: str) -> set[str]:
+    """Normalize singular/plural collection nouns before page-family matching."""
+
+    return {
+        _COLLECTION_TARGET_ALIASES[token]
+        for token in _tokenize(value)
+        if token in _COLLECTION_TARGET_ALIASES
+    }
 
 
 def _with_retriever_backend(config: Dict[str, Any], backend: str) -> Dict[str, Any]:
@@ -1548,9 +1572,7 @@ class RoutedHybridRetriever:
         lower = query.casefold()
         if self._explicit_required_page_markers(query):
             return True
-        if _COLLECTION_QUERY_RE.search(query) and (
-            set(_tokenize(query)) & _COLLECTION_TARGET_TERMS
-        ):
+        if _COLLECTION_QUERY_RE.search(query) and _collection_target_tokens(query):
             # Collection requests have a concrete landing-page target even
             # when the caller does not know its URL. Page Cards resolve that
             # target from the frozen corpus.
@@ -1781,7 +1803,7 @@ class RoutedHybridRetriever:
             score += min(0.84, 0.14 * len(alias_tokens & page_tokens))
             score += min(0.56, 0.18 * len(alias_tokens & identity_tokens))
 
-        collection_targets = query_tokens & _COLLECTION_TARGET_TERMS
+        collection_targets = _collection_target_tokens(query)
         if _COLLECTION_QUERY_RE.search(query) and collection_targets:
             try:
                 path_parts = [
@@ -1791,21 +1813,21 @@ class RoutedHybridRetriever:
                 ]
             except Exception:
                 path_parts = []
-            final_path_tokens = (
-                set(_tokenize(path_parts[-1].replace("-", " ")))
-                if path_parts
-                else set()
+            final_path_targets = _collection_target_tokens(
+                path_parts[-1].replace("-", " ") if path_parts else ""
             )
-            ancestor_path_tokens = set(
-                _tokenize(" ".join(path_parts[:-1]).replace("-", " "))
+            ancestor_path_targets = _collection_target_tokens(
+                " ".join(path_parts[:-1]).replace("-", " ")
             )
-            if collection_targets & final_path_tokens:
+            if collection_targets & final_path_targets:
                 # Prefer the collection landing page over one child that
                 # merely repeats generic words such as "current degree".
                 score += 0.95
-            elif collection_targets & ancestor_path_tokens:
+            elif collection_targets & ancestor_path_targets:
                 score -= 0.28
-            if collection_targets & identity_tokens:
+            if collection_targets & _collection_target_tokens(
+                str(page.get("identity_text") or "")
+            ):
                 score += 0.30
         if any(marker in lower_query for marker in ("page", "homepage", "site", "صفحة", "الصفحة", "موقع", "الموقع")):
             score += min(0.24, 0.08 * float(len(identity_overlap)))
@@ -1937,7 +1959,7 @@ class RoutedHybridRetriever:
         query_tokens = set(_tokenize(query))
         masters_collection_requested = bool(
             _COLLECTION_QUERY_RE.search(query)
-            and {"programs", "degrees"} & query_tokens
+            and {"program", "degree"} & _collection_target_tokens(query)
             and {"master", "masters", "msc"} & query_tokens
         )
         if masters_collection_requested:
@@ -2443,7 +2465,7 @@ class RoutedHybridRetriever:
         scored = [(score, page) for score, page in scored if score >= 0.58]
         scored.sort(key=lambda item: (-item[0], item[1]["normalized_url"]))
         max_pages = 6 if intent == "multi_page_aggregation" else 3
-        collection_targets = set(_tokenize(query)) & _COLLECTION_TARGET_TERMS
+        collection_targets = _collection_target_tokens(query)
         if _COLLECTION_QUERY_RE.search(query) and collection_targets:
             collection_pages = []
             for score, page in scored:
@@ -2455,8 +2477,8 @@ class RoutedHybridRetriever:
                     )
                 except Exception:
                     final_path_part = ""
-                if collection_targets & set(
-                    _tokenize(final_path_part.replace("-", " "))
+                if collection_targets & _collection_target_tokens(
+                    final_path_part.replace("-", " ")
                 ):
                     collection_pages.append((score, page))
             if collection_pages:

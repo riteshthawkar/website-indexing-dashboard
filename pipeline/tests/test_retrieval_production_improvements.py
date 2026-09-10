@@ -1852,7 +1852,7 @@ def test_routed_collection_query_prefers_complete_landing_page_over_child():
         },
     ]
 
-    query = "List all current departments available at the university."
+    query = "List every current department offered at the university."
     plan = retriever._infer_coverage_requirements(
         query,
         retriever._coverage_intent(query, QueryMode.FACT),
@@ -1869,7 +1869,7 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
 
     masters_markers = retriever._explicit_required_page_markers(
-        "List all current master's degree programs offered by MBZUAI."
+        "List every current master's degree program offered by MBZUAI."
     )
     maai_markers = retriever._explicit_required_page_markers(
         "What are MAAI's duration, credits, tuition, and scholarship status?"
