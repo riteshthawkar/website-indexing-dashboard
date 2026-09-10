@@ -1898,6 +1898,9 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     english_divisions_markers = retriever._explicit_required_page_markers(
         "Which divisions does MBZUAI have?"
     )
+    undergraduate_program_markers = retriever._explicit_required_page_markers(
+        "What undergraduate degree options does MBZUAI offer?"
+    )
     admissions_funding_markers = retriever._explicit_required_page_markers(
         "Summarize master's admissions requirements and funding at MBZUAI."
     )
@@ -1910,6 +1913,7 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     assert housing_markers == ["/campus-community/housing"]
     assert arabic_divisions_markers[0] == "/research/our-divisions"
     assert english_divisions_markers[0] == "/research/our-divisions"
+    assert undergraduate_program_markers[0] == "/study/undergraduate-program"
     assert admissions_funding_markers[:2] == [
         "/graduate-masters-admissions",
         "/study/msc-programs",
@@ -1930,6 +1934,7 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
         ),
         "List every current master's degree program offered by the university.",
         "Tell me about master's admissions.",
+        "What documents do I need?",
     ],
 )
 def test_aggregate_program_query_injects_complete_page_parent(query):

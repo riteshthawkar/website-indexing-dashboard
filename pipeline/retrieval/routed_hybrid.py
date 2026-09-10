@@ -50,7 +50,7 @@ logger = logging.getLogger(__name__)
 _ADJUDICATOR_RUNTIME_INIT_LOCK = Lock()
 _AGGREGATE_REQUIRED_PAGE_QUERY_RE = re.compile(
     r"\b(?:requirements|qualifications|roles|responsibilities|features|benefits|"
-    r"differences|criteria|items|articles|entries|listed|shown|displayed|sections|"
+    r"differences|criteria|items|articles|entries|documents?|listed|shown|displayed|sections|"
     r"categories|stages|process|support|services|uses|options|focus areas|"
     r"research interests|hands-on access|offerings|committees|industry engagement|"
     r"divisions|programs|degrees|each|duration|study mode|delivery mode|credit load|"
@@ -2049,6 +2049,16 @@ class RoutedHybridRetriever:
         )
         if divisions_requested:
             markers.append("/research/our-divisions")
+        undergraduate_program_requested = bool(
+            re.search(r"\b(?:undergraduate|bachelor(?:'s)?)\b", lower)
+            and re.search(
+                r"\b(?:programs?|degrees?|options?|offer(?:ed|s)?|study)\b",
+                lower,
+            )
+            and not re.search(r"\badmissions?\b", lower)
+        )
+        if undergraduate_program_requested:
+            markers.append("/study/undergraduate-program")
         query_tokens = set(_tokenize(query))
         masters_collection_requested = bool(
             _COLLECTION_QUERY_RE.search(query)
