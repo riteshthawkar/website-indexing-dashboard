@@ -9196,6 +9196,54 @@ def test_conflicting_navigation_action_cannot_override_explicit_page_requirement
     ]
 
 
+def test_inferred_navigation_action_cannot_override_context_page_requirement():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    admissions_url = (
+        "https://preprod.mbzuai.ac.ae/admissions/graduate-masters-admissions"
+    )
+    coverage_plan = {
+        "required_pages": [admissions_url],
+        "required_pages_source": "context_page+retrieval_payload",
+        "context_page_url": admissions_url,
+    }
+    navigation_plan = {
+        "status": "ready",
+        "confidence": 0.91,
+        "source": "page_graph_navigation_catalog",
+        "goal": "Find the documents needed to apply",
+        "target_page": {
+            "url": "https://preprod.mbzuai.ac.ae/node/281",
+        },
+        "steps": [
+            {
+                "action_id": "page-action:apply-now",
+                "action_type": "apply",
+                "label": "Apply now",
+                "target_url": "https://apply.mbzuai.ac.ae/ApplicantPortal/s",
+            }
+        ],
+        "evidence": {"action_ids": ["page-action:apply-now"]},
+        "warnings": [],
+    }
+
+    changed = retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    )
+
+    assert changed is False
+    assert coverage_plan["required_pages"] == [admissions_url]
+    assert navigation_plan["status"] == "not_requested"
+    assert navigation_plan["target_page"] is None
+    assert navigation_plan["steps"] == []
+    assert navigation_plan["source"] == "context_page_coverage_guard"
+    assert navigation_plan["warnings"] == [
+        "navigation_action_suppressed_by_context_page_requirement"
+    ]
+
+
 def test_catalog_action_named_in_goal_can_resolve_equivalent_page_surface():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

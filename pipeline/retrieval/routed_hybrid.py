@@ -3542,16 +3542,31 @@ class RoutedHybridRetriever:
                     for value in required_pages
                 )
             )
-            if (
-                coverage_plan.get("required_pages_source") == "explicit_markers"
-                and required_pages
+            required_pages_source = str(
+                coverage_plan.get("required_pages_source") or ""
+            ).strip()
+            conflicting_required_page = bool(
+                required_pages
                 and not target_matches_required_page
                 and not target_aliases_required_page
                 and not explicit_action_label_match
+            )
+            suppression_reason = ""
+            if (
+                required_pages_source == "explicit_markers"
+                and conflicting_required_page
             ):
-                # Deterministic page requirements encode an explicit entity or
-                # page named by the user. A semantically similar action on a
-                # different page must not replace that evidence contract.
+                suppression_reason = "explicit_page_requirement"
+            elif (
+                required_pages_source.startswith("context_page")
+                and conflicting_required_page
+            ):
+                suppression_reason = "context_page_requirement"
+            if suppression_reason:
+                # Explicit and page-context requirements are stronger evidence
+                # signals than a semantically similar action inferred on an
+                # unrelated page. Keep the requested page unless the user names
+                # the action label or the navigation target is the same page.
                 if isinstance(navigation_plan, dict):
                     warnings = [
                         str(value)
@@ -3559,11 +3574,15 @@ class RoutedHybridRetriever:
                         if str(value)
                     ]
                     warnings.append(
-                        "navigation_action_suppressed_by_explicit_page_requirement"
+                        f"navigation_action_suppressed_by_{suppression_reason}"
                     )
                     navigation_plan["status"] = "not_requested"
                     navigation_plan["confidence"] = 0.0
-                    navigation_plan["source"] = "explicit_coverage_guard"
+                    navigation_plan["source"] = (
+                        "explicit_coverage_guard"
+                        if suppression_reason == "explicit_page_requirement"
+                        else "context_page_coverage_guard"
+                    )
                     navigation_plan["target_page"] = None
                     navigation_plan["steps"] = []
                     navigation_plan["evidence"] = {
