@@ -1182,6 +1182,7 @@ def build_evidence_pack(
         )
     )
     required_page_set = set(required_pages)
+    aggregate_parent_page_count = max(1, len(required_pages))
 
     candidates: List[Tuple[float, str, Dict[str, Any]]] = []
     validated_email_targets = _validated_navigation_email_targets(result)
@@ -1229,6 +1230,11 @@ def build_evidence_pack(
             )
         )
     candidates.sort(key=lambda item: (-item[0], _doc_id(item[2])))
+    aggregate_candidate_ids = {
+        _doc_id(doc)
+        for _score, _kind, doc in candidates
+        if bool(doc.get("coverage_aggregate")) and _doc_id(doc)
+    }
 
     selected_candidate_keys: set[str] = set()
     media_reserve = 3 if max_items >= 6 else 2 if max_items >= 4 else 1
@@ -1278,16 +1284,21 @@ def build_evidence_pack(
                 query=query,
                 max_chars=item_char_limit,
             )
-        elif (
-            kind == "chunk"
-            and bool(doc.get("coverage_aggregate"))
-            and intent in {"multi_page_aggregation", "large_page"}
-        ):
-            # Collection parents begin with a compact page synopsis whose
-            # section inventory is complete. Query-centering this text can
-            # jump into a later child and silently drop an early list item.
-            item_char_limit = min(item_char_limit, 2600)
-            item_text = item_text[:item_char_limit]
+        elif kind == "chunk" and bool(doc.get("coverage_aggregate")):
+            # A required complete-page parent is the only record guaranteed to
+            # retain every sibling section. Preserve it before isolated facts,
+            # including for broad-synthesis and ordinary collection intents.
+            # With multiple required pages, split the total budget fairly and
+            # center each bounded excerpt on the requested facets.
+            aggregate_limit = max(
+                2600,
+                min(7000, max_chars // aggregate_parent_page_count),
+            )
+            item_char_limit = min(item_char_limit, aggregate_limit)
+            if len(item_text) > item_char_limit and aggregate_parent_page_count > 1:
+                item_text = _query_dense_excerpt(item_text, query, item_char_limit)
+            else:
+                item_text = item_text[:item_char_limit]
         elif kind == "chunk" and _MULTI_DETAIL_QUERY_RE.search(str(query or "")):
             # A complete structured block is safer than a short extracted span,
             # but sending a full page chunk adds latency and the answer runtime
@@ -1411,22 +1422,21 @@ def build_evidence_pack(
                 break
 
     for required_page in required_pages:
-        if intent in {"multi_page_aggregation", "large_page"}:
-            aggregate_added = False
-            for _score, kind, doc in candidates:
-                if (
-                    bool(doc.get("coverage_aggregate"))
-                    and _candidate_matches_requirement(
-                        doc,
-                        required_page,
-                        page=True,
-                    )
-                    and _append_candidate(kind, doc)
-                ):
-                    aggregate_added = True
-                    break
-            if aggregate_added:
-                continue
+        aggregate_added = False
+        for _score, kind, doc in candidates:
+            if (
+                bool(doc.get("coverage_aggregate"))
+                and _candidate_matches_requirement(
+                    doc,
+                    required_page,
+                    page=True,
+                )
+                and _append_candidate(kind, doc)
+            ):
+                aggregate_added = True
+                break
+        if aggregate_added:
+            continue
         for _score, kind, doc in candidates:
             if _candidate_matches_requirement(doc, required_page, page=True) and _append_candidate(kind, doc):
                 break
@@ -1519,6 +1529,9 @@ def build_evidence_pack(
                 return index
         return 999
 
+    def _aggregate_sort_rank(item: Dict[str, Any]) -> int:
+        return 0 if str(item.get("id") or "") in aggregate_candidate_ids else 1
+
     coverage_first_intent = intent in {"broad_synthesis", "multi_page_aggregation", "large_page"} or len(required_pages) > 1
     if coverage_first_intent:
         if explicit_media_query:
@@ -1535,6 +1548,7 @@ def build_evidence_pack(
                 key=lambda item: (
                     _required_page_sort_rank(item),
                     _required_entity_sort_rank(item),
+                    _aggregate_sort_rank(item),
                     evidence_order.get(str(item.get("kind") or ""), 99),
                     int(item.get("rank") or 0),
                 )
@@ -1553,6 +1567,7 @@ def build_evidence_pack(
             items.sort(
                 key=lambda item: (
                     _required_page_sort_rank(item),
+                    _aggregate_sort_rank(item),
                     evidence_order.get(str(item.get("kind") or ""), 99),
                     _required_entity_sort_rank(item),
                     int(item.get("rank") or 0),

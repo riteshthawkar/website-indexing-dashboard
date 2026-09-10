@@ -10,6 +10,8 @@ _WORKFLOW_RE = re.compile(
     r"\b(?:apply|applying|application process|application steps?|submit(?:ting)? (?:an? )?application|"
     r"start(?:ing)? (?:an? )?(?:\w+\s+){0,4}application|"
     r"(?:undergraduate|graduate|phd|doctoral|masters?|msc) application|"
+    r"(?:undergraduate|graduate|phd|doctoral|masters?|msc)(?:['’]s)? admissions?|"
+    r"admissions? (?:requirements?|eligibility|criteria|documents?|materials?|process|steps?)|"
     r"admission process|admissions process)\b"
     r"|(?:كيفية التقديم|كيف\s+(?:أ|ا)?قدّم|كيف\s+(?:أ|ا)?قدم|التقديم|إجراءات القبول|"
     r"اجراءات القبول|طلب الالتحاق|تقديم الطلب)",

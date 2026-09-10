@@ -20,6 +20,7 @@ from pipeline.core.evidence_adjudicator import (
 )
 from pipeline.core.admissions_routing import (
     admissions_surface_preference,
+    admissions_workflow_audience,
     canonical_admissions_marker,
 )
 from pipeline.core.navigation_intent import normalize_navigation_context
@@ -1949,9 +1950,19 @@ class RoutedHybridRetriever:
             )
         if "office of the registrar" in lower or "مكتب التسجيل" in lower:
             markers.append("/student-resources/office-of-the-registrar")
+        careers_division_scope = bool(
+            re.search(
+                r"\b(?:career|careers|job|jobs|vacanc(?:y|ies)|open positions?)\b"
+                r"|(?:الوظائف|وظائف|الشواغر|شواغر|صفحة الوظائف)",
+                lower,
+            )
+        )
         divisions_requested = bool(
-            re.search(r"\b(?:our|research|university) divisions?\b", lower)
-            or re.search(r"(?:أقسامها|اقسامها|الأقسام|الاقسام)", lower)
+            not careers_division_scope
+            and (
+                re.search(r"\b(?:our|research|university) divisions?\b", lower)
+                or re.search(r"(?:أقسامها|اقسامها|الأقسام|الاقسام|أقسام|اقسام)", lower)
+            )
         )
         institutes_requested = bool(
             re.search(r"\b(?:research )?institutes?\b", lower)
@@ -1973,6 +1984,16 @@ class RoutedHybridRetriever:
             and {"master", "masters", "msc"} & query_tokens
         )
         if masters_collection_requested:
+            markers.append("/study/msc-programs")
+        admissions_audience = admissions_workflow_audience(query)
+        if admissions_audience == "masters" and re.search(
+            r"\b(?:scholarships?|funding|funded|tuition|stipend|accommodation|healthcare|student visa)\b"
+            r"|(?:المنح|التمويل|الرسوم|السكن|الرعاية الصحية|التأشيرة)",
+            lower,
+        ):
+            # Requirements and funding intentionally live on separate current
+            # pages. Require both sources so a multi-aspect answer cannot be
+            # satisfied by an old intake announcement or a generic FAQ.
             markers.append("/study/msc-programs")
         if institutes_requested and (
             "research" in lower

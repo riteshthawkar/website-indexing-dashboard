@@ -1877,6 +1877,12 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     housing_markers = retriever._explicit_required_page_markers(
         "هل أحتاج إلى إحضار مسحوق الغسيل للسكن الجامعي؟"
     )
+    arabic_divisions_markers = retriever._explicit_required_page_markers(
+        "ما هي أقسام جامعة محمد بن زايد للذكاء الاصطناعي؟"
+    )
+    admissions_funding_markers = retriever._explicit_required_page_markers(
+        "Summarize master's admissions requirements and funding at MBZUAI."
+    )
 
     assert masters_markers[0] == "/study/msc-programs"
     assert maai_markers[0] == (
@@ -1884,6 +1890,11 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     )
     assert "/study/msc-programs" in maai_markers
     assert housing_markers == ["/campus-community/housing"]
+    assert arabic_divisions_markers[0] == "/research/our-divisions"
+    assert admissions_funding_markers[:2] == [
+        "/graduate-masters-admissions",
+        "/study/msc-programs",
+    ]
     assert {"laundry", "detergent", "housing"} <= set(
         _semantic_query_alias_tokens(
             "هل أحتاج إلى إحضار مسحوق الغسيل للسكن الجامعي؟"
@@ -2505,6 +2516,54 @@ def test_evidence_pack_reserves_complete_collection_parent_before_list_fragments
     assert pack["items"][0]["id"] == "parent:masters:page"
     assert pack["items"][0]["text"].startswith(complete_inventory)
     assert "Computational Biology" in pack["items"][0]["text"]
+
+
+def test_evidence_pack_preserves_complete_parent_for_broad_collection_synthesis():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    page_url = "https://example.edu/research/divisions"
+    parent_text = (
+        "TITLE: Our divisions CONTENT_WINDOWS: "
+        "## Division of Biological and Life Sciences "
+        + ("Biology context. " * 100)
+        + "## Division of Computing and Mathematical Sciences "
+        + ("Computing context. " * 100)
+        + "## Division of Undergraduate Studies Undergraduate context."
+    )
+    result = {
+        "fact_documents": [
+            {
+                "id": "fact-intro",
+                "text": "The university has several interdisciplinary divisions.",
+                "source_url": page_url,
+            }
+        ],
+        "retrieval_documents": [
+            {
+                "id": "parent:divisions:page",
+                "text": parent_text,
+                "source_url": page_url,
+                "coverage_aggregate": True,
+            }
+        ],
+    }
+
+    pack = build_evidence_pack(
+        query="Which divisions does the university have?",
+        result=result,
+        max_items=3,
+        max_chars=7000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [page_url],
+        },
+    )
+
+    assert pack["items"][0]["id"] == "parent:divisions:page"
+    assert "Division of Biological and Life Sciences" in pack["items"][0]["text"]
+    assert "Division of Computing and Mathematical Sciences" in pack["items"][0]["text"]
+    assert "Division of Undergraduate Studies" in pack["items"][0]["text"]
 
 
 def test_evidence_pack_reserves_leaf_chunk_for_required_multi_detail_page():

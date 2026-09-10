@@ -12,6 +12,12 @@ def test_admissions_workflow_classifier_covers_degree_levels_and_arabic():
     assert canonical_admissions_marker("How can I start an undergraduate application?") == (
         "/admissions/undergraduate-admissions"
     )
+    assert admissions_workflow_audience("Tell me about master's admissions at MBZUAI.") == (
+        "masters"
+    )
+    assert canonical_admissions_marker(
+        "What are the master's admissions requirements?"
+    ) == "/graduate-masters-admissions"
 
 
 def test_non_admissions_apply_language_does_not_force_admissions_pages():
