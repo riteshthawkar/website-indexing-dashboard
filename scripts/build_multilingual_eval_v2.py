@@ -718,7 +718,13 @@ def _task(
     packs: Sequence[Dict[str, Any]],
     cross_lingual: bool = False,
     navigation: bool = False,
+    answer_source_indexes: Sequence[int] | None = None,
 ) -> Dict[str, Any]:
+    normalized_answer_source_indexes = list(answer_source_indexes or [])
+    if any(index < 0 or index >= len(packs) for index in normalized_answer_source_indexes):
+        raise ValueError(
+            f"Task {task_id} has an answer source index outside its source packs"
+        )
     required_action_ids: List[str] = []
     if navigation:
         actions = [action for pack in packs for action in (pack.get("actions") or [])]
@@ -760,6 +766,7 @@ def _task(
         "source_type": source_type,
         "cross_lingual": bool(cross_lingual),
         "navigation": bool(navigation),
+        "answer_source_indexes": normalized_answer_source_indexes,
         "required_action_ids": required_action_ids,
         "sources": list(packs),
     }
@@ -1203,7 +1210,19 @@ def build_task_plan(catalog: Mapping[str, Any]) -> List[Dict[str, Any]]:
     for index, pair in enumerate(synthesis_sources["english_mixed"], start=1):
         tasks.append(_task(f"en-mixed-synthesis-{index:03d}", language="English", query_type="synthesis", source_type="mixed", packs=pair, cross_lingual=any(source["language"] != "English" for source in pair)))
     for index, pair in enumerate(synthesis_sources["arabic"], start=1):
-        tasks.append(_task(f"ar-synthesis-{index:03d}", language="Arabic", query_type="synthesis", source_type="webpage", packs=pair))
+        tasks.append(
+            _task(
+                f"ar-synthesis-{index:03d}",
+                language="Arabic",
+                query_type="synthesis",
+                source_type="webpage",
+                packs=pair,
+                # This case asks only for admissions facts. Keep the program
+                # overview as a graph/retrieval requirement without forcing an
+                # unrelated citation into the generated answer.
+                answer_source_indexes=(0,) if index == 1 else None,
+            )
+        )
     for index, pair in enumerate(synthesis_sources["cross_arabic"], start=1):
         tasks.append(_task(f"ar-cross-synthesis-{index:03d}", language="Arabic", query_type="synthesis", source_type="webpage", packs=pair, cross_lingual=True))
     for index, pair in enumerate(synthesis_sources["arabic_mixed"], start=1):
@@ -1532,6 +1551,18 @@ def _normalize_generated_item(task: Mapping[str, Any], item: Mapping[str, Any]) 
             if str(source.get("source_url") or "")
         )
     )
+    answer_source_indexes = list(task.get("answer_source_indexes") or [])
+    answer_source_urls = (
+        list(
+            dict.fromkeys(
+                str(task["sources"][index].get("source_url") or "")
+                for index in answer_source_indexes
+                if str(task["sources"][index].get("source_url") or "")
+            )
+        )
+        if answer_source_indexes
+        else source_urls
+    )
     source_hosts = list(dict.fromkeys(_host(url) for url in source_urls if _host(url)))
     tags = [
         SUITE_NAME,
@@ -1565,8 +1596,8 @@ def _normalize_generated_item(task: Mapping[str, Any], item: Mapping[str, Any]) 
         "task_id": task_id,
         "difficulty": _clean(item.get("difficulty")) or "medium",
         "evidence_quotes": normalized_evidence,
-        "expected_reference_urls": source_urls,
-        "expected_citation_urls": source_urls,
+        "expected_reference_urls": answer_source_urls,
+        "expected_citation_urls": answer_source_urls,
         "required_pages": source_urls,
         "min_distinct_sources": len(source_urls) if len(source_urls) > 1 else 0,
         "answer_must_include": _as_list(item.get("answer_must_include")),

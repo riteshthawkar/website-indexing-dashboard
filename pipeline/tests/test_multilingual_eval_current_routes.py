@@ -166,3 +166,29 @@ def test_navigation_task_accepts_visually_indistinguishable_actions():
     )
 
     assert task["required_action_ids"] == ["action:programs", "action:visitor"]
+
+
+def test_answer_citation_scope_can_be_narrower_than_retrieval_coverage():
+    module = _module()
+    sources = [
+        {
+            "source_key": "requirements",
+            "source_url": "https://example.test/admissions",
+        },
+        {
+            "source_key": "overview",
+            "source_url": "https://example.test/program",
+        },
+    ]
+
+    task = module._task(
+        "ar-synthesis-001",
+        language="Arabic",
+        query_type="synthesis",
+        source_type="webpage",
+        packs=sources,
+        answer_source_indexes=(0,),
+    )
+
+    assert task["sources"] == sources
+    assert task["answer_source_indexes"] == [0]
