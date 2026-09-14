@@ -22,6 +22,19 @@ def test_admissions_workflow_classifier_covers_degree_levels_and_arabic():
     ) == "/graduate-masters-admissions"
 
 
+@pytest.mark.parametrize(
+    "query",
+    [
+        "What are the current general admission requirements for master's and PhD programs at MBZUAI?",
+        "ما متطلبات القبول العامة الحالية لبرامج الماجستير والدكتوراه في جامعة محمد بن زايد للذكاء الاصطناعي؟",
+        "ما متطلبات القبول لبرامج الماجستير والدكتوراه؟",
+    ],
+)
+def test_combined_masters_and_phd_requirements_route_to_both_graduate_surfaces(query):
+    assert admissions_workflow_audience(query) == "graduate"
+    assert canonical_admissions_marker(query) == "/admissions"
+
+
 def test_non_admissions_apply_language_does_not_force_admissions_pages():
     assert admissions_workflow_audience(
         "Who can apply for onsite access to the MBZUAI Library?"

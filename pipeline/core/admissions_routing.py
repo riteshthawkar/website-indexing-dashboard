@@ -41,7 +41,7 @@ _ARABIC_ADMISSIONS_TOPIC_RE = re.compile(
 )
 _ARABIC_ADMISSIONS_DETAIL_RE = re.compile(
     r"(?:الحد\s+الادني|المعدل|المستندات?|الوثائق?|الشهادات?|"
-    r"المتطلبات?|الشروط?|المعايير|معايير|الاهليه|المهارات?|مهارات|"
+    r"(?:ال)?متطلب(?:ات)?|الشروط?|المعايير|معايير|الاهليه|المهارات?|مهارات|"
     r"البرمجه|البرمجة|الخبره|الخبرة)"
 )
 
@@ -95,9 +95,20 @@ def admissions_workflow_audience(query: Any) -> str:
         return ""
     if re.search(r"\b(?:undergraduate|bachelor|bsc|b\.sc)\b|(?:البكالوريوس|الجامعية)", text):
         return "undergraduate"
-    if re.search(r"\b(?:phd|ph\.d|doctorate|doctoral)\b|(?:الدكتوراه|دكتوراه)", text):
+    phd_requested = bool(
+        re.search(r"\b(?:phd|ph\.d|doctorate|doctoral)\b|(?:الدكتوراه|دكتوراه)", text)
+    )
+    masters_requested = bool(
+        re.search(r"\b(?:master|masters|msc|m\.sc)\b|(?:الماجستير|ماجستير)", text)
+    )
+    if phd_requested and masters_requested:
+        # A comparison or shared-requirements question spans both graduate
+        # admissions surfaces; routing it as Ph.D.-only silently drops the
+        # master's evidence.
+        return "graduate"
+    if phd_requested:
         return "phd"
-    if re.search(r"\b(?:master|masters|msc|m\.sc)\b|(?:الماجستير|ماجستير)", text):
+    if masters_requested:
         return "masters"
     if re.search(r"\bgraduate\b|(?:الدراسات العليا|برامج الدراسات العليا)", text):
         return "graduate"

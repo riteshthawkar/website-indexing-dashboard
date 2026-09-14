@@ -1907,6 +1907,9 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     admissions_funding_markers = retriever._explicit_required_page_markers(
         "Summarize master's admissions requirements and funding at MBZUAI."
     )
+    combined_graduate_markers = retriever._explicit_required_page_markers(
+        "ما متطلبات القبول العامة الحالية لبرامج الماجستير والدكتوراه في جامعة محمد بن زايد للذكاء الاصطناعي؟"
+    )
 
     assert masters_markers[0] == "/study/msc-programs"
     assert conversational_masters_markers[0] == "/study/msc-programs"
@@ -1921,6 +1924,10 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     assert admissions_funding_markers[:2] == [
         "/graduate-masters-admissions",
         "/study/msc-programs",
+    ]
+    assert combined_graduate_markers[:2] == [
+        "/graduate-masters-admissions",
+        "/admissions/graduate-phd-admissions",
     ]
     assert {"laundry", "detergent", "housing"} <= set(
         _semantic_query_alias_tokens(
