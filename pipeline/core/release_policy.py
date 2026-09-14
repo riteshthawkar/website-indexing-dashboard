@@ -10,7 +10,7 @@ from pipeline.core.io import sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v4"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v5"
 PRODUCTION_RETRIEVAL_DATASET = (
     PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
 )
@@ -25,11 +25,11 @@ PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
     "2f34a329411d5de5a7749ac64c0906a1b9bccf237f45cd69ad89b0f3ddcd0db2"
 )
 PRODUCTION_RETRIEVAL_GATES_SHA256 = (
-    "ba221e2d2507582d1566270f5116e423fefce21639cfb23c5773819bfad91128"
+    "d8f7dc9127492df69cc928a7036060da04a816c11fc1224589a477370c823056"
 )
 PRODUCTION_ANSWER_DATASET_SHA256 = PRODUCTION_RETRIEVAL_DATASET_SHA256
 PRODUCTION_ANSWER_GATES_SHA256 = (
-    "94fd1df2f00eef43f1fa957bb82147fb08be896f1a474f91b8837b74c92913eb"
+    "7eaea59fdde7c6e6ffe2cf470554f29be15540b31ddec8f5f2109208ad90fec5"
 )
 PRODUCTION_MIN_RETRIEVAL_QUERIES = 160
 PRODUCTION_MIN_ANSWER_QUERIES = 160
@@ -170,6 +170,9 @@ def validate_production_eval_manifest(
     allow_answer_waiver: bool = False,
 ) -> list[str]:
     errors: list[str] = []
+    if allow_answer_waiver:
+        errors.append("Canonical production answer readiness cannot be waived")
+        allow_answer_waiver = False
     expected_retrieval = production_eval_manifest_metadata(answer=False)
     expected_answer = production_eval_manifest_metadata(answer=True)
     for label, payload, expected in (

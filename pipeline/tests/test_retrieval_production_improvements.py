@@ -4293,11 +4293,114 @@ def test_current_multisource_markers_cover_research_admissions_and_student_suppo
     assert "governance_structure.pdf" in retriever._explicit_required_page_markers(
         "How does the chair's biography relate to university governance?"
     )
-    assert (
-        "mbzuai_research_showcase_20250417-final.pdf"
-        in retriever._explicit_required_page_markers(
+    assert set(
+        retriever._explicit_required_page_markers(
             "How do the divisions and research showcase describe innovation?"
         )
+    ) >= {
+        "/research/our-divisions",
+        "mbzuai_research_showcase_20250417-final.pdf",
+    }
+
+
+def test_multisource_coverage_cannot_be_complete_with_only_one_required_source():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.unsupported_intent_guard_enabled = False
+    divisions_url = "https://preprod.mbzuai.ac.ae/research/our-divisions"
+    showcase_url = (
+        "https://staticcdn.mbzuai.ac.ae/mbzuaiwpprd01/2025/04/"
+        "MBZUAI_Research_Showcase_20250417-Final.pdf"
+    )
+    retriever._coverage_page_records = [
+        {
+            "source_url": divisions_url,
+            "normalized_url": retriever._normalize_source_url(divisions_url),
+        },
+        {
+            "source_url": showcase_url,
+            "normalized_url": retriever._normalize_source_url(showcase_url),
+        },
+    ]
+
+    plan = retriever._coverage_plan_for_result(
+        query=(
+            "How do MBZUAI’s divisions and the research showcase together describe "
+            "the university’s approach to research and innovation?"
+        ),
+        payload={
+            "selected_chunk_ids": ["showcase-chunk"],
+            "retrieval_documents": [
+                {"id": "showcase-chunk", "source_url": showcase_url, "text": "Research showcase"}
+            ],
+        },
+        mode=QueryMode.SYNTHESIS,
+    )
+
+    assert plan["required_pages_source"] == "explicit_markers"
+    assert set(plan["required_pages"]) == {divisions_url, showcase_url}
+    assert plan["coverage_status"] == "partial"
+
+
+def test_arabic_undergraduate_details_require_the_current_admissions_page():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.unsupported_intent_guard_enabled = False
+    admissions_url = (
+        "https://preprod.mbzuai.ac.ae/ar/admissions-aid/undergraduate-admissions"
+    )
+    unrelated_url = "https://preprod.mbzuai.ac.ae/ar/news/ai-reach"
+    retriever._coverage_page_records = [
+        {
+            "source_url": admissions_url,
+            "normalized_url": retriever._normalize_source_url(admissions_url),
+        },
+        {
+            "source_url": unrelated_url,
+            "normalized_url": retriever._normalize_source_url(unrelated_url),
+        },
+    ]
+
+    plan = retriever._coverage_plan_for_result(
+        query=(
+            "ما الحد الأدنى للمعدل التراكمي وما المستندات المطلوبة "
+            "للتقديم لبرنامج البكالوريوس؟"
+        ),
+        payload={
+            "selected_chunk_ids": ["news-chunk"],
+            "retrieval_documents": [
+                {"id": "news-chunk", "source_url": unrelated_url, "text": "خبر جامعي"}
+            ],
+        },
+        mode=QueryMode.SYNTHESIS,
+    )
+
+    assert plan["required_pages"] == [admissions_url]
+    assert plan["required_pages_source"] == "explicit_markers"
+    assert plan["coverage_status"] == "partial"
+
+
+def test_undergraduate_admissions_route_aliases_form_one_page_family():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    legacy_url = "https://preprod.mbzuai.ac.ae/admissions/undergraduate-admissions"
+    current_url = "https://preprod.mbzuai.ac.ae/admissions-aid/undergraduate-admissions"
+    arabic_url = "https://preprod.mbzuai.ac.ae/ar/admissions-aid/undergraduate-admissions"
+    marker = "/admissions-aid/undergraduate-admissions"
+
+    assert retriever._coverage_marker_matches(marker, legacy_url)
+    assert retriever._coverage_marker_matches(marker, current_url)
+    assert retriever._coverage_marker_matches(marker, arabic_url)
+    assert retriever._coverage_page_family_key(legacy_url) == (
+        retriever._coverage_page_family_key(current_url)
+    )
+    assert retriever._coverage_page_family_key(current_url) == (
+        retriever._coverage_page_family_key(arabic_url)
     )
 
 
@@ -7086,6 +7189,22 @@ def test_promotion_revalidates_release_manifest_integrity(tmp_path):
     with pytest.raises(ValueError, match="non-empty waiver reason"):
         promote_release_manifest(manifest_path=manifest_path, active_release_file=active_path)
 
+    invalid = json.loads(json.dumps(valid))
+    invalid["schema_version"] = 2
+    invalid["config_name"] = "mbzuai_production"
+    invalid["status"] = "passed_with_waiver"
+    invalid["answer_evaluation"].update(
+        {
+            "query_count": 0,
+            "skipped": True,
+            "waived": True,
+            "waiver_reason": "urgent production release",
+        }
+    )
+    atomic_write_json(manifest_path, invalid)
+    with pytest.raises(ValueError, match="Canonical production answer readiness cannot be waived"):
+        promote_release_manifest(manifest_path=manifest_path, active_release_file=active_path)
+
 
 def test_release_check_rejects_modern_upload_manifest_that_differs_from_run_snapshot(tmp_path, monkeypatch):
     from pipeline.core import release
@@ -7346,6 +7465,26 @@ def test_retrieval_cache_fingerprint_includes_serving_implementation(monkeypatch
     )
 
     assert first != second
+
+
+def test_serving_contract_fingerprint_tracks_admissions_routing_code():
+    from pipeline.core.config import production_serving_contract_payload
+
+    payload = production_serving_contract_payload(
+        {
+            "embedder": {
+                "model": "gemini-embedding-2",
+                "output_dimensionality": 1536,
+            },
+            "retrieval": {"retriever_backend": "routed_hybrid"},
+        }
+    )
+
+    admissions_digest = payload["implementation_sha256"].get(
+        "core/admissions_routing.py"
+    )
+    assert isinstance(admissions_digest, str)
+    assert len(admissions_digest) == 64
 
 
 def test_retrieval_eval_expands_gold_ids_from_expected_source_urls(tmp_path):

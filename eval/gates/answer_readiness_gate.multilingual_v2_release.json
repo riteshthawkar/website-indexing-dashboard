@@ -145,5 +145,23 @@
       "pass_rate": {"min": 0.8},
       "llm_completeness_mean": {"min": 0.78}
     }
+  },
+  "per_query": {
+    "critical-grounding-regressions": {
+      "where": {
+        "id": [
+          "mlv2-ar-synthesis-001-64896724",
+          "mlv2-ar-synthesis-005-d033abb3",
+          "mlv2-en-mixed-synthesis-001-f514864f"
+        ]
+      },
+      "min_queries": 3,
+      "metrics": {
+        "pass_score": {"min": 1.0, "max_failures": 0},
+        "expected_reference_url_pass": {"min": 1.0, "max_failures": 0},
+        "must_include_pass": {"min": 1.0, "max_failures": 0},
+        "llm_judge_pass": {"min": 1.0, "max_failures": 0}
+      }
+    }
   }
 }

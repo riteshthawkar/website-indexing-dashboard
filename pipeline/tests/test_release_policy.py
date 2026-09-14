@@ -98,3 +98,27 @@ def test_production_evaluation_manifest_rejects_judge_provider_fallback() -> Non
     errors = validate_production_eval_manifest(retrieval, answer)
 
     assert any("llm_judge" in error for error in errors)
+
+
+def test_production_evaluation_manifest_cannot_waive_answer_readiness() -> None:
+    retrieval = {
+        **production_eval_manifest_metadata(answer=False),
+        "query_count": PRODUCTION_MIN_RETRIEVAL_QUERIES,
+    }
+    answer = {
+        **production_eval_manifest_metadata(answer=True),
+        "query_count": 0,
+        "skipped": True,
+        "waived": True,
+        "waiver_reason": "urgent release",
+        "llm_judge": {},
+    }
+
+    errors = validate_production_eval_manifest(
+        retrieval,
+        answer,
+        allow_answer_waiver=True,
+    )
+
+    assert any("cannot be waived" in error for error in errors)
+    assert any(f"at least {PRODUCTION_MIN_ANSWER_QUERIES}" in error for error in errors)

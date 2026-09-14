@@ -33,16 +33,62 @@ _DESCRIPTIVE_APPLY_RE = re.compile(
     r"\b(?:requirements?|rules?|conditions?|policies|fees?)\s+apply\s+to\b",
     flags=re.IGNORECASE,
 )
+_ARABIC_DIACRITICS_RE = re.compile(
+    r"[\u0610-\u061a\u0640\u064b-\u065f\u0670\u06d6-\u06ed]"
+)
+_ARABIC_ADMISSIONS_TOPIC_RE = re.compile(
+    r"(?:القبول|التقديم|طلب\s+الالتحاق|الالتحاق|التسجيل)"
+)
+_ARABIC_ADMISSIONS_DETAIL_RE = re.compile(
+    r"(?:الحد\s+الادني|المعدل|المستندات?|الوثائق?|الشهادات?|"
+    r"المتطلبات?|الشروط?|المعايير|معايير|الاهليه)"
+)
+
+
+def _routing_text(query: Any) -> str:
+    """Return query text plus safe Arabic-normalized routing aliases.
+
+    Arabic conjunctions and prepositions attach to nouns. Adding de-prefixed
+    aliases lets general intent rules recognize forms such as ``للتقديم`` and
+    ``والقبول`` without maintaining a phrase list for every surface form.
+    """
+
+    text = " ".join(str(query or "").split()).casefold()
+    if not re.search(r"[\u0600-\u06ff]", text):
+        return text
+
+    normalized = _ARABIC_DIACRITICS_RE.sub("", text).translate(
+        str.maketrans({"أ": "ا", "إ": "ا", "آ": "ا", "ٱ": "ا", "ى": "ي"})
+    )
+    aliases: list[str] = []
+    for token in re.findall(r"[\u0621-\u064a]+", normalized):
+        if token.startswith(("وال", "فال", "بال", "كال")) and len(token) > 4:
+            aliases.append(token[1:])
+        if token.startswith("لل") and len(token) > 3:
+            aliases.append("ال" + token[2:])
+    return " ".join(dict.fromkeys((text, normalized, *aliases)))
 
 
 def admissions_workflow_audience(query: Any) -> str:
     """Classify an application-process query without treating news as workflow."""
 
-    text = " ".join(str(query or "").split()).casefold()
+    text = _routing_text(query)
     workflow_match = _WORKFLOW_RE.search(text)
-    if not text or not workflow_match or _NON_ADMISSIONS_APPLICATION_RE.search(text):
+    arabic_detail_request = bool(
+        _ARABIC_ADMISSIONS_TOPIC_RE.search(text)
+        and _ARABIC_ADMISSIONS_DETAIL_RE.search(text)
+    )
+    if (
+        not text
+        or (not workflow_match and not arabic_detail_request)
+        or _NON_ADMISSIONS_APPLICATION_RE.search(text)
+    ):
         return ""
-    if workflow_match.group(0).casefold() == "apply" and _DESCRIPTIVE_APPLY_RE.search(text):
+    if (
+        workflow_match
+        and workflow_match.group(0).casefold() == "apply"
+        and _DESCRIPTIVE_APPLY_RE.search(text)
+    ):
         # “Requirements apply to undergraduate applicants” describes scope;
         # it is not a request to perform the application workflow.
         return ""
@@ -68,7 +114,7 @@ def canonical_admissions_marker(query: Any) -> str:
     return {
         "phd": "/admissions/graduate-phd-admissions",
         "masters": "/graduate-masters-admissions",
-        "undergraduate": "/admissions/undergraduate-admissions",
+        "undergraduate": "/admissions-aid/undergraduate-admissions",
         "graduate": "/admissions",
         "generic": "/admissions",
     }.get(audience, "")
@@ -103,6 +149,7 @@ def admissions_surface_preference(
         "phd": ("/admissions/graduate-phd-admissions",),
         "masters": ("/graduate-masters-admissions",),
         "undergraduate": (
+            "/admissions-aid/undergraduate-admissions",
             "/admissions/undergraduate-admissions",
             "/undergraduate-admissions",
         ),

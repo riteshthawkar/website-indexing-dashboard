@@ -82,6 +82,7 @@ _VECTOR_STORE_RUNTIME_ONLY_KEYS = {
     "ingest_application_name",
 }
 _SERVING_IMPLEMENTATION_FILES = (
+    "core/admissions_routing.py",
     "core/evidence_adjudicator.py",
     "core/navigation_intent.py",
     "core/query_expansion.py",

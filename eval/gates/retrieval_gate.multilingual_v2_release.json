@@ -153,5 +153,23 @@
       "no_answer_violation_rate": {"max": 0.0},
       "unsupported_abstention_rate": {"min": 1.0}
     }
+  },
+  "per_query": {
+    "critical-grounding-regressions": {
+      "where": {
+        "id": [
+          "mlv2-ar-synthesis-001-64896724",
+          "mlv2-ar-synthesis-005-d033abb3",
+          "mlv2-en-mixed-synthesis-001-f514864f"
+        ]
+      },
+      "min_queries": 3,
+      "metrics": {
+        "required_page_coverage": {"min": 1.0, "max_failures": 0},
+        "source_identity_recall_at_10": {"min": 1.0, "max_failures": 0},
+        "multi_page_coverage_rate": {"min": 1.0, "max_failures": 0},
+        "abstention_correct": {"min": 1.0, "max_failures": 0}
+      }
+    }
   }
 }

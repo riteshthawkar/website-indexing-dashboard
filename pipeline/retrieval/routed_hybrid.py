@@ -75,6 +75,13 @@ _BROAD_OVERVIEW_QUERY_RE = re.compile(
     r"|(?:أخبرني عن|اخبرني عن|حدثني عن|نبذة عن|معلومات عن|اشرح)",
     re.IGNORECASE,
 )
+_UNDERGRADUATE_ADMISSIONS_PATH_ALIASES = frozenset(
+    {
+        "/undergraduate-admissions",
+        "/admissions/undergraduate-admissions",
+        "/admissions-aid/undergraduate-admissions",
+    }
+)
 _COLLECTION_TARGET_ALIASES = {
     "article": "article",
     "articles": "article",
@@ -1293,6 +1300,8 @@ class RoutedHybridRetriever:
         except Exception:
             return normalized
         family_path = re.sub(r"^/ar(?=/|$)", "", parsed.path or "")
+        if family_path.rstrip("/") in _UNDERGRADUATE_ADMISSIONS_PATH_ALIASES:
+            family_path = "/admissions-aid/undergraduate-admissions"
         return f"{parsed.scheme}://{parsed.netloc}{family_path}".rstrip("/")
 
     def _coverage_page_recency_key(self, value: Any) -> tuple[int, int, int]:
@@ -1373,7 +1382,15 @@ class RoutedHybridRetriever:
                 return False
             language_neutral_path = re.sub(r"^/ar(?=/|$)", "", path)
             marker_path = unquote(marker).rstrip("/")
-            return path == marker_path or language_neutral_path == marker_path
+            return bool(
+                path == marker_path
+                or language_neutral_path == marker_path
+                or (
+                    marker_path in _UNDERGRADUATE_ADMISSIONS_PATH_ALIASES
+                    and language_neutral_path
+                    in _UNDERGRADUATE_ADMISSIONS_PATH_ALIASES
+                )
+            )
         return marker.strip("/") in normalized_url
 
     def _build_coverage_page_records(self) -> List[Dict[str, Any]]:
@@ -2028,6 +2045,10 @@ class RoutedHybridRetriever:
             not careers_division_scope
             and (
                 re.search(r"\b(?:our|research|university) divisions?\b", lower)
+                or re.search(
+                    r"\b(?:the|its|mbzuai(?:['’]s)?)\s+divisions\b",
+                    lower,
+                )
                 or re.search(
                     r"\b(?:what|which)\s+(?:are\s+)?"
                     r"(?:(?:academic|research|university|mbzuai)\s+)?divisions?\b",

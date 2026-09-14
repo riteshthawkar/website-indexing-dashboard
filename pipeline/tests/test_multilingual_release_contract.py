@@ -68,6 +68,24 @@ def test_release_gates_require_arabic_coverage_and_latency_metrics():
     assert retrieval_gates["by_benchmark_tag"]["navigation"]["query_count"]["min"] == 16
     assert answer_gates["overall"]["p95_first_content_latency_ms"]["max"] == 15000
     assert answer_gates["overall"]["p95_latency_ms"]["max"] == 60000
+    critical_ids = set(
+        answer_gates["per_query"]["critical-grounding-regressions"]["where"]["id"]
+    )
+    assert critical_ids == {
+        "mlv2-ar-synthesis-001-64896724",
+        "mlv2-ar-synthesis-005-d033abb3",
+        "mlv2-en-mixed-synthesis-001-f514864f",
+    }
+    assert (
+        answer_gates["per_query"]["critical-grounding-regressions"]["metrics"]
+        ["pass_score"]["max_failures"]
+        == 0
+    )
+    assert (
+        retrieval_gates["per_query"]["critical-grounding-regressions"]["metrics"]
+        ["required_page_coverage"]["max_failures"]
+        == 0
+    )
 
 
 def test_release_gate_slices_are_present_in_multilingual_v2_dataset():
