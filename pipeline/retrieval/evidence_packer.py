@@ -1433,11 +1433,29 @@ def build_evidence_pack(
                 break
 
     if not explicit_media_query:
-        for _score, kind, doc in candidates:
-            if kind != "chunk" or not bool(
-                doc.get("evidence_completion_priority")
-            ):
-                continue
+        completion_candidates = [
+            candidate
+            for candidate in candidates
+            if candidate[1] == "chunk"
+            and bool(candidate[2].get("evidence_completion_priority"))
+        ]
+
+        def _completion_rank(candidate: Tuple[float, str, Dict[str, Any]]) -> Tuple[int, float, str]:
+            score, _kind, doc = candidate
+            try:
+                linked_rank = max(0, int(doc.get("linked_evidence_rank")))
+            except (TypeError, ValueError):
+                linked_rank = 1_000_000
+            # Selected evidence spans are already relevance-ranked. When more
+            # than one span has a longer linked chunk, complete the highest
+            # ranked span first instead of letting token overlap choose a
+            # later, unrelated bullet list from the same document.
+            return linked_rank, -score, _doc_id(doc)
+
+        for _score, kind, doc in sorted(
+            completion_candidates,
+            key=_completion_rank,
+        ):
             _append_candidate(kind, doc)
             break
 

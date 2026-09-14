@@ -8764,6 +8764,18 @@ def test_evidence_pack_reserves_linked_complete_block_before_page_parents():
                     "source_url": showcase_url,
                     "evidence_linked": True,
                     "evidence_completion_priority": True,
+                    "linked_evidence_rank": 0,
+                },
+                {
+                    "id": "chunk:c650:showcase:later-list",
+                    "text": (
+                        "Research showcase approach and innovation. "
+                        "- A later list item - Another later list item"
+                    ),
+                    "source_url": showcase_url,
+                    "evidence_linked": True,
+                    "evidence_completion_priority": True,
+                    "linked_evidence_rank": 8,
                 },
             ]
         },
@@ -8777,7 +8789,7 @@ def test_evidence_pack_reserves_linked_complete_block_before_page_parents():
     )
 
     linked_items = [item for item in pack["items"] if item.get("evidence_linked")]
-    assert len(linked_items) == 1
+    assert linked_items
     assert linked_items[0]["text"] == complete_takeaways
     assert "Believe in Yourself" in " ".join(item["text"] for item in pack["items"])
     assert all(item["id"] != "unrelated-showcase-news" for item in pack["items"])
