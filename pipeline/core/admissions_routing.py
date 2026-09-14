@@ -149,6 +149,8 @@ def admissions_surface_preference(
     surface = str(page_type or "").casefold()
     is_news = (
         surface == "news_or_event"
+        or "/news/" in url
+        or "/news-events/news/" in url
         or "/knowledge-center/the-node/" in url
         or bool(re.search(r"\b(?:news|opens? admissions|admissions? (?:cycle|now open))\b", page_title))
     )

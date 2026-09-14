@@ -4537,6 +4537,45 @@ def test_arabic_general_graduate_admissions_resolves_opaque_pages_by_identity():
     assert plan["coverage_status"] == "partial"
 
 
+def test_graduate_admissions_identity_never_resolves_to_news_article():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    canonical_url = (
+        "https://preprod.mbzuai.ac.ae/graduate-masters-admissions"
+    )
+    news_url = (
+        "https://preprod.mbzuai.ac.ae/news-events/news/"
+        "mbzuai-opens-graduate-admissions-class-2025-including-new-master-applied-ai"
+    )
+
+    def page(url: str, title: str) -> dict:
+        return {
+            "source_url": url,
+            "normalized_url": retriever._normalize_source_url(url),
+            "title_text": title.casefold(),
+            "title_tokens": set(_tokenize(title)),
+            "identity_tokens": set(_tokenize(title)),
+        }
+
+    retriever._coverage_page_records = [
+        page(canonical_url, "Graduate master's admissions"),
+        page(
+            news_url,
+            "MBZUAI opens graduate admissions for class of 2025 including new Master in Applied AI",
+        ),
+    ]
+
+    assert retriever._semantic_identity_page_url(
+        identity="graduate master admissions",
+        query=(
+            "What are the current general admission requirements for both master's "
+            "and PhD programs at MBZUAI?"
+        ),
+    ) == canonical_url
+
+
 def test_undergraduate_admissions_route_aliases_form_one_page_family():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

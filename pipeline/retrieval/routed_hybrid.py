@@ -1427,6 +1427,20 @@ class RoutedHybridRetriever:
         if not candidates:
             return ""
 
+        if "admissions" in required_tokens or "admission" in required_tokens:
+            canonical_candidates = [
+                page
+                for page in candidates
+                if admissions_surface_preference(
+                    identity,
+                    source_url=page.get("source_url"),
+                    title=page.get("title_text"),
+                )
+                >= 0.0
+            ]
+            if canonical_candidates:
+                candidates = canonical_candidates
+
         language_candidates = [
             page
             for page in candidates
