@@ -1853,6 +1853,9 @@ def build_release_manifest(
         **production_eval_manifest_metadata(answer=True),
         "query_count": _count(answer_report.get("query_count")),
         "llm_judge": answer_report.get("llm_judge") or {},
+        "skipped": bool(answer_report.get("skipped")),
+        "waived": bool(answer_report.get("waived")),
+        "waiver_reason": str(answer_report.get("waiver_reason") or ""),
     }
     if canonical_production:
         eval_policy_errors.extend(
