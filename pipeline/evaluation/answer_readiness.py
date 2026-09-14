@@ -471,6 +471,7 @@ _ARABIC_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"تراكم", "تجمع"}),
     frozenset({"تعاون", "تعاوني"}),
     frozenset({"اداري", "ادارة"}),
+    frozenset({"كشوف", "سجلات"}),
 )
 _ENGLISH_LEXICAL_EQUIVALENCE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"ahead", "before"}),

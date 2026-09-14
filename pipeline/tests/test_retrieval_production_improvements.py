@@ -2673,6 +2673,10 @@ def test_answer_readiness_arabic_term_matching_handles_clitics_and_pronouns():
         "مدة البرنامج عامان بدوام جزئي.",
         "سنتين",
     )
+    assert _required_term_supported(
+        "يجب تقديم السجلات الدراسية الرسمية التي تتضمن المقررات والدرجات.",
+        "كشوف الدرجات الرسمية",
+    )
 
 
 def test_answer_readiness_term_matching_handles_cross_language_dates_and_safe_variants():
