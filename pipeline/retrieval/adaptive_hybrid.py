@@ -82,6 +82,7 @@ _TOKENIZE_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_TOKENIZE_CACHE_SIZE", "32
 _TOKEN_SET_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_TOKEN_SET_CACHE_SIZE", "32768") or "0"))
 _SYMBOLIC_TOKENIZE_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_SYMBOLIC_TOKENIZE_CACHE_SIZE", "32768") or "0"))
 _SYMBOLIC_TOKEN_SET_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_SYMBOLIC_TOKEN_SET_CACHE_SIZE", "32768") or "0"))
+_SCORING_CACHE_SIZE = max(0, int(os.getenv("RETRIEVAL_SCORING_CACHE_SIZE", "16384") or "0"))
 _QUERY_EMBEDDING_CACHE: "OrderedDict[Tuple[str, int | None, str, str], List[float]]" = OrderedDict()
 _QUERY_EMBEDDING_CACHE_LOCK = threading.Lock()
 _QUERY_EMBEDDING_FAILURE_STATE: Dict[Tuple[str, int | None, str], Tuple[float, str]] = {}
@@ -984,8 +985,13 @@ class QueryMode(str, Enum):
     SYNTHESIS = "synthesis"
 
 
+@lru_cache(maxsize=_SCORING_CACHE_SIZE)
+def _clean_text_cached(value: str) -> str:
+    return " ".join(value.split()).strip()
+
+
 def _clean_text(value: Any) -> str:
-    return " ".join(str(value or "").split()).strip()
+    return _clean_text_cached(str(value or ""))
 
 
 def _token_variants(token: str) -> List[str]:
@@ -1266,6 +1272,7 @@ def _answer_focus_tokens(query: str) -> List[str]:
     return list(dict.fromkeys(tokens))
 
 
+@lru_cache(maxsize=_SCORING_CACHE_SIZE)
 def _answer_focus_match_bonus(query: str, text: str) -> float:
     focus_tokens = _answer_focus_tokens(query)
     if not focus_tokens:
@@ -1707,6 +1714,7 @@ def _best_lookup_fragment_bonus(text: str, profile: LookupQueryProfile) -> float
     return best
 
 
+@lru_cache(maxsize=_SCORING_CACHE_SIZE)
 def _lookup_signal_bonus(query: str, text: str) -> float:
     profile = _lookup_query_profile(query)
     if not profile.is_exact_lookup:
@@ -1935,7 +1943,8 @@ def _contextual_family_accommodation_match(query: str, record_text: str) -> bool
     )
 
 
-def _phrase_match_bonus(query_terms: Sequence[str], text: str) -> float:
+@lru_cache(maxsize=_SCORING_CACHE_SIZE)
+def _phrase_match_bonus_cached(query_terms: Tuple[str, ...], text: str) -> float:
     normalized_text = _clean_text(text).lower()
     if not normalized_text or not query_terms:
         return 0.0
@@ -1947,6 +1956,10 @@ def _phrase_match_bonus(query_terms: Sequence[str], text: str) -> float:
             bonus += 0.35
             break
     return bonus
+
+
+def _phrase_match_bonus(query_terms: Sequence[str], text: str) -> float:
+    return _phrase_match_bonus_cached(tuple(query_terms), str(text or ""))
 
 
 def _query_starts_with(query: str, prefixes: Sequence[str]) -> bool:
@@ -4422,6 +4435,7 @@ class AdaptiveHybridRetriever:
                 result.append(str(record_id))
         return result
 
+    @lru_cache(maxsize=_SCORING_CACHE_SIZE)
     def _score_text_match(self, query: str, text: str) -> float:
         return self._score_preindexed_text_match(
             query,
@@ -4834,6 +4848,7 @@ class AdaptiveHybridRetriever:
         scored.sort(key=lambda item: item[1], reverse=True)
         return [media_id for media_id, _score in scored[:top_k]]
 
+    @lru_cache(maxsize=_SCORING_CACHE_SIZE)
     def _source_query_bonus(
         self,
         query: str,
@@ -6015,6 +6030,7 @@ class AdaptiveHybridRetriever:
         scored.sort(key=lambda item: item[1], reverse=True)
         return [fact_id for fact_id, score in scored[:top_k] if score > 0.0]
 
+    @lru_cache(maxsize=_SCORING_CACHE_SIZE)
     def _fact_query_bonus(self, query: str, fact_text: str) -> float:
         text = _clean_text(fact_text)
         if not text:

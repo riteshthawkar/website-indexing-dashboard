@@ -1286,3 +1286,53 @@ def test_person_name_detection_does_not_treat_program_names_as_people():
     assert _person_name_tokens(
         "What is the email address linked to Mark Juan in the directory listing?"
     ) == ["mark", "juan"]
+
+
+def test_repeated_local_scoring_reuses_bounded_caches_without_changing_scores():
+    from pipeline.retrieval.adaptive_hybrid import (
+        AdaptiveHybridRetriever,
+        _answer_focus_match_bonus,
+        _clean_text_cached,
+        _lookup_signal_bonus,
+        _phrase_match_bonus,
+        _phrase_match_bonus_cached,
+    )
+
+    retriever = AdaptiveHybridRetriever.__new__(AdaptiveHybridRetriever)
+    query = "Which email address should I use to contact Student Recruitment?"
+    text = "  Student Recruitment can be contacted at student.recruitment@mbzuai.ac.ae.  "
+
+    cached_functions = (
+        _answer_focus_match_bonus,
+        _lookup_signal_bonus,
+        _phrase_match_bonus_cached,
+        AdaptiveHybridRetriever._score_text_match,
+        AdaptiveHybridRetriever._source_query_bonus,
+        AdaptiveHybridRetriever._fact_query_bonus,
+    )
+    for function in cached_functions:
+        function.cache_clear()
+
+    scorers = (
+        lambda: retriever._score_text_match(query, text),
+        lambda: retriever._source_query_bonus(query, text=text),
+        lambda: retriever._fact_query_bonus(query, text),
+        lambda: _answer_focus_match_bonus(query, text),
+        lambda: _lookup_signal_bonus(query, text),
+        lambda: _phrase_match_bonus(("student", "recruitment"), text),
+    )
+    first_scores = [score() for score in scorers]
+    before = [function.cache_info().hits for function in cached_functions]
+    second_scores = [score() for score in scorers]
+    after = [function.cache_info().hits for function in cached_functions]
+
+    assert second_scores == first_scores
+    assert all(current > previous for previous, current in zip(before, after))
+
+    _clean_text_cached.cache_clear()
+    assert _clean_text_cached(text) == _clean_text_cached(text)
+    assert _clean_text_cached.cache_info().hits == 1
+
+    for function in cached_functions:
+        function.cache_clear()
+    _clean_text_cached.cache_clear()
