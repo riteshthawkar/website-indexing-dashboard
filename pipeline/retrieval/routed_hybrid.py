@@ -3625,6 +3625,74 @@ class RoutedHybridRetriever:
             and bool(str(step.get("target_url") or "").strip())
             for step in navigation_plan.get("steps") or []
         )
+        target_matches_required_page = any(
+            self._normalize_source_url(value) == normalized_target
+            for value in required_pages
+        )
+        navigation_planner = getattr(self, "navigation_planner", None)
+        target_aliases_required_page = bool(
+            navigation_planner
+            and any(
+                navigation_planner.page_urls_share_identity(
+                    value,
+                    target_url,
+                )
+                for value in required_pages
+            )
+        )
+        required_pages_source = str(
+            coverage_plan.get("required_pages_source") or ""
+        ).strip()
+
+        if (
+            not has_exact_action_target
+            and required_pages
+            and not target_matches_required_page
+            and not target_aliases_required_page
+            and (
+                required_pages_source == "explicit_markers"
+                or required_pages_source.startswith("context_page")
+            )
+        ):
+            # An inferred open-page target is weaker than an explicit semantic
+            # page requirement or the page the user is currently viewing. For
+            # example, an admissions-criteria query may mention the name of a
+            # degree and otherwise cause the program overview to displace the
+            # dedicated admissions policy page. Keep the authoritative source
+            # contract and remove the conflicting navigation suggestion.
+            suppression_reason = (
+                "explicit_page_requirement"
+                if required_pages_source == "explicit_markers"
+                else "context_page_requirement"
+            )
+            if isinstance(navigation_plan, dict):
+                warnings = [
+                    str(value)
+                    for value in navigation_plan.get("warnings") or []
+                    if str(value)
+                ]
+                warnings.append(
+                    f"navigation_open_page_suppressed_by_{suppression_reason}"
+                )
+                navigation_plan["status"] = "not_requested"
+                navigation_plan["confidence"] = 0.0
+                navigation_plan["source"] = (
+                    "explicit_coverage_guard"
+                    if suppression_reason == "explicit_page_requirement"
+                    else "context_page_coverage_guard"
+                )
+                navigation_plan["target_page"] = None
+                navigation_plan["steps"] = []
+                navigation_plan["evidence"] = {
+                    "page_card_ids": [],
+                    "document_revision_ids": [],
+                    "section_ids": [],
+                    "chunk_ids": [],
+                    "action_ids": [],
+                }
+                navigation_plan["warnings"] = list(dict.fromkeys(warnings))
+            return False
+
         if has_exact_action_target:
             normalized_goal = " ".join(
                 _tokenize(str(navigation_plan.get("goal") or ""))
@@ -3638,24 +3706,6 @@ class RoutedHybridRetriever:
                 and str(step.get("action_type") or "").strip().casefold()
                 != "open_page"
             )
-            target_matches_required_page = any(
-                self._normalize_source_url(value) == normalized_target
-                for value in required_pages
-            )
-            navigation_planner = getattr(self, "navigation_planner", None)
-            target_aliases_required_page = bool(
-                navigation_planner
-                and any(
-                    navigation_planner.page_urls_share_identity(
-                        value,
-                        target_url,
-                    )
-                    for value in required_pages
-                )
-            )
-            required_pages_source = str(
-                coverage_plan.get("required_pages_source") or ""
-            ).strip()
             conflicting_required_page = bool(
                 required_pages
                 and not target_matches_required_page
