@@ -4397,6 +4397,97 @@ def test_arabic_undergraduate_details_require_the_current_admissions_page():
     assert plan["coverage_status"] == "partial"
 
 
+def test_arabic_programming_prerequisite_routes_to_undergraduate_admissions():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.unsupported_intent_guard_enabled = False
+    admissions_url = (
+        "https://preprod.mbzuai.ac.ae/ar/admissions-aid/undergraduate-admissions"
+    )
+    unrelated_url = "https://preprod.mbzuai.ac.ae/ar/news/ai-reach"
+    retriever._coverage_page_records = [
+        {
+            "source_url": admissions_url,
+            "normalized_url": retriever._normalize_source_url(admissions_url),
+        },
+        {
+            "source_url": unrelated_url,
+            "normalized_url": retriever._normalize_source_url(unrelated_url),
+        },
+    ]
+
+    plan = retriever._coverage_plan_for_result(
+        query=(
+            "هل تُعد مهارات البرمجة الحاسوبية مطلوبة للقبول "
+            "في قسم دراسات البكالوريوس؟"
+        ),
+        payload={
+            "selected_chunk_ids": ["news-chunk"],
+            "retrieval_documents": [
+                {"id": "news-chunk", "source_url": unrelated_url, "text": "خبر جامعي"}
+            ],
+        },
+        mode=QueryMode.FACT,
+    )
+
+    assert plan["required_pages"] == [admissions_url]
+    assert plan["required_pages_source"] == "explicit_markers"
+    assert plan["coverage_status"] == "partial"
+
+
+def test_arabic_general_graduate_admissions_resolves_opaque_pages_by_identity():
+    from pipeline.retrieval.adaptive_hybrid import QueryMode, _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    retriever.unsupported_intent_guard_enabled = False
+    masters_url = "https://preprod.mbzuai.ac.ae/ar/node/217"
+    phd_url = "https://preprod.mbzuai.ac.ae/ar/node/335"
+    generic_url = "https://preprod.mbzuai.ac.ae/ar/admissions"
+    english_masters_url = (
+        "https://preprod.mbzuai.ac.ae/admissions/graduate-masters-admissions"
+    )
+
+    def page(url: str, identity: str) -> dict:
+        return {
+            "source_url": url,
+            "normalized_url": retriever._normalize_source_url(url),
+            "identity_text": identity.casefold(),
+            "identity_tokens": set(_tokenize(identity)),
+        }
+
+    retriever._coverage_page_records = [
+        page(masters_url, "Graduate master's admissions"),
+        page(phd_url, "Graduate Ph.D. admissions"),
+        page(generic_url, "Admissions"),
+        page(english_masters_url, "Graduate master's admissions"),
+    ]
+    query = (
+        "ما المتطلبات العامة والتفاصيل الأساسية المطلوبة للالتحاق "
+        "ببرامج الدراسات العليا في MBZUAI؟"
+    )
+
+    markers = retriever._explicit_required_page_markers(query)
+    plan = retriever._coverage_plan_for_result(
+        query=query,
+        payload={
+            "selected_chunk_ids": ["generic-chunk"],
+            "retrieval_documents": [
+                {"id": "generic-chunk", "source_url": generic_url, "text": "معلومات عامة"}
+            ],
+        },
+        mode=QueryMode.SYNTHESIS,
+    )
+
+    assert markers[:2] == [masters_url, phd_url]
+    assert "/admissions" not in markers
+    assert plan["required_pages"] == [masters_url, phd_url]
+    assert plan["required_pages_source"] == "explicit_markers"
+    assert plan["coverage_status"] == "partial"
+
+
 def test_undergraduate_admissions_route_aliases_form_one_page_family():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

@@ -1393,6 +1393,63 @@ class RoutedHybridRetriever:
             )
         return marker.strip("/") in normalized_url
 
+    def _semantic_identity_page_url(
+        self,
+        *,
+        identity: str,
+        query: str,
+    ) -> str:
+        """Resolve a logical page identity to the best URL in this release.
+
+        Some localized Drupal pages are published only as opaque ``/ar/node``
+        routes.  Their Page Cards still carry stable semantic titles, so route
+        against those identities rather than freezing transient node IDs into
+        query logic.  Prefer a page in the query language and a descriptive
+        route when both are available.
+        """
+
+        required_tokens = set(_tokenize(identity))
+        if not required_tokens:
+            return ""
+        query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
+        candidates: List[Dict[str, Any]] = []
+        for page in getattr(self, "_coverage_page_records", []) or []:
+            identity_tokens = set(page.get("identity_tokens") or set())
+            if required_tokens <= identity_tokens:
+                candidates.append(page)
+        if not candidates:
+            return ""
+
+        language_candidates = [
+            page
+            for page in candidates
+            if query_is_arabic
+            == bool(
+                re.search(
+                    r"(?:^|/)ar(?:/|$)",
+                    unquote(urlparse(str(page.get("source_url") or "")).path or ""),
+                    flags=re.IGNORECASE,
+                )
+            )
+        ]
+        if language_candidates:
+            candidates = language_candidates
+
+        def selection_key(page: Dict[str, Any]) -> tuple[int, int, int, int, str]:
+            source_url = str(page.get("source_url") or "")
+            try:
+                path = unquote(urlparse(source_url).path or "").casefold()
+            except Exception:
+                path = source_url.casefold()
+            descriptive_route = int(not re.fullmatch(r"/(?:ar/)?node/\d+/?", path))
+            return (
+                descriptive_route,
+                *self._coverage_page_recency_key(source_url),
+                self._normalize_source_url(source_url),
+            )
+
+        return str(max(candidates, key=selection_key).get("source_url") or "").rstrip("/")
+
     def _build_coverage_page_records(self) -> List[Dict[str, Any]]:
         by_url: Dict[str, Dict[str, Any]] = {}
         sources = [
@@ -2002,8 +2059,21 @@ class RoutedHybridRetriever:
         lower = query.casefold()
         query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
         markers: List[str] = []
+        admissions_audience = admissions_workflow_audience(query)
         admissions_marker = canonical_admissions_marker(query)
-        if admissions_marker:
+        if admissions_audience == "graduate":
+            # A general graduate-admissions answer spans the master's and
+            # Ph.D. requirement pages. Resolve semantic Page Card identities
+            # so localized opaque node routes remain usable after a recrawl.
+            for identity, fallback_marker in (
+                ("graduate master admissions", "/graduate-masters-admissions"),
+                ("graduate phd admissions", "/admissions/graduate-phd-admissions"),
+            ):
+                markers.append(
+                    self._semantic_identity_page_url(identity=identity, query=query)
+                    or fallback_marker
+                )
+        elif admissions_marker:
             markers.append(admissions_marker)
         if any(
             phrase in lower
@@ -2092,7 +2162,6 @@ class RoutedHybridRetriever:
         )
         if masters_collection_requested:
             markers.append("/study/msc-programs")
-        admissions_audience = admissions_workflow_audience(query)
         if admissions_audience == "masters" and re.search(
             r"\b(?:scholarships?|funding|funded|tuition|stipend|accommodation|healthcare|student visa)\b"
             r"|(?:المنح|التمويل|الرسوم|السكن|الرعاية الصحية|التأشيرة)",

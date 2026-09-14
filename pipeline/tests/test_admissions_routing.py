@@ -37,6 +37,7 @@ def test_non_admissions_apply_language_does_not_force_admissions_pages():
         "ما الحد الأدنى للمعدل المطلوب للقبول في برنامج البكالوريوس في MBZUAI، وما نوع الشهادات أو المستندات الدراسية التي يجب تقديمها، وهل تُذكر إمكانية التقديم في السنة الأخيرة من المدرسة الثانوية؟",
         "ما شروط القبول والمستندات المطلوبة للبكالوريوس؟",
         "ما معايير القبول والوثائق اللازمة لبرنامج البكالوريوس؟",
+        "هل تُعد مهارات البرمجة الحاسوبية مطلوبة للقبول في قسم دراسات البكالوريوس؟",
     ],
 )
 def test_arabic_admissions_details_handle_attached_prefixes(query):
@@ -50,6 +51,7 @@ def test_arabic_admissions_details_handle_attached_prefixes(query):
         "ما المستندات المطلوبة لوظيفة في MBZUAI؟",
         "ما شروط التسجيل في مكتبة الجامعة؟",
         "ما معايير القبول في مسابقة الجامعة؟",
+        "هل مهارات البرمجة مطلوبة للقبول في مسابقة الجامعة؟",
     ],
 )
 def test_arabic_admissions_details_keep_non_admissions_scopes_excluded(query):
