@@ -1432,6 +1432,15 @@ def build_evidence_pack(
                 _append_candidate(kind, doc)
                 break
 
+    if not explicit_media_query:
+        for _score, kind, doc in candidates:
+            if kind != "chunk" or not bool(
+                doc.get("evidence_completion_priority")
+            ):
+                continue
+            _append_candidate(kind, doc)
+            break
+
     if not explicit_media_query and len(required_pages) > 1:
         # Preserve compact answer-bearing spans before complete-page parents
         # consume the character budget. Select them in source-diverse rounds so
@@ -1467,15 +1476,6 @@ def build_evidence_pack(
                     break
             if span_added >= span_limit:
                 break
-
-    if not explicit_media_query:
-        for _score, kind, doc in candidates:
-            if kind != "chunk" or not bool(
-                doc.get("evidence_completion_priority")
-            ):
-                continue
-            _append_candidate(kind, doc)
-            break
 
     for required_page in required_pages:
         aggregate_added = False
