@@ -2090,6 +2090,22 @@ class RoutedHybridRetriever:
                 )
         elif admissions_marker:
             markers.append(admissions_marker)
+        mbzuai_president_requested = bool(
+            re.search(
+                r"\b(?:president\s+of\s+(?:mbzuai|the university)|"
+                r"(?:mbzuai|the university)(?:['’]s)?\s+president)\b"
+                r"|(?:رئيس\s+الجامعة|رئيس\s+جامعة\s+محمد\s+بن\s+زايد)",
+                lower,
+            )
+        )
+        if mbzuai_president_requested:
+            markers.append(
+                self._semantic_identity_page_url(
+                    identity="office president",
+                    query=query,
+                )
+                or "/about-us/leadership/office-the-president"
+            )
         if any(
             phrase in lower
             for phrase in (
@@ -2126,6 +2142,10 @@ class RoutedHybridRetriever:
                 lower,
             )
         )
+        research_institutes_and_divisions_requested = bool(
+            re.search(r"\b(?:research\s+)?institutes?\b", lower)
+            and re.search(r"\bdivisions?\b", lower)
+        )
         divisions_requested = bool(
             not careers_division_scope
             and (
@@ -2143,6 +2163,7 @@ class RoutedHybridRetriever:
                     _COLLECTION_QUERY_RE.search(query)
                     and re.search(r"\bdivisions?\b", lower)
                 )
+                or research_institutes_and_divisions_requested
                 or re.search(r"(?:أقسامها|اقسامها|الأقسام|الاقسام|أقسام|اقسام)", lower)
             )
         )
@@ -2171,9 +2192,18 @@ class RoutedHybridRetriever:
             markers.append("/study/undergraduate-program")
         query_tokens = set(_tokenize(query))
         masters_collection_requested = bool(
-            _COLLECTION_QUERY_RE.search(query)
-            and {"program", "degree"} & _collection_target_tokens(query)
+            {"program", "degree"} & _collection_target_tokens(query)
             and {"master", "masters", "msc"} & query_tokens
+            and (
+                _COLLECTION_QUERY_RE.search(query)
+                or (
+                    re.search(r"\b(?:programs|degrees|offerings)\b", lower)
+                    and (
+                        re.search(r"\b(?:what|which)\b", lower)
+                        or _BROAD_OVERVIEW_QUERY_RE.search(query)
+                    )
+                )
+            )
         )
         if masters_collection_requested:
             markers.append("/study/msc-programs")

@@ -1886,6 +1886,9 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     masters_markers = retriever._explicit_required_page_markers(
         "List every current master's degree program offered by MBZUAI."
     )
+    conversational_masters_markers = retriever._explicit_required_page_markers(
+        "What master's programs can a prospective student study at MBZUAI? Give a useful overview."
+    )
     maai_markers = retriever._explicit_required_page_markers(
         "What are MAAI's duration, credits, tuition, and scholarship status?"
     )
@@ -1906,6 +1909,7 @@ def test_updated_program_and_housing_markers_resolve_current_pages():
     )
 
     assert masters_markers[0] == "/study/msc-programs"
+    assert conversational_masters_markers[0] == "/study/msc-programs"
     assert maai_markers[0] == (
         "/study/msc-programs/masters-in-applied-artificial-intelligence"
     )
@@ -2733,6 +2737,32 @@ def test_routed_static_page_markers_choose_canonical_language_routes_and_avoid_p
     )
     assert "/ai-programs" not in funding_markers
     assert "mbzuai_faculty_brochure" not in funding_markers
+
+
+def test_routed_static_page_markers_cover_president_and_cross_collection_research_queries():
+    from pipeline.retrieval.adaptive_hybrid import _tokenize
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    president_url = "https://preprod.mbzuai.ac.ae/about-us/leadership/office-the-president"
+    retriever._coverage_page_records = [
+        {
+            "source_url": president_url,
+            "normalized_url": president_url,
+            "title_tokens": set(_tokenize("Office of the President")),
+            "identity_tokens": set(_tokenize("Office of the President")),
+        }
+    ]
+
+    assert retriever._explicit_required_page_markers(
+        "Who is the president of MBZUAI, and what leadership role does he perform?"
+    )[0] == president_url
+
+    research_markers = retriever._explicit_required_page_markers(
+        "How do MBZUAI's research institutes and divisions work together to support interdisciplinary AI research?"
+    )
+    assert "/research/our-divisions" in research_markers
+    assert "/research/our-institutes-centers" in research_markers
 
 
 def test_routed_static_page_markers_cover_named_multisource_arabic_routes():
