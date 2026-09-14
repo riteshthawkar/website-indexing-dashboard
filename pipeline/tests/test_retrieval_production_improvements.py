@@ -4456,13 +4456,25 @@ def test_arabic_general_graduate_admissions_resolves_opaque_pages_by_identity():
             "normalized_url": retriever._normalize_source_url(url),
             "identity_text": identity.casefold(),
             "identity_tokens": set(_tokenize(identity)),
+            "title_text": identity.casefold(),
+            "title_tokens": set(_tokenize(identity)),
         }
 
+    misleading_news_url = (
+        "https://preprod.mbzuai.ac.ae/ar/news-events/news/"
+        "mbzuai-opens-graduate-admissions-class-2025-including-new-master-applied-ai"
+    )
     retriever._coverage_page_records = [
         page(masters_url, "Graduate master's admissions"),
         page(phd_url, "Graduate Ph.D. admissions"),
         page(generic_url, "Admissions"),
         page(english_masters_url, "Graduate master's admissions"),
+        {
+            **page(misleading_news_url, "خبر عن دفعة عام 2025"),
+            "identity_tokens": set(
+                _tokenize("Graduate master's admissions mentioned in article purpose")
+            ),
+        },
     ]
     query = (
         "ما المتطلبات العامة والتفاصيل الأساسية المطلوبة للالتحاق "

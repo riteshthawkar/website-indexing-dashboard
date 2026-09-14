@@ -1414,8 +1414,15 @@ class RoutedHybridRetriever:
         query_is_arabic = bool(re.search(r"[\u0600-\u06ff]", query))
         candidates: List[Dict[str, Any]] = []
         for page in getattr(self, "_coverage_page_records", []) or []:
-            identity_tokens = set(page.get("identity_tokens") or set())
-            if required_tokens <= identity_tokens:
+            # Titles are the identity boundary. Purpose/body text can mention
+            # another admissions page (especially in old intake news) and
+            # must not turn that article into the canonical destination.
+            title_tokens = set(
+                page.get("title_tokens")
+                or page.get("identity_tokens")
+                or set()
+            )
+            if required_tokens <= title_tokens:
                 candidates.append(page)
         if not candidates:
             return ""
@@ -1475,6 +1482,7 @@ class RoutedHybridRetriever:
                         "source_url": source_url.rstrip("/"),
                         "normalized_url": key,
                         "parts": [],
+                        "title_parts": [],
                         "identity_parts": [],
                         "document_revision_ids": set(),
                         "linked_chunk_ids": set(),
@@ -1488,6 +1496,10 @@ class RoutedHybridRetriever:
                 ).strip()
                 if document_revision_id:
                     page["document_revision_ids"].add(document_revision_id)
+                for value in (record.get("document_title"), record.get("title")):
+                    text = str(value or "").strip()
+                    if text:
+                        page["title_parts"].append(text[:600])
                 for chunk_id in (
                     [record.get("id")]
                     if str(record.get("id") or "").startswith("chunk:")
@@ -1527,6 +1539,7 @@ class RoutedHybridRetriever:
             identity_text = " ".join(
                 [parsed.hostname or "", slug_text, *page["identity_parts"]]
             )[:2400].casefold()
+            title_text = " ".join(page["title_parts"])[:1200].casefold()
             records.append(
                 {
                     "source_url": page["source_url"],
@@ -1535,6 +1548,8 @@ class RoutedHybridRetriever:
                     "tokens": set(_tokenize(search_text)),
                     "identity_text": identity_text,
                     "identity_tokens": set(_tokenize(identity_text)),
+                    "title_text": title_text,
+                    "title_tokens": set(_tokenize(title_text)),
                     "document_revision_ids": set(page["document_revision_ids"]),
                     "linked_chunk_ids": set(page["linked_chunk_ids"]),
                 }
