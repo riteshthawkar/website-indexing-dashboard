@@ -9328,7 +9328,7 @@ def test_actionable_navigation_target_becomes_a_required_evidence_page():
     ]
 
 
-def test_inferred_open_page_cannot_override_explicit_admissions_requirement():
+def test_inferred_open_page_becomes_secondary_to_explicit_admissions_requirement():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 
     retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
@@ -9360,7 +9360,13 @@ def test_inferred_open_page_cannot_override_explicit_admissions_requirement():
                 "source_url": admissions_url,
             }
         ],
-        "retrieval_documents": [],
+        "retrieval_documents": [
+            {
+                "id": "admissions-chunk",
+                "text": "الحد الأدنى للمعدل العام هو 90%.",
+                "source_url": admissions_url,
+            }
+        ],
     }
     coverage_plan = {
         "required_pages": [admissions_url],
@@ -9375,17 +9381,22 @@ def test_inferred_open_page_cannot_override_explicit_admissions_requirement():
     assert retriever._require_navigation_target_page(
         coverage_plan,
         navigation_plan,
-    ) is False
+    ) is True
     changed = retriever._backfill_navigation_target_coverage(
         query="ما متطلبات القبول في برنامج البكالوريوس؟",
         payload=payload,
         coverage_plan=coverage_plan,
     )
 
-    assert changed is False
-    assert coverage_plan["required_pages"] == [admissions_url]
-    assert "program-overview" not in payload["selected_evidence_span_ids"]
+    assert changed is True
+    assert coverage_plan["required_pages"] == [admissions_url, program_url]
+    assert coverage_plan["supporting_navigation_pages"] == [program_url]
+    assert "program-overview" in payload["selected_evidence_span_ids"]
     assert payload["evidence_span_documents"][0]["source_url"] == admissions_url
+    assert [
+        document["source_url"]
+        for document in payload["retrieval_documents"][:2]
+    ] == [admissions_url, program_url]
     assert navigation_plan["status"] == "not_requested"
     assert navigation_plan["target_page"] is None
     assert navigation_plan["steps"] == []

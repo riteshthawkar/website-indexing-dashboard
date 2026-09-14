@@ -3292,7 +3292,7 @@ class RoutedHybridRetriever:
             other_docs: List[Dict[str, Any]] = []
             for doc in retrieval_docs:
                 source_url = self._source_url_from_record(doc)
-                if str(doc.get("id") or "") in set(payload.get("selected_evidence_span_ids") or []) and self._required_page_match_rank(source_url, required_pages):
+                if self._required_page_match_rank(source_url, required_pages) is not None:
                     required_docs.append(doc)
                 else:
                     other_docs.append(doc)
@@ -3659,7 +3659,8 @@ class RoutedHybridRetriever:
             # example, an admissions-criteria query may mention the name of a
             # degree and otherwise cause the program overview to displace the
             # dedicated admissions policy page. Keep the authoritative source
-            # contract and remove the conflicting navigation suggestion.
+            # first, retain the inferred page only as secondary retrieval
+            # context, and remove the conflicting navigation suggestion.
             suppression_reason = (
                 "explicit_page_requirement"
                 if required_pages_source == "explicit_markers"
@@ -3691,7 +3692,23 @@ class RoutedHybridRetriever:
                     "action_ids": [],
                 }
                 navigation_plan["warnings"] = list(dict.fromkeys(warnings))
-            return False
+            coverage_plan["required_pages"] = [*required_pages, target_url]
+            coverage_plan["supporting_navigation_pages"] = list(
+                dict.fromkeys(
+                    [
+                        *[
+                            str(value)
+                            for value in coverage_plan.get(
+                                "supporting_navigation_pages"
+                            )
+                            or []
+                            if str(value).strip()
+                        ],
+                        target_url,
+                    ]
+                )
+            )
+            return True
 
         if has_exact_action_target:
             normalized_goal = " ".join(
