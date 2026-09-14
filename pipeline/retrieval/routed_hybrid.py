@@ -2125,16 +2125,26 @@ class RoutedHybridRetriever:
                     "/admissions",
                 ]
             )
-        if (
-            re.search(r"\bundergraduate\b", lower)
-            and re.search(r"\b(?:applicant|admissions?|criteria|program(?:me)?|description)\b", lower)
-        ):
-            markers.extend(
-                [
-                    "/admissions-aid/undergraduate-admissions",
-                    "/academics/undergraduate-program",
-                ]
+        if re.search(r"\bundergraduate\b", lower):
+            undergraduate_admissions_details = bool(
+                re.search(
+                    r"\b(?:applicants?|admissions?|criteria|requirements?|documentation|"
+                    r"documents?|transcripts?|certificates?|english proficiency|application fee|"
+                    r"gpa|grade|high school|final year)\b",
+                    lower,
+                )
             )
+            undergraduate_program_details = bool(
+                re.search(
+                    r"\b(?:program(?:me)?|degree) description\b|"
+                    r"\b(?:curriculum|duration|study mode|course structure|streams?)\b",
+                    lower,
+                )
+            )
+            if undergraduate_admissions_details:
+                markers.append("/admissions-aid/undergraduate-admissions")
+            if undergraduate_program_details:
+                markers.append("/study/undergraduate-program")
         campus_facilities_requested = bool(
             re.search(
                 r"\b(?:campus (?:facilities|amenities|services)|student-life support|student support services)\b",
@@ -2315,16 +2325,22 @@ class RoutedHybridRetriever:
             markers.append(
                 "/news/mbzuai-students-connect-with-industry-partners-to-secure-internship-and-career-opportunities"
             )
-        if query_is_arabic and re.search(r"(?:برنامج )?البكالوريوس", lower) and re.search(
-            r"(?:مدة الدراسة|المنح|شروط القبول|الثانوية|90%)",
-            lower,
-        ):
-            markers.extend(["/study/mbzuai-undergraduate", "/study/ug-admission-process"])
+        if query_is_arabic and re.search(r"(?:برنامج )?البكالوريوس", lower):
+            if re.search(
+                r"(?:مدة الدراسة|مدة البرنامج|الخطة الدراسية|المناهج|المسارات|المنح)",
+                lower,
+            ):
+                markers.append("/study/undergraduate-program")
+            if re.search(
+                r"(?:القبول|التقديم|المعدل|المستندات?|الوثائق?|الشهادات?|الثانوية|90%)",
+                lower,
+            ):
+                markers.append("/admissions-aid/undergraduate-admissions")
         if re.search(r"\bundergraduate applicants?\b", lower) and re.search(
             r"\b(?:academic|documentation|transcripts?|graduation certificates?|english proficiency|application fee)\b",
             lower,
         ):
-            markers.extend(["/study/ug-admission-process", "/study/undergraduate-program"])
+            markers.append("/admissions-aid/undergraduate-admissions")
         if "library" in lower and re.search(
             r"\b(?:researcher resident|visitor access|receive visitors|visit request|visiting)\b",
             lower,

@@ -2807,7 +2807,16 @@ def test_routed_static_page_markers_cover_named_answer_evidence_pages():
     ]
     assert retriever._explicit_required_page_markers(
         "ما مدة الدراسة وفرص المنح وشروط القبول في برنامج البكالوريوس؟"
-    ) == ["/study/mbzuai-undergraduate", "/study/ug-admission-process"]
+    ) == [
+        "/study/undergraduate-program",
+        "/admissions-aid/undergraduate-admissions",
+    ]
+
+    assert retriever._explicit_required_page_markers(
+        "ما الحد الأدنى للمعدل المطلوب للقبول في برنامج البكالوريوس في MBZUAI، "
+        "وما نوع الشهادات أو المستندات الدراسية التي يجب تقديمها، وهل تُذكر إمكانية "
+        "التقديم في السنة الأخيرة من المدرسة الثانوية؟"
+    ) == ["/admissions-aid/undergraduate-admissions"]
 
     assert retriever._explicit_required_page_markers(
         "What does the MBZUAI Visitor Program say visitors can get hands-on access to?"
@@ -2827,7 +2836,7 @@ def test_routed_static_page_markers_cover_multi_aspect_admissions_and_library_pa
 
     assert retriever._explicit_required_page_markers(
         "What academic and documentation requirements apply to undergraduate applicants, including English proficiency and the application fee?"
-    ) == ["/study/ug-admission-process", "/study/undergraduate-program"]
+    ) == ["/admissions-aid/undergraduate-admissions"]
     assert retriever._explicit_required_page_markers(
         "I am visiting the MBZUAI Library as a researcher resident in the UAE. What visitor access can I request, who can borrow materials and licensed electronic resources, and where are physical resources discoverable?"
     ) == [
@@ -4280,7 +4289,7 @@ def test_current_multisource_markers_cover_research_admissions_and_student_suppo
         )
     ) >= {
         "/admissions-aid/undergraduate-admissions",
-        "/academics/undergraduate-program",
+        "/study/undergraduate-program",
     }
     assert set(
         retriever._explicit_required_page_markers(
