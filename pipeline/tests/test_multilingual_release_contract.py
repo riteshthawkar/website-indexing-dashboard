@@ -56,6 +56,20 @@ def test_arabic_critical_synthesis_accepts_equivalent_interdisciplinary_terms():
     ]
 
 
+def test_arabic_admissions_accepts_the_exact_source_label_across_languages():
+    dataset_path = REPO_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
+    example = next(
+        row
+        for row in load_eval_examples(dataset_path)
+        if row.id == "mlv2-ar-synthesis-001-64896724"
+    )
+
+    assert "كشوف الدرجات الرسمية" not in example.metadata["answer_must_include"]
+    assert example.metadata["answer_must_include_any_groups"] == [
+        ["كشوف الدرجات الرسمية", "Official high school transcripts"]
+    ]
+
+
 def test_release_gates_require_arabic_coverage_and_latency_metrics():
     answer_gates = json.loads(
         (
