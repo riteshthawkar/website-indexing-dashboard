@@ -42,6 +42,20 @@ def test_eval_example_normalizes_supported_language_aliases():
     assert EvalExample(id="en", query="Question", query_type="fact", language="en").normalized().language == "English"
 
 
+def test_arabic_critical_synthesis_accepts_equivalent_interdisciplinary_terms():
+    dataset_path = REPO_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
+    example = next(
+        row
+        for row in load_eval_examples(dataset_path)
+        if row.id == "mlv2-ar-synthesis-005-d033abb3"
+    )
+
+    assert "العمل البيني" not in example.metadata["answer_must_include"]
+    assert example.metadata["answer_must_include_any_groups"] == [
+        ["العمل البيني", "العمل متعدد التخصصات", "التعاون متعدد التخصصات"]
+    ]
+
+
 def test_release_gates_require_arabic_coverage_and_latency_metrics():
     answer_gates = json.loads(
         (

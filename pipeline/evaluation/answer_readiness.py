@@ -28,7 +28,7 @@ from pipeline.evaluation.retrieval_eval import check_metric_gates, load_eval_gat
 
 _ANSWER_READINESS_REPORT_VERSION = 4
 _PREDICTION_METADATA_VERSION = 1
-_JUDGE_PROMPT_VERSION = "mbzuai-answer-readiness-judge-v3"
+_JUDGE_PROMPT_VERSION = "mbzuai-answer-readiness-judge-v4"
 AnswerProgressCallback = Callable[[str, Mapping[str, Any]], None]
 _OPENAI_JUDGE_CLIENT: Any | None = None
 _OPENAI_JUDGE_CLIENT_CONFIG: tuple[str, float, int] | None = None
@@ -1353,7 +1353,7 @@ def _build_judge_prompt(example: EvalExample, row: Mapping[str, Any]) -> str:
         "7. When expected_reference_urls are present, citation_quality must reflect whether the returned references include the expected official page(s) or an equally specific official supporting page.\n"
         "8. When citation_requirements are present, citation_quality must reflect whether citations substantively support each required claim, not just whether any URL is present.\n"
         "9. When expected_response_structure is present, helpfulness and completeness must reflect whether the answer is structured in that usable format when appropriate.\n"
-        "10. When expected_followup_topics or expected_suggested_actions are present, component_quality must reflect whether followups/actions are useful, relevant next steps and not random suggestions.\n"
+        "10. Followups and suggested actions are optional unless the evaluation input explicitly sets metadata.require_followups or metadata.require_suggested_actions. When optional components are present, component_quality must reflect whether they are useful, relevant next steps and not random suggestions; their absence alone is not a production blocker.\n"
         "11. Use verdict 'pass' only for production-ready responses. Use 'review' for borderline responses and 'fail' for unsafe/incorrect/unsupported responses.\n"
         "12. Do not penalize an answer for including a term or detail that appears in the reference answer or required coverage. If your numeric scores are all production-ready "
         "(overall >= 0.80, correctness >= 0.75, groundedness >= 0.75, relevance >= 0.70, helpfulness >= 0.70, and safety >= 0.80), the verdict should normally be 'pass'; "
@@ -1779,7 +1779,15 @@ def _score_answer_row(
             required_judge_minimums["completeness"] = 0.70
         if citation_requirements or expected_source_hints or expected_reference_urls:
             required_judge_minimums["citation_quality"] = 0.70
-        if expected_followup_topics or expected_suggested_actions or row.get("ui_payload") or row.get("followups") or row.get("suggested_actions"):
+        require_followups = bool(metadata.get("require_followups"))
+        require_suggested_actions = bool(metadata.get("require_suggested_actions"))
+        if (
+            require_followups
+            or require_suggested_actions
+            or row.get("ui_payload")
+            or row.get("followups")
+            or row.get("suggested_actions")
+        ):
             required_judge_minimums["component_quality"] = 0.65
         row_judge_threshold_pass = all(
             llm_values[field] >= minimum

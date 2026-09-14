@@ -10,7 +10,7 @@ from pipeline.core.io import sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v6"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v7"
 PRODUCTION_RETRIEVAL_DATASET = (
     PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
 )
@@ -22,7 +22,7 @@ PRODUCTION_ANSWER_GATES = (
     PROJECT_ROOT / "eval" / "gates" / "answer_readiness_gate.multilingual_v2_release.json"
 )
 PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
-    "833781817d07a36613b727b6fa441a6fb376551ef9a05dc3c1bfa6a25af7d1d1"
+    "8a09079103b02e9c403721512133a15bc84865d2765f9b7b0e9543b0600bed66"
 )
 PRODUCTION_RETRIEVAL_GATES_SHA256 = (
     "d8f7dc9127492df69cc928a7036060da04a816c11fc1224589a477370c823056"

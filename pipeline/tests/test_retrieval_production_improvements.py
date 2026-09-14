@@ -5267,6 +5267,46 @@ def test_answer_readiness_judge_prompt_includes_full_generated_rubric():
     assert "citation_requirements" in prompt
     assert "Deadline and requirements must be cited." in prompt
     assert "Do not penalize an answer for including a term or detail that appears in the reference answer" in prompt
+    assert "their absence alone is not a production blocker" in prompt
+
+
+def test_answer_readiness_does_not_require_optional_followups_for_core_answer_pass():
+    from pipeline.evaluation import answer_readiness
+    from pipeline.evaluation.dataset import EvalExample
+
+    example = EvalExample(
+        id="optional-followups",
+        query="What undergraduate documents are required?",
+        query_type="synthesis",
+        source_type="webpage",
+        reference_answer="Official transcripts are required.",
+        metadata={
+            "answer_must_include": ["Official transcripts"],
+            "expected_followup_topics": ["application deadlines"],
+        },
+    )
+    row = {
+        "response": "Official transcripts are required.",
+        "sources": [{"url": "https://mbzuai.ac.ae/admissions"}],
+    }
+    judge = {
+        "correctness": 1.0,
+        "groundedness": 1.0,
+        "relevance": 1.0,
+        "helpfulness": 0.9,
+        "completeness": 1.0,
+        "citation_quality": 0.9,
+        "component_quality": 0.3,
+        "safety": 1.0,
+        "overall": 0.9,
+        "verdict": "pass",
+        "reasons": ["The core answer is complete; optional followups are absent."],
+    }
+
+    score = answer_readiness._score_answer_row(example, row, judge=judge)
+
+    assert score.pass_score == 1.0
+    assert score.llm_judge_pass == 1.0
 
 
 def test_answer_readiness_judge_falls_back_to_openai_on_gemini_quota(monkeypatch):
