@@ -8715,6 +8715,7 @@ def test_routed_hydrates_complete_chunks_linked_from_selected_spans():
     hydrated = payload["retrieval_documents"][0]
     assert hydrated["id"] == chunk_id
     assert hydrated["evidence_linked"] is True
+    assert hydrated["evidence_completion_priority"] is True
     assert "Believe in Yourself" in hydrated["text"]
 
 
@@ -8751,6 +8752,7 @@ def test_evidence_pack_reserves_linked_complete_block_before_page_parents():
                     "text": complete_takeaways,
                     "source_url": showcase_url,
                     "evidence_linked": True,
+                    "evidence_completion_priority": True,
                 },
             ]
         },

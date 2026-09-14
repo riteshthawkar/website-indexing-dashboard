@@ -1134,10 +1134,12 @@ def _candidate_score(
         # generation sees the full structured block in one evidence item.
         score += 72.0
     if bool(doc.get("evidence_linked")):
-        # A selected evidence span points to this complete source chunk.  Keep
-        # the linked block ahead of broad page parents so the last list item or
-        # sentence qualifier is not lost at an aggregate excerpt boundary.
-        score += 96.0
+        score += 18.0
+    if bool(doc.get("evidence_completion_priority")):
+        # The linked source block demonstrably contains another list item past
+        # the selected span boundary. Keep that bounded completion ahead of a
+        # broad page parent without promoting every linked media-heavy chunk.
+        score += 110.0
 
     if kind == "answer" and not (doc.get("source_span_ids") or doc.get("linked_span_ids")):
         score -= 14.0
@@ -1338,6 +1340,9 @@ def build_evidence_pack(
                 "confidence": _confidence(doc),
                 "authority_score": _authority_score(doc),
                 "evidence_linked": bool(doc.get("evidence_linked")),
+                "evidence_completion_priority": bool(
+                    doc.get("evidence_completion_priority")
+                ),
             }
         )
         return True
@@ -1427,25 +1432,45 @@ def build_evidence_pack(
                 _append_candidate(kind, doc)
                 break
 
-    if not explicit_media_query:
-        # Reserve complete chunks linked from the retriever's selected spans
-        # before aggregate parents consume the character budget. One chunk per
-        # source normally suffices, while a second can preserve a split list or
-        # coordinated definition on the same page.
-        linked_per_source: Dict[str, int] = {}
-        linked_limit = min(3, max_items)
-        linked_added = 0
-        for _score, kind, doc in candidates:
-            if kind != "chunk" or not bool(doc.get("evidence_linked")):
+    if not explicit_media_query and len(required_pages) > 1:
+        # Preserve compact answer-bearing spans before complete-page parents
+        # consume the character budget. Select them in source-diverse rounds so
+        # a synthesis keeps evidence from every requested page, then add only a
+        # linked chunk that demonstrably completes a split structured list.
+        span_groups: Dict[str, List[Tuple[float, str, Dict[str, Any]]]] = {}
+        span_source_order: List[str] = []
+        for candidate in candidates:
+            _score, kind, doc = candidate
+            if kind != "evidence_span":
                 continue
             source = _source_url(doc) or "local"
-            if linked_per_source.get(source, 0) >= 2:
-                continue
-            if _append_candidate(kind, doc):
-                linked_per_source[source] = linked_per_source.get(source, 0) + 1
-                linked_added += 1
-            if linked_added >= linked_limit:
+            if source not in span_groups:
+                span_groups[source] = []
+                span_source_order.append(source)
+            span_groups[source].append(candidate)
+        span_limit = min(6, max_items)
+        span_added = 0
+        for source_round in range(3):
+            for source in span_source_order:
+                grouped = span_groups[source]
+                if source_round >= len(grouped):
+                    continue
+                _score, kind, doc = grouped[source_round]
+                if _append_candidate(kind, doc):
+                    span_added += 1
+                if span_added >= span_limit:
+                    break
+            if span_added >= span_limit:
                 break
+
+    if not explicit_media_query:
+        for _score, kind, doc in candidates:
+            if kind != "chunk" or not bool(
+                doc.get("evidence_completion_priority")
+            ):
+                continue
+            _append_candidate(kind, doc)
+            break
 
     for required_page in required_pages:
         aggregate_added = False
@@ -1559,7 +1584,9 @@ def build_evidence_pack(
         return 0 if str(item.get("id") or "") in aggregate_candidate_ids else 1
 
     def _linked_evidence_sort_rank(item: Dict[str, Any]) -> int:
-        return 0 if bool(item.get("evidence_linked")) else 1
+        if bool(item.get("evidence_completion_priority")):
+            return 0
+        return 1
 
     coverage_first_intent = intent in {"broad_synthesis", "multi_page_aggregation", "large_page"} or len(required_pages) > 1
     if coverage_first_intent:

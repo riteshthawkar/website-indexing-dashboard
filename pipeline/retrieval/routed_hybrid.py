@@ -3234,6 +3234,14 @@ class RoutedHybridRetriever:
             hydrated_ids: set[str] = set()
             for span_rank, span in enumerate(payload["evidence_span_documents"]):
                 span_source = self._source_url_from_record(span)
+                span_text = str(span.get("text") or span.get("dense_text") or "")
+                span_list_items = len(
+                    re.findall(
+                        r"(?:^|\s)(?:[-*•·]\s*){1,2}(?=[^\s-])",
+                        span_text,
+                        flags=re.MULTILINE,
+                    )
+                )
                 for raw_chunk_id in span.get("linked_chunk_ids") or []:
                     chunk_id = str(raw_chunk_id or "").strip()
                     if not chunk_id or chunk_id in hydrated_ids:
@@ -3251,6 +3259,21 @@ class RoutedHybridRetriever:
                         )
                     hydrated["evidence_linked"] = True
                     hydrated["linked_evidence_rank"] = span_rank
+                    hydrated_text = str(
+                        hydrated.get("text") or hydrated.get("dense_text") or ""
+                    )
+                    hydrated_list_items = len(
+                        re.findall(
+                            r"(?:^|\s)(?:[-*•·]\s*){1,2}(?=[^\s-])",
+                            hydrated_text,
+                            flags=re.MULTILINE,
+                        )
+                    )
+                    hydrated["evidence_completion_priority"] = bool(
+                        span_list_items >= 2
+                        and hydrated_list_items > span_list_items
+                        and len(hydrated_text) <= 2400
+                    )
                     hydrated_chunks.append(hydrated)
                     hydrated_ids.add(chunk_id)
             if hydrated_chunks:
