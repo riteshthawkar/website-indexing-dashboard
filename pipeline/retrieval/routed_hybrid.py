@@ -3212,6 +3212,57 @@ class RoutedHybridRetriever:
                     dict.fromkeys([*linked_parent_ids, *[str(value) for value in (payload.get("selected_parent_ids") or []) if str(value)]])
                 )
 
+            # Evidence spans are intentionally compact, so a list extractor can
+            # stop one item before the end or detach a qualifier that lives in
+            # the same source chunk.  Hydrate the chunks explicitly linked by
+            # the selected spans and mark them as completeness support.  This
+            # is a local artifact lookup (no extra embedding/provider call) and
+            # lets the evidence pack reserve the complete source block instead
+            # of relying on a truncated page parent.
+            chunk_map = getattr(getattr(self, "vector", None), "chunk_map", {})
+            retrieval_documents = [
+                dict(doc)
+                for doc in (payload.get("retrieval_documents") or [])
+                if isinstance(doc, dict)
+            ]
+            existing_by_id = {
+                str(doc.get("id") or ""): doc
+                for doc in retrieval_documents
+                if str(doc.get("id") or "")
+            }
+            hydrated_chunks: List[Dict[str, Any]] = []
+            hydrated_ids: set[str] = set()
+            for span_rank, span in enumerate(payload["evidence_span_documents"]):
+                span_source = self._source_url_from_record(span)
+                for raw_chunk_id in span.get("linked_chunk_ids") or []:
+                    chunk_id = str(raw_chunk_id or "").strip()
+                    if not chunk_id or chunk_id in hydrated_ids:
+                        continue
+                    existing = existing_by_id.get(chunk_id)
+                    if existing is not None:
+                        hydrated = dict(existing)
+                    else:
+                        chunk = chunk_map.get(chunk_id) if isinstance(chunk_map, Mapping) else None
+                        if not isinstance(chunk, dict):
+                            continue
+                        hydrated = self._chunk_payload_from_record(
+                            chunk,
+                            required_page=span_source,
+                        )
+                    hydrated["evidence_linked"] = True
+                    hydrated["linked_evidence_rank"] = span_rank
+                    hydrated_chunks.append(hydrated)
+                    hydrated_ids.add(chunk_id)
+            if hydrated_chunks:
+                payload["retrieval_documents"] = [
+                    *hydrated_chunks,
+                    *[
+                        doc
+                        for doc in retrieval_documents
+                        if str(doc.get("id") or "") not in hydrated_ids
+                    ],
+                ]
+
         retrieval_docs = [doc for doc in (payload.get("retrieval_documents") or []) if isinstance(doc, dict)]
         if retrieval_docs:
             required_docs: List[Dict[str, Any]] = []

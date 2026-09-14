@@ -8665,6 +8665,110 @@ def test_routed_prioritizes_required_current_sources_over_old_catalog_spans():
     assert payload["selected_parent_ids"][:2] == ["map-parent", "facilities-parent"]
 
 
+def test_routed_hydrates_complete_chunks_linked_from_selected_spans():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    page_url = "https://staticcdn.mbzuai.ac.ae/research-showcase.pdf"
+    chunk_id = "chunk:c650:showcase:00019:takeaways"
+    retriever.vector = SimpleNamespace(
+        chunk_map={
+            chunk_id: {
+                "id": chunk_id,
+                "text": (
+                    "Take Away Messages\n"
+                    "- Identify Research That Matters\n"
+                    "- Trust Your Instincts\n"
+                    "- Get Your Hands Dirty\n"
+                    "- Believe in Yourself"
+                ),
+                "source_url": page_url,
+                "document_title": "Research Showcase",
+                "section_heading": "Take Away Messages",
+            }
+        }
+    )
+    payload = {
+        "evidence_span_documents": [
+            {
+                "id": "span-takeaways",
+                "text": (
+                    "Take Away Messages - Identify Research That Matters - "
+                    "Trust Your Instincts - Get Your Hands Dirty"
+                ),
+                "source_url": page_url,
+                "linked_chunk_ids": [chunk_id],
+            }
+        ],
+        "selected_evidence_span_ids": ["span-takeaways"],
+        "selected_chunk_ids": [],
+        "selected_parent_ids": [],
+        "retrieval_documents": [],
+    }
+
+    retriever._prioritize_required_page_evidence(
+        query="What approach does the research showcase describe?",
+        payload=payload,
+        coverage_plan={"required_pages": [page_url]},
+    )
+
+    hydrated = payload["retrieval_documents"][0]
+    assert hydrated["id"] == chunk_id
+    assert hydrated["evidence_linked"] is True
+    assert "Believe in Yourself" in hydrated["text"]
+
+
+def test_evidence_pack_reserves_linked_complete_block_before_page_parents():
+    from pipeline.retrieval.evidence_packer import build_evidence_pack
+
+    divisions_url = "https://mbzuai.ac.ae/research/our-divisions"
+    showcase_url = "https://staticcdn.mbzuai.ac.ae/research-showcase.pdf"
+    complete_takeaways = (
+        "Take Away Messages: Identify Research That Matters; Trust Your Instincts; "
+        "Get Your Hands Dirty; Believe in Yourself."
+    )
+    pack = build_evidence_pack(
+        query=(
+            "How do MBZUAI's divisions and the research showcase together describe "
+            "the university's approach to research and innovation?"
+        ),
+        result={
+            "retrieval_documents": [
+                {
+                    "id": "parent:divisions:page",
+                    "text": "Divisions context. " * 500,
+                    "source_url": divisions_url,
+                    "coverage_aggregate": True,
+                },
+                {
+                    "id": "parent:showcase:page",
+                    "text": "Showcase background. " * 500,
+                    "source_url": showcase_url,
+                    "coverage_aggregate": True,
+                },
+                {
+                    "id": "chunk:c650:showcase:takeaways",
+                    "text": complete_takeaways,
+                    "source_url": showcase_url,
+                    "evidence_linked": True,
+                },
+            ]
+        },
+        max_items=5,
+        max_chars=10000,
+        max_per_source=2,
+        coverage_plan={
+            "intent": "broad_synthesis",
+            "required_pages": [divisions_url, showcase_url],
+        },
+    )
+
+    linked_items = [item for item in pack["items"] if item.get("evidence_linked")]
+    assert len(linked_items) == 1
+    assert linked_items[0]["text"] == complete_takeaways
+    assert "Believe in Yourself" in " ".join(item["text"] for item in pack["items"])
+
+
 def test_routed_coverage_plan_includes_contact_page_for_arrival_transport_queries():
     from pipeline.retrieval.adaptive_hybrid import QueryMode, _tokenize
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
