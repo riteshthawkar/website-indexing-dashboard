@@ -43,6 +43,8 @@ def test_eval_example_normalizes_supported_language_aliases():
 
 
 def test_arabic_critical_synthesis_accepts_equivalent_interdisciplinary_terms():
+    from pipeline.evaluation.answer_readiness import _required_terms_result
+
     dataset_path = REPO_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
     example = next(
         row
@@ -51,9 +53,26 @@ def test_arabic_critical_synthesis_accepts_equivalent_interdisciplinary_terms():
     )
 
     assert "العمل البيني" not in example.metadata["answer_must_include"]
+    assert "تعليم مميز يركز على الذكاء الاصطناعي" not in example.metadata["answer_must_include"]
     assert example.metadata["answer_must_include_any_groups"] == [
-        ["العمل البيني", "العمل متعدد التخصصات", "التعاون متعدد التخصصات"]
+        ["العمل البيني", "العمل متعدد التخصصات", "التعاون متعدد التخصصات"],
+        [
+            "تعليم مميز يركز على الذكاء الاصطناعي",
+            "تعليم متميز قائم على الذكاء الاصطناعي أولًا",
+            "AI-first education",
+        ],
     ]
+
+    missing, coverage = _required_terms_result(
+        (
+            "نبني جامعة شاملة للمستقبل، ويوسع قسم الدراسات الجامعية العمل متعدد "
+            "التخصصات عبر تعليم متميز قائم على الذكاء الاصطناعي أولًا وتعلّم ريادة الأعمال."
+        ),
+        example.metadata["answer_must_include"],
+        example.metadata,
+    )
+    assert missing == []
+    assert coverage == 1.0
 
 
 def test_arabic_admissions_accepts_the_exact_source_label_across_languages():

@@ -27,7 +27,7 @@
   },
   "dataset": {
     "path": "eval/mbzuai_gold/mbzuai_multilingual_v2.jsonl",
-    "sha256": "76349823da8767b137f63f248bba62592985a5bb8605cf187cd448b51c9f911b",
+    "sha256": "94d60f13958b2c942066ce5ff172beac3275e877a0dd82b368c644689d5aae8f",
     "coverage": {
       "query_count": 160,
       "language_counts": {
