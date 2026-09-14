@@ -8734,6 +8734,13 @@ def test_evidence_pack_reserves_linked_complete_block_before_page_parents():
             "the university's approach to research and innovation?"
         ),
         result={
+            "evidence_span_documents": [
+                {
+                    "id": "unrelated-showcase-news",
+                    "text": "A separate news story also mentions research innovation.",
+                    "source_url": "https://mbzuai.ac.ae/news/unrelated-showcase",
+                }
+            ],
             "retrieval_documents": [
                 {
                     "id": "parent:divisions:page",
@@ -8769,6 +8776,7 @@ def test_evidence_pack_reserves_linked_complete_block_before_page_parents():
     assert len(linked_items) == 1
     assert linked_items[0]["text"] == complete_takeaways
     assert "Believe in Yourself" in " ".join(item["text"] for item in pack["items"])
+    assert all(item["id"] != "unrelated-showcase-news" for item in pack["items"])
 
 
 def test_routed_coverage_plan_includes_contact_page_for_arrival_transport_queries():

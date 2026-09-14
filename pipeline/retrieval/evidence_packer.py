@@ -1444,6 +1444,11 @@ def build_evidence_pack(
             if kind != "evidence_span":
                 continue
             source = _source_url(doc) or "local"
+            if (
+                required_page_set
+                and _normalize_url_for_match(source) not in required_page_set
+            ):
+                continue
             if source not in span_groups:
                 span_groups[source] = []
                 span_source_order.append(source)
