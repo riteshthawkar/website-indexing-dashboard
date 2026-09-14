@@ -9210,6 +9210,66 @@ def test_actionable_navigation_target_becomes_a_required_evidence_page():
     ]
 
 
+def test_late_navigation_target_is_backfilled_before_coverage_evaluation():
+    from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
+
+    retriever = RoutedHybridRetriever.__new__(RoutedHybridRetriever)
+    admissions_url = (
+        "https://preprod.mbzuai.ac.ae/ar/admissions-aid/undergraduate-admissions"
+    )
+    program_url = "https://preprod.mbzuai.ac.ae/ar/study/undergraduate-program"
+    retriever.vector = SimpleNamespace(
+        evidence_span_map={
+            "program-overview": {
+                "id": "program-overview",
+                "text": "برنامج بكالوريوس العلوم في الذكاء الاصطناعي.",
+                "source_url": program_url,
+                "linked_chunk_ids": ["program-chunk"],
+                "span_type": "program",
+            }
+        },
+        _score_text_match=lambda query, text: 1.0,
+    )
+    payload = {
+        "abstained": False,
+        "selected_evidence_span_ids": ["admissions-requirements"],
+        "selected_chunk_ids": ["admissions-chunk"],
+        "selected_parent_ids": [],
+        "evidence_span_documents": [
+            {
+                "id": "admissions-requirements",
+                "text": "الحد الأدنى للمعدل العام هو 90%.",
+                "source_url": admissions_url,
+            }
+        ],
+        "retrieval_documents": [],
+    }
+    coverage_plan = {
+        "required_pages": [admissions_url],
+        "required_pages_source": "explicit_markers",
+    }
+    navigation_plan = {
+        "status": "partial",
+        "target_page": {"url": program_url},
+        "steps": [{"action_type": "open_page", "target_url": program_url}],
+    }
+
+    assert retriever._require_navigation_target_page(
+        coverage_plan,
+        navigation_plan,
+    ) is True
+    changed = retriever._backfill_navigation_target_coverage(
+        query="ما متطلبات القبول في برنامج البكالوريوس؟",
+        payload=payload,
+        coverage_plan=coverage_plan,
+    )
+
+    assert changed is True
+    assert coverage_plan["required_pages"] == [program_url, admissions_url]
+    assert "program-overview" in payload["selected_evidence_span_ids"]
+    assert payload["evidence_span_documents"][0]["source_url"] == program_url
+
+
 def test_context_page_is_required_only_when_present_in_frozen_corpus():
     from pipeline.retrieval.routed_hybrid import RoutedHybridRetriever
 

@@ -3660,6 +3660,36 @@ class RoutedHybridRetriever:
         coverage_plan["required_pages"] = [target_url, *required_pages]
         return True
 
+    def _backfill_navigation_target_coverage(
+        self,
+        *,
+        query: str,
+        payload: Dict[str, Any],
+        coverage_plan: Dict[str, Any],
+    ) -> bool:
+        """Backfill a page that the graph planner adds after initial coverage.
+
+        The first required-page backfill runs before the navigation plan exists.
+        A newly selected graph target therefore needs the same bounded local
+        evidence recovery before the final evidence pack evaluates coverage.
+        """
+
+        changed = self._augment_payload_for_required_coverage(
+            query=query,
+            payload=payload,
+            coverage_plan=coverage_plan,
+        )
+        if changed:
+            confidence, factors = score_retrieval_confidence(payload)
+            payload["retrieval_confidence"] = confidence
+            payload["confidence_factors"] = factors
+        self._prioritize_required_page_evidence(
+            query=query,
+            payload=payload,
+            coverage_plan=coverage_plan,
+        )
+        return changed
+
     def _require_context_page(
         self,
         coverage_plan: Dict[str, Any],
@@ -4109,12 +4139,21 @@ class RoutedHybridRetriever:
                 navigation_context=planned_navigation_context,
             )
             payload["navigation_intent"] = planned_navigation_context["intent"]
-            payload["navigation_target_page_required"] = (
-                self._require_navigation_target_page(
-                    coverage_plan,
-                    payload["navigation_plan"],
-                )
+            navigation_target_page_required = self._require_navigation_target_page(
+                coverage_plan,
+                payload["navigation_plan"],
             )
+            payload["navigation_target_page_required"] = (
+                navigation_target_page_required
+            )
+            if navigation_target_page_required:
+                payload["navigation_target_evidence_backfilled"] = (
+                    self._backfill_navigation_target_coverage(
+                        query=coverage_query,
+                        payload=payload,
+                        coverage_plan=coverage_plan,
+                    )
+                )
             navigation_parent_ids = self._navigation_target_parent_ids(
                 payload["navigation_plan"]
             )
