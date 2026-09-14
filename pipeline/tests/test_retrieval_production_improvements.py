@@ -7255,7 +7255,7 @@ def test_promotion_revalidates_release_manifest_integrity(tmp_path):
         }
     )
     atomic_write_json(manifest_path, invalid)
-    with pytest.raises(ValueError, match="Canonical production answer readiness cannot be waived"):
+    with pytest.raises(ValueError, match="policy_id does not match"):
         promote_release_manifest(manifest_path=manifest_path, active_release_file=active_path)
 
 

@@ -81,7 +81,7 @@ SELECTED_SOURCE_HASH_KEYS = (
     "navigation_catalog_sha256",
 )
 RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v8"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v9"
 PRODUCTION_RETRIEVAL_DATASET_SHA256 = (
     "94d60f13958b2c942066ce5ff172beac3275e877a0dd82b368c644689d5aae8f"
 )

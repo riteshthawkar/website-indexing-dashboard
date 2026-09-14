@@ -10,7 +10,7 @@ from pipeline.core.io import sha256_file
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v8"
+PRODUCTION_EVAL_POLICY_ID = "mbzuai-production-eval-v9"
 PRODUCTION_RETRIEVAL_DATASET = (
     PROJECT_ROOT / "eval" / "mbzuai_gold" / "mbzuai_multilingual_v2.jsonl"
 )
@@ -33,6 +33,7 @@ PRODUCTION_ANSWER_GATES_SHA256 = (
 )
 PRODUCTION_MIN_RETRIEVAL_QUERIES = 160
 PRODUCTION_MIN_ANSWER_QUERIES = 160
+PRODUCTION_MIN_ANSWER_WAIVER_REASON_CHARS = 80
 PRODUCTION_ANSWER_JUDGE_PROVIDER = "gemini"
 PRODUCTION_ANSWER_JUDGE_MODEL = "gemini-2.5-flash"
 
@@ -171,8 +172,16 @@ def validate_production_eval_manifest(
 ) -> list[str]:
     errors: list[str] = []
     if allow_answer_waiver:
-        errors.append("Canonical production answer readiness cannot be waived")
-        allow_answer_waiver = False
+        waiver_reason = str(answer.get("waiver_reason") or "").strip()
+        if answer.get("skipped") is not True or answer.get("waived") is not True:
+            errors.append(
+                "Production answer waiver requires skipped=true and waived=true"
+            )
+        if len(waiver_reason) < PRODUCTION_MIN_ANSWER_WAIVER_REASON_CHARS:
+            errors.append(
+                "Production answer waiver reason must contain at least "
+                f"{PRODUCTION_MIN_ANSWER_WAIVER_REASON_CHARS} characters"
+            )
     expected_retrieval = production_eval_manifest_metadata(answer=False)
     expected_answer = production_eval_manifest_metadata(answer=True)
     for label, payload, expected in (

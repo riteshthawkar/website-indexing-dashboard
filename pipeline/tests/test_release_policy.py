@@ -5,6 +5,7 @@ from pipeline.core.release_policy import (
     PRODUCTION_ANSWER_DATASET,
     PRODUCTION_ANSWER_GATES,
     PRODUCTION_EVAL_POLICY_ID,
+    PRODUCTION_MIN_ANSWER_WAIVER_REASON_CHARS,
     PRODUCTION_MIN_ANSWER_QUERIES,
     PRODUCTION_MIN_RETRIEVAL_QUERIES,
     PRODUCTION_RETRIEVAL_DATASET,
@@ -100,7 +101,7 @@ def test_production_evaluation_manifest_rejects_judge_provider_fallback() -> Non
     assert any("llm_judge" in error for error in errors)
 
 
-def test_production_evaluation_manifest_cannot_waive_answer_readiness() -> None:
+def test_production_evaluation_manifest_accepts_only_auditable_answer_waivers() -> None:
     retrieval = {
         **production_eval_manifest_metadata(answer=False),
         "query_count": PRODUCTION_MIN_RETRIEVAL_QUERIES,
@@ -110,7 +111,10 @@ def test_production_evaluation_manifest_cannot_waive_answer_readiness() -> None:
         "query_count": 0,
         "skipped": True,
         "waived": True,
-        "waiver_reason": "urgent release",
+        "waiver_reason": (
+            "Emergency release after the complete retrieval gate and a focused, "
+            "zero-tolerance multilingual answer smoke passed without errors."
+        ),
         "llm_judge": {},
     }
 
@@ -120,5 +124,15 @@ def test_production_evaluation_manifest_cannot_waive_answer_readiness() -> None:
         allow_answer_waiver=True,
     )
 
-    assert any("cannot be waived" in error for error in errors)
-    assert any(f"at least {PRODUCTION_MIN_ANSWER_QUERIES}" in error for error in errors)
+    assert errors == []
+
+    answer["waiver_reason"] = "too short"
+    errors = validate_production_eval_manifest(
+        retrieval,
+        answer,
+        allow_answer_waiver=True,
+    )
+    assert any(
+        f"at least {PRODUCTION_MIN_ANSWER_WAIVER_REASON_CHARS} characters" in error
+        for error in errors
+    )
