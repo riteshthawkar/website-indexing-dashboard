@@ -7,9 +7,19 @@ from typing import Any
 
 
 _EXPORTS = {
+    "AutoEvalBuilder": ("lawa_rag.auto_eval", "AutoEvalBuilder"),
+    "AutoEvalGenerationError": ("lawa_rag.auto_eval", "AutoEvalGenerationError"),
+    "CorpusSnapshot": ("lawa_rag.auto_eval", "CorpusSnapshot"),
+    "CoveragePlan": ("lawa_rag.auto_eval", "CoveragePlan"),
     "DEFAULT_RAGAS_METRICS": ("pipeline.evaluation.ragas_eval", "DEFAULT_RAGAS_METRICS"),
     "EVALUATION_PRESETS": ("pipeline.evaluation.presets", "EVALUATION_PRESETS"),
     "EvalExample": ("pipeline.evaluation.dataset", "EvalExample"),
+    "EvalSuite": ("lawa_rag.auto_eval", "EvalSuite"),
+    "Persona": ("lawa_rag.auto_eval", "Persona"),
+    "RetrievalBundleAdapter": ("lawa_rag.auto_eval", "RetrievalBundleAdapter"),
+    "create_structured_llm": ("lawa_rag.auto_eval", "create_structured_llm"),
+    "approve_cases": ("lawa_rag.auto_eval", "approve_cases"),
+    "export_eval_examples": ("lawa_rag.auto_eval", "export_eval_examples"),
     "aggregate_quality": ("pipeline.evaluation.controlled_ab", "aggregate_quality"),
     "choose_abstention_threshold": (
         "pipeline.evaluation.controlled_ab",

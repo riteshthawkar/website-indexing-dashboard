@@ -209,6 +209,11 @@ from lawa_rag.retrieval import RoutedHybridRetriever, build_evidence_pack
 from lawa_rag.evaluation import load_eval_examples, evaluate_retrieval_dataset
 ```
 
+Grounded, role-based synthetic suite generation is documented in
+[`auto_evaluation.md`](auto_evaluation.md). It uses an immutable corpus snapshot,
+structural difficulty, separate question/reference calls, exact citation
+validation, and resumable per-scenario checkpoints.
+
 Provider-specific modules are imported lazily. Importing `lawa_rag` alone does
 not initialize Gemini, OpenAI, Pinecone, PostgreSQL, or network clients.
 
@@ -265,6 +270,7 @@ lawa_rag/
 ├── representation.py Representation V2 contracts
 ├── retrieval.py       lazy retrieval exports
 ├── evaluation.py      lazy evaluation exports
+├── auto_eval/         grounded suite generation and review
 ├── service.py         retrieval-service factory
 └── indexing.py        compatibility import facade
 ```

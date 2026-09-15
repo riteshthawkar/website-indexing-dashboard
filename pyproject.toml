@@ -81,6 +81,9 @@ test = [
   "tomli==2.2.1; python_version < '3.11'",
 ]
 
+[project.scripts]
+lawa-rag-auto-eval = "lawa_rag.auto_eval.cli:main"
+
 [tool.setuptools]
 include-package-data = true
 

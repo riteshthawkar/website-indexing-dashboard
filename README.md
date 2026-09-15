@@ -199,5 +199,6 @@ PIPELINE_EMBEDDER__VERIFY_INDEX_MIN_COUNT_ONLY=true bash scripts/pipeline.sh run
 - setup guide: [`docs/setup.md`](docs/setup.md)
 - retriever handoff: [`docs/retriever_system.md`](docs/retriever_system.md)
 - reusable Python package: [`docs/internal_package.md`](docs/internal_package.md)
+- grounded automatic evaluation: [`docs/auto_evaluation.md`](docs/auto_evaluation.md)
 - generic website profiles and the isolated crawl-to-chunks package flow:
   [`docs/internal_package.md#generic-website-ingestion`](docs/internal_package.md#generic-website-ingestion)

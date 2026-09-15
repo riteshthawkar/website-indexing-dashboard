@@ -65,11 +65,15 @@ def test_importing_core_and_lazy_facades_does_not_load_provider_implementations(
     script = """
 import sys
 import lawa_rag
+import lawa_rag.auto_eval
 import lawa_rag.evaluation
 import lawa_rag.retrieval
+import pipeline.evaluation
+from pipeline.evaluation import EvalExample
 assert 'pipeline.retrieval.adaptive_hybrid' not in sys.modules
 assert 'pipeline.evaluation.answer_generation' not in sys.modules
 assert 'google.genai' not in sys.modules
+assert 'openai' not in sys.modules
 assert 'pinecone' not in sys.modules
 print('lazy imports preserved')
 """
@@ -87,11 +91,13 @@ print('lazy imports preserved')
 def test_retrieval_and_evaluation_facades_resolve_real_implementations() -> None:
     import lawa_rag.evaluation as evaluation
     import lawa_rag.retrieval as retrieval
+    from lawa_rag.auto_eval import AutoEvalBuilder
     from pipeline.evaluation.dataset import EvalExample
     from pipeline.retrieval.adaptive_hybrid import QueryMode
 
     assert retrieval.QueryMode is QueryMode
     assert evaluation.EvalExample is EvalExample
+    assert evaluation.AutoEvalBuilder is AutoEvalBuilder
     assert "RoutedHybridRetriever" in dir(retrieval)
     assert "evaluate_retrieval_dataset" in dir(evaluation)
     with pytest.raises(AttributeError):
