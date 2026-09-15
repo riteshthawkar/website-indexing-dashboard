@@ -117,6 +117,12 @@ def _validate_answerable(case, selected, evidence, add) -> None:
         add("error", "missing_evidence", "Answerable case requires selected evidence")
     if not case.reference_answer:
         add("error", "missing_reference_answer", "Answerable case requires a reference answer")
+    elif _looks_like_abstention(case.reference_answer):
+        add(
+            "error",
+            "answerable_abstention",
+            "Answerable case reference answer says the requested information is unavailable",
+        )
     if not case.claims:
         add("error", "missing_claims", "Answerable case requires atomic gold claims")
     if not case.citations:
@@ -135,6 +141,13 @@ def _validate_claims(case, selected, add) -> None:
     claim_ids = {item for claim in case.claims for item in claim.evidence_ids}
     if not claim_ids.issubset(cited_ids):
         add("error", "citation_coverage", "Gold citations do not cover every claim")
+    if case.target_difficulty in {"medium", "hard"} and not selected.issubset(claim_ids):
+        unused = sorted(selected - claim_ids)
+        add(
+            "error",
+            "unused_gold_evidence",
+            f"Medium/hard case does not require all selected evidence: {unused[:5]}",
+        )
 
 
 def _validate_citations(case, selected, evidence, add) -> None:
@@ -169,6 +182,23 @@ def _quote_is_supported(quote: str, text: str) -> bool:
     normalized_quote = clean_text(quote).casefold()
     normalized_text = clean_text(text).casefold()
     return len(normalized_quote) >= 8 and normalized_quote in normalized_text
+
+
+def _looks_like_abstention(answer: str) -> bool:
+    normalized = clean_text(answer).casefold()
+    phrases = (
+        "the provided evidence does not",
+        "the evidence does not",
+        "information is not available",
+        "no information is available",
+        "does not establish this",
+        "لا تتوفر معلومات",
+        "لا تتوفر في الأدلة",
+        "لا توجد معلومات",
+        "الأدلة المقدمة لا",
+        "لا يمكن تحديد",
+    )
+    return any(phrase in normalized for phrase in phrases)
 
 
 def _uniqueness_issues(cases: Iterable[GeneratedEvalCase]) -> list[ValidationIssue]:

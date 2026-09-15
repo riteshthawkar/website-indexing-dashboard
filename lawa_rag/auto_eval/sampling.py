@@ -5,16 +5,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Sequence
 
-from ._sampling_support import adjacency, modality, prompt_unit, semantic_overlap, stable_number
+from ._sampling_support import (
+    adjacency,
+    deduplicated_candidates,
+    modality,
+    prompt_unit,
+    semantic_overlap,
+    stable_number,
+    usable_for_generation,
+)
 from .corpus import CorpusSnapshot, EvidenceUnit
 from .planning import DifficultyProfile, ScenarioBlueprint
 
 
 _TASK_KINDS = {
     "fact": {"fact", "evidence_span", "answer", "chunk"},
-    "navigate": {"action", "page_card"},
+    "navigate": {"action"},
     "aggregate": {"table", "database"},
     "multimodal": {"media", "image", "video"},
+}
+
+_TEXT_KINDS = {
+    "chunk", "parent", "fact", "summary", "assertion", "answer", "evidence_span"
+}
+_CANDIDATE_KINDS = {
+    "fact": _TEXT_KINDS,
+    "explain": _TEXT_KINDS,
+    "compare": _TEXT_KINDS,
+    "synthesis": _TEXT_KINDS,
+    "navigate": {"action", "page_card"},
+    "aggregate": {"table", "database"},
 }
 
 
@@ -83,6 +103,7 @@ class EvidenceSampler:
         target = min(len(candidates), scenario.difficulty.evidence_count)
         while len(selected) < target:
             remaining = [item for item in candidates if item not in selected]
+            remaining = deduplicated_candidates(remaining, selected, self._sources)
             selected_sources = {item.source_id for item in selected}
             if len(selected_sources) < scenario.difficulty.source_count:
                 diverse = [item for item in remaining if item.source_id not in selected_sources]
@@ -109,8 +130,10 @@ class EvidenceSampler:
         )
 
     def _task_candidates(self, task: str) -> list[EvidenceUnit]:
-        useful = [item for item in self.snapshot.evidence if len(item.text.strip()) >= 24]
-        return sorted(useful, key=lambda item: item.evidence_id)
+        useful = [item for item in self.snapshot.evidence if usable_for_generation(item)]
+        allowed = _CANDIDATE_KINDS.get(task)
+        scoped = [item for item in useful if item.kind in allowed] if allowed else useful
+        return sorted(scoped or useful, key=lambda item: item.evidence_id)
 
     def _anchor_candidates(
         self, task: str, candidates: Sequence[EvidenceUnit]

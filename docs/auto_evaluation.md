@@ -103,8 +103,8 @@ lawa-rag-auto-eval generate \
   --plan eval/auto/coverage.yaml \
   --personas eval/auto/personas.yaml \
   --provider openai \
-  --model gpt-5-mini \
-  --critic-model gpt-5-mini \
+  --model gpt-4.1-mini \
+  --critic-model gpt-4.1-mini \
   --max-concurrency 4 \
   --output-dir eval/auto/suite-v1
 ```
@@ -118,9 +118,9 @@ To let the LLM infer six personas, remove `--personas` and optionally add:
 Question, reference, and critic roles may use different providers or models:
 
 ```bash
---provider gemini --model gemini-2.5-flash \
---reference-provider openai --reference-model gpt-5-mini \
---critic-provider openai --critic-model gpt-5-mini
+--provider openai --model gpt-4.1-mini \
+--reference-provider openai --reference-model gpt-4.1-mini \
+--critic-provider gemini --critic-model gemini-3.5-flash-lite
 ```
 
 Generation is resumable by default. Each accepted case is written atomically
@@ -204,8 +204,8 @@ snapshot = RetrievalBundleAdapter.from_run(
     "runs/example/candidate-001",
     domain="university",
 )
-generator = create_structured_llm("openai", model="gpt-5-mini")
-critic = create_structured_llm("openai", model="gpt-5-mini")
+generator = create_structured_llm("openai", model="gpt-4.1-mini")
+critic = create_structured_llm("gemini", model="gemini-3.5-flash-lite")
 
 suite = AutoEvalBuilder(
     question_llm=generator,
@@ -222,3 +222,7 @@ suite = AutoEvalBuilder(
 For the strongest independence, use different models for question generation
 and reference/critic validation. Always review a sample of every persona,
 difficulty, language, source type, and all no-answer cases before promotion.
+An LLM critic is a useful rejection layer, not proof that a case is correct:
+release promotion should also require deterministic validation and a calibrated
+human-reviewed sample. Keep generation fail-closed when the requested case
+count is not reached.

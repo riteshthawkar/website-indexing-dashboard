@@ -182,7 +182,7 @@ class AutoEvalBuilder:
                 self.question_llm, snapshot, persona, scenario, bundle, feedback
             )
             reference = generate_reference(
-                self.reference_llm, snapshot, scenario, bundle, question["query"]
+                self.reference_llm, snapshot, scenario, bundle, question["query"], feedback
             )
             case = self._case_from_payloads(
                 snapshot, persona, scenario, bundle, question, reference, attempt

@@ -38,12 +38,29 @@ def critic_accepted(payload: Mapping[str, Any]) -> bool:
     if payload.get("passed") is not True or payload.get("answerability_correct") is not True:
         return False
     try:
-        grounding = float(payload.get("grounding_score"))
-        naturalness = float(payload.get("naturalness_score"))
-        difficulty = float(payload.get("difficulty_match_score"))
+        scores = {
+            "grounding": float(payload.get("grounding_score")),
+            "naturalness": float(payload.get("naturalness_score")),
+            "difficulty": float(payload.get("difficulty_match_score")),
+            "query_grounding": float(payload.get("query_grounding_score")),
+            "answer_completeness": float(payload.get("answer_completeness_score")),
+            "task_match": float(payload.get("task_match_score")),
+            "persona_fit": float(payload.get("persona_fit_score")),
+            "language_quality": float(payload.get("language_quality_score")),
+        }
     except (TypeError, ValueError):
         return False
-    return grounding >= 0.9 and naturalness >= 0.6 and difficulty >= 0.6
+    thresholds = {
+        "grounding": 0.9,
+        "naturalness": 0.6,
+        "difficulty": 0.6,
+        "query_grounding": 0.9,
+        "answer_completeness": 0.9,
+        "task_match": 0.75,
+        "persona_fit": 0.6,
+        "language_quality": 0.8,
+    }
+    return all(scores[name] >= threshold for name, threshold in thresholds.items())
 
 
 def failure_message(failures, output_dir) -> str:

@@ -16,6 +16,7 @@ from lawa_rag.auto_eval import (
     LLMIdentity,
     export_eval_examples,
     generate_personas,
+    validate_case,
 )
 from pipeline.evaluation.dataset import load_eval_examples
 from pipeline.tests.lawa_rag_auto_eval_support import simple_snapshot, student_persona
@@ -27,6 +28,7 @@ class ScriptedLLM:
         self.fail_on_call = fail_on_call
         self.calls: list[str] = []
         self.reference_calls = 0
+        self.reference_prompts: list[str] = []
 
     @property
     def identity(self) -> LLMIdentity:
@@ -62,6 +64,7 @@ class ScriptedLLM:
             }
         if schema_name == "auto_eval_reference_v1":
             self.reference_calls += 1
+            self.reference_prompts.append(user_prompt)
             if '"answerable": false' in user_prompt:
                 return {
                     "reference_answer": "The frozen corpus does not establish this fact.",
@@ -94,6 +97,11 @@ class ScriptedLLM:
                 "grounding_score": 1.0,
                 "naturalness_score": 1.0,
                 "difficulty_match_score": 1.0,
+                "query_grounding_score": 1.0,
+                "answer_completeness_score": 1.0,
+                "task_match_score": 1.0,
+                "persona_fit_score": 1.0,
+                "language_quality_score": 1.0,
                 "issues": [],
             }
         raise AssertionError(schema_name)
@@ -138,6 +146,13 @@ def test_builder_generates_valid_resumable_suite_and_legacy_export(tmp_path: Pat
     )
     assert not tampered.validate(snapshot).ok
 
+    abstaining = replace(
+        suite.cases[0],
+        reference_answer="لا تتوفر في الأدلة المقدمة معلومات للإجابة.",
+    )
+    error_codes = {item.code for item in validate_case(abstaining, snapshot).errors}
+    assert "answerable_abstention" in error_codes
+
     no_call = ScriptedLLM(fail_on_call=True)
     resumed = AutoEvalBuilder(question_llm=no_call, max_concurrency=1).generate(
         snapshot,
@@ -158,6 +173,7 @@ def test_invalid_grounding_is_retried_before_case_is_accepted() -> None:
     ).generate(simple_snapshot(), _plan(), personas=(student_persona(),))
 
     assert llm.reference_calls == 2
+    assert "Citation quote is not in evidence:library-hours" in llm.reference_prompts[1]
     assert suite.cases[0].review_status == "auto_validated"
 
 

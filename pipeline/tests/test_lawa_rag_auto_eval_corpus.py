@@ -98,3 +98,34 @@ def test_adapter_normalizes_pdf_and_database_sources() -> None:
     assert {item.source_type for item in snapshot.sources} == {"pdf", "database"}
     assert {item.kind for item in snapshot.evidence} == {"chunk", "database"}
     assert "pages 1" in snapshot.evidence_map()["pdf:page-1"].locator
+
+
+def test_page_content_title_wins_over_action_label_for_same_source() -> None:
+    shared = {
+        "document_revision_id": "revision:admissions",
+        "source_url": "https://example.edu/admissions",
+    }
+    snapshot = RetrievalBundleAdapter.from_mapping(
+        {
+            "action_records": [
+                {
+                    **shared,
+                    "id": "action:email",
+                    "title": "student.recruitment@example.edu",
+                    "label": "Email admissions",
+                    "target_url": "mailto:student.recruitment@example.edu",
+                }
+            ],
+            "chunk_records": [
+                {
+                    **shared,
+                    "id": "chunk:admissions",
+                    "document_title": "Undergraduate admissions",
+                    "text": "Applications require the published supporting documents.",
+                }
+            ],
+        },
+        domain="university",
+    )
+
+    assert snapshot.sources[0].title == "Undergraduate admissions"

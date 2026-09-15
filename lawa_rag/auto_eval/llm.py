@@ -53,11 +53,13 @@ def parse_json_object(value: str) -> dict[str, Any]:
 
 @dataclass
 class OpenAIStructuredLLM:
-    model: str = "gpt-5-mini"
+    model: str = "gpt-4.1-mini"
     api_key: str = field(default="", repr=False)
     timeout_seconds: float = 180.0
     max_output_tokens: int = 5000
-    temperature: float | None = 0.2
+    # Some OpenAI models accept only their default temperature. Callers can
+    # still opt in when they deliberately choose a model that supports it.
+    temperature: float | None = None
 
     @property
     def identity(self) -> LLMIdentity:
@@ -88,8 +90,9 @@ class OpenAIStructuredLLM:
 
 @dataclass
 class GeminiStructuredLLM:
-    model: str = "gemini-2.5-flash"
+    model: str = "gemini-3.5-flash-lite"
     api_key: str = field(default="", repr=False)
+    timeout_seconds: float = 120.0
     max_output_tokens: int = 5000
     temperature: float = 0.2
 
@@ -104,7 +107,10 @@ class GeminiStructuredLLM:
         key = self.api_key or os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
         if not key:
             raise StructuredLLMError("GOOGLE_API_KEY or GEMINI_API_KEY is required")
-        client = genai.Client(api_key=key)
+        client = genai.Client(
+            api_key=key,
+            http_options=types.HttpOptions(timeout=int(self.timeout_seconds * 1000)),
+        )
         config = types.GenerateContentConfig(
             system_instruction=system_prompt,
             response_mime_type="application/json",
@@ -153,9 +159,9 @@ def create_structured_llm(
 ) -> RetryingStructuredLLM:
     normalized = str(provider or "").strip().lower()
     if normalized == "openai":
-        delegate = OpenAIStructuredLLM(model=model or "gpt-5-mini")
+        delegate = OpenAIStructuredLLM(model=model or "gpt-4.1-mini")
     elif normalized == "gemini":
-        delegate = GeminiStructuredLLM(model=model or "gemini-2.5-flash")
+        delegate = GeminiStructuredLLM(model=model or "gemini-3.5-flash-lite")
     else:
         raise ValueError("provider must be 'openai' or 'gemini'")
     return RetryingStructuredLLM(delegate=delegate, max_attempts=max_attempts)

@@ -28,8 +28,10 @@ def generate_question(llm, snapshot, persona, scenario, bundle, feedback):
     }
 
 
-def generate_reference(llm, snapshot, scenario, bundle, query):
-    system, user = reference_prompts(snapshot, scenario, bundle, query)
+def generate_reference(llm, snapshot, scenario, bundle, query, feedback=""):
+    system, user = reference_prompts(
+        snapshot, scenario, bundle, query, feedback=feedback
+    )
     return llm.generate_json(
         system_prompt=system,
         user_prompt=user,

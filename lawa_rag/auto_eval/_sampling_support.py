@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import asdict
 from typing import Any
 
@@ -38,6 +39,53 @@ def modality(kind: str) -> str:
     if kind in {"table", "database"}:
         return "structured"
     return "text"
+
+
+def usable_for_generation(unit: EvidenceUnit) -> bool:
+    text = unit.text.strip()
+    if len(text) < 24:
+        return False
+    if unit.kind in {
+        "action", "fact", "media", "image", "video", "table", "database"
+    }:
+        return True
+    normalized = text.casefold()
+    low_signal_markers = (
+        "section: embedded media",
+        "## embedded media",
+        "section: you might also be interested in",
+        "# you might also be interested in",
+    )
+    if any(marker in normalized for marker in low_signal_markers):
+        return False
+
+    # Converted pages can contain chunks that are little more than a breadcrumb
+    # followed by a final Markdown heading (for example, ``## Admission
+    # criteria``).  They are useful graph nodes, but they do not contain enough
+    # evidence to ground a question or reference answer.
+    heading = re.search(r"(?:^|\s)#{1,6}\s+", text)
+    if heading is not None and len(text_tokens(text[heading.end() :])) < 8:
+        return False
+    return True
+
+
+def content_signature(unit: EvidenceUnit) -> str:
+    suffix = unit.evidence_id.rsplit(":", 1)[-1].lower()
+    if len(suffix) >= 12 and re.fullmatch(r"[0-9a-f]+", suffix):
+        return f"{unit.kind}:{suffix}"
+    return " ".join(unit.text.casefold().split())
+
+
+def deduplicated_candidates(candidates, selected, sources):
+    signatures = {content_signature(item) for item in selected}
+    distinct = [item for item in candidates if content_signature(item) not in signatures]
+    distinct = distinct or list(candidates)
+    semantic = [
+        item
+        for item in distinct
+        if max(semantic_overlap(item, chosen, sources) for chosen in selected) < 0.68
+    ]
+    return semantic or distinct
 
 
 def prompt_unit(unit: EvidenceUnit, source, max_chars: int) -> dict[str, Any]:

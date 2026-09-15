@@ -40,6 +40,9 @@ def answerable_schedule(count: int, no_answer_fraction: float, rng) -> list[bool
 
 def available_task(task: str, snapshot: CorpusSnapshot) -> str:
     kinds = {unit.kind for unit in snapshot.evidence}
+    if task == "follow_up":
+        # V1 exports single queries and cannot faithfully replay prior chat turns.
+        return "explain"
     if task == "navigate" and not snapshot.actions:
         return "explain"
     if task == "multimodal" and not kinds.intersection({"media", "image", "video"}):

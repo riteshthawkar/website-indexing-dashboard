@@ -60,8 +60,14 @@ def test_retry_wrapper_retries_transient_provider_failures() -> None:
 
 
 def test_provider_factory_is_lazy_and_validates_provider_name() -> None:
-    assert create_structured_llm("openai").identity.provider == "openai"
-    assert create_structured_llm("gemini").identity.provider == "gemini"
+    openai_llm = create_structured_llm("openai")
+    assert openai_llm.identity.provider == "openai"
+    assert openai_llm.identity.model == "gpt-4.1-mini"
+    assert openai_llm.delegate.temperature is None
+    gemini_llm = create_structured_llm("gemini")
+    assert gemini_llm.identity.provider == "gemini"
+    assert gemini_llm.identity.model == "gemini-3.5-flash-lite"
+    assert gemini_llm.delegate.timeout_seconds == 120
     with pytest.raises(ValueError, match="provider"):
         create_structured_llm("unknown")
 
@@ -73,11 +79,17 @@ def test_critic_gate_requires_boolean_pass_and_calibrated_scores() -> None:
         "grounding_score": 0.9,
         "naturalness_score": 0.6,
         "difficulty_match_score": 0.6,
+        "query_grounding_score": 0.9,
+        "answer_completeness_score": 0.9,
+        "task_match_score": 0.75,
+        "persona_fit_score": 0.6,
+        "language_quality_score": 0.8,
     }
 
     assert critic_accepted(passing)
     assert not critic_accepted({**passing, "passed": "true"})
     assert not critic_accepted({**passing, "grounding_score": 0.89})
+    assert not critic_accepted({**passing, "task_match_score": 0.74})
 
 
 def test_import_does_not_initialize_external_provider_sdks() -> None:

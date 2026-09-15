@@ -39,6 +39,21 @@ _METADATA_FIELDS = (
     "updated_at",
 )
 
+_SOURCE_KIND_PRIORITY = {
+    "page_card": 5,
+    "parent": 4,
+    "chunk": 4,
+    "summary": 4,
+    "fact": 3,
+    "assertion": 3,
+    "answer": 3,
+    "evidence_span": 3,
+    "table": 3,
+    "database": 3,
+    "media": 2,
+    "action": 1,
+}
+
 
 def bundle_records(bundle: Mapping[str, Any]):
     for group, kind in RECORD_GROUPS.items():
@@ -64,13 +79,17 @@ def source_identity(record: Mapping[str, Any]) -> tuple[str, str]:
 
 def build_sources(records) -> tuple[SourceRecord, ...]:
     sources: dict[str, SourceRecord] = {}
-    for _group, _kind, record in records:
+    scores: dict[str, tuple[int, int, int]] = {}
+    for _group, kind, record in records:
         candidate = _source_from_record(record)
-        current = sources.get(candidate.source_id)
-        candidate_size = len(candidate.title) + len(candidate.uri)
-        current_size = len(current.title) + len(current.uri) if current else -1
-        if candidate_size > current_size:
+        score = (
+            _SOURCE_KIND_PRIORITY.get(kind, 2),
+            int(bool(clean_text(record.get("document_title")))),
+            len(candidate.title) + len(candidate.uri),
+        )
+        if score > scores.get(candidate.source_id, (-1, -1, -1)):
             sources[candidate.source_id] = candidate
+            scores[candidate.source_id] = score
     return tuple(sorted(sources.values(), key=lambda item: item.source_id))
 
 

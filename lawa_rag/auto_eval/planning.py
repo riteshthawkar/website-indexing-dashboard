@@ -48,7 +48,10 @@ class DifficultyProfile:
         if normalized == "hard":
             operations = ("retrieve", "integrate", "reason")
             modalities = 2 if task == "multimodal" else 1
-            return cls(normalized, 3, 2, 1, operations, modalities, 2)
+            sources = 1 if task == "navigate" else 2
+            evidence = 2 if task == "navigate" else 3
+            hops = 2 if task == "navigate" else 1
+            return cls(normalized, evidence, sources, hops, operations, modalities, 2)
         raise ValueError(f"Unsupported difficulty: {level!r}")
 
     @property
