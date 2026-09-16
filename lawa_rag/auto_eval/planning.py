@@ -6,13 +6,21 @@ import random
 from dataclasses import asdict, dataclass, field
 from typing import Any, Mapping, Sequence
 
-from ._coverage import answerable_schedule, available_task, validate_weights, weighted_schedule
+from ._coverage import (
+    align_tasks_and_difficulties,
+    answerable_schedule,
+    available_task,
+    validate_weights,
+    weighted_schedule,
+)
+from ._persona_selection import select_persona
 from ._util import canonical_json, clean_text, json_mapping, stable_id, string_tuple
 from .corpus import CorpusSnapshot
 from .personas import Persona
 
 
 DIFFICULTY_LEVELS = ("easy", "medium", "hard")
+PLANNING_VERSION = "task-language-persona.v3"
 TASK_TYPES = (
     "fact",
     "explain",
@@ -49,7 +57,7 @@ class DifficultyProfile:
             operations = ("retrieve", "integrate", "reason")
             modalities = 2 if task == "multimodal" else 1
             sources = 1 if task == "navigate" else 2
-            evidence = 2 if task == "navigate" else 3
+            evidence = 2 if task in {"navigate", "explain"} else 3
             hops = 2 if task == "navigate" else 1
             return cls(normalized, evidence, sources, hops, operations, modalities, 2)
         raise ValueError(f"Unsupported difficulty: {level!r}")
@@ -69,7 +77,7 @@ class DifficultyProfile:
 
     @property
     def measured_level(self) -> str:
-        if self.score >= 5.0:
+        if self.score >= 4.5:
             return "hard"
         if self.score >= 1.8:
             return "medium"
@@ -170,13 +178,17 @@ class ScenarioPlanner:
             raise ValueError("At least one persona is required")
         rng = random.Random(plan.seed)
         tasks = weighted_schedule(plan.tasks, plan.count, rng)
-        levels = weighted_schedule(plan.difficulties, plan.count, rng)
+        levels = align_tasks_and_difficulties(
+            tasks, weighted_schedule(plan.difficulties, plan.count, rng)
+        )
         languages = weighted_schedule(plan.languages, plan.count, rng)
         answerable = answerable_schedule(plan.count, plan.no_answer_fraction, rng)
         output = []
+        persona_usage = {item.persona_id: 0 for item in personas}
         for index in range(plan.count):
-            persona = personas[index % len(personas)]
             task = available_task(tasks[index], snapshot)
+            persona = select_persona(personas, task, languages[index], persona_usage)
+            persona_usage[persona.persona_id] += 1
             scenario_id = stable_id(
                 "scenario",
                 snapshot.snapshot_id,
@@ -209,4 +221,5 @@ __all__ = [
     "DifficultyProfile",
     "ScenarioBlueprint",
     "ScenarioPlanner",
+    "PLANNING_VERSION",
 ]

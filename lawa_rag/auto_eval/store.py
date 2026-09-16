@@ -33,9 +33,10 @@ class GenerationStore:
         self,
         snapshot: CorpusSnapshot,
         plan: CoveragePlan,
+        generation: Mapping[str, Any],
     ) -> tuple[tuple[Persona, ...], tuple[ScenarioBlueprint, ...]]:
         state = read_json(self.state_path)
-        _verify_state(state, snapshot, plan)
+        _verify_state(state, snapshot, plan, generation)
         personas = tuple(
             Persona.from_dict(item)
             for item in read_jsonl(self.root / "personas.jsonl")
@@ -121,13 +122,15 @@ def _final_status(validation: ValidationReport, failure_count: int) -> str:
     return "complete" if validation.ok else "invalid"
 
 
-def _verify_state(state: Mapping[str, Any], snapshot: CorpusSnapshot, plan: CoveragePlan) -> None:
+def _verify_state(state, snapshot, plan, generation) -> None:
     if state.get("schema_version") != STORE_SCHEMA_VERSION:
         raise ValueError("Unsupported auto-evaluation generation checkpoint")
     if state.get("snapshot_id") != snapshot.snapshot_id:
         raise ValueError("Cannot resume with a different corpus snapshot")
     if state.get("plan_fingerprint") != plan.fingerprint:
         raise ValueError("Cannot resume with a different coverage plan")
+    if state.get("generation") != dict(generation):
+        raise ValueError("Cannot resume with different generation models or algorithms")
 
 
 __all__ = ["GenerationStore", "STORE_SCHEMA_VERSION"]

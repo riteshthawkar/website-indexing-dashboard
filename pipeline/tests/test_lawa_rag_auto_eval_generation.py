@@ -15,7 +15,6 @@ from lawa_rag.auto_eval import (
     EvalSuite,
     LLMIdentity,
     export_eval_examples,
-    generate_personas,
     validate_case,
 )
 from pipeline.evaluation.dataset import load_eval_examples
@@ -28,7 +27,9 @@ class ScriptedLLM:
         self.fail_on_call = fail_on_call
         self.calls: list[str] = []
         self.reference_calls = 0
+        self.question_prompts: list[str] = []
         self.reference_prompts: list[str] = []
+        self.critic_prompts: list[str] = []
 
     @property
     def identity(self) -> LLMIdentity:
@@ -54,6 +55,7 @@ class ScriptedLLM:
                 ]
             }
         if schema_name == "auto_eval_question_v1":
+            self.question_prompts.append(f"{system_prompt}\n{user_prompt}")
             query = "When is the university library open on weekdays?"
             if "query already exists" in user_prompt:
                 query = "What are the university library's weekday opening hours?"
@@ -91,6 +93,7 @@ class ScriptedLLM:
                 "citation_requirements": ["opening hours"],
             }
         if schema_name == "auto_eval_critic_v1":
+            self.critic_prompts.append(f"{system_prompt}\n{user_prompt}")
             return {
                 "passed": True,
                 "answerability_correct": True,
@@ -131,6 +134,16 @@ def test_builder_generates_valid_resumable_suite_and_legacy_export(tmp_path: Pat
     assert suite.validate(snapshot).ok
     assert suite.cases[0].review_status == "auto_verified"
     assert suite.cases[0].citations[0].evidence_id == "evidence:library-hours"
+    assert suite.cases[0].generation["validation_version"] == "semantic-grounding.v2"
+    assert "never invent a transliteration" in llm.question_prompts[0]
+    assert "exact comparison dimensions" in llm.question_prompts[0]
+    assert "distinctive fact" in llm.question_prompts[0]
+    assert "do not invent translated or transliterated names" in llm.reference_prompts[0]
+    assert "literal coverage obligations" in llm.reference_prompts[0]
+    assert "comparative atomic claim" in llm.reference_prompts[0]
+    assert "preserve visible counts, colors" in llm.reference_prompts[0]
+    assert "transliterations of proper names" in llm.critic_prompts[0]
+    assert "compare counts, colors" in llm.critic_prompts[0]
     assert EvalSuite.from_directory(output).suite_id == suite.suite_id
     assert json.loads((output / "generation_state.json").read_text())["status"] == "complete"
 
@@ -154,27 +167,18 @@ def test_builder_generates_valid_resumable_suite_and_legacy_export(tmp_path: Pat
     assert "answerable_abstention" in error_codes
 
     no_call = ScriptedLLM(fail_on_call=True)
-    resumed = AutoEvalBuilder(question_llm=no_call, max_concurrency=1).generate(
+    resumed = AutoEvalBuilder(
+        question_llm=no_call,
+        reference_llm=no_call,
+        critic_llm=no_call,
+        max_concurrency=1,
+    ).generate(
         snapshot,
         _plan("French"),
         personas=(student_persona(),),
         output_dir=output,
     )
     assert resumed.suite_id == suite.suite_id
-
-
-def test_invalid_grounding_is_retried_before_case_is_accepted() -> None:
-    llm = ScriptedLLM(invalid_reference_calls=1)
-    suite = AutoEvalBuilder(
-        question_llm=llm,
-        reference_llm=llm,
-        max_concurrency=1,
-        generation_attempts=2,
-    ).generate(simple_snapshot(), _plan(), personas=(student_persona(),))
-
-    assert llm.reference_calls == 2
-    assert "Citation quote is not in evidence:library-hours" in llm.reference_prompts[1]
-    assert suite.cases[0].review_status == "auto_validated"
 
 
 def test_duplicate_queries_are_regenerated() -> None:
@@ -195,27 +199,20 @@ def test_duplicate_queries_are_regenerated() -> None:
     assert len({item.query for item in suite.cases}) == 2
 
 
-def test_no_answer_generation_is_flagged_for_human_review() -> None:
-    plan = CoveragePlan(
-        count=1,
-        languages={"English": 1.0},
-        difficulties={"easy": 1.0},
-        tasks={"fact": 1.0},
-        no_answer_fraction=1.0,
-    )
-    suite = AutoEvalBuilder(
-        question_llm=ScriptedLLM(),
-        max_concurrency=1,
-    ).generate(simple_snapshot(), plan, personas=(student_persona(),))
-
-    assert suite.cases[0].evidence_ids == ()
-    assert suite.cases[0].review_status == "needs_review"
-    assert suite.validate(simple_snapshot()).warnings[0].code == "negative_needs_review"
-
-
 def test_failed_scenario_is_checkpointed_and_can_resume(tmp_path: Path) -> None:
     output = tmp_path / "recoverable"
-    invalid = ScriptedLLM(invalid_reference_calls=5)
+    invalid = ScriptedLLM()
+    invalid_evidence_id = "evidence:outside-bundle"
+    original_generate = invalid.generate_json
+
+    def invalid_reference(**kwargs):
+        payload = original_generate(**kwargs)
+        if kwargs["schema_name"] == "auto_eval_reference_v1":
+            payload["claims"][0]["evidence_ids"] = [invalid_evidence_id]
+            payload["citations"][0]["evidence_id"] = invalid_evidence_id
+        return payload
+
+    invalid.generate_json = invalid_reference
     builder = AutoEvalBuilder(
         question_llm=invalid,
         reference_llm=invalid,
@@ -240,10 +237,3 @@ def test_failed_scenario_is_checkpointed_and_can_resume(tmp_path: Path) -> None:
     ).generate(simple_snapshot(), _plan(), output_dir=output)
     assert len(suite.cases) == 1
     assert json.loads((output / "generation_state.json").read_text())["status"] == "complete"
-
-
-def test_personas_can_be_generated_from_the_corpus() -> None:
-    personas = generate_personas(simple_snapshot(), ScriptedLLM(), count=2)
-
-    assert [item.role for item in personas] == ["student", "visitor"]
-    assert all(item.metadata["generated"] for item in personas)

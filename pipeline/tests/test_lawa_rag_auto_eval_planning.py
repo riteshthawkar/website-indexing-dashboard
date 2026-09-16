@@ -1,4 +1,4 @@
-"""Coverage, persona, difficulty, and evidence-sampling contract tests."""
+"""Coverage, persona selection, and difficulty-planning contract tests."""
 
 from __future__ import annotations
 
@@ -7,14 +7,11 @@ from collections import Counter
 from lawa_rag.auto_eval import (
     CoveragePlan,
     DifficultyProfile,
-    EvidenceSampler,
     Persona,
     RetrievalBundleAdapter,
-    ScenarioBlueprint,
     ScenarioPlanner,
 )
 from pipeline.tests.lawa_rag_auto_eval_support import sample_bundle, student_persona
-from lawa_rag.auto_eval._sampling_support import content_signature, usable_for_generation
 
 
 def test_coverage_planner_hits_requested_quotas_deterministically() -> None:
@@ -50,176 +47,6 @@ def test_coverage_planner_hits_requested_quotas_deterministically() -> None:
     assert len({item.scenario_id for item in first}) == 20
 
 
-def test_sampler_enforces_source_diversity_and_separates_distractors() -> None:
-    snapshot = RetrievalBundleAdapter.from_mapping(sample_bundle(), domain="university")
-    scenario = ScenarioBlueprint(
-        scenario_id="scenario:hard",
-        ordinal=1,
-        persona_id=student_persona().persona_id,
-        task="synthesis",
-        language="English",
-        answerable=True,
-        difficulty=DifficultyProfile.for_level("hard", "synthesis"),
-    )
-    bundle = EvidenceSampler(snapshot).sample(scenario)
-
-    assert len(bundle.evidence) == 3
-    assert len(bundle.source_ids) == 2
-    assert len(bundle.distractors) == 2
-    assert set(bundle.evidence_ids).isdisjoint(bundle.distractor_ids)
-    assert bundle.difficulty.measured_level == "hard"
-
-
-def test_unanswerable_scenarios_have_no_gold_evidence() -> None:
-    snapshot = RetrievalBundleAdapter.from_mapping(sample_bundle(), domain="university")
-    scenario = ScenarioBlueprint(
-        scenario_id="scenario:negative",
-        ordinal=1,
-        persona_id=student_persona().persona_id,
-        task="fact",
-        language="English",
-        answerable=False,
-        difficulty=DifficultyProfile.for_level("easy", "fact"),
-    )
-    bundle = EvidenceSampler(snapshot).sample(scenario)
-
-    assert bundle.evidence == ()
-    assert len(bundle.distractors) == 2
-
-
-def test_navigation_sampling_requires_an_action_anchor() -> None:
-    snapshot = RetrievalBundleAdapter.from_mapping(sample_bundle(), domain="university")
-    scenario = ScenarioBlueprint(
-        scenario_id="scenario:navigate",
-        ordinal=1,
-        persona_id=student_persona().persona_id,
-        task="navigate",
-        language="English",
-        answerable=True,
-        difficulty=DifficultyProfile.for_level("hard", "navigate"),
-    )
-
-    bundle = EvidenceSampler(snapshot).sample(scenario)
-
-    assert any(item.kind == "action" for item in bundle.evidence)
-    assert scenario.difficulty.evidence_count == 2
-    assert scenario.difficulty.source_count == 1
-    assert scenario.difficulty.graph_hops == 2
-    assert scenario.difficulty.measured_level == "hard"
-
-
-def test_sampler_excludes_low_signal_related_link_blocks() -> None:
-    snapshot = RetrievalBundleAdapter.from_mapping(
-        {
-            "chunk_records": [
-                {
-                    "id": "chunk:related-links",
-                    "document_id": "page",
-                    "text": "SECTION: You might also be interested in # You might also be "
-                    "interested in [News](https://example.edu/news)",
-                },
-                {
-                    "id": "chunk:useful",
-                    "document_id": "page",
-                    "text": "Applicants must submit official transcripts and two references.",
-                },
-            ]
-        },
-        domain="university",
-    )
-
-    units = snapshot.evidence_map()
-    assert not usable_for_generation(units["chunk:related-links"])
-    assert usable_for_generation(units["chunk:useful"])
-
-
-def test_sampler_excludes_heading_only_converted_chunks() -> None:
-    snapshot = RetrievalBundleAdapter.from_mapping(
-        {
-            "chunk_records": [
-                {
-                    "id": "chunk:heading-only",
-                    "document_id": "program",
-                    "text": "TITLE: Program | SECTION: Details ## Admission criteria",
-                },
-                {
-                    "id": "chunk:substantive-section",
-                    "document_id": "program",
-                    "text": "TITLE: Program | SECTION: Details ## Admission criteria "
-                    "Applicants need a relevant degree, transcripts, references, and "
-                    "proof of English proficiency.",
-                },
-            ]
-        },
-        domain="university",
-    )
-
-    units = snapshot.evidence_map()
-    assert not usable_for_generation(units["chunk:heading-only"])
-    assert usable_for_generation(units["chunk:substantive-section"])
-
-
-def test_content_signature_deduplicates_copied_localized_records() -> None:
-    snapshot = RetrievalBundleAdapter.from_mapping(
-        {
-            "chunk_records": [
-                {
-                    "id": "chunk:english:00001:abcdef123456",
-                    "document_id": "english",
-                    "text": "TITLE: English page The same substantive body.",
-                },
-                {
-                    "id": "chunk:arabic:00001:abcdef123456",
-                    "document_id": "arabic",
-                    "text": "TITLE: Arabic page The same substantive body.",
-                },
-            ]
-        },
-        domain="university",
-    )
-
-    first, second = snapshot.evidence
-    assert content_signature(first) == content_signature(second)
-
-
-def test_sampler_does_not_count_chunk_parent_copy_as_two_gold_units() -> None:
-    shared = {
-        "document_id": "admissions",
-        "document_title": "Admissions",
-        "source_url": "https://example.edu/admissions",
-    }
-    copied = "Applicants submit official transcripts and two recommendation letters."
-    snapshot = RetrievalBundleAdapter.from_mapping(
-        {
-            "chunk_records": [
-                {**shared, "id": "chunk:requirements", "text": copied},
-                {
-                    **shared,
-                    "id": "chunk:interview",
-                    "text": "Shortlisted applicants complete an online faculty interview.",
-                },
-            ],
-            "parent_records": [
-                {**shared, "id": "parent:requirements", "text": copied},
-            ],
-        },
-        domain="university",
-    )
-    scenario = ScenarioBlueprint(
-        scenario_id="scenario:medium-copy",
-        ordinal=1,
-        persona_id=student_persona().persona_id,
-        task="explain",
-        language="English",
-        answerable=True,
-        difficulty=DifficultyProfile.for_level("medium", "explain"),
-    )
-
-    selected = EvidenceSampler(snapshot).sample(scenario).evidence_ids
-
-    assert not {"chunk:requirements", "parent:requirements"}.issubset(selected)
-
-
 def test_single_query_planner_maps_follow_up_to_supported_task() -> None:
     snapshot = RetrievalBundleAdapter.from_mapping(sample_bundle(), domain="university")
     plan = CoveragePlan(
@@ -232,3 +59,57 @@ def test_single_query_planner_maps_follow_up_to_supported_task() -> None:
     scenario = ScenarioPlanner().plan(snapshot, (student_persona(),), plan)[0]
 
     assert scenario.task == "explain"
+
+
+def test_planner_pairs_constrained_tasks_with_sensible_difficulty() -> None:
+    snapshot = RetrievalBundleAdapter.from_mapping(sample_bundle(), domain="university")
+    plan = CoveragePlan(
+        count=8,
+        tasks={
+            "fact": 1,
+            "explain": 2,
+            "compare": 1,
+            "synthesis": 1,
+            "navigate": 2,
+            "multimodal": 1,
+        },
+        difficulties={"easy": 3, "medium": 3, "hard": 2},
+        languages={"English": 1},
+    )
+
+    scenarios = ScenarioPlanner().plan(snapshot, (student_persona(),), plan)
+    task_levels = {(item.task, item.difficulty.target_level) for item in scenarios}
+
+    assert ("fact", "easy") in task_levels
+    assert not any(task == "fact" and level == "hard" for task, level in task_levels)
+    assert not any(task == "compare" and level == "easy" for task, level in task_levels)
+    hard_explain = DifficultyProfile.for_level("hard", "explain")
+    assert hard_explain.evidence_count == 2
+    assert hard_explain.measured_level == "hard"
+
+
+def test_planner_assigns_personas_that_support_the_query_language() -> None:
+    snapshot = RetrievalBundleAdapter.from_mapping(sample_bundle(), domain="university")
+    english = Persona.create(
+        role="English-speaking applicant",
+        goals=("understand admissions",),
+        preferred_languages=("en",),
+        likely_tasks=("fact", "explain"),
+    )
+    arabic = Persona.create(
+        role="Arabic-speaking applicant",
+        goals=("understand admissions",),
+        preferred_languages=("ar",),
+        likely_tasks=("fact", "explain"),
+    )
+    plan = CoveragePlan(
+        count=4,
+        tasks={"fact": 1, "explain": 1},
+        difficulties={"easy": 1},
+        languages={"English": 1, "Arabic": 1},
+    )
+
+    scenarios = ScenarioPlanner().plan(snapshot, (english, arabic), plan)
+
+    expected = {"English": english.persona_id, "Arabic": arabic.persona_id}
+    assert all(item.persona_id == expected[item.language] for item in scenarios)

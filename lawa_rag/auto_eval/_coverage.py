@@ -3,9 +3,32 @@
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Mapping
 
 from .corpus import CorpusSnapshot
+
+
+_LEVEL_PREFERENCES = {
+    "fact": ("easy", "medium", "hard"),
+    "compare": ("medium", "hard", "easy"),
+    "synthesis": ("hard", "medium", "easy"),
+    "aggregate": ("hard", "medium", "easy"),
+    "multimodal": ("medium", "easy", "hard"),
+    "explain": ("medium", "hard", "easy"),
+    "follow_up": ("medium", "easy", "hard"),
+    "navigate": ("easy", "medium", "hard"),
+}
+_TASK_PRIORITY = {
+    "fact": 0,
+    "compare": 1,
+    "synthesis": 1,
+    "aggregate": 1,
+    "multimodal": 2,
+    "explain": 3,
+    "follow_up": 3,
+    "navigate": 4,
+}
 
 
 def validate_weights(name, weights, allowed: set[str] | None) -> None:
@@ -36,6 +59,21 @@ def answerable_schedule(count: int, no_answer_fraction: float, rng) -> list[bool
     values = [False] * unsupported + [True] * (count - unsupported)
     rng.shuffle(values)
     return values
+
+
+def align_tasks_and_difficulties(tasks: list[str], levels: list[str]) -> list[str]:
+    """Preserve quotas while avoiding structurally implausible task/level pairs."""
+    remaining = Counter(levels)
+    assigned = [""] * len(tasks)
+    order = sorted(range(len(tasks)), key=lambda index: (_TASK_PRIORITY[tasks[index]], index))
+    for index in order:
+        preferences = _LEVEL_PREFERENCES.get(tasks[index], tuple(sorted(remaining)))
+        level = next((item for item in preferences if remaining[item] > 0), None)
+        if level is None:
+            raise ValueError("Difficulty schedule was exhausted")
+        assigned[index] = level
+        remaining[level] -= 1
+    return assigned
 
 
 def available_task(task: str, snapshot: CorpusSnapshot) -> str:

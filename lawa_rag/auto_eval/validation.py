@@ -5,11 +5,20 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass
 from typing import Any, Iterable, Sequence
 
+from ._coherence import coherent_bundle, relationship_index
 from ._util import clean_text, stable_id
+from ._validation_support import (
+    answerable_semantic_issues,
+    evidence_scope_labels,
+    has_cross_scope_claim,
+    query_uncovered_evidence,
+)
 from .cases import EVAL_CASE_SCHEMA_VERSION, GeneratedEvalCase
 from .corpus import CorpusSnapshot
 from .personas import Persona
 
+
+VALIDATION_VERSION = "semantic-grounding.v2"
 
 @dataclass(frozen=True)
 class ValidationIssue:
@@ -76,6 +85,7 @@ def validate_case(case: GeneratedEvalCase, snapshot: CorpusSnapshot) -> Validati
         add("error", "unknown_evidence", f"Unknown evidence ids: {unknown[:5]}")
     if case.answerable:
         _validate_answerable(case, selected, evidence, add)
+        _validate_coherence(case, selected, evidence, snapshot, add)
     else:
         _validate_unanswerable(case, add)
     if case.target_difficulty != case.measured_difficulty.target_level:
@@ -117,21 +127,17 @@ def _validate_answerable(case, selected, evidence, add) -> None:
         add("error", "missing_evidence", "Answerable case requires selected evidence")
     if not case.reference_answer:
         add("error", "missing_reference_answer", "Answerable case requires a reference answer")
-    elif _looks_like_abstention(case.reference_answer):
-        add(
-            "error",
-            "answerable_abstention",
-            "Answerable case reference answer says the requested information is unavailable",
-        )
+    for code, message in answerable_semantic_issues(case):
+        add("error", code, message)
     if not case.claims:
         add("error", "missing_claims", "Answerable case requires atomic gold claims")
     if not case.citations:
         add("error", "missing_citations", "Answerable case requires evidence citations")
-    _validate_claims(case, selected, add)
+    _validate_claims(case, selected, evidence, add)
     _validate_citations(case, selected, evidence, add)
 
 
-def _validate_claims(case, selected, add) -> None:
+def _validate_claims(case, selected, evidence, add) -> None:
     for claim in case.claims:
         if not claim.text or not claim.evidence_ids:
             add("error", "invalid_claim", "Each claim requires text and evidence ids")
@@ -148,8 +154,19 @@ def _validate_claims(case, selected, add) -> None:
             "unused_gold_evidence",
             f"Medium/hard case does not require all selected evidence: {unused[:5]}",
         )
-
-
+    if case.task == "compare" and not has_cross_scope_claim(case, selected, evidence):
+        add(
+            "error",
+            "comparison_missing_cross_scope_claim",
+            "Comparison requires an atomic claim jointly supported by every compared scope",
+        )
+    uncovered = query_uncovered_evidence(case, evidence)
+    if uncovered:
+        add(
+            "error",
+            "query_does_not_require_gold_evidence",
+            f"Missing selected scope: {list(evidence_scope_labels(uncovered, evidence))[:5]}",
+        )
 def _validate_citations(case, selected, evidence, add) -> None:
     for citation in case.citations:
         unit = evidence.get(citation.evidence_id)
@@ -157,6 +174,22 @@ def _validate_citations(case, selected, evidence, add) -> None:
             add("error", "citation_outside_bundle", "Citation is outside the selected bundle")
         elif not _quote_is_supported(citation.quote, unit.text):
             add("error", "invalid_quote", f"Citation quote is not in {citation.evidence_id}")
+
+
+def _validate_coherence(case, selected, evidence, snapshot, add) -> None:
+    units = [evidence[item] for item in case.evidence_ids if item in selected and item in evidence]
+    if len(units) < 2:
+        return
+    if not coherent_bundle(
+        units,
+        snapshot.source_map(),
+        relationship_index(snapshot.relationships),
+    ):
+        add(
+            "error",
+            "incoherent_gold_evidence",
+            "Selected gold evidence does not form one connected topical bundle",
+        )
 
 
 def _validate_unanswerable(case, add) -> None:
@@ -184,23 +217,6 @@ def _quote_is_supported(quote: str, text: str) -> bool:
     return len(normalized_quote) >= 8 and normalized_quote in normalized_text
 
 
-def _looks_like_abstention(answer: str) -> bool:
-    normalized = clean_text(answer).casefold()
-    phrases = (
-        "the provided evidence does not",
-        "the evidence does not",
-        "information is not available",
-        "no information is available",
-        "does not establish this",
-        "لا تتوفر معلومات",
-        "لا تتوفر في الأدلة",
-        "لا توجد معلومات",
-        "الأدلة المقدمة لا",
-        "لا يمكن تحديد",
-    )
-    return any(phrase in normalized for phrase in phrases)
-
-
 def _uniqueness_issues(cases: Iterable[GeneratedEvalCase]) -> list[ValidationIssue]:
     issues: list[ValidationIssue] = []
     seen_ids: set[str] = set()
@@ -215,8 +231,8 @@ def _uniqueness_issues(cases: Iterable[GeneratedEvalCase]) -> list[ValidationIss
         seen_queries.add(normalized_query)
     return issues
 
-
 __all__ = [
+    "VALIDATION_VERSION",
     "ValidationIssue",
     "ValidationReport",
     "validate_case",

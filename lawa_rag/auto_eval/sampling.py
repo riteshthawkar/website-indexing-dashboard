@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Sequence
 
+from ._bundle_selection import select_evidence
+from ._coherence import relationship_index
 from ._sampling_support import (
     adjacency,
-    deduplicated_candidates,
     modality,
     prompt_unit,
+    reuse_key,
     semantic_overlap,
-    stable_number,
     usable_for_generation,
 )
 from .corpus import CorpusSnapshot, EvidenceUnit
 from .planning import DifficultyProfile, ScenarioBlueprint
 
+
+SAMPLING_VERSION = "coherent-persona.v16"
 
 _TASK_KINDS = {
     "fact": {"fact", "evidence_span", "answer", "chunk"},
@@ -81,8 +85,11 @@ class EvidenceSampler:
         self.seed = seed
         self._sources = snapshot.source_map()
         self._adjacency = adjacency(snapshot)
+        self._relations = relationship_index(snapshot.relationships)
+        self._evidence = snapshot.evidence_map()
+        self._usage: Counter[str] = Counter()
 
-    def sample(self, scenario: ScenarioBlueprint) -> EvidenceBundle:
+    def sample(self, scenario: ScenarioBlueprint, *, persona=None) -> EvidenceBundle:
         candidates = self._task_candidates(scenario.task)
         if not candidates:
             raise ValueError(f"No evidence is available for task {scenario.task!r}")
@@ -97,23 +104,17 @@ class EvidenceSampler:
                 source_ids=(),
                 difficulty=scenario.difficulty,
             )
-        anchors = self._anchor_candidates(scenario.task, candidates)
-        anchor_index = stable_number(scenario.scenario_id, self.seed) % len(anchors)
-        selected = [anchors[anchor_index]]
-        target = min(len(candidates), scenario.difficulty.evidence_count)
-        while len(selected) < target:
-            remaining = [item for item in candidates if item not in selected]
-            remaining = deduplicated_candidates(remaining, selected, self._sources)
-            selected_sources = {item.source_id for item in selected}
-            if len(selected_sources) < scenario.difficulty.source_count:
-                diverse = [item for item in remaining if item.source_id not in selected_sources]
-                remaining = diverse or remaining
-            selected.append(
-                max(
-                    remaining,
-                    key=lambda item: self._candidate_score(item, selected, scenario),
-                )
-            )
+        selected = select_evidence(
+            candidates=candidates,
+            anchors=self._anchor_candidates(scenario.task, candidates),
+            scenario=scenario,
+            sources=self._sources,
+            relations=self._relations,
+            seed=self.seed,
+            usage=self._usage,
+            persona=persona,
+        )
+        self.reserve(item.evidence_id for item in selected)
         distractors = self._pick_distractors(
             selected,
             list(self.snapshot.evidence),
@@ -129,6 +130,14 @@ class EvidenceSampler:
             difficulty=difficulty,
         )
 
+    def reserve(self, evidence_ids) -> None:
+        for evidence_id in evidence_ids:
+            self._usage[evidence_id] += 1
+            unit = self._evidence.get(evidence_id)
+            semantic_key = reuse_key(unit) if unit is not None else ""
+            if semantic_key:
+                self._usage[semantic_key] += 1
+
     def _task_candidates(self, task: str) -> list[EvidenceUnit]:
         useful = [item for item in self.snapshot.evidence if usable_for_generation(item)]
         allowed = _CANDIDATE_KINDS.get(task)
@@ -141,33 +150,6 @@ class EvidenceSampler:
         preferred = _TASK_KINDS.get(task)
         selected = [item for item in candidates if item.kind in preferred] if preferred else []
         return selected or list(candidates)
-
-    def _candidate_score(
-        self,
-        candidate: EvidenceUnit,
-        selected: Sequence[EvidenceUnit],
-        scenario: ScenarioBlueprint,
-    ) -> tuple[float, str]:
-        overlap = max(
-            (semantic_overlap(candidate, item, self._sources) for item in selected),
-            default=0.0,
-        )
-        distance = min(
-            (self._distance(candidate.evidence_id, item.evidence_id) for item in selected),
-            default=0,
-        )
-        connected = 3.0 if distance > 0 else 0.0
-        selected_sources = {item.source_id for item in selected}
-        diverse = candidate.source_id not in selected_sources
-        diversity = (
-            2.0
-            if diverse and scenario.difficulty.source_count > len(selected_sources)
-            else 0.0
-        )
-        same_source = (
-            1.5 if not diverse and scenario.difficulty.source_count <= 1 else 0.0
-        )
-        return connected + 4.0 * overlap + diversity + same_source, candidate.evidence_id
 
     def _distance(self, start: str, target: str, *, maximum: int = 3) -> int:
         if start == target:
@@ -215,6 +197,7 @@ class EvidenceSampler:
                 self._distance(left.evidence_id, right.evidence_id)
                 for index, left in enumerate(selected)
                 for right in selected[index + 1 :]
+                if left.source_id != right.source_id
             ),
             default=0,
         )
@@ -230,4 +213,4 @@ class EvidenceSampler:
         )
 
 
-__all__ = ["EvidenceBundle", "EvidenceSampler"]
+__all__ = ["EvidenceBundle", "EvidenceSampler", "SAMPLING_VERSION"]

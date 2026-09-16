@@ -7,13 +7,13 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Sequence
 
-from ._util import clean_text, stable_id, string_tuple
+from ._util import clean_text, string_tuple
 from ._generation_support import (
-    citations_from,
-    claims_from,
+    build_generated_case,
     critic_accepted,
     failure_message,
     generation_metadata,
+    normalize_critic_scores,
     save_failure,
 )
 from ._model_calls import generate_question, generate_reference, run_critic
@@ -96,7 +96,7 @@ class AutoEvalBuilder:
         if store and store.exists:
             if not resume:
                 raise FileExistsError(f"Evaluation output already exists: {store.root}")
-            return store.restore_inputs(snapshot, plan)
+            return store.restore_inputs(snapshot, plan, self._generation_metadata())
         selected = tuple(personas or ())
         if not selected:
             selected = generate_personas(
@@ -121,13 +121,15 @@ class AutoEvalBuilder:
             return [], []
         persona_map = {item.persona_id: item for item in personas}
         sampler = EvidenceSampler(snapshot)
+        for case in existing:
+            sampler.reserve(case.evidence_ids)
         generated: list[GeneratedEvalCase] = []
         failures: list[tuple[str, str]] = []
         seen_queries = {clean_text(item.query).casefold() for item in existing}
         with ThreadPoolExecutor(max_workers=self.max_concurrency) as executor:
             futures = {}
             for scenario in scenarios:
-                bundle = sampler.sample(scenario)
+                bundle = sampler.sample(scenario, persona=persona_map[scenario.persona_id])
                 future = executor.submit(
                     self._generate_case,
                     snapshot,
@@ -184,8 +186,14 @@ class AutoEvalBuilder:
             reference = generate_reference(
                 self.reference_llm, snapshot, scenario, bundle, question["query"], feedback
             )
-            case = self._case_from_payloads(
-                snapshot, persona, scenario, bundle, question, reference, attempt
+            case = build_generated_case(
+                snapshot,
+                persona,
+                scenario,
+                bundle,
+                question,
+                reference,
+                {**self._generation_metadata(), "attempt": attempt},
             )
             report = validate_case(case, snapshot)
             if report.errors:
@@ -193,6 +201,8 @@ class AutoEvalBuilder:
                 feedback = last_error
                 continue
             checked = run_critic(self.critic_llm, snapshot, case, bundle)
+            if checked is not None:
+                checked = normalize_critic_scores(checked)
             if checked is not None and not critic_accepted(checked):
                 issues = string_tuple(checked.get("issues"))
                 last_error = "; ".join(issues) or "critic rejected the case"
@@ -204,37 +214,6 @@ class AutoEvalBuilder:
             return replace(case, review_status=status, critic=dict(checked or {}))
         raise AutoEvalGenerationError(last_error)
 
-    def _case_from_payloads(
-        self, snapshot, persona, scenario, bundle, question, reference, attempt
-    ):
-        query = question["query"]
-        return GeneratedEvalCase(
-            case_id=stable_id("eval-case", snapshot.snapshot_id, scenario.scenario_id, query),
-            scenario_id=scenario.scenario_id,
-            persona_id=persona.persona_id,
-            query=query,
-            language=scenario.language,
-            task=scenario.task,
-            answerable=scenario.answerable,
-            target_difficulty=scenario.difficulty.target_level,
-            measured_difficulty=bundle.difficulty,
-            reference_answer=clean_text(reference.get("reference_answer")),
-            claims=claims_from(reference.get("claims")),
-            citations=citations_from(reference.get("citations")),
-            evidence_ids=bundle.evidence_ids,
-            distractor_ids=bundle.distractor_ids,
-            source_ids=bundle.source_ids,
-            expected_response_structure=question["expected_response_structure"],
-            answer_must_include=string_tuple(reference.get("answer_must_include")),
-            answer_must_not_include=string_tuple(reference.get("answer_must_not_include")),
-            answer_should_cover=string_tuple(reference.get("answer_should_cover")),
-            citation_requirements=string_tuple(reference.get("citation_requirements")),
-            generation={**self._generation_metadata(), "attempt": attempt},
-            metadata={"intent": question["intent"]},
-        )
-
     def _generation_metadata(self) -> dict[str, Any]:
-        return generation_metadata(
-            self.question_llm, self.reference_llm, self.critic_llm
-        )
+        return generation_metadata(self.question_llm, self.reference_llm, self.critic_llm)
 __all__ = ["AutoEvalBuilder", "AutoEvalGenerationError"]

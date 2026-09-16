@@ -27,6 +27,8 @@ Each suite records:
 - the requested coverage plan and deterministic scenario IDs;
 - natural questions with structural difficulty features;
 - independent reference answers, atomic claims, citations, and exact quotes;
+- persona-aware, topically coherent evidence bundles with copied chunk/parent
+  variants deduplicated;
 - model and prompt provenance, validation results, and resumable checkpoints.
 
 Difficulty is measured from evidence count, distinct sources, graph hops,
@@ -126,7 +128,10 @@ Question, reference, and critic roles may use different providers or models:
 Generation is resumable by default. Each accepted case is written atomically
 under `case_checkpoints/`. Re-running the same command skips completed scenario
 IDs. Changed corpus content or coverage configuration is rejected instead of
-silently being mixed into the existing suite.
+silently being mixed into the existing suite. Changes to the generation,
+planning, sampling, or citation-normalization versions—or to any configured
+validation version or model identity—also require a new output directory, so a resumed suite cannot
+silently mix generation contracts.
 
 The normal request count is one persona call when personas are inferred, two
 calls per case for question and reference generation, and one additional call
@@ -156,6 +161,20 @@ suite-v1/
 All generated no-answer cases retain `review_status: needs_review`. Corpus
 absence cannot be proven reliably from a short LLM prompt, so these cases must
 be manually approved before they become a release gate.
+
+`auto_verified` means that the case passed deterministic checks and the
+configured LLM critic. It is not human approval. During calibration, inspect
+every generated case; after calibration, sample every persona, task,
+difficulty, language, and source type. Pay particular attention to translated
+proper names, cross-source comparisons, and multimodal questions. The sampler
+and prompts reject common forms of these defects, but a lightweight critic can
+still be overconfident.
+
+Citation validation remains exact even for cross-language cases. If a model
+returns a translated paraphrase in a citation field, the framework records the
+repair in case metadata and substitutes a bounded exact excerpt from the same
+selected evidence unit. It never weakens quote validation or changes the cited
+evidence ID.
 
 After inspecting the relevant cases and confirming corpus-wide absence, record
 the approval without hand-editing suite identities:
