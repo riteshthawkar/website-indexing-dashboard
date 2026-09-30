@@ -1,37 +1,79 @@
-from .answer_generation import generate_answer_predictions
-from .answer_readiness import evaluate_answer_readiness
-from .ablation import compare_retrieval_report_files, compare_retrieval_reports
-from .benchmark_io import (
-    evaluate_standard_rankings,
-    export_hf_benchmark,
-    export_ir_datasets_benchmark,
-    summarize_standard_benchmark,
-)
-from .benchmark_runner import run_standard_benchmark_retrieval
-from .dataset import EvalExample, load_eval_examples, mbzuai_eval_template, write_eval_examples
-from .dataset_tools import summarize_eval_examples, validate_eval_examples
-from .presets import EVALUATION_PRESETS
-from .ragas_eval import DEFAULT_RAGAS_METRICS, run_ragas_evaluation
-from .retrieval_eval import evaluate_retrieval_dataset
+"""Lazy compatibility imports for evaluation implementations."""
 
-__all__ = [
-    "DEFAULT_RAGAS_METRICS",
-    "EVALUATION_PRESETS",
-    "EvalExample",
-    "compare_retrieval_report_files",
-    "compare_retrieval_reports",
-    "evaluate_retrieval_dataset",
-    "evaluate_answer_readiness",
-    "evaluate_standard_rankings",
-    "export_hf_benchmark",
-    "export_ir_datasets_benchmark",
-    "generate_answer_predictions",
-    "load_eval_examples",
-    "mbzuai_eval_template",
-    "run_standard_benchmark_retrieval",
-    "run_ragas_evaluation",
-    "summarize_eval_examples",
-    "summarize_standard_benchmark",
-    "validate_eval_examples",
-    "write_eval_examples",
-]
+from __future__ import annotations
+
+from importlib import import_module
+from typing import Any
+
+
+_EXPORTS = {
+    "DEFAULT_RAGAS_METRICS": ("pipeline.evaluation.ragas_eval", "DEFAULT_RAGAS_METRICS"),
+    "EVALUATION_PRESETS": ("pipeline.evaluation.presets", "EVALUATION_PRESETS"),
+    "EvalExample": ("pipeline.evaluation.dataset", "EvalExample"),
+    "compare_retrieval_report_files": (
+        "pipeline.evaluation.ablation",
+        "compare_retrieval_report_files",
+    ),
+    "compare_retrieval_reports": (
+        "pipeline.evaluation.ablation",
+        "compare_retrieval_reports",
+    ),
+    "evaluate_answer_readiness": (
+        "pipeline.evaluation.answer_readiness",
+        "evaluate_answer_readiness",
+    ),
+    "evaluate_retrieval_dataset": (
+        "pipeline.evaluation.retrieval_eval",
+        "evaluate_retrieval_dataset",
+    ),
+    "evaluate_standard_rankings": (
+        "pipeline.evaluation.benchmark_io",
+        "evaluate_standard_rankings",
+    ),
+    "export_hf_benchmark": ("pipeline.evaluation.benchmark_io", "export_hf_benchmark"),
+    "export_ir_datasets_benchmark": (
+        "pipeline.evaluation.benchmark_io",
+        "export_ir_datasets_benchmark",
+    ),
+    "generate_answer_predictions": (
+        "pipeline.evaluation.answer_generation",
+        "generate_answer_predictions",
+    ),
+    "load_eval_examples": ("pipeline.evaluation.dataset", "load_eval_examples"),
+    "mbzuai_eval_template": ("pipeline.evaluation.dataset", "mbzuai_eval_template"),
+    "run_ragas_evaluation": ("pipeline.evaluation.ragas_eval", "run_ragas_evaluation"),
+    "run_standard_benchmark_retrieval": (
+        "pipeline.evaluation.benchmark_runner",
+        "run_standard_benchmark_retrieval",
+    ),
+    "summarize_eval_examples": (
+        "pipeline.evaluation.dataset_tools",
+        "summarize_eval_examples",
+    ),
+    "summarize_standard_benchmark": (
+        "pipeline.evaluation.benchmark_io",
+        "summarize_standard_benchmark",
+    ),
+    "validate_eval_examples": (
+        "pipeline.evaluation.dataset_tools",
+        "validate_eval_examples",
+    ),
+    "write_eval_examples": ("pipeline.evaluation.dataset", "write_eval_examples"),
+}
+
+
+def __getattr__(name: str) -> Any:
+    target = _EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attribute_name = target
+    value = getattr(import_module(module_name), attribute_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    return sorted(set(globals()) | set(_EXPORTS))
+
+
+__all__ = sorted(_EXPORTS)

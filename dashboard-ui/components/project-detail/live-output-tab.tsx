@@ -23,9 +23,9 @@ import type { PipelineRun, RunLogEntry, StructuredRunLogEntry } from "@/lib/type
 const PAGE_SIZE = 200;
 
 function levelClass(level: string) {
-  if (level === "error") return "border-red-500/20 bg-red-500/10 text-red-200";
-  if (level === "warning" || level === "warn") return "border-amber-500/20 bg-amber-500/10 text-amber-100";
-  return "border-emerald-500/20 bg-emerald-500/10 text-emerald-100";
+  if (level === "error") return "border-red-500/20 bg-red-500/10 text-destructive";
+  if (level === "warning" || level === "warn") return "border-amber-500/20 bg-amber-500/10 text-warning";
+  return "border-emerald-500/20 bg-emerald-500/10 text-success";
 }
 
 function summarizeStages(run: PipelineRun) {
@@ -70,14 +70,14 @@ function ProcessMetric({
 }) {
   const toneClass =
     tone === "success"
-      ? "border-emerald-500/15 bg-emerald-500/10 text-emerald-50"
+      ? "border-emerald-500/15 bg-emerald-500/10 text-success"
       : tone === "warning"
-        ? "border-amber-500/15 bg-amber-500/10 text-amber-50"
+        ? "border-amber-500/15 bg-amber-500/10 text-warning"
         : tone === "danger"
-          ? "border-red-500/15 bg-red-500/10 text-red-50"
-          : "border-white/8 bg-black/20";
+          ? "border-red-500/15 bg-red-500/10 text-destructive"
+          : "border-border bg-muted";
   return (
-    <div className={`rounded-2xl border px-4 py-3 ${toneClass}`}>
+    <div className={`rounded-lg border px-4 py-3 ${toneClass}`}>
       <div className="text-[11px] uppercase tracking-[0.24em] text-muted-foreground/80">{label}</div>
       <div className="mt-2 text-lg font-semibold tracking-tight">{value}</div>
     </div>
@@ -87,12 +87,12 @@ function ProcessMetric({
 function LogEntryRow({ entry }: { entry: StructuredRunLogEntry }) {
   const hasData = entry.data && Object.keys(entry.data).length > 0;
   return (
-    <div className={`rounded-2xl border p-4 shadow-[0_18px_44px_-30px_rgba(0,0,0,0.85)] ${levelClass(entry.level)}`}>
+    <div className={`rounded-lg border p-4 ${levelClass(entry.level)}`}>
       <div className="mb-2 flex flex-wrap items-center gap-2">
-        <Badge variant="outline" className="border-white/10 bg-black/25 font-mono text-[10px] uppercase">
+        <Badge variant="outline" className="border-border bg-muted font-mono text-[10px] uppercase">
           {entry.level}
         </Badge>
-        <Badge variant="outline" className="border-white/10 bg-black/25 text-[10px]">
+        <Badge variant="outline" className="border-border bg-muted text-[10px]">
           {entry.event_type}
         </Badge>
         {entry.stage && (
@@ -107,7 +107,7 @@ function LogEntryRow({ entry }: { entry: StructuredRunLogEntry }) {
       {hasData && (
         <details className="mt-3">
           <summary className="cursor-pointer text-[11px] text-muted-foreground">Payload</summary>
-          <pre className="mt-2 overflow-x-auto rounded-2xl border border-white/8 bg-black/25 p-3 text-[11px] leading-5 text-muted-foreground">
+          <pre className="mt-2 overflow-x-auto rounded-lg border border-border bg-muted p-3 text-[11px] leading-5 text-muted-foreground">
             {JSON.stringify(entry.data, null, 2)}
           </pre>
         </details>
@@ -118,7 +118,7 @@ function LogEntryRow({ entry }: { entry: StructuredRunLogEntry }) {
 
 function RawLogRow({ entry }: { entry: RunLogEntry }) {
   return (
-    <div className="rounded-2xl border border-white/8 bg-black/20 p-3">
+    <div className="rounded-lg border border-border bg-muted p-3">
       <div className="mb-1 flex flex-wrap items-center gap-2 text-[11px] text-muted-foreground">
         <Badge variant="outline" className={levelClass(entry.level)}>
           {entry.level.toUpperCase()}
@@ -273,7 +273,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
   return (
     <div className="grid gap-6 xl:grid-cols-[minmax(0,1.9fr)_minmax(320px,0.9fr)]">
       <div className="space-y-6">
-        <Card className="rounded-[1.9rem] border border-white/8 bg-card/80 shadow-[0_28px_72px_-40px_rgba(0,0,0,0.85)] backdrop-blur-xl">
+        <Card className="rounded-lg border border-border bg-card ">
           <CardHeader className="space-y-4">
             <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
               <div className="space-y-2">
@@ -289,7 +289,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
                   <Badge variant="outline">process: {run.process_state}</Badge>
                 )}
                 {isRunning && connected ? (
-                  <Badge variant="outline" className="border-red-500/25 bg-red-500/12 text-red-200">
+                  <Badge variant="outline" className="border-red-500/25 bg-red-500/12 text-destructive">
                     <span className="mr-1.5 inline-block h-2 w-2 animate-pulse rounded-full bg-red-400" />
                     live socket
                   </Badge>
@@ -312,7 +312,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
 
             <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
               <Select value={levelFilter} onValueChange={(value) => setLevelFilter(value || "all")}>
-                <SelectTrigger className="w-full rounded-2xl">
+                <SelectTrigger className="w-full rounded-lg">
                   <SelectValue placeholder="All levels" />
                 </SelectTrigger>
                 <SelectContent>
@@ -324,7 +324,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
                 </SelectContent>
               </Select>
               <Select value={eventTypeFilter} onValueChange={(value) => setEventTypeFilter(value || "all")}>
-                <SelectTrigger className="w-full rounded-2xl">
+                <SelectTrigger className="w-full rounded-lg">
                   <SelectValue placeholder="All event types" />
                 </SelectTrigger>
                 <SelectContent>
@@ -337,7 +337,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
                 </SelectContent>
               </Select>
               <Select value={stageFilter} onValueChange={(value) => setStageFilter(value || "all")}>
-                <SelectTrigger className="w-full rounded-2xl">
+                <SelectTrigger className="w-full rounded-lg">
                   <SelectValue placeholder="All stages" />
                 </SelectTrigger>
                 <SelectContent>
@@ -353,7 +353,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
                 value={search}
                 onChange={(event) => setSearch(event.target.value)}
                 placeholder="Search message, stage, payload"
-                className="rounded-2xl"
+                className="rounded-lg"
               />
             </div>
 
@@ -367,7 +367,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
                 </span>
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                {loadError && <span className="text-red-300">{loadError}</span>}
+                {loadError && <span className="text-destructive">{loadError}</span>}
                 <Button variant={autoScroll ? "secondary" : "outline"} size="sm" onClick={() => setAutoScroll((value) => !value)}>
                   {autoScroll ? "Auto-scroll on" : "Auto-scroll off"}
                 </Button>
@@ -384,7 +384,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
           </CardHeader>
 
           <CardContent>
-            <ScrollArea className="h-[42rem] rounded-[1.6rem] border border-white/8 bg-black/35 p-5">
+            <ScrollArea className="h-[42rem] rounded-lg border border-border bg-muted p-5">
               {combinedEntries.length === 0 ? (
                 <p className="text-muted-foreground">
                   {loadingHistory ? "Loading structured logs..." : isRunning ? "Waiting for structured logs..." : "No structured logs recorded for this run."}
@@ -405,7 +405,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
       </div>
 
       <div className="space-y-6">
-        <Card className="rounded-[1.9rem] border border-white/8 bg-card/80 shadow-[0_28px_72px_-40px_rgba(0,0,0,0.85)] backdrop-blur-xl">
+        <Card className="rounded-lg border border-border bg-card ">
           <CardHeader className="space-y-3">
             <div className="flex items-center justify-between gap-3">
               <div>
@@ -425,11 +425,11 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
             </div>
           </CardHeader>
           <CardContent>
-            <ScrollArea className="h-[42rem] rounded-[1.6rem] border border-white/8 bg-black/35 p-4">
+            <ScrollArea className="h-[42rem] rounded-lg border border-border bg-muted p-4">
               {rawLogsQuery.isLoading ? (
                 <p className="text-muted-foreground">Loading raw process logs...</p>
               ) : rawLogsQuery.error ? (
-                <p className="text-red-300">{(rawLogsQuery.error as Error).message}</p>
+                <p className="text-destructive">{(rawLogsQuery.error as Error).message}</p>
               ) : !(rawLogsQuery.data || []).length ? (
                 <p className="text-muted-foreground">No raw process logs available for this run.</p>
               ) : (
@@ -440,7 +440,7 @@ export function LiveOutputTab({ run, isRunning }: { run: PipelineRun; isRunning:
                 </div>
               )}
             </ScrollArea>
-            <div className="mt-4 flex items-center gap-2 rounded-2xl border border-white/8 bg-black/15 p-3 text-sm text-muted-foreground">
+            <div className="mt-4 flex items-center gap-2 rounded-lg border border-border bg-muted p-3 text-sm text-muted-foreground">
               <TerminalSquare className="h-4 w-4" />
               Stage filter and search affect structured logs immediately. Raw process tail follows the selected stage filter on refresh.
             </div>

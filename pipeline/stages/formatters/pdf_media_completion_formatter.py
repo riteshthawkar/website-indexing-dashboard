@@ -19,6 +19,7 @@ from urllib.parse import urlsplit
 
 from pipeline.core.artifacts import load_artifact_catalog
 from pipeline.core.base import FormatterStage, StageContext, StageResult
+from pipeline.core.document_schemas import SUPPORTED_DOCLING_PAGE_WINDOWS_SCHEMAS
 from pipeline.core.io import atomic_write_json, ensure_dir, load_json_safe, sha256_file
 from pipeline.core.media import build_media_manifest, load_media_manifest_items, normalize_media_item
 from pipeline.core.registry import register_stage
@@ -33,7 +34,6 @@ from pipeline.stages.formatters.media_enrichment_formatter import (
 )
 
 
-_WINDOW_SCHEMA = "mbzuai_docling_page_windows.v1"
 _PAGE_WINDOW_MARKER = ".docling.pages_"
 
 
@@ -185,7 +185,7 @@ def _discover_layouts(
             payload = load_json_safe(structured_path, {}) or {}
             if not isinstance(payload, dict):
                 continue
-            if str(payload.get("schema") or "") == _WINDOW_SCHEMA:
+            if str(payload.get("schema") or "") in SUPPORTED_DOCLING_PAGE_WINDOWS_SCHEMAS:
                 wrapper_count += 1
                 documents[source_file]["from_window_wrapper"] = True
                 for part in payload.get("parts") or []:

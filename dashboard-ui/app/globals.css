@@ -4,6 +4,123 @@
 
 @custom-variant dark (&:is(.dark *));
 
+.graph-viewport {
+  position: relative;
+  height: clamp(360px, calc(100dvh - 380px), 860px);
+  overflow: hidden;
+  overscroll-behavior: contain;
+  background: var(--background);
+}
+.graph-viewport:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: -2px;
+}
+.graph-renderer {
+  position: absolute;
+  inset: 0;
+  touch-action: none;
+  cursor: grab;
+}
+.graph-result {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 48px;
+  padding: 10px 12px;
+  border-radius: 4px;
+  text-align: start;
+  cursor: pointer;
+}
+.graph-result:hover {
+  background: var(--accent);
+}
+.graph-result:focus-visible {
+  outline: 2px solid var(--ring);
+  outline-offset: 2px;
+}
+.graph-inspector-content {
+  max-height: calc(clamp(360px, calc(100dvh - 380px), 860px) + 50px);
+  overflow-y: auto;
+}
+.graph-workspace {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--card);
+}
+.graph-command-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px;
+  border-bottom: 1px solid var(--border);
+}
+.graph-workspace-body, .graph-detail-layout {
+  display: grid;
+  min-width: 0;
+}
+.graph-workspace-main {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+}
+.graph-search-rail {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 16px;
+  padding: 12px;
+  max-height: 280px;
+  overflow: auto;
+  border-bottom: 1px solid var(--border);
+}
+.graph-workspace-expanded {
+  height: 100dvh;
+  border: 0;
+  border-radius: 0;
+  overflow: auto;
+}
+.graph-workspace-expanded .graph-viewport {
+  height: calc(100dvh - 250px);
+  min-height: 320px;
+}
+@media (min-width: 1024px) {
+  .graph-workspace-with-rail { grid-template-columns: 248px minmax(0, 1fr); }
+  .graph-search-rail {
+    max-height: calc(100dvh - 245px);
+    min-height: 440px;
+    border-right: 1px solid var(--border);
+    border-bottom: 0;
+  }
+  .graph-detail-open { grid-template-columns: minmax(0, 1fr) 260px; }
+  .graph-workspace-expanded .graph-search-rail { max-height: calc(100dvh - 60px); }
+  .graph-workspace-expanded .graph-inspector-content { max-height: calc(100dvh - 170px); }
+}
+@media (max-width: 1023px) {
+  .graph-inspector-content {
+    max-height: none;
+  }
+}
+@media (max-width: 640px) {
+  .graph-command-bar .graph-scope-controls { display: contents; }
+  .graph-command-bar > button:last-child { order: 1; }
+  .graph-scope-controls > div:nth-child(n+2) {
+    order: 2;
+    width: calc((100% - 8px) / 2);
+  }
+  .graph-viewport {
+    height: 380px;
+  }
+}
+@media (pointer: coarse) {
+  .graph-toolbar button {
+    min-height: 44px;
+    min-width: 44px;
+  }
+}
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
@@ -26,6 +143,8 @@
   --color-input: var(--input);
   --color-border: var(--border);
   --color-destructive: var(--destructive);
+  --color-success: #26704c;
+  --color-warning: #8a5909;
   --color-accent-foreground: var(--accent-foreground);
   --color-accent: var(--accent);
   --color-muted-foreground: var(--muted-foreground);
@@ -48,38 +167,39 @@
 }
 
 :root {
-  --background: oklch(1 0 0);
-  --foreground: oklch(0.145 0 0);
-  --card: oklch(1 0 0);
-  --card-foreground: oklch(0.145 0 0);
-  --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.145 0 0);
-  --primary: oklch(0.205 0 0);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.97 0 0);
-  --secondary-foreground: oklch(0.205 0 0);
-  --muted: oklch(0.97 0 0);
-  --muted-foreground: oklch(0.556 0 0);
-  --accent: oklch(0.97 0 0);
-  --accent-foreground: oklch(0.205 0 0);
-  --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.922 0 0);
-  --input: oklch(0.922 0 0);
-  --ring: oklch(0.708 0 0);
+  color-scheme: light;
+  --background: #ffffff;
+  --foreground: #20262e;
+  --card: #ffffff;
+  --card-foreground: #20262e;
+  --popover: #ffffff;
+  --popover-foreground: #20262e;
+  --primary: #2457a7;
+  --primary-foreground: #ffffff;
+  --secondary: #f1f3f5;
+  --secondary-foreground: #20262e;
+  --muted: #f7f8fa;
+  --muted-foreground: #626e7b;
+  --accent: #edf2f9;
+  --accent-foreground: #244c83;
+  --destructive: #b42318;
+  --border: #e0e4e9;
+  --input: #cdd3dc;
+  --ring: #2457a7;
   --chart-1: oklch(0.809 0.105 251.813);
   --chart-2: oklch(0.623 0.214 259.815);
   --chart-3: oklch(0.546 0.245 262.881);
   --chart-4: oklch(0.488 0.243 264.376);
   --chart-5: oklch(0.424 0.199 265.638);
-  --radius: 0.625rem;
-  --sidebar: oklch(0.985 0 0);
-  --sidebar-foreground: oklch(0.145 0 0);
-  --sidebar-primary: oklch(0.205 0 0);
-  --sidebar-primary-foreground: oklch(0.985 0 0);
-  --sidebar-accent: oklch(0.97 0 0);
-  --sidebar-accent-foreground: oklch(0.205 0 0);
-  --sidebar-border: oklch(0.922 0 0);
-  --sidebar-ring: oklch(0.708 0 0);
+  --radius: 0.25rem;
+  --sidebar: #f7f8fa;
+  --sidebar-foreground: #414b57;
+  --sidebar-primary: #2457a7;
+  --sidebar-primary-foreground: #ffffff;
+  --sidebar-accent: #e9eef6;
+  --sidebar-accent-foreground: #244c83;
+  --sidebar-border: #e0e4e9;
+  --sidebar-ring: #2457a7;
 }
 
 .dark {
@@ -125,25 +245,43 @@
   }
   body {
     @apply bg-background text-foreground;
-    background-image:
-      radial-gradient(circle at top, rgba(53, 210, 198, 0.04), transparent 24%),
-      radial-gradient(circle at right top, rgba(84, 122, 255, 0.03), transparent 18%),
-      linear-gradient(to right, rgba(255, 255, 255, 0.012) 1px, transparent 1px),
-      linear-gradient(to bottom, rgba(255, 255, 255, 0.012) 1px, transparent 1px);
-    background-size: 36px 36px;
+  }
+  summary {
+    border-radius: var(--radius);
+  }
+  summary:focus-visible {
+    outline: 2px solid var(--ring);
+    outline-offset: 4px;
   }
   ::selection {
-    background: color-mix(in oklab, var(--primary) 55%, transparent);
-    color: var(--primary-foreground);
+    background: var(--accent);
+    color: var(--accent-foreground);
   }
 }
 
 @layer components {
+  .pipeline-progress {
+    appearance: none;
+    width: 100%;
+    height: 4px;
+    border: 0;
+    background: var(--border);
+    color: var(--primary);
+  }
+  .pipeline-progress::-webkit-progress-bar {
+    background: var(--border);
+  }
+  .pipeline-progress::-webkit-progress-value {
+    background: var(--primary);
+  }
+  .pipeline-progress::-moz-progress-bar {
+    background: var(--primary);
+  }
   .app-shell-panel {
-    @apply rounded-3xl border border-white/8 bg-card/75 shadow-[0_28px_70px_-36px_rgba(0,0,0,0.85)] backdrop-blur-xl;
+    @apply rounded-lg border bg-card;
   }
 
   .page-section {
-    @apply px-6 py-8 xl:px-8 xl:py-10;
+    @apply min-w-0 px-4 py-5 md:px-6;
   }
 }

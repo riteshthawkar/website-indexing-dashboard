@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from pipeline.core.base import StageContext
+from pipeline.core.document_schemas import SUPPORTED_DOCLING_PAGE_WINDOWS_SCHEMAS
 from pipeline.core.chunking import (
     TOKENIZER_ENCODING,
     ChunkLimitExceededError,
@@ -870,7 +871,10 @@ def docling_chunks_from_json(
     always_emit_headings: bool = False,
 ) -> List[Dict[str, Any]]:
     window_index = load_json_safe(json_path, {})
-    if isinstance(window_index, dict) and window_index.get("schema") == "mbzuai_docling_page_windows.v1":
+    if (
+        isinstance(window_index, dict)
+        and window_index.get("schema") in SUPPORTED_DOCLING_PAGE_WINDOWS_SCHEMAS
+    ):
         chunks: List[Dict[str, Any]] = []
         for part in window_index.get("parts") or []:
             structured_path = str(part.get("structured_document_path") or "").strip()

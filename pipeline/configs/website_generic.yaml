@@ -1,0 +1,194 @@
+# Tenant-neutral website ingestion preset. Do not execute this placeholder
+# directly; compile it through WebsiteProfile so source boundaries are explicit.
+
+project_name: "website-template"
+work_dir: "./runs"
+
+source_profile:
+  schema_version: "source-profile/v1"
+  kind: "website"
+  source_id: "website-template"
+  website_profile_version: "website-profile/v1"
+  allowed_hosts:
+    - "example.invalid"
+  languages:
+    - "en"
+  robots_policy: "respect"
+  robots_authorization_note: ""
+
+pipeline:
+  # The legacy production_profile flag selects the existing MBZUAI release
+  # contract. Generic runs use source validation plus immutable_run instead.
+  production_profile: false
+  require_production_preflight: false
+  immutable_run: true
+  audit_on_stage_complete: true
+  audit_on_run_complete: true
+  fail_on_audit_error: true
+
+stages:
+  - id: crawl_web
+    type: crawler
+    plugin: crawl4ai
+  - id: score_raw_content
+    type: quality_gate
+    plugin: quality_scorer
+  - id: clean_html
+    type: cleaner
+    plugin: trafilatura
+  - id: convert_documents
+    type: converter
+    plugin: docling
+  - id: convert_html
+    type: converter
+    plugin: markitdown
+  - id: deduplicate_content
+    type: quality_gate
+    plugin: dedup_filter
+  - id: chunk_content
+    type: chunker
+    plugin: hybrid
+
+crawler:
+  start_url: "https://example.invalid/"
+  allowed_domains:
+    - "example.invalid"
+  allowed_hosts:
+    - "example.invalid"
+  priority_seed_urls:
+    - "https://example.invalid/"
+  excluded_subdomains: []
+  excluded_path_prefixes: []
+  include_external: false
+  allow_query_urls: false
+  allowed_query_param_names: []
+  require_https: true
+  ignore_https_errors: false
+  max_pages: 5000
+  max_depth: 8
+  fetch_concurrency: 5
+  download_concurrency: 8
+  timeout: 45
+  headless: true
+  java_script_enabled: true
+  wait_until: "domcontentloaded"
+  delay_before_return_html: 0.5
+  fail_on_empty_result: true
+  fail_on_incomplete_frontier: true
+  require_complete_priority_seeds: true
+  frontier_empty_timeout_sec: 180
+  crawl_stall_timeout_sec: 900
+  max_file_size_mb: 100
+  max_image_size_mb: 10
+  download_retry_attempts: 3
+  download_retry_backoff_sec: 2.0
+  checkpoint_flush_interval_sec: 5
+  sitemap_enabled: true
+  sitemap_seed_limit: 5000
+  sitemap_frontier_seed_limit: 5000
+  sitemap_max_response_bytes: 16777216
+  sitemap_max_sources: 100
+  sitemap_max_depth: 4
+  sitemap_origins:
+    - "https://example.invalid"
+  sitemap_entry_urls: []
+  minimum_sitemap_seed_count: 0
+  sitemap_batch_crawl: true
+  sitemap_crawl_batch_size: 40
+  sitemap_failed_url_retry_attempts: 2
+  sitemap_failed_retry_backoff_sec: 2.0
+  respect_robots_txt: true
+  robots_origins:
+    - "https://example.invalid"
+  robots_unknown_host_policy: "deny"
+  robots_user_agent: "LawaRAGWebsiteIndexer"
+  robots_max_response_bytes: 524288
+  robots_override_authorization: ""
+  user_agent: "LawaRAGWebsiteIndexer/0.1"
+  headers:
+    Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    Accept-Language: "en"
+    X-Crawler-Name: "LawaRAGWebsiteIndexer"
+  validate_source_html: true
+  validate_source_html_mode: "on_quality_warning"
+  legacy_site_content_heuristics: false
+  parse_source_html_for_media: true
+  extract_images: true
+  download_page_images: false
+  max_images_per_page: 20
+  extract_videos: true
+  max_videos_per_page: 10
+  fetch_video_transcripts: true
+  max_video_transcript_kb: 128
+  dynamic_collections: []
+  require_complete_dynamic_collections: false
+
+quality:
+  min_content_length: 100
+  detect_login_walls: true
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.70
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+  dedup_threshold: 0.85
+  dedup_num_perm: 128
+  dedup_ngram_size: 5
+  target_languages:
+    - "en"
+
+cleaner:
+  engine: "trafilatura"
+  include_tables: true
+  include_links: true
+  preserve_embedded_media: true
+  preserve_disclosure_content: true
+  compare_bs4_when_structurally_richer: true
+  min_content_length: 100
+  min_content_words: 5
+  recursive: true
+  fail_on_empty_input: true
+  fail_on_zero_output: true
+  minimum_retention_ratio: 0.75
+  minimum_host_retention_ratio: 0.50
+  minimum_host_input_count: 5
+  maximum_error_count: 0
+  maximum_error_ratio: 0.0
+  require_critical_url_survival: false
+
+converter:
+  max_workers: 8
+  overwrite: false
+  max_images_in_markdown: 4
+  max_videos_in_markdown: 3
+  append_only_semantic_images: true
+  do_ocr: true
+  do_table_structure: true
+  force_backend_text: true
+  images_scale: 2.0
+  generate_picture_images: false
+  generate_page_images: false
+  document_timeout: 180
+  docling_max_pages: 80
+  docling_max_file_size_mb: 35
+  docling_large_pdf_strategy: "page_windows"
+  docling_large_pdf_window_pages: 40
+  docling_large_pdf_min_window_pages: 1
+  docling_large_pdf_allow_window_text_fallback: true
+  reuse_existing_conversions: true
+  min_free_disk_mb: 1024
+  use_vlm: false
+
+chunker:
+  strategy: "hybrid"
+  use_docling_native: true
+  include_section_headings: true
+  always_emit_headings: false
+  target_tokens: 450
+  max_tokens: 650
+  overlap_tokens: 80
+  min_chunk_tokens: 140
+  max_chunks_per_document: 0
+
+storage:
+  provider: "local"

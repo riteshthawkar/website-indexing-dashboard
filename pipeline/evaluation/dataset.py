@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List
 
 ALLOWED_QUERY_TYPES = {"fact", "scoped", "synthesis", "multimodal"}
 ALLOWED_SOURCE_TYPES = {"webpage", "pdf", "mixed", "image", "video", "none"}
+# Historical suites used English and Arabic. Generic package consumers may use
+# any non-empty BCP-47 tag or human-readable language label.
 ALLOWED_LANGUAGES = {"English", "Arabic"}
 _LANGUAGE_ALIASES = {
     "en": "English",
@@ -47,8 +49,8 @@ class EvalExample:
             raise ValueError(f"Unsupported query_type {self.query_type!r} for eval example {self.id}")
         if source_type not in ALLOWED_SOURCE_TYPES:
             raise ValueError(f"Unsupported source_type {self.source_type!r} for eval example {self.id}")
-        if language not in ALLOWED_LANGUAGES:
-            raise ValueError(f"Unsupported language {self.language!r} for eval example {self.id}")
+        if not language:
+            raise ValueError(f"Missing language for eval example {self.id}")
         if not str(self.id or "").strip():
             raise ValueError("Eval example id is required")
         if not str(self.query or "").strip():

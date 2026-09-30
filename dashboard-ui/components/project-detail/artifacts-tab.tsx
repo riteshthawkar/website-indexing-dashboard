@@ -239,7 +239,7 @@ export function ArtifactsTab({ run }: { run: PipelineRun }) {
                 />
               </div>
             ) : (
-              <ScrollArea className="h-[28rem] rounded-md border bg-black/50 p-4">
+              <ScrollArea className="h-[28rem] rounded-md border bg-muted p-4">
                 <pre className="text-xs whitespace-pre-wrap font-mono">
                   {fileContentQuery.data?.parsed_json
                     ? JSON.stringify(fileContentQuery.data.parsed_json, null, 2)

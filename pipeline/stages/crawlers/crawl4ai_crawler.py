@@ -598,17 +598,31 @@ def _tokenize_path(url: str) -> set[str]:
     return tokens
 
 
-def _semantic_tokens(text: str) -> set[str]:
+def _semantic_tokens(
+    text: str,
+    *,
+    legacy_site_heuristics: bool = True,
+) -> set[str]:
     tokens = set()
+    stopwords = URL_TOKEN_STOPWORDS
+    if not legacy_site_heuristics:
+        stopwords = URL_TOKEN_STOPWORDS - {"mbzuai"}
     for token in re.split(r"[^a-z0-9]+", str(text or "").lower()):
-        if len(token) < 3 or token in URL_TOKEN_STOPWORDS:
+        if len(token) < 3 or token in stopwords:
             continue
         tokens.add(token)
     return tokens
 
 
-def _url_semantic_tokens(url: str) -> set[str]:
-    return _semantic_tokens(urlparse(url).path)
+def _url_semantic_tokens(
+    url: str,
+    *,
+    legacy_site_heuristics: bool = True,
+) -> set[str]:
+    return _semantic_tokens(
+        urlparse(url).path,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
 
 
 def _token_coverage(required: set[str], observed: set[str]) -> float:
@@ -749,13 +763,28 @@ def _normalize_known_empty_cohort_policies(
     return policies, errors
 
 
-def _html_quality_report(html: str, page_url: str, markdown: str = "") -> Dict[str, Any]:
+def _html_quality_report(
+    html: str,
+    page_url: str,
+    markdown: str = "",
+    *,
+    legacy_site_heuristics: bool = True,
+) -> Dict[str, Any]:
     title = _extract_html_title(html)
     visible_text = _visible_text_from_html(html)
     combined_text = " ".join(part for part in (title, visible_text, markdown) if part)
-    path_tokens = _url_semantic_tokens(page_url)
-    combined_tokens = _semantic_tokens(combined_text)
-    title_tokens = _semantic_tokens(title)
+    path_tokens = _url_semantic_tokens(
+        page_url,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
+    combined_tokens = _semantic_tokens(
+        combined_text,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
+    title_tokens = _semantic_tokens(
+        title,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
     token_coverage = _token_coverage(path_tokens, combined_tokens)
     title_token_coverage = _token_coverage(path_tokens, title_tokens)
     lower_text = combined_text.lower()
@@ -768,9 +797,14 @@ def _html_quality_report(html: str, page_url: str, markdown: str = "") -> Dict[s
     if _contains_error_or_block_text(combined_text):
         reasons.append("blocked_or_error_page")
         critical = True
-    if path_tokens and _is_generic_mbzuai_title(title):
+    if legacy_site_heuristics and path_tokens and _is_generic_mbzuai_title(title):
         reasons.append("generic_mbzuai_title")
-    if path_tokens and any(phrase in lower_text for phrase in GENERIC_SITE_SHELL_PHRASES) and token_coverage < 0.5:
+    if (
+        legacy_site_heuristics
+        and path_tokens
+        and any(phrase in lower_text for phrase in GENERIC_SITE_SHELL_PHRASES)
+        and token_coverage < 0.5
+    ):
         reasons.append("generic_site_shell")
     if path_tokens and token_coverage < 0.34 and title_token_coverage < 0.34:
         reasons.append("url_token_mismatch")
@@ -813,10 +847,24 @@ def _select_preferred_page_capture(
     rendered_html: str,
     raw_source_html: str = "",
     rendered_markdown: str = "",
+    legacy_site_heuristics: bool = True,
 ) -> Tuple[str, str, Dict[str, Any]]:
     """Select the HTML capture that best represents the requested page."""
-    rendered_report = _html_quality_report(rendered_html, page_url, markdown=rendered_markdown)
-    raw_report = _html_quality_report(raw_source_html, page_url) if raw_source_html else {}
+    rendered_report = _html_quality_report(
+        rendered_html,
+        page_url,
+        markdown=rendered_markdown,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
+    raw_report = (
+        _html_quality_report(
+            raw_source_html,
+            page_url,
+            legacy_site_heuristics=legacy_site_heuristics,
+        )
+        if raw_source_html
+        else {}
+    )
     selected_html = rendered_html
     selected_source = "rendered"
     selection_reason = "rendered_capture_accepted"
@@ -862,16 +910,30 @@ def _markdown_plain_text(markdown: str) -> str:
     return " ".join(text.split())
 
 
-def _clean_page_title_for_markdown(title: str) -> str:
+def _clean_page_title_for_markdown(
+    title: str,
+    *,
+    legacy_site_heuristics: bool = True,
+) -> str:
     title = " ".join(str(title or "").split()).strip()
+    if not legacy_site_heuristics:
+        return title
     return re.sub(r"\s+-\s+MBZUAI$", "", title, flags=re.I).strip() or title
 
 
-def _ensure_markdown_has_page_title(markdown: str, html: str) -> str:
+def _ensure_markdown_has_page_title(
+    markdown: str,
+    html: str,
+    *,
+    legacy_site_heuristics: bool = True,
+) -> str:
     markdown = str(markdown or "").strip()
     if not markdown:
         return ""
-    title = _clean_page_title_for_markdown(_extract_html_title(html))
+    title = _clean_page_title_for_markdown(
+        _extract_html_title(html),
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
     if not title:
         return markdown
     plain = _markdown_plain_text(markdown).lower()
@@ -880,7 +942,13 @@ def _ensure_markdown_has_page_title(markdown: str, html: str) -> str:
     return f"# {title}\n\n{markdown}"
 
 
-def _starts_with_generic_site_shell(markdown: str) -> bool:
+def _starts_with_generic_site_shell(
+    markdown: str,
+    *,
+    legacy_site_heuristics: bool = True,
+) -> bool:
+    if not legacy_site_heuristics:
+        return False
     plain = _markdown_plain_text(markdown).lower()
     return plain.startswith("thought curators for ai creators") or plain.startswith("thoughtcurators for ai creators")
 
@@ -936,7 +1004,14 @@ def _markdown_looks_navigation_heavy(markdown: str) -> bool:
     return bool(plain) and len(link_text) / max(len(plain), 1) > 0.55 and len(link_lines) >= 10
 
 
-def _markdown_looks_thin_boilerplate(markdown: str, page_url: str = "") -> bool:
+def _markdown_looks_thin_boilerplate(
+    markdown: str,
+    page_url: str = "",
+    *,
+    legacy_site_heuristics: bool = True,
+) -> bool:
+    if not legacy_site_heuristics:
+        return False
     plain = _markdown_plain_text(markdown)
     if not plain:
         return False
@@ -960,33 +1035,64 @@ def _markdown_looks_thin_boilerplate(markdown: str, page_url: str = "") -> bool:
     return "/study/faculty/" in path or "/ar/study/faculty/" in path
 
 
-def _markdown_quality_reason(markdown: str, page_url: str, *, html: str = "") -> str:
+def _markdown_quality_reason(
+    markdown: str,
+    page_url: str,
+    *,
+    html: str = "",
+    legacy_site_heuristics: bool = True,
+) -> str:
     plain = _markdown_plain_text(markdown)
     if not plain:
         return "empty_markdown"
     if _contains_error_or_block_text(plain):
         return "blocked_or_error_page"
-    if urlparse(page_url).path.strip("/") and _starts_with_generic_site_shell(markdown):
+    if urlparse(page_url).path.strip("/") and _starts_with_generic_site_shell(
+        markdown,
+        legacy_site_heuristics=legacy_site_heuristics,
+    ):
         return "generic_site_shell"
     if _markdown_looks_navigation_heavy(markdown):
         return "navigation_heavy"
-    if _markdown_looks_thin_boilerplate(markdown, page_url):
+    if _markdown_looks_thin_boilerplate(
+        markdown,
+        page_url,
+        legacy_site_heuristics=legacy_site_heuristics,
+    ):
         return "thin_boilerplate"
 
-    path_tokens = _url_semantic_tokens(page_url)
+    path_tokens = _url_semantic_tokens(
+        page_url,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
     if not path_tokens:
         return ""
 
-    markdown_tokens = _semantic_tokens(plain)
+    markdown_tokens = _semantic_tokens(
+        plain,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
     markdown_coverage = _token_coverage(path_tokens, markdown_tokens)
     lower_plain = plain.lower()
-    if _is_generic_mbzuai_title(plain) and markdown_coverage < 0.34:
+    if (
+        legacy_site_heuristics
+        and _is_generic_mbzuai_title(plain)
+        and markdown_coverage < 0.34
+    ):
         return "generic_mbzuai_title"
-    if any(phrase in lower_plain for phrase in GENERIC_SITE_SHELL_PHRASES) and markdown_coverage < 0.5:
+    if (
+        legacy_site_heuristics
+        and any(phrase in lower_plain for phrase in GENERIC_SITE_SHELL_PHRASES)
+        and markdown_coverage < 0.5
+    ):
         return "generic_site_shell"
 
     if html:
-        html_report = _html_quality_report(html, page_url)
+        html_report = _html_quality_report(
+            html,
+            page_url,
+            legacy_site_heuristics=legacy_site_heuristics,
+        )
         if (
             html_report.get("usable")
             and float(html_report.get("token_coverage") or 0.0) >= 0.67
@@ -1094,7 +1200,12 @@ def _bs4_html_to_markdown(html: str) -> str:
     return "\n\n".join(lines).strip()
 
 
-def _html_to_markdown(html: str, page_url: str = "") -> str:
+def _html_to_markdown(
+    html: str,
+    page_url: str = "",
+    *,
+    legacy_site_heuristics: bool = True,
+) -> str:
     if not html or not str(html).strip():
         return ""
 
@@ -1115,12 +1226,24 @@ def _html_to_markdown(html: str, page_url: str = "") -> str:
         extracted = ""
 
     if extracted and not _markdown_looks_navigation_heavy(extracted):
-        return _ensure_markdown_has_page_title(extracted, html)
+        return _ensure_markdown_has_page_title(
+            extracted,
+            html,
+            legacy_site_heuristics=legacy_site_heuristics,
+        )
 
     fallback = _bs4_html_to_markdown(html)
     if fallback:
-        return _ensure_markdown_has_page_title(fallback, html)
-    return _ensure_markdown_has_page_title(extracted, html)
+        return _ensure_markdown_has_page_title(
+            fallback,
+            html,
+            legacy_site_heuristics=legacy_site_heuristics,
+        )
+    return _ensure_markdown_has_page_title(
+        extracted,
+        html,
+        legacy_site_heuristics=legacy_site_heuristics,
+    )
 
 
 async def _read_bounded_response(response: Any, max_bytes: int) -> bytes:
@@ -2887,6 +3010,9 @@ class Crawl4AICrawler(CrawlerStage):
                 "crawler.cohort_probe_min_interval_sec must be a non-negative number"
             )
 
+        if not isinstance(crawler.get("legacy_site_content_heuristics", True), bool):
+            errors.append("crawler.legacy_site_content_heuristics must be a boolean")
+
         if AsyncWebCrawler is None or BrowserConfig is None or CrawlerRunConfig is None:
             errors.append("crawl4ai is not installed. Run: pip install crawl4ai")
 
@@ -2905,6 +3031,9 @@ class Crawl4AICrawler(CrawlerStage):
     async def execute(self, ctx: StageContext) -> StageResult:
         self.ctx = ctx
         self.config = dict(ctx.crawler_config)
+        self.legacy_site_content_heuristics = bool(
+            self.config.get("legacy_site_content_heuristics", True)
+        )
         self.start_url = _normalize_http_url(self.config.get("start_url"))
         if not self.start_url:
             return StageResult.failure("crawler.start_url is missing or invalid")
@@ -5699,6 +5828,9 @@ class Crawl4AICrawler(CrawlerStage):
         return str(soup), True
 
     async def _process_result(self, result: Any, *, mark_failure: bool = True) -> bool:
+        legacy_site_heuristics = bool(
+            getattr(self, "legacy_site_content_heuristics", True)
+        )
         page_url = _normalize_http_url(getattr(result, "url", None))
         if not page_url:
             return False
@@ -5743,7 +5875,12 @@ class Crawl4AICrawler(CrawlerStage):
         raw_source_html = ""
         raw_source_status: Optional[int] = None
         rendered_markdown = self._extract_crawl4ai_markdown(result)
-        rendered_quality_report = _html_quality_report(rendered_html, page_url, markdown=rendered_markdown)
+        rendered_quality_report = _html_quality_report(
+            rendered_html,
+            page_url,
+            markdown=rendered_markdown,
+            legacy_site_heuristics=legacy_site_heuristics,
+        )
         should_fetch_source = (
             self.validate_source_html_mode == "always"
             or (
@@ -5769,6 +5906,7 @@ class Crawl4AICrawler(CrawlerStage):
             rendered_html,
             raw_source_html=raw_source_html,
             rendered_markdown=rendered_markdown,
+            legacy_site_heuristics=legacy_site_heuristics,
         )
         selected_quality_reasons = (quality_report.get("selected") or {}).get("reasons") or []
         if selected_quality_reasons:
@@ -6044,6 +6182,9 @@ class Crawl4AICrawler(CrawlerStage):
         capture_source: str = "rendered",
         prefer_html: bool = False,
     ) -> Tuple[str, str, str]:
+        legacy_site_heuristics = bool(
+            getattr(self, "legacy_site_content_heuristics", True)
+        )
         crawl_markdown = ""
         if not prefer_html:
             crawl_markdown = (
@@ -6051,13 +6192,31 @@ class Crawl4AICrawler(CrawlerStage):
                 if rendered_markdown
                 else self._extract_crawl4ai_markdown(result)
             )
-        crawl_reason = _markdown_quality_reason(crawl_markdown, page_url, html=html) if crawl_markdown else "empty_markdown"
+        crawl_reason = (
+            _markdown_quality_reason(
+                crawl_markdown,
+                page_url,
+                html=html,
+                legacy_site_heuristics=legacy_site_heuristics,
+            )
+            if crawl_markdown
+            else "empty_markdown"
+        )
         if crawl_markdown and capture_source == "rendered" and not crawl_reason:
             return crawl_markdown, "crawl4ai", ""
 
-        generated_markdown = _html_to_markdown(html, page_url)
+        generated_markdown = _html_to_markdown(
+            html,
+            page_url,
+            legacy_site_heuristics=legacy_site_heuristics,
+        )
         generated_reason = (
-            _markdown_quality_reason(generated_markdown, page_url, html=html)
+            _markdown_quality_reason(
+                generated_markdown,
+                page_url,
+                html=html,
+                legacy_site_heuristics=legacy_site_heuristics,
+            )
             if generated_markdown
             else "empty_markdown"
         )

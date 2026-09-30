@@ -1226,6 +1226,17 @@ class RoutedHybridRetriever:
         self.work_dir = Path(work_dir).resolve()
         retrieval_cfg = dict(self.config.get("retrieval") or {})
         pipeline_cfg = dict(self.config.get("pipeline") or {})
+        crawler_cfg = dict(self.config.get("crawler") or {})
+        source_profile = dict(self.config.get("source_profile") or {})
+        raw_coverage_hosts = (
+            crawler_cfg.get("allowed_hosts")
+            or crawler_cfg.get("allowed_domains")
+            or source_profile.get("allowed_hosts")
+            or ()
+        )
+        self._allowed_coverage_hosts = tuple(
+            str(h).strip().lower() for h in raw_coverage_hosts if str(h).strip()
+        )
 
         self.routed_graph_enabled = bool(retrieval_cfg.get("routed_graph_enabled", True))
         self.routed_graph_required = bool(pipeline_cfg.get("production_profile", False)) or bool(
@@ -2722,6 +2733,13 @@ class RoutedHybridRetriever:
             host = (urlparse(str(value or "")).hostname or "").casefold()
         except Exception:
             return False
+        if not host:
+            return False
+        if getattr(self, "_allowed_coverage_hosts", None):
+            return any(
+                host == h or host.endswith(f".{h}")
+                for h in self._allowed_coverage_hosts
+            )
         return bool(
             host == "mbzuai.ac.ae"
             or host.endswith(".mbzuai.ac.ae")

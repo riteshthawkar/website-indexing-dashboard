@@ -1,0 +1,20 @@
+personas:
+  - role: prospective student
+    goals:
+      - discover suitable programs
+      - understand admissions requirements
+    knowledge_level: beginner
+    preferred_languages: [English, Arabic]
+    query_style: conversational and sometimes incomplete
+    likely_tasks: [fact, compare, explain, navigate]
+    domain: university
+
+  - role: research collaborator
+    goals:
+      - identify relevant research groups
+      - find collaboration routes and contacts
+    knowledge_level: expert
+    preferred_languages: [English]
+    query_style: precise and technical
+    likely_tasks: [synthesis, compare, navigate]
+    domain: university

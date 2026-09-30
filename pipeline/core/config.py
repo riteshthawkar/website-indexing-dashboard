@@ -40,6 +40,7 @@ class ProductionConfigMismatchError(ValueError):
 
 _INDEXING_CONTRACT_SECTIONS = (
     "pipeline",
+    "source_profile",
     "selected_profile",
     "crawler",
     "cleaner",

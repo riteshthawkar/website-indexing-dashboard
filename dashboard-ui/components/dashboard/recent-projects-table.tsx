@@ -1,6 +1,4 @@
-"use client";
-
-import { useRouter } from "next/navigation";
+import Link from "next/link";
 import {
   Table,
   TableBody,
@@ -13,70 +11,63 @@ import { StatusBadge } from "@/components/shared/status-badge";
 import { formatDate, formatDuration } from "@/lib/utils";
 import type { PipelineRun } from "@/lib/types";
 
-interface RecentProjectsTableProps {
-  runs: PipelineRun[];
-}
-
-export function RecentProjectsTable({ runs }: RecentProjectsTableProps) {
-  const router = useRouter();
-
+export function RecentProjectsTable({ runs }: { runs: PipelineRun[] }) {
   return (
-    <div className="overflow-x-auto">
-      <Table>
-        <TableHeader>
-            <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Stage</TableHead>
-              <TableHead className="text-right">Progress</TableHead>
-              <TableHead className="text-right">Docs</TableHead>
-            <TableHead className="text-right">Chunks</TableHead>
-            <TableHead className="text-right">Media</TableHead>
-            <TableHead className="text-right">Embeddings</TableHead>
-            <TableHead>Duration</TableHead>
-            <TableHead>Created</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {runs.map((run) => (
-            <TableRow
-              key={run.id}
-              className="cursor-pointer"
-              onClick={() => router.push(`/projects/detail?id=${run.id}`)}
-            >
-              <TableCell>
-                <span className="font-medium">{run.run_name}</span>
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead>Project</TableHead>
+          <TableHead>Status</TableHead>
+          <TableHead>Last stage</TableHead>
+          <TableHead className="text-right">Chunks</TableHead>
+          <TableHead>Runtime</TableHead>
+          <TableHead>Created</TableHead>
+        </TableRow>
+      </TableHeader>
+      <TableBody>
+        {runs.map((run) => {
+          const preview = run.run_type === "graph_preview";
+          return (
+            <TableRow key={run.id}>
+              <TableCell className="w-full min-w-60">
+                <Link
+                  href={`/projects/detail?id=${run.id}${preview ? "&tab=graphs" : ""}`}
+                  className="block max-w-64 truncate xl:max-w-sm font-medium hover:text-primary hover:underline"
+                  title={run.run_name}
+                >
+                  {run.run_name.replace(/^Graph snapshots · /, "")}
+                </Link>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {preview ? "Saved graph snapshots" : run.run_type}
+                </p>
               </TableCell>
               <TableCell>
-                <div className="flex flex-col gap-1">
-                  <StatusBadge status={run.status} pulse />
-                  {run.process_state && run.process_state !== run.status && (
-                    <StatusBadge status={run.process_state} />
-                  )}
-                </div>
+                {preview ? (
+                  <span className="text-xs text-muted-foreground">
+                    Read-only
+                  </span>
+                ) : (
+                  <StatusBadge status={run.process_state || run.status} pulse />
+                )}
               </TableCell>
-              <TableCell className="min-w-[220px]">
-                <div className="space-y-2">
-                  <div className="truncate text-sm font-medium">{run.current_stage || run.last_completed_stage || "\u2014"}</div>
-                  <div className="h-2 overflow-hidden rounded-full border border-white/8 bg-black/25">
-                    <div
-                      className="h-full rounded-full bg-[linear-gradient(90deg,rgba(53,210,198,0.9),rgba(73,143,226,0.92))]"
-                      style={{ width: `${run.stage_summary?.progress_percent || 0}%` }}
-                    />
-                  </div>
-                </div>
+              <TableCell className="max-w-52 truncate text-muted-foreground">
+                {preview
+                  ? "—"
+                  : run.current_stage || run.last_completed_stage || "—"}
               </TableCell>
-              <TableCell className="text-right">{run.stage_summary?.progress_percent ?? 0}%</TableCell>
-              <TableCell className="text-right">{run.docs_converted}</TableCell>
-              <TableCell className="text-right">{run.chunks_created}</TableCell>
-              <TableCell className="text-right">{run.media_items_extracted}</TableCell>
-              <TableCell className="text-right">{run.embeddings_created}</TableCell>
-              <TableCell>{formatDuration(run.duration_seconds)}</TableCell>
-              <TableCell className="text-muted-foreground">{formatDate(run.created_at)}</TableCell>
+              <TableCell className="text-right">
+                {preview ? "—" : run.chunks_created.toLocaleString()}
+              </TableCell>
+              <TableCell>
+                {preview ? "—" : formatDuration(run.duration_seconds)}
+              </TableCell>
+              <TableCell className="text-muted-foreground">
+                {formatDate(run.created_at)}
+              </TableCell>
             </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
+          );
+        })}
+      </TableBody>
+    </Table>
   );
 }

@@ -6,6 +6,9 @@ The production path scrapes the MBZUAI website, normalizes website and document 
 
 ## Stack
 
+For offline inspection of saved page and knowledge graphs, see the
+[Graph Explorer guide](docs/graph_explorer.md).
+
 - Python pipeline and CLI
 - Crawl4AI, Trafilatura, MarkItDown, and Docling for website/document processing
 - OpenAI for structured assertion extraction and validation
@@ -16,6 +19,7 @@ The production path scrapes the MBZUAI website, normalizes website and document 
 ## Repository Layout
 
 - [`pipeline/`](pipeline/): pipeline stages, retrieval, evaluation, CLI
+- [`lawa_rag/`](lawa_rag/): stable, reusable Python package API
 - [`pipeline/configs/mbzuai_production.yaml`](pipeline/configs/mbzuai_production.yaml): canonical production contract
 - [`pipeline/configs/default.yaml`](pipeline/configs/default.yaml): shared defaults inherited by environment-specific configs
 - [`docs/`](docs/): operator and system docs
@@ -197,3 +201,7 @@ PIPELINE_EMBEDDER__VERIFY_INDEX_MIN_COUNT_ONLY=true bash scripts/pipeline.sh run
 
 - setup guide: [`docs/setup.md`](docs/setup.md)
 - retriever handoff: [`docs/retriever_system.md`](docs/retriever_system.md)
+- reusable Python package: [`docs/internal_package.md`](docs/internal_package.md)
+- grounded automatic evaluation: [`docs/auto_evaluation.md`](docs/auto_evaluation.md)
+- generic website profiles and the isolated crawl-to-chunks package flow:
+  [`docs/internal_package.md#generic-website-ingestion`](docs/internal_package.md#generic-website-ingestion)

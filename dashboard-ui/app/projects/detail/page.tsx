@@ -6,7 +6,10 @@ import { ProjectDetailClient } from "./client";
 function Loading() {
   return (
     <>
-      <PageHeader title="Loading..." />
+      <PageHeader
+        title="Loading..."
+        parent={{ href: "/projects", label: "Projects" }}
+      />
       <div className="p-6 space-y-4">
         <Skeleton className="h-48" />
         <Skeleton className="h-64" />

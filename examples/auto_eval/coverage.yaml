@@ -1,0 +1,22 @@
+count: 100
+languages:
+  English: 0.55
+  Arabic: 0.35
+  mixed-language: 0.10
+difficulties:
+  easy: 0.30
+  medium: 0.45
+  hard: 0.25
+tasks:
+  fact: 0.20
+  explain: 0.15
+  compare: 0.15
+  synthesis: 0.20
+  navigate: 0.10
+  aggregate: 0.08
+  multimodal: 0.07
+  follow_up: 0.05
+no_answer_fraction: 0.10
+seed: 17
+metadata:
+  purpose: pre-release regression suite

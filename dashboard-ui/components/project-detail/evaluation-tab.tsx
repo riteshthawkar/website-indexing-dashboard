@@ -408,7 +408,7 @@ export function EvaluationTab({ run }: { run: PipelineRun }) {
             </Button>
           </div>
           {(datasetInitResult || datasetSummary || datasetValidation) && (
-            <ScrollArea className="h-56 rounded-md border bg-black/50 p-4">
+            <ScrollArea className="h-56 rounded-md border bg-muted p-4">
               <pre className="text-xs font-mono whitespace-pre-wrap">
                 {JSON.stringify(datasetValidation || datasetSummary || datasetInitResult, null, 2)}
               </pre>
@@ -561,7 +561,7 @@ export function EvaluationTab({ run }: { run: PipelineRun }) {
             </div>
           </div>
           {benchmarkSummary && (
-            <ScrollArea className="h-40 rounded-md border bg-black/50 p-4">
+            <ScrollArea className="h-40 rounded-md border bg-muted p-4">
               <pre className="text-xs font-mono whitespace-pre-wrap">{JSON.stringify(benchmarkSummary, null, 2)}</pre>
             </ScrollArea>
           )}
