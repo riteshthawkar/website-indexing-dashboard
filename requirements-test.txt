@@ -1,3 +1,4 @@
 # Test-only tooling used by the pre-deploy suite.
 pip-audit==2.10.0
 pytest==9.0.3
+ijson==3.5.0

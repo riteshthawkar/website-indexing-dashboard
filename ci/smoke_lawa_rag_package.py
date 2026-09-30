@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import lawa_rag
+import lawa_rag.ingestion as ingestion
 import pipeline
 from lawa_rag import IndexingPipeline, WebsiteProfile, load_pipeline_config
 from lawa_rag.retrieval import (
@@ -93,6 +94,39 @@ def _smoke_generic_website_profile() -> int:
     return len(plugins)
 
 
+def _smoke_ingestion(root: Path) -> int:
+    directory = root / "documents"
+    directory.mkdir()
+    (directory / "guide.md").write_text("# Guide\nLocal source content.", encoding="utf-8")
+    (directory / "record.json").write_text('{"policy":"Local policy","code":"007"}')
+    collection = ingestion.Collection("wheel-smoke", "knowledge")
+    catalog = ingestion.IngestionCatalog(root / "collection-state")
+    source = ingestion.Source(
+        "documents", "folder", directory.as_uri(),
+        ingestion.AccessPolicy(principals=("reviewer",)),
+    )
+    connector = ingestion.LocalFolderConnector(source)
+    first = ingestion.sync_source(catalog, collection, connector)
+    repeated = ingestion.sync_source(catalog, collection, connector)
+    if first.counts["added"] != 2 or repeated.counts["needs_processing"] != 0:
+        raise RuntimeError("installed ingestion refresh contract failed")
+    if catalog.records(collection, access=ingestion.AccessContext("wheel-smoke")):
+        raise RuntimeError("private source leaked to an anonymous caller")
+    access = ingestion.AccessContext("wheel-smoke", ("reviewer",))
+    preparation = ingestion.prepare_collection(catalog, collection, access=access)
+    if not preparation.ok or preparation.counts["converted"] != 1:
+        raise RuntimeError("installed document preparation contract failed")
+    if ingestion.prepare_collection(catalog, collection, access=access).counts["reused"] != 1:
+        raise RuntimeError("installed conversion cache contract failed")
+    snapshot = ingestion.build_evaluation_corpus(
+        catalog, collection, access=access, processor_key=preparation.processor_key,
+    )
+    ingestion.update_source_access(catalog, collection, "documents", ingestion.AccessPolicy())
+    if catalog.records(collection, access=access):
+        raise RuntimeError("installed ingestion source revocation failed")
+    return len(snapshot.sources)
+
+
 def _smoke_retrieval(root: Path) -> dict:
     work_dir = root / "synthetic-release"
     write_synthetic_release(work_dir, vector_store_provider="pgvector")
@@ -152,12 +186,14 @@ def main() -> int:
     args = parser.parse_args()
     expected_root = args.expected_package_root.expanduser().resolve()
     _assert_import_root(lawa_rag.__file__, expected_root, "lawa_rag")
+    _assert_import_root(ingestion.__file__, expected_root, "lawa_rag.ingestion")
     _assert_import_root(pipeline.__file__, expected_root, "pipeline")
     _configure_offline_credentials()
 
     with tempfile.TemporaryDirectory(prefix="lawa-rag-wheel-smoke-") as value:
         root = Path(value)
         website_stage_count = _smoke_generic_website_profile()
+        ingestion_source_count = _smoke_ingestion(root)
         stage_count = _smoke_production_plan(root)
         result = _smoke_retrieval(root)
         asyncio.run(_smoke_service(root))
@@ -165,6 +201,7 @@ def main() -> int:
     print(
         "installed wheel production smoke passed: "
         f"website={website_stage_count} stages, production={stage_count} stages, "
+        f"ingestion={ingestion_source_count} source, "
         f"evidence={result['selected_chunk_ids']}"
     )
     return 0

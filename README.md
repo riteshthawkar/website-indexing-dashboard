@@ -6,6 +6,9 @@ The production path scrapes the MBZUAI website, normalizes website and document 
 
 ## Stack
 
+For offline inspection of saved page and knowledge graphs, see the
+[Graph Explorer guide](docs/graph_explorer.md).
+
 - Python pipeline and CLI
 - Crawl4AI, Trafilatura, MarkItDown, and Docling for website/document processing
 - OpenAI for structured assertion extraction and validation

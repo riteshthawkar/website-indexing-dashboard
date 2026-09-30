@@ -134,11 +134,17 @@ WebsiteProfile
   -> multilingual, heading-aware chunking
 ```
 
-This is intentionally the shared ingestion boundary for future source types.
-Document-folder/object-storage and database connectors will emit the same
-normalized document, media, provenance, and deletion records before entering
-deduplication and chunking. They therefore will not duplicate the downstream
-representation, embedding, graph, vector-store, evaluation, or release logic.
+The first multi-source collection boundary is now available through
+`lawa_rag.ingestion`: completed generic website runs, local document folders and S3/Spaces
+can share a versioned catalog with permission-aware reads, incremental change
+classification, guarded deletions and safe replay. See
+[`multi_source_ingestion.md`](multi_source_ingestion.md) for SDK/CLI commands and
+its explicit limits. Originals are retained; optional Docling preparation adds
+structured documents with source/page/slide/table provenance. See
+[`object_storage_and_documents.md`](object_storage_and_documents.md) for setup,
+conversion commands, OCR requirements and verified coverage. Database connectors,
+media captioning and collection index publication remain subsequent steps.
+Existing MBZUAI jobs are unchanged.
 
 ## Run an indexing pipeline
 

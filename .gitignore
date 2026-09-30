@@ -52,6 +52,7 @@ runs/
 history/
 dashboard/dashboard.db
 dashboard/logs/
+dashboard/.graph-cache/
 
 # Frontend local artifacts
 dashboard-ui/node_modules/
