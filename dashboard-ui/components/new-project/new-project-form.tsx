@@ -2,13 +2,26 @@
 
 import { useState, useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import {
+  Card,
+  CardContent,
+  CardHeader,
+  CardTitle,
+  CardDescription,
+} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Textarea } from "@/components/ui/textarea";
 import { Badge } from "@/components/ui/badge";
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import { useCreateRun, useStartRun } from "@/lib/hooks/use-runs";
 import { fetchConfig } from "@/lib/api";
 
@@ -47,7 +60,11 @@ export function NewProjectForm() {
       }
       configSnapshot = parsed as Record<string, unknown>;
     } catch (error) {
-      setConfigError(error instanceof Error ? error.message : "Configuration is not valid JSON.");
+      setConfigError(
+        error instanceof Error
+          ? error.message
+          : "Configuration is not valid JSON.",
+      );
       return;
     }
     setConfigError(null);
@@ -72,12 +89,13 @@ export function NewProjectForm() {
       <CardHeader>
         <CardTitle>Create New Project</CardTitle>
         <CardDescription>
-          Start from the single default pipeline template, adjust it for this run, then launch.
+          Start from the single default pipeline template, adjust it for this
+          run, then launch.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-6">
         <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
+          <div className="space-y-2 rounded-lg border border-border bg-muted/25 p-4">
             <Label htmlFor="name">Project Name *</Label>
             <Input
               id="name"
@@ -86,20 +104,24 @@ export function NewProjectForm() {
               onChange={(e) => setName(e.target.value)}
             />
           </div>
-          <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
+          <div className="space-y-2 rounded-lg border border-border bg-muted/25 p-4">
             <Label htmlFor="type">Run Type</Label>
             <Select value={runType} onValueChange={(v) => v && setRunType(v)}>
-              <SelectTrigger>
+              <SelectTrigger id="type" className="w-full">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {RUN_TYPES.map((t) => (
-                  <SelectItem key={t} value={t}>{t}</SelectItem>
-                ))}
+                <SelectGroup>
+                  {RUN_TYPES.map((t) => (
+                    <SelectItem key={t} value={t}>
+                      {t}
+                    </SelectItem>
+                  ))}
+                </SelectGroup>
               </SelectContent>
             </Select>
           </div>
-          <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
+          <div className="space-y-2 rounded-lg border border-border bg-muted/25 p-4">
             <Label htmlFor="url">Start URL (optional override)</Label>
             <Input
               id="url"
@@ -108,10 +130,13 @@ export function NewProjectForm() {
               onChange={(e) => setStartUrl(e.target.value)}
             />
           </div>
-          <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
+          <div className="space-y-2 rounded-lg border border-border bg-muted/25 p-4">
             <Label>Base Configuration</Label>
-            <div className="flex min-h-10 items-center rounded-xl border border-white/10 bg-black/30 px-3">
-              <Badge variant="secondary" className="rounded-md border-white/10 bg-white/8 px-3 py-1 text-xs uppercase tracking-[0.18em]">
+            <div className="flex min-h-10 items-center rounded-xl border border-border bg-muted px-3">
+              <Badge
+                variant="secondary"
+                className="rounded-md border-border bg-background px-3 py-1 text-xs uppercase tracking-[0.18em]"
+              >
                 {configName}
               </Badge>
             </div>
@@ -119,36 +144,50 @@ export function NewProjectForm() {
         </div>
 
         <p className="text-sm text-muted-foreground">
-          The run stores its own config snapshot. Editing this JSON changes only the new run you are launching.
+          The run stores its own config snapshot. Editing this JSON changes only
+          the new run you are launching.
         </p>
 
-        <div className="space-y-2 rounded-2xl border border-white/8 bg-muted/25 p-4">
+        <div className="space-y-2 rounded-lg border border-border bg-muted/25 p-4">
           <div className="flex items-center justify-between gap-3">
             <Label htmlFor="config-snapshot">Run Configuration Snapshot</Label>
-            <span className="text-xs text-muted-foreground">JSON, derived from `default.yaml`</span>
+            <span className="text-xs text-muted-foreground">
+              JSON, derived from `default.yaml`
+            </span>
           </div>
           <Textarea
             id="config-snapshot"
             value={configText}
             onChange={(e) => setConfigText(e.target.value)}
-            className="min-h-[28rem] resize-y bg-black/65 font-mono text-[12px] leading-6 text-cyan-100"
+            className="min-h-[28rem] resize-y bg-muted font-mono text-[12px] leading-6 text-primary"
             spellCheck={false}
             disabled={!configLoaded && !configError}
           />
           {configError ? (
-            <p className="text-sm text-red-400">{configError}</p>
+            <p className="text-sm text-destructive">{configError}</p>
           ) : (
             <p className="text-xs text-muted-foreground">
-              Keep the base config in version control and use this snapshot to override crawl scope, stages, indexes, or retrieval settings for the run.
+              Keep the base config in version control and use this snapshot to
+              override crawl scope, stages, indexes, or retrieval settings for
+              the run.
             </p>
           )}
         </div>
 
         <div className="flex flex-col gap-3 sm:flex-row">
-          <Button className="sm:flex-1" onClick={() => handleCreate(false)} disabled={!name.trim() || !configLoaded || loading}>
+          <Button
+            className="sm:flex-1"
+            onClick={() => handleCreate(false)}
+            disabled={!name.trim() || !configLoaded || loading}
+          >
             Create Run
           </Button>
-          <Button className="sm:flex-1" variant="secondary" onClick={() => handleCreate(true)} disabled={!name.trim() || !configLoaded || loading}>
+          <Button
+            className="sm:flex-1"
+            variant="secondary"
+            onClick={() => handleCreate(true)}
+            disabled={!name.trim() || !configLoaded || loading}
+          >
             Create & Start
           </Button>
         </div>

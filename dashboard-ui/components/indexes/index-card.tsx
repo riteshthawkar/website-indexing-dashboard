@@ -13,14 +13,7 @@ export function IndexCard({ index }: { index: PineconeIndex }) {
       <CardHeader className="pb-2">
         <div className="flex items-center justify-between">
           <CardTitle className="text-base">{index.index_name}</CardTitle>
-          <Badge
-            variant="outline"
-            className={
-              hasError
-                ? "bg-red-500/15 text-red-400 border-red-500/20"
-                : "bg-emerald-500/15 text-emerald-400 border-emerald-500/20"
-            }
-          >
+          <Badge variant={hasError ? "destructive" : "success"}>
             {hasError ? "Error" : "Connected"}
           </Badge>
         </div>
@@ -32,7 +25,9 @@ export function IndexCard({ index }: { index: PineconeIndex }) {
           <dl className="grid grid-cols-2 gap-2 text-sm">
             <div>
               <dt className="text-muted-foreground">Vectors</dt>
-              <dd className="font-medium">{index.vector_count.toLocaleString()}</dd>
+              <dd className="font-medium">
+                {index.vector_count.toLocaleString()}
+              </dd>
             </div>
             <div>
               <dt className="text-muted-foreground">Dimensions</dt>

@@ -23,6 +23,9 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 from artifact_ops import list_artifacts, list_run_files, read_run_file
+from graph_routes import make_graph_router
+from graph_service import graph_service
+from graph_preview_guard import preview_guard
 from database import init_db, get_db, Run, RunLog, utcnow
 from run_data import collect_artifact_summary, collect_media_summary, load_run_media
 from scanner import scan_and_import
@@ -461,6 +464,11 @@ def _enrich_run_payload(run: Run, *, include_config_snapshot: bool = False, incl
     result["stage_summary"] = {"total": 0, "completed": 0, "running": 0, "failed": 0, "pending": 0, "progress_percent": 0}
     result["process_state"] = result["status"]
 
+    if result.get("run_type") == "graph_preview":
+        # Browsing registration is independent of the referenced run's workers.
+        result["process_state"] = "preview"
+        return result
+
     work_dir = result.get("work_dir")
     if not work_dir:
         return result
@@ -628,9 +636,22 @@ async def lifespan(app: FastAPI):
     yield
     run_manager.shutdown()
     evaluation_job_manager.shutdown()
+    graph_service.shutdown()
 
 
 app = FastAPI(title="MBZUAI Pipeline Dashboard", lifespan=lifespan)
+
+
+def _registered_run_type(run_id: int):
+    db = get_db()
+    try:
+        run = db.get(Run, run_id)
+        return run.run_type if run else None
+    finally:
+        db.close()
+
+
+app.middleware("http")(preview_guard(_registered_run_type))
 
 # CORS for dev mode (Next.js on :3000)
 app.add_middleware(
@@ -914,6 +935,9 @@ def _load_run_or_404(run_id: int) -> Run:
         return run
     finally:
         db.close()
+
+
+app.include_router(make_graph_router(_load_run_or_404))
 
 
 @app.post("/api/runs/{run_id}/retrieve")
@@ -1686,7 +1710,7 @@ async def ws_run_logs(websocket: WebSocket, run_id: int):
 # Catch-all: serve Next.js static export
 # ---------------------------------------------------------------------------
 
-@app.get("/{full_path:path}")
+@app.api_route("/{full_path:path}", methods=["GET", "HEAD"])
 async def serve_frontend(full_path: str):
     if UI_DIR.is_dir():
         file_path = UI_DIR / full_path

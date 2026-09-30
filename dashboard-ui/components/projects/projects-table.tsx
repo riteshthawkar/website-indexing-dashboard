@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import Link from "next/link";
 import { useRouter } from "next/navigation";
 import {
   Table,
@@ -11,6 +12,16 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectGroup,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { projectRows, type ProjectSort } from "@/lib/project-list";
 import { StatusBadge } from "@/components/shared/status-badge";
 import { ConfirmDialog } from "@/components/shared/confirm-dialog";
 import { formatDate, formatDuration, formatBytes } from "@/lib/utils";
@@ -18,141 +29,258 @@ import { useStartRun, useCancelRun, useDeleteRun } from "@/lib/hooks/use-runs";
 import { Play, Square, Trash2 } from "lucide-react";
 import type { PipelineRun } from "@/lib/types";
 
-interface ProjectsTableProps {
-  runs: PipelineRun[];
-}
+const SORT_OPTIONS = [
+  { value: "newest", label: "Newest first" },
+  { value: "oldest", label: "Oldest first" },
+  { value: "name", label: "Name A–Z" },
+];
 
-export function ProjectsTable({ runs }: ProjectsTableProps) {
+export function ProjectsTable({ runs }: { runs: PipelineRun[] }) {
   const router = useRouter();
   const startMutation = useStartRun();
   const cancelMutation = useCancelRun();
   const deleteMutation = useDeleteRun();
   const [deleteId, setDeleteId] = useState<number | null>(null);
+  const [metrics, setMetrics] = useState(false);
+  const [search, setSearch] = useState("");
+  const [sort, setSort] = useState<ProjectSort>("newest");
+  const rows = projectRows(runs, search, sort);
 
   return (
     <>
-      <div className="overflow-x-auto">
-        <Table>
-          <TableHeader>
-            <TableRow>
-              <TableHead>Name</TableHead>
-              <TableHead>Type</TableHead>
-              <TableHead>Status</TableHead>
-              <TableHead>Process</TableHead>
-              <TableHead>Stage</TableHead>
-              <TableHead>URL</TableHead>
-              <TableHead className="text-right">Progress</TableHead>
-              <TableHead className="text-right">Pages</TableHead>
-              <TableHead className="text-right">Docs</TableHead>
-              <TableHead className="text-right">Chunks</TableHead>
-              <TableHead className="text-right">Media</TableHead>
-              <TableHead className="text-right">Embeddings</TableHead>
-              <TableHead className="text-right">Size</TableHead>
-              <TableHead>Duration</TableHead>
-              <TableHead>Created</TableHead>
-              <TableHead className="text-right">Actions</TableHead>
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {runs.map((run) => (
-              <TableRow
-                key={run.id}
-                className="cursor-pointer"
-                onClick={() => router.push(`/projects/detail?id=${run.id}`)}
-              >
-                <TableCell>
-                  <span className="font-medium">{run.run_name}</span>
+      <div className="flex flex-wrap items-center gap-3 px-4 py-3">
+        <Input
+          aria-label="Search loaded projects"
+          placeholder="Search loaded projects…"
+          className="w-full sm:w-64"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+        />
+        <Select
+          value={sort}
+          items={SORT_OPTIONS}
+          onValueChange={(value) => {
+            if (SORT_OPTIONS.some((option) => option.value === value))
+              setSort(value as ProjectSort);
+          }}
+        >
+          <SelectTrigger aria-label="Sort projects" className="h-9 w-36">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectGroup>
+              {SORT_OPTIONS.map((option) => (
+                <SelectItem key={option.value} value={option.value}>
+                  {option.label}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          </SelectContent>
+        </Select>
+        <p role="status" className="mr-auto text-xs text-muted-foreground">
+          {rows.length} of {runs.length}
+        </p>
+        <Button
+          variant="ghost"
+          size="sm"
+          aria-pressed={metrics}
+          onClick={() => setMetrics(!metrics)}
+        >
+          {metrics ? "Hide detailed metrics" : "Show detailed metrics"}
+        </Button>
+      </div>
+      <Table>
+        <TableHeader>
+          <TableRow>
+            <TableHead>Project</TableHead>
+            <TableHead>Status</TableHead>
+            <TableHead>Stage / progress</TableHead>
+            {metrics ? (
+              <>
+                <TableHead>URL</TableHead>
+                {["Pages", "Docs", "Chunks", "Media", "Embeddings", "Size"].map(
+                  (label) => (
+                    <TableHead key={label} className="text-right">
+                      {label}
+                    </TableHead>
+                  ),
+                )}
+              </>
+            ) : null}
+            <TableHead>Runtime</TableHead>
+            <TableHead>Created</TableHead>
+            <TableHead className="text-right">Actions</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.map((run) => {
+            const preview = run.run_type === "graph_preview";
+            return (
+              <TableRow key={run.id}>
+                <TableCell className="w-full min-w-60">
+                  <Link
+                    href={`/projects/detail?id=${run.id}${preview ? "&tab=graphs" : ""}`}
+                    title={run.run_name}
+                    className="block max-w-64 truncate xl:max-w-sm font-medium hover:text-primary hover:underline"
+                  >
+                    {run.run_name.replace(/^Graph snapshots · /, "")}
+                  </Link>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {preview ? "Saved graph snapshots" : run.run_type} · #
+                    {run.id}
+                  </p>
                 </TableCell>
-                <TableCell className="text-muted-foreground">{run.run_type}</TableCell>
                 <TableCell>
-                  <StatusBadge status={run.status} pulse />
-                </TableCell>
-                <TableCell>
-                  {run.process_state && run.process_state !== run.status ? (
-                    <StatusBadge status={run.process_state} pulse />
+                  {preview ? (
+                    <span className="text-xs text-muted-foreground">
+                      Read-only
+                    </span>
                   ) : (
-                    <span className="text-xs text-muted-foreground">—</span>
+                    <div className="flex flex-col gap-1">
+                      <StatusBadge status={run.status} pulse />
+                      {run.process_state && run.process_state !== run.status ? (
+                        <StatusBadge status={run.process_state} pulse />
+                      ) : null}
+                    </div>
                   )}
                 </TableCell>
-                <TableCell className="min-w-[220px]">
-                  <div className="space-y-2">
-                    <div className="truncate text-sm font-medium">
-                      {run.current_stage || run.last_completed_stage || "\u2014"}
+                <TableCell className="min-w-40 max-w-52">
+                  {preview ? (
+                    <span className="text-muted-foreground">—</span>
+                  ) : (
+                    <div className="flex flex-col gap-1.5">
+                      <span
+                        className="truncate text-xs"
+                        title={
+                          run.current_stage || run.last_completed_stage || ""
+                        }
+                      >
+                        {run.current_stage ||
+                          run.last_completed_stage ||
+                          "Not started"}
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <progress
+                          className="pipeline-progress"
+                          aria-label={`Stage progress for ${run.run_name}`}
+                          max={100}
+                          value={run.stage_summary?.progress_percent ?? 0}
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          {run.stage_summary?.progress_percent ?? 0}%
+                        </span>
+                      </div>
                     </div>
-                    <div className="h-2 overflow-hidden rounded-full border border-white/8 bg-black/25">
-                      <div
-                        className="h-full rounded-full bg-[linear-gradient(90deg,rgba(53,210,198,0.9),rgba(73,143,226,0.92))]"
-                        style={{ width: `${run.stage_summary?.progress_percent || 0}%` }}
-                      />
-                    </div>
-                  </div>
+                  )}
                 </TableCell>
-                <TableCell className="max-w-[200px] truncate text-muted-foreground">
-                  {run.start_url || "\u2014"}
+                {metrics ? (
+                  <>
+                    <TableCell
+                      className="max-w-52 truncate text-muted-foreground"
+                      title={run.start_url ?? ""}
+                    >
+                      {run.start_url || "—"}
+                    </TableCell>
+                    {[
+                      run.pages_scraped,
+                      run.docs_converted,
+                      run.chunks_created,
+                      run.media_items_extracted,
+                      run.embeddings_created,
+                      formatBytes(run.total_bytes),
+                    ].map((value, i) => (
+                      <TableCell key={i} className="text-right">
+                        {preview
+                          ? "—"
+                          : typeof value === "number"
+                            ? value.toLocaleString()
+                            : value}
+                      </TableCell>
+                    ))}
+                  </>
+                ) : null}
+                <TableCell>
+                  {preview ? "—" : formatDuration(run.duration_seconds)}
                 </TableCell>
-                <TableCell className="text-right">{run.stage_summary?.progress_percent ?? 0}%</TableCell>
-                <TableCell className="text-right">{run.pages_scraped}</TableCell>
-                <TableCell className="text-right">{run.docs_converted}</TableCell>
-                <TableCell className="text-right">{run.chunks_created}</TableCell>
-                <TableCell className="text-right">{run.media_items_extracted}</TableCell>
-                <TableCell className="text-right">{run.embeddings_created}</TableCell>
-                <TableCell className="text-right">{formatBytes(run.total_bytes)}</TableCell>
-                <TableCell>{formatDuration(run.duration_seconds)}</TableCell>
-                <TableCell className="text-muted-foreground">{formatDate(run.created_at)}</TableCell>
-                <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
+                <TableCell className="text-muted-foreground">
+                  {formatDate(run.created_at)}
+                </TableCell>
+                <TableCell>
                   <div className="flex justify-end gap-1">
-                    {(run.status === "pending" || run.status === "failed") && (
+                    {!preview &&
+                    (run.status === "pending" || run.status === "failed") ? (
                       <Button
                         variant="ghost"
-                        size="icon"
+                        size="icon-sm"
+                        aria-label={`Start ${run.run_name}`}
+                        disabled={startMutation.isPending}
                         onClick={async () => {
                           await startMutation.mutateAsync(run.id);
                           router.push(`/projects/detail?id=${run.id}&tab=live`);
                         }}
-                        disabled={startMutation.isPending}
                       >
-                        <Play className="h-4 w-4" />
+                        <Play />
                       </Button>
-                    )}
-                    {run.status === "running" && (
+                    ) : null}
+                    {!preview && run.status === "running" ? (
                       <Button
                         variant="ghost"
-                        size="icon"
+                        size="icon-sm"
+                        aria-label={`Cancel ${run.run_name}`}
                         onClick={() => cancelMutation.mutate(run.id)}
                         disabled={cancelMutation.isPending}
                       >
-                        <Square className="h-4 w-4" />
+                        <Square />
                       </Button>
-                    )}
-                    {run.status !== "running" && (
+                    ) : null}
+                    {run.status !== "running" ? (
                       <Button
                         variant="ghost"
-                        size="icon"
+                        size="icon-sm"
+                        aria-label={`Delete ${run.run_name}`}
                         onClick={() => setDeleteId(run.id)}
                       >
-                        <Trash2 className="h-4 w-4 text-destructive" />
+                        <Trash2 />
                       </Button>
-                    )}
+                    ) : null}
                   </div>
                 </TableCell>
               </TableRow>
-            ))}
-          </TableBody>
-        </Table>
-      </div>
-
+            );
+          })}
+          {rows.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={metrics ? 13 : 6}>
+                <div className="flex flex-wrap items-center justify-between gap-3 py-5">
+                  <p className="text-sm text-muted-foreground">
+                    No projects match this search.
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setSearch("")}
+                  >
+                    Clear search
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          ) : null}
+        </TableBody>
+      </Table>
       <ConfirmDialog
         open={deleteId !== null}
         onOpenChange={(open) => !open && setDeleteId(null)}
-        title="Delete Project"
-        description="This will permanently delete this project and all its data. This action cannot be undone."
+        title="Delete project"
+        description="This will permanently delete this project and its dashboard records. This action cannot be undone."
         confirmLabel="Delete"
         variant="destructive"
         loading={deleteMutation.isPending}
         onConfirm={() => {
-          if (deleteId) {
-            deleteMutation.mutate(deleteId, { onSuccess: () => setDeleteId(null) });
-          }
+          if (deleteId)
+            deleteMutation.mutate(deleteId, {
+              onSuccess: () => setDeleteId(null),
+            });
         }}
       />
     </>

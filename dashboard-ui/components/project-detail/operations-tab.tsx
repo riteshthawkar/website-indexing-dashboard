@@ -295,7 +295,7 @@ export function OperationsTab({ run }: { run: PipelineRun }) {
             </Button>
           </div>
           {serviceQuery.data && (
-            <ScrollArea className="h-56 rounded-md border bg-black/50 p-4">
+            <ScrollArea className="h-56 rounded-md border bg-muted p-4">
               <pre className="text-xs font-mono whitespace-pre-wrap">
                 {JSON.stringify(serviceQuery.data as RetrieverServiceStatus, null, 2)}
               </pre>
@@ -335,7 +335,7 @@ export function OperationsTab({ run }: { run: PipelineRun }) {
                 </Badge>
                 <Badge variant="outline">{validationResult.config_name}</Badge>
               </div>
-              <ScrollArea className="h-40 rounded-md border bg-black/50 p-4">
+              <ScrollArea className="h-40 rounded-md border bg-muted p-4">
                 <pre className="text-xs font-mono whitespace-pre-wrap">
                   {JSON.stringify(validationResult, null, 2)}
                 </pre>
@@ -348,7 +348,7 @@ export function OperationsTab({ run }: { run: PipelineRun }) {
                 <Badge variant="secondary">dry run</Badge>
                 <Badge variant="outline">steps: {dryRunResult.plan.length}</Badge>
               </div>
-              <ScrollArea className="h-40 rounded-md border bg-black/50 p-4">
+              <ScrollArea className="h-40 rounded-md border bg-muted p-4">
                 <pre className="text-xs font-mono whitespace-pre-wrap">
                   {JSON.stringify(dryRunResult, null, 2)}
                 </pre>
@@ -363,7 +363,7 @@ export function OperationsTab({ run }: { run: PipelineRun }) {
                 <Badge variant="outline">warnings: {auditResult.warnings.length}</Badge>
                 <Badge variant="outline">repaired: {auditResult.repaired_artifact_references}</Badge>
               </div>
-              <ScrollArea className="h-40 rounded-md border bg-black/50 p-4">
+              <ScrollArea className="h-40 rounded-md border bg-muted p-4">
                 <pre className="text-xs font-mono whitespace-pre-wrap">
                   {JSON.stringify(auditResult, null, 2)}
                 </pre>

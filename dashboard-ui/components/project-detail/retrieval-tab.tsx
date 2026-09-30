@@ -201,7 +201,7 @@ export function RetrievalTab({ run }: { run: PipelineRun }) {
               <CardTitle>Raw Retrieval Payload</CardTitle>
             </CardHeader>
             <CardContent>
-              <ScrollArea className="h-96 rounded-md border bg-black/50 p-4">
+              <ScrollArea className="h-96 rounded-md border bg-muted p-4">
                 <pre className="text-xs font-mono whitespace-pre-wrap">
                   {JSON.stringify(retrievalMutation.data, null, 2)}
                 </pre>

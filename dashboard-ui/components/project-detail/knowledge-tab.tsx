@@ -371,7 +371,7 @@ export function KnowledgeTab({ runId }: { runId: number }) {
           {!data.graph ? (
             <p className="text-sm text-muted-foreground">No Neo4j upload manifest found for this run.</p>
           ) : (
-            <ScrollArea className="h-80 rounded-md border bg-black/50 p-4">
+            <ScrollArea className="h-80 rounded-md border bg-muted p-4">
               <pre className="text-xs font-mono whitespace-pre-wrap">
                 {JSON.stringify(data.graph, null, 2)}
               </pre>
